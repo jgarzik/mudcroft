@@ -55,6 +55,7 @@ mudd/src/
 | `classes` | Custom class definitions |
 | `credits` | Player credit balances per universe |
 | `timers` | Persisted one-shot timers |
+| `universe_settings` | Key-value settings per universe (e.g., portal_room_id) |
 
 ### Permission/Combat Tables
 
@@ -120,7 +121,7 @@ Client -> /ws?token=<jwt>
           1. Create PlayerSession (player_id, sender channel)
           2. Register with ConnectionManager
           3. Send Welcome message
-          4. Place player in first room
+          4. Spawn at portal room (if set) or send "not initialized" message
           5. Loop: recv ClientMessage -> execute_command -> send ServerMessage
        -> On disconnect: unregister session
 ```
@@ -132,6 +133,8 @@ ClientMessage::Command{text}
   -> parse verb + args
   -> match verb:
      - look, north/south/east/west, say, help: built-in handlers
+     - goto <room_id>: Wizard+ only, teleport to room
+     - setportal [room_id]: Wizard+ only, set spawn point
      - eval: Wizard+ only, creates Sandbox with GameApi
   -> execute, send ServerMessage
 ```

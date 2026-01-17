@@ -152,6 +152,61 @@ curl -X POST http://localhost:8080/universe/upload \
   --data-binary @universe.zip
 ```
 
+## Universe Initialization
+
+After creating a universe and uploading Lua libraries, wizards must initialize it by setting a spawn portal. Until a portal is set, players see "Universe not initialized" when connecting.
+
+### Workflow
+
+1. **Upload universe** - Create universe via API or ZIP upload
+2. **Connect as wizard** - Log in with wizard+ access level
+3. **Run init script** - Execute Lua to create rooms:
+   ```
+   eval return init()
+   ```
+4. **Teleport to entrance** - Use `goto` to find your spawn room:
+   ```
+   goto <room_id>
+   ```
+5. **Set portal** - Designate current room as spawn point:
+   ```
+   setportal
+   ```
+
+### Wizard Commands
+
+| Command | Description |
+|---------|-------------|
+| `goto <room_id>` | Teleport to any room by ID |
+| `setportal` | Set portal to current room |
+| `setportal <room_id>` | Set portal to specified room |
+
+### Portal Storage
+
+Portal is stored in `universe_settings` table:
+
+```sql
+-- Check current portal
+SELECT * FROM universe_settings WHERE universe_id = 'default' AND key = 'portal_room_id';
+
+-- Manually set portal (emergency use)
+INSERT OR REPLACE INTO universe_settings (universe_id, key, value)
+VALUES ('default', 'portal_room_id', '<room_uuid>');
+```
+
+### Universe Settings API
+
+The `universe_settings` table provides key-value storage per universe:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| universe_id | TEXT | Foreign key to universes |
+| key | TEXT | Setting name |
+| value | TEXT | Setting value |
+
+Currently used keys:
+- `portal_room_id` - UUID of spawn room
+
 ## Account Management
 
 ### Create Account
@@ -357,4 +412,7 @@ SELECT id, object_id, method, fire_at FROM timers ORDER BY fire_at;
 
 -- Credit balances
 SELECT player_id, balance FROM credits WHERE universe_id = '<id>';
+
+-- Universe settings (including portal)
+SELECT * FROM universe_settings WHERE universe_id = '<id>';
 ```
