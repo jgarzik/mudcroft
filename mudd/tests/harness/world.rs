@@ -155,6 +155,28 @@ impl TestWorld {
             .set_exit(&arena_room_id, "south", &spawn_room_id)
             .await?;
 
+        // Set portal to spawn room so players spawn there
+        store.set_portal(&universe_id, &spawn_room_id).await?;
+
+        // Also set up "default" universe for WebSocket connections
+        // (WebSocket handler currently hardcodes "default" universe)
+        let default_exists: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM universes WHERE id = 'default'")
+                .fetch_optional(server.pool())
+                .await?;
+        if default_exists.is_none() {
+            store
+                .create_universe("default", "Default Universe", &wizard_account_id, json!({}))
+                .await?;
+        }
+
+        // Create a default spawn room for the default universe
+        let mut default_spawn = Object::new("default", "room");
+        default_spawn.set_property("name", json!("Default Spawn"));
+        default_spawn.set_property("description", json!("The default spawn point."));
+        store.create(&default_spawn).await?;
+        store.set_portal("default", &default_spawn.id).await?;
+
         Ok(Self {
             universe_id,
             region_id,

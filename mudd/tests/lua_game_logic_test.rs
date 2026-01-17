@@ -10,24 +10,14 @@ use harness::{Role, TestServer};
 /// Execute Lua game logic tests via eval command
 ///
 /// This test:
-/// 1. Starts a TestServer with the full test world
-/// 2. Creates a "default" universe (required by execute_lua)
-/// 3. Connects as a wizard (required for eval command)
-/// 4. Executes a subset of working tests
-/// 5. Parses the output for pass/fail count
+/// 1. Starts a TestServer with the full test world (TestWorld::create sets up "default" universe)
+/// 2. Connects as a wizard (required for eval command)
+/// 3. Executes a subset of working tests
+/// 4. Parses the output for pass/fail count
 #[tokio::test]
 async fn test_lua_game_logic() {
     let server = TestServer::start().await.expect("Failed to start server");
-
-    // Create the "default" universe that execute_lua uses
-    sqlx::query("INSERT INTO accounts (id, username) VALUES ('system', 'system')")
-        .execute(server.pool())
-        .await
-        .expect("Failed to create system account");
-    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('default', 'Default Universe', 'system')")
-        .execute(server.pool())
-        .await
-        .expect("Failed to create default universe");
+    // Note: TestWorld::create() now sets up the "default" universe with a portal
 
     // Connect as wizard
     let mut wizard = server
@@ -273,16 +263,7 @@ return result
 #[tokio::test]
 async fn test_lua_set_actor_permissions() {
     let server = TestServer::start().await.expect("Failed to start server");
-
-    // Create the "default" universe
-    sqlx::query("INSERT INTO accounts (id, username) VALUES ('system', 'system')")
-        .execute(server.pool())
-        .await
-        .expect("Failed to create system account");
-    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('default', 'Default Universe', 'system')")
-        .execute(server.pool())
-        .await
-        .expect("Failed to create default universe");
+    // Note: TestWorld::create() now sets up the "default" universe with a portal
 
     // Connect as wizard
     let mut wizard = server

@@ -211,22 +211,27 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
         let _ = socket.send(Message::Text(json.into())).await;
     }
 
-    // Spawn player in starting room
+    // Spawn player at portal room (if set)
     let universe_id = "default"; // TODO: from universe selection
-    if let Ok(rooms) = state.object_store.get_by_class(universe_id, "room").await {
-        if let Some(first_room) = rooms.first() {
-            let room_id = first_room.id.clone();
-            state
-                .connections
-                .update_room(&player_id, Some(room_id.clone()))
-                .await;
+    if let Ok(Some(portal_id)) = state.object_store.get_portal(universe_id).await {
+        state
+            .connections
+            .update_room(&player_id, Some(portal_id.clone()))
+            .await;
 
-            // Send initial room description
-            if let Some(room_msg) = build_room_message(&state, &room_id).await {
-                if let Ok(json) = serde_json::to_string(&room_msg) {
-                    let _ = socket.send(Message::Text(json.into())).await;
-                }
+        // Send initial room description
+        if let Some(room_msg) = build_room_message(&state, &portal_id).await {
+            if let Ok(json) = serde_json::to_string(&room_msg) {
+                let _ = socket.send(Message::Text(json.into())).await;
             }
+        }
+    } else {
+        // No portal set - player stays nowhere
+        let msg = ServerMessage::Output {
+            text: "Universe not initialized. Wizards: use 'setportal' command.".to_string(),
+        };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = socket.send(Message::Text(json.into())).await;
         }
     }
 
@@ -444,9 +449,110 @@ async fn execute_command(
             }
         }
         "help" => ServerMessage::Output {
-            text: "Commands: look, north/south/east/west, say <message>, eval <lua>, help"
+            text: "Commands: look, north/south/east/west, say <message>, eval <lua>, goto <room_id>, setportal [room_id], help"
                 .to_string(),
         },
+        "goto" => {
+            // Wizard+ only
+            if access_level < AccessLevel::Wizard {
+                return ServerMessage::Error {
+                    message: "Permission denied: wizard+ required for goto".to_string(),
+                };
+            }
+
+            // Get room_id from args
+            let room_id = if parts.len() > 1 {
+                parts[1].to_string()
+            } else {
+                return ServerMessage::Error {
+                    message: "Usage: goto <room_id>".to_string(),
+                };
+            };
+
+            // Verify room exists
+            match state.object_store.get(&room_id).await {
+                Ok(Some(room)) if room.class == "room" => {
+                    // Update player's room
+                    state
+                        .connections
+                        .update_room(player_id, Some(room_id.clone()))
+                        .await;
+
+                    // Return room description
+                    if let Some(room_msg) = build_room_message(state, &room_id).await {
+                        return room_msg;
+                    }
+                    ServerMessage::Output {
+                        text: "Teleported but room has no description.".to_string(),
+                    }
+                }
+                Ok(Some(_)) => ServerMessage::Error {
+                    message: format!("Object {} is not a room.", room_id),
+                },
+                Ok(None) => ServerMessage::Error {
+                    message: format!("Room not found: {}", room_id),
+                },
+                Err(e) => ServerMessage::Error {
+                    message: format!("Error looking up room: {}", e),
+                },
+            }
+        }
+        "setportal" => {
+            // Wizard+ only
+            if access_level < AccessLevel::Wizard {
+                return ServerMessage::Error {
+                    message: "Permission denied: wizard+ required for setportal".to_string(),
+                };
+            }
+
+            let universe_id = "default"; // TODO: from session
+
+            // Get room_id from args or current room
+            let room_id = if parts.len() > 1 {
+                parts[1].to_string()
+            } else {
+                match state.connections.get_room_id(player_id).await {
+                    Some(id) => id,
+                    None => {
+                        return ServerMessage::Error {
+                            message: "You are nowhere. Use 'setportal <room_id>' to specify a room."
+                                .to_string(),
+                        };
+                    }
+                }
+            };
+
+            // Verify room exists
+            match state.object_store.get(&room_id).await {
+                Ok(Some(room)) if room.class == "room" => {
+                    // Set portal
+                    if let Err(e) = state.object_store.set_portal(universe_id, &room_id).await {
+                        return ServerMessage::Error {
+                            message: format!("Failed to set portal: {}", e),
+                        };
+                    }
+
+                    let room_name = room
+                        .properties
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown Room");
+
+                    ServerMessage::Output {
+                        text: format!("Portal set to: {} ({})", room_name, room_id),
+                    }
+                }
+                Ok(Some(_)) => ServerMessage::Error {
+                    message: format!("Object {} is not a room.", room_id),
+                },
+                Ok(None) => ServerMessage::Error {
+                    message: format!("Room not found: {}", room_id),
+                },
+                Err(e) => ServerMessage::Error {
+                    message: format!("Error looking up room: {}", e),
+                },
+            }
+        }
         "eval" => {
             // Wizard+ only
             if access_level < AccessLevel::Wizard {

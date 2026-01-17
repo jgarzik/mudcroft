@@ -468,6 +468,12 @@ async fn test_websocket_command() {
         .await
         .unwrap();
 
+    // Receive initial room description (player spawns at portal)
+    let _room = ws
+        .recv_json_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+
     // Send a command
     ws.send_command("look")
         .await
@@ -481,13 +487,13 @@ async fn test_websocket_command() {
     assert_eq!(echo["type"], "echo");
     assert_eq!(echo["command"], "look");
 
-    // Should receive output
+    // Should receive room description
     let output = ws
         .recv_json_timeout(std::time::Duration::from_secs(5))
         .await
         .expect("Failed to receive output");
-    assert_eq!(output["type"], "output");
-    assert!(output["text"].is_string());
+    assert_eq!(output["type"], "room");
+    assert!(output["name"].is_string());
 
     ws.close().await.ok();
 }
@@ -503,6 +509,12 @@ async fn test_websocket_help_command() {
 
     // Receive welcome
     let _welcome = ws
+        .recv_json_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Receive initial room description (player spawns at portal)
+    let _room = ws
         .recv_json_timeout(std::time::Duration::from_secs(5))
         .await
         .unwrap();
@@ -567,6 +579,12 @@ async fn test_websocket_unknown_command() {
 
     // Receive welcome
     let _welcome = ws
+        .recv_json_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Receive initial room description (player spawns at portal)
+    let _room = ws
         .recv_json_timeout(std::time::Duration::from_secs(5))
         .await
         .unwrap();
@@ -706,18 +724,18 @@ async fn test_harness_multiple_clients() {
         .await
         .expect("player2 failed to send command");
 
-    // Both should receive responses
+    // Both should receive room descriptions (players spawn in a room)
     let resp1 = player1
-        .expect("output")
+        .expect("room")
         .await
-        .expect("player1 didn't get output");
+        .expect("player1 didn't get room");
     let resp2 = player2
-        .expect("output")
+        .expect("room")
         .await
-        .expect("player2 didn't get output");
+        .expect("player2 didn't get room");
 
-    assert_eq!(resp1["type"], "output");
-    assert_eq!(resp2["type"], "output");
+    assert_eq!(resp1["type"], "room");
+    assert_eq!(resp2["type"], "room");
 }
 
 // Race Condition Tests
@@ -748,11 +766,11 @@ async fn test_race_concurrent_commands() {
     r1.expect("player1 command should succeed");
     r2.expect("player2 command should succeed");
 
-    // Both should receive responses
-    let (msg1, msg2) = tokio::join!(player1.expect("output"), player2.expect("output"),);
+    // Both should receive room responses (players spawn in a room)
+    let (msg1, msg2) = tokio::join!(player1.expect("room"), player2.expect("room"),);
 
-    assert!(msg1.is_ok(), "player1 should get output");
-    assert!(msg2.is_ok(), "player2 should get output");
+    assert!(msg1.is_ok(), "player1 should get room");
+    assert!(msg2.is_ok(), "player2 should get room");
 }
 
 #[tokio::test]
@@ -780,14 +798,14 @@ async fn test_race_mixed_roles() {
     w.expect("wizard command should work");
     p.expect("player command should work");
 
-    // Both get responses
-    let (wm, pm) = tokio::join!(wizard.expect("output"), player.expect("output"),);
+    // Wizard gets output (help command), player gets room (look command)
+    let (wm, pm) = tokio::join!(wizard.expect("output"), player.expect("room"),);
 
     let wiz_output = wm.expect("wizard should get output");
-    let player_output = pm.expect("player should get output");
+    let player_room = pm.expect("player should get room");
 
     assert_eq!(wiz_output["type"], "output");
-    assert_eq!(player_output["type"], "output");
+    assert_eq!(player_room["type"], "room");
 }
 
 /// Test: Wizard can execute Lua via eval command
@@ -1208,17 +1226,7 @@ async fn test_effects_persistence() {
 #[tokio::test]
 async fn test_eval_create_object() {
     let server = TestServer::start().await.expect("Failed to start server");
-
-    // Create the "default" universe that execute_lua uses
-    // Note: execute_lua in websocket.rs hardcodes "default" as universe_id
-    sqlx::query("INSERT INTO accounts (id, username) VALUES ('system', 'system')")
-        .execute(server.pool())
-        .await
-        .expect("Failed to create system account");
-    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('default', 'Default Universe', 'system')")
-        .execute(server.pool())
-        .await
-        .expect("Failed to create default universe");
+    // Note: TestWorld::create() now sets up the "default" universe with a portal
 
     // Connect as wizard
     let mut wizard = server

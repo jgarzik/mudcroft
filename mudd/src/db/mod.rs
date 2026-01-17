@@ -337,6 +337,20 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Universe settings table (key-value per universe)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS universe_settings (
+                universe_id TEXT NOT NULL REFERENCES universes(id),
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (universe_id, key)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Create indexes
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_universe ON objects(universe_id)")
             .execute(&self.pool)
