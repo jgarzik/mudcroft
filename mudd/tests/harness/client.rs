@@ -134,11 +134,9 @@ impl TestClient {
                 match &role {
                     Role::Builder { .. } | Role::Wizard { .. } | Role::Admin { .. } => {
                         let level = role.access_level();
-                        sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
-                            .bind(level)
-                            .bind(&account_id)
-                            .execute(server.pool())
-                            .await?;
+                        let account_service =
+                            mudd::auth::accounts::AccountService::new(server.pool().clone());
+                        account_service.set_access_level(&account_id, level).await?;
                     }
                     _ => {}
                 }

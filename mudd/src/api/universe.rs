@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    body::Bytes, extract::State, http::StatusCode, response::IntoResponse, routing::post, Json,
+    Router,
+};
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
@@ -12,6 +15,9 @@ use super::AppState;
 /// Universe creation request - JSON with libs as code strings
 #[derive(Debug, Deserialize)]
 struct UniverseCreateRequest {
+    /// Optional universe ID (defaults to generated UUID)
+    #[serde(default)]
+    id: Option<String>,
     /// Universe name
     name: String,
     /// Owner account ID
@@ -40,7 +46,9 @@ struct ErrorResponse {
 
 /// Build the universe router
 pub fn router() -> Router<AppState> {
-    Router::new().route("/universe/create", post(create_universe))
+    Router::new()
+        .route("/universe/create", post(create_universe))
+        .route("/universe/upload", post(upload_universe))
 }
 
 /// POST /universe/create
@@ -60,8 +68,10 @@ async fn process_universe_request(
     request: UniverseCreateRequest,
     state: &AppState,
 ) -> Result<UniverseCreateResponse, String> {
-    // Generate universe ID
-    let universe_id = uuid::Uuid::new_v4().to_string();
+    // Use provided ID or generate one
+    let universe_id = request
+        .id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Store libs and collect hashes
     let mut lib_hashes: HashMap<String, String> = HashMap::new();
@@ -102,8 +112,16 @@ async fn process_universe_request(
     })
 }
 
-/// Alternative: Create universe from ZIP file (for future use)
-#[allow(dead_code)]
+/// POST /universe/upload
+/// Accepts ZIP file with universe.json and Lua libraries
+async fn upload_universe(State(state): State<AppState>, body: Bytes) -> axum::response::Response {
+    match create_universe_from_zip(&body, &state).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
+    }
+}
+
+/// Create universe from ZIP file
 async fn create_universe_from_zip(
     zip_data: &[u8],
     state: &AppState,
@@ -111,69 +129,86 @@ async fn create_universe_from_zip(
     /// Universe config parsed from universe.json in zipfile
     #[derive(Debug, Deserialize)]
     struct ZipUniverseConfig {
+        /// Optional ID (defaults to generated UUID)
+        #[serde(default)]
+        id: Option<String>,
         name: String,
         owner_id: String,
         #[serde(default)]
         config: serde_json::Value,
     }
 
-    // Parse ZIP file
-    let cursor = Cursor::new(zip_data);
-    let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP file: {}", e))?;
+    // Extract all data from ZIP synchronously (ZipArchive is not Send)
+    let (universe_config, lua_files): (ZipUniverseConfig, Vec<(String, String)>) = {
+        let cursor = Cursor::new(zip_data);
+        let mut archive =
+            ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP file: {}", e))?;
 
-    // Read universe.json
-    let universe_config: ZipUniverseConfig = {
-        let mut file = archive
-            .by_name("universe.json")
-            .map_err(|_| "Missing universe.json in ZIP file".to_string())?;
+        // Read universe.json
+        let config: ZipUniverseConfig = {
+            let mut file = archive
+                .by_name("universe.json")
+                .map_err(|_| "Missing universe.json in ZIP file".to_string())?;
 
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .map_err(|e| format!("Failed to read universe.json: {}", e))?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .map_err(|e| format!("Failed to read universe.json: {}", e))?;
 
-        serde_json::from_str(&contents).map_err(|e| format!("Invalid universe.json: {}", e))?
+            serde_json::from_str(&contents).map_err(|e| format!("Invalid universe.json: {}", e))?
+        };
+
+        // Get all Lua file names
+        let file_names: Vec<String> = (0..archive.len())
+            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+            .collect();
+
+        // Extract all Lua files
+        let mut lua_files = Vec::new();
+        for name in file_names {
+            if name.ends_with(".lua") {
+                let mut file = archive
+                    .by_name(&name)
+                    .map_err(|e| format!("Failed to read {}: {}", name, e))?;
+
+                let mut source = String::new();
+                file.read_to_string(&mut source)
+                    .map_err(|e| format!("Failed to read {}: {}", name, e))?;
+
+                // Clean name (remove lib/ prefix and .lua suffix)
+                let clean_name = name
+                    .strip_prefix("lib/")
+                    .unwrap_or(&name)
+                    .strip_suffix(".lua")
+                    .unwrap_or(&name)
+                    .to_string();
+
+                lua_files.push((clean_name, source));
+            }
+        }
+
+        (config, lua_files)
     };
+    // ZipArchive is now dropped, safe to do async operations
 
-    // Generate universe ID
-    let universe_id = uuid::Uuid::new_v4().to_string();
+    // Use provided ID or generate one
+    let universe_id = universe_config
+        .id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // Collect all .lua files and their hashes
+    // Store Lua files and collect hashes (async)
     let mut lib_hashes: HashMap<String, String> = HashMap::new();
     let mut libs_loaded = Vec::new();
 
-    // Get file names first to avoid borrowing issues
-    let file_names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
-        .collect();
+    for (name, source) in lua_files {
+        let hash = state
+            .object_store
+            .store_code(&source)
+            .await
+            .map_err(|e| format!("Failed to store {}: {}", name, e))?;
 
-    for name in file_names {
-        if name.ends_with(".lua") {
-            let mut file = archive
-                .by_name(&name)
-                .map_err(|e| format!("Failed to read {}: {}", name, e))?;
-
-            let mut source = String::new();
-            file.read_to_string(&mut source)
-                .map_err(|e| format!("Failed to read {}: {}", name, e))?;
-
-            // Store in code_store
-            let hash = state
-                .object_store
-                .store_code(&source)
-                .await
-                .map_err(|e| format!("Failed to store {}: {}", name, e))?;
-
-            // Track the hash with a clean name (remove lib/ prefix if present)
-            let clean_name = name
-                .strip_prefix("lib/")
-                .unwrap_or(&name)
-                .strip_suffix(".lua")
-                .unwrap_or(&name)
-                .to_string();
-
-            lib_hashes.insert(clean_name.clone(), hash);
-            libs_loaded.push(clean_name);
-        }
+        lib_hashes.insert(name.clone(), hash);
+        libs_loaded.push(name);
     }
 
     // Build final config with lib hashes

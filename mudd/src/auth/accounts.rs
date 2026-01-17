@@ -176,6 +176,44 @@ impl AccountService {
             created_at,
         }))
     }
+
+    /// Get account by username
+    pub async fn get_by_username(&self, username: &str) -> Result<Option<Account>, AuthError> {
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT id, username, access_level, created_at FROM accounts WHERE username = ?",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(id, username, access_level, created_at)| Account {
+            id,
+            username,
+            access_level,
+            created_at,
+        }))
+    }
+
+    /// Create account (simpler alias for create_account, returns just Account)
+    pub async fn create(&self, username: &str, password: &str) -> Result<Account, AuthError> {
+        let (account, _token) = self.create_account(username, password).await?;
+        Ok(account)
+    }
+
+    /// Set account access level
+    pub async fn set_access_level(&self, account_id: &str, level: &str) -> Result<(), AuthError> {
+        let result = sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
+            .bind(level)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(AuthError::AccountNotFound);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

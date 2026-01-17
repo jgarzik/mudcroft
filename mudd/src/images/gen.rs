@@ -46,20 +46,21 @@ pub async fn generate_room_image(
         .unwrap_or("A nondescript room.");
 
     // Get region for environment type (if available)
-    let environment_type = if let Some(region_id) = room.properties.get("region_id").and_then(|v| v.as_str()) {
-        if let Ok(Some(region)) = object_store.get(region_id).await {
-            region
-                .properties
-                .get("environment_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("indoor")
-                .to_string()
+    let environment_type =
+        if let Some(region_id) = room.properties.get("region_id").and_then(|v| v.as_str()) {
+            if let Ok(Some(region)) = object_store.get(region_id).await {
+                region
+                    .properties
+                    .get("environment_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("indoor")
+                    .to_string()
+            } else {
+                "indoor".to_string()
+            }
         } else {
             "indoor".to_string()
-        }
-    } else {
-        "indoor".to_string()
-    };
+        };
 
     info!(
         "Generating image for room '{}' with theme '{}'",
@@ -102,7 +103,12 @@ Respond with ONLY the image prompt, no explanations or preamble."#,
     // Step 2: Generate image
     debug!("Requesting image generation from Venice");
     let image_url = venice
-        .generate_image(account_id, &image_prompt, ImageStyle::Painterly, ImageSize::Medium)
+        .generate_image(
+            account_id,
+            &image_prompt,
+            ImageStyle::Painterly,
+            ImageSize::Medium,
+        )
         .await
         .map_err(|e| format!("Failed to generate image: {}", e))?;
 
@@ -121,8 +127,14 @@ Respond with ONLY the image prompt, no explanations or preamble."#,
 
     // Step 4: Update room with image hash
     let mut updated_room = room.clone();
-    updated_room.properties.insert("image_hash".to_string(), serde_json::json!(image_hash.clone()));
-    updated_room.properties.insert("image_generated_at".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
+    updated_room.properties.insert(
+        "image_hash".to_string(),
+        serde_json::json!(image_hash.clone()),
+    );
+    updated_room.properties.insert(
+        "image_generated_at".to_string(),
+        serde_json::json!(chrono::Utc::now().timestamp()),
+    );
 
     object_store
         .update(&updated_room)

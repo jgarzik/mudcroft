@@ -53,13 +53,11 @@ impl ClassDef {
 }
 
 /// Registry of all class definitions
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ClassRegistry {
     classes: HashMap<String, ClassDef>,
     db_pool: Option<SqlitePool>,
 }
-
 
 impl ClassRegistry {
     /// Create a new registry with base classes

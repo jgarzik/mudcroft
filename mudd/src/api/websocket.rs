@@ -88,6 +88,15 @@ impl ConnectionManager {
             session.room_id = room_id;
         }
     }
+
+    /// Get player's current room ID
+    pub async fn get_room_id(&self, player_id: &str) -> Option<String> {
+        self.sessions
+            .read()
+            .await
+            .get(player_id)
+            .and_then(|s| s.room_id.clone())
+    }
 }
 
 /// Messages sent from server to client
@@ -96,10 +105,7 @@ impl ConnectionManager {
 pub enum ServerMessage {
     /// Welcome message on connect
     #[serde(rename = "welcome")]
-    Welcome {
-        player_id: String,
-        theme_id: String,
-    },
+    Welcome { player_id: String, theme_id: String },
     /// Text output to display
     #[serde(rename = "output")]
     Output { text: String },
@@ -205,6 +211,25 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
         let _ = socket.send(Message::Text(json.into())).await;
     }
 
+    // Spawn player in starting room
+    let universe_id = "default"; // TODO: from universe selection
+    if let Ok(rooms) = state.object_store.get_by_class(universe_id, "room").await {
+        if let Some(first_room) = rooms.first() {
+            let room_id = first_room.id.clone();
+            state
+                .connections
+                .update_room(&player_id, Some(room_id.clone()))
+                .await;
+
+            // Send initial room description
+            if let Some(room_msg) = build_room_message(&state, &room_id).await {
+                if let Ok(json) = serde_json::to_string(&room_msg) {
+                    let _ = socket.send(Message::Text(json.into())).await;
+                }
+            }
+        }
+    }
+
     // Main loop: handle incoming messages and outgoing messages
     loop {
         tokio::select! {
@@ -269,6 +294,68 @@ async fn handle_client_message(
     }
 }
 
+/// Build a Room message from a room object
+async fn build_room_message(state: &AppState, room_id: &str) -> Option<ServerMessage> {
+    // Get room object
+    let room = state.object_store.get(room_id).await.ok()??;
+
+    // Get room contents
+    let contents = state
+        .object_store
+        .get_contents(room_id)
+        .await
+        .unwrap_or_default();
+
+    // Extract room properties
+    let name = room
+        .properties
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown Room")
+        .to_string();
+
+    let description = room
+        .properties
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("You see nothing special.")
+        .to_string();
+
+    // Extract exits (keys of the exits object)
+    let exits: Vec<String> = room
+        .properties
+        .get("exits")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default();
+
+    // Extract content names (filter out players for now, just show items)
+    let content_names: Vec<String> = contents
+        .iter()
+        .filter_map(|obj| {
+            obj.properties
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    // Get image hash if present
+    let image_hash = room
+        .properties
+        .get("image_hash")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Some(ServerMessage::Room {
+        name,
+        description,
+        exits,
+        contents: content_names,
+        image_hash,
+    })
+}
+
 /// Parse and execute a player command
 async fn execute_command(
     state: &AppState,
@@ -288,13 +375,66 @@ async fn execute_command(
     let verb = parts[0].to_lowercase();
 
     match verb.as_str() {
-        "look" | "l" => ServerMessage::Output {
-            text: "You see nothing special.".to_string(),
-        },
-        "north" | "n" | "south" | "s" | "east" | "e" | "west" | "w" | "up" | "u" | "down" | "d" => {
-            // TODO: Actually move the player
+        "look" | "l" => {
+            // Get player's current room
+            if let Some(room_id) = state.connections.get_room_id(player_id).await {
+                if let Some(room_msg) = build_room_message(state, &room_id).await {
+                    return room_msg;
+                }
+            }
             ServerMessage::Output {
-                text: format!("You go {}.", verb),
+                text: "You are nowhere.".to_string(),
+            }
+        }
+        "north" | "n" | "south" | "s" | "east" | "e" | "west" | "w" | "up" | "u" | "down" | "d" => {
+            // Normalize direction
+            let direction = match verb.as_str() {
+                "n" => "north",
+                "s" => "south",
+                "e" => "east",
+                "w" => "west",
+                "u" => "up",
+                "d" => "down",
+                other => other,
+            };
+
+            // Get player's current room
+            let current_room_id = match state.connections.get_room_id(player_id).await {
+                Some(id) => id,
+                None => {
+                    return ServerMessage::Output {
+                        text: "You are nowhere.".to_string(),
+                    };
+                }
+            };
+
+            // Check if exit exists
+            let dest_room_id = match state
+                .object_store
+                .get_exit(&current_room_id, direction)
+                .await
+            {
+                Ok(Some(dest)) => dest,
+                _ => {
+                    return ServerMessage::Output {
+                        text: "You can't go that way.".to_string(),
+                    };
+                }
+            };
+
+            // Update player's room
+            state
+                .connections
+                .update_room(player_id, Some(dest_room_id.clone()))
+                .await;
+
+            // Return new room description
+            if let Some(room_msg) = build_room_message(state, &dest_room_id).await {
+                return room_msg;
+            }
+
+            ServerMessage::Output {
+                text: "You move but find yourself nowhere.".to_string(),
             }
         }
         "say" => {

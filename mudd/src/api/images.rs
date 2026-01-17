@@ -18,10 +18,7 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Serve an image by hash
-async fn get_image(
-    Path(hash): Path<String>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn get_image(Path(hash): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
     match state.image_store.get(&hash).await {
         Ok(Some(image)) => {
             // Return image with appropriate headers
@@ -39,10 +36,6 @@ async fn get_image(
                 .into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "Image not found").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error: {}", e),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response(),
     }
 }

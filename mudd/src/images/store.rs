@@ -88,13 +88,12 @@ impl ImageStore {
 
     /// Get image by hash
     pub async fn get(&self, hash: &str) -> Result<Option<ImageData>, String> {
-        let row: Option<(String, Vec<u8>, String)> = sqlx::query_as(
-            "SELECT hash, data, mime_type FROM image_store WHERE hash = ?",
-        )
-        .bind(hash)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("Failed to get image: {}", e))?;
+        let row: Option<(String, Vec<u8>, String)> =
+            sqlx::query_as("SELECT hash, data, mime_type FROM image_store WHERE hash = ?")
+                .bind(hash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("Failed to get image: {}", e))?;
 
         Ok(row.map(|(hash, data, mime_type)| ImageData {
             hash,
@@ -132,31 +131,31 @@ impl ImageStore {
 
     /// Check if an image exists
     pub async fn exists(&self, hash: &str) -> bool {
-        let result: Result<Option<(i32,)>, _> = sqlx::query_as(
-            "SELECT 1 FROM image_store WHERE hash = ?",
-        )
-        .bind(hash)
-        .fetch_optional(&self.pool)
-        .await;
+        let result: Result<Option<(i32,)>, _> =
+            sqlx::query_as("SELECT 1 FROM image_store WHERE hash = ?")
+                .bind(hash)
+                .fetch_optional(&self.pool)
+                .await;
 
         matches!(result, Ok(Some(_)))
     }
 
     /// Delete image by hash (only if reference_count is 0)
     pub async fn delete(&self, hash: &str) -> Result<bool, String> {
-        let result = sqlx::query(
-            "DELETE FROM image_store WHERE hash = ? AND reference_count <= 0",
-        )
-        .bind(hash)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("Failed to delete image: {}", e))?;
+        let result = sqlx::query("DELETE FROM image_store WHERE hash = ? AND reference_count <= 0")
+            .bind(hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("Failed to delete image: {}", e))?;
 
         if result.rows_affected() > 0 {
             debug!("Deleted image with hash {}", hash);
             Ok(true)
         } else {
-            warn!("Image {} not deleted (has references or doesn't exist)", hash);
+            warn!(
+                "Image {} not deleted (has references or doesn't exist)",
+                hash
+            );
             Ok(false)
         }
     }
