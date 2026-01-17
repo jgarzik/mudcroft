@@ -1,0 +1,150 @@
+/* Reset and base styles */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-text);
+  font-family: var(--font-family);
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Layout utilities */
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.flex-1 { flex: 1; }
+.items-center { align-items: center; }
+.justify-center { justify-content: center; }
+.justify-between { justify-content: space-between; }
+.gap-1 { gap: 0.25rem; }
+.gap-2 { gap: 0.5rem; }
+.gap-4 { gap: 1rem; }
+.p-2 { padding: 0.5rem; }
+.p-4 { padding: 1rem; }
+.w-full { width: 100%; }
+.h-full { height: 100%; }
+.overflow-auto { overflow: auto; }
+.overflow-hidden { overflow: hidden; }
+
+/* Panel styles - theme-aware */
+.panel {
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--border-radius);
+}
+
+/* Pixel border style (for Sierra theme) */
+[data-border-style="pixel"] .panel {
+  box-shadow:
+    inset -2px -2px 0 0 #000033,
+    inset 2px 2px 0 0 #5555ff;
+}
+
+/* Modern shadow style */
+[data-shadows="subtle"] .panel {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+[data-shadows="strong"] .panel {
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+/* Input styles */
+input, button {
+  font-family: var(--font-family);
+  font-size: var(--font-size-md);
+  border-radius: var(--border-radius);
+}
+
+input {
+  background-color: var(--color-background);
+  border: var(--border-width) solid var(--color-border);
+  color: var(--color-text);
+  padding: 0.5rem 0.75rem;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+input::placeholder {
+  color: var(--color-text-muted);
+}
+
+/* Button styles */
+button {
+  background-color: var(--color-primary);
+  border: var(--border-width) solid var(--color-border);
+  color: var(--color-text);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+button:hover {
+  background-color: var(--color-secondary);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Pixel button (Sierra theme) */
+[data-border-style="pixel"] button {
+  box-shadow:
+    inset -2px -2px 0 0 #005555,
+    inset 2px 2px 0 0 #55ffff;
+}
+
+[data-border-style="pixel"] button:active {
+  box-shadow:
+    inset 2px 2px 0 0 #005555,
+    inset -2px -2px 0 0 #55ffff;
+}
+
+/* Text colors */
+.text-muted { color: var(--color-text-muted); }
+.text-error { color: var(--color-error); }
+.text-success { color: var(--color-success); }
+.text-highlight { color: var(--color-highlight); }
+.text-primary { color: var(--color-primary); }
+
+/* Font sizes */
+.text-sm { font-size: var(--font-size-sm); }
+.text-md { font-size: var(--font-size-md); }
+.text-lg { font-size: var(--font-size-lg); }
+.text-xl { font-size: var(--font-size-xl); }
+
+/* Monospace */
+.font-mono { font-family: var(--font-family-mono); }
+
+/* Scrollbar styling for webkit browsers */
+::-webkit-scrollbar {
+  width: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-background);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: var(--border-radius);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-primary);
+}

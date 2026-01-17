@@ -7,10 +7,12 @@ pub mod auth;
 pub mod combat;
 pub mod credits;
 pub mod db;
+pub mod images;
 pub mod lua;
 pub mod objects;
 pub mod permissions;
 pub mod raft;
+pub mod theme;
 pub mod timers;
 pub mod venice;
 

@@ -96,7 +96,10 @@ impl ConnectionManager {
 pub enum ServerMessage {
     /// Welcome message on connect
     #[serde(rename = "welcome")]
-    Welcome { player_id: String },
+    Welcome {
+        player_id: String,
+        theme_id: String,
+    },
     /// Text output to display
     #[serde(rename = "output")]
     Output { text: String },
@@ -107,6 +110,8 @@ pub enum ServerMessage {
         description: String,
         exits: Vec<String>,
         contents: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_hash: Option<String>,
     },
     /// Error message
     #[serde(rename = "error")]
@@ -189,9 +194,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
 
     state.connections.register(session).await;
 
-    // Send welcome message
+    // Send welcome message with theme
+    // TODO: Get theme_id from universe config when universe selection is implemented
+    let theme_id = crate::theme::DEFAULT_THEME_ID.to_string();
     let welcome = ServerMessage::Welcome {
         player_id: player_id.clone(),
+        theme_id,
     };
     if let Ok(json) = serde_json::to_string(&welcome) {
         let _ = socket.send(Message::Text(json.into())).await;

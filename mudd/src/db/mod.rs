@@ -63,6 +63,7 @@ impl Database {
                 name TEXT NOT NULL,
                 owner_id TEXT NOT NULL REFERENCES accounts(id),
                 config TEXT NOT NULL DEFAULT '{}',
+                theme_id TEXT NOT NULL DEFAULT 'sierra-retro',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
             "#,
@@ -199,6 +200,23 @@ impl Database {
         // Index for active effects lookup
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_active_effects_entity ON active_effects(entity_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Image store (content-addressed)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS image_store (
+                hash TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                source TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                reference_count INTEGER DEFAULT 0
+            )
+            "#,
         )
         .execute(&self.pool)
         .await?;

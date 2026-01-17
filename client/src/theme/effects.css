@@ -1,0 +1,152 @@
+/* Visual effects - conditionally applied based on theme */
+
+/* Scanlines effect */
+[data-scanlines="true"]::after {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0.15),
+    rgba(0, 0, 0, 0.15) 1px,
+    transparent 1px,
+    transparent 2px
+  );
+}
+
+/* CRT glow effect */
+[data-crt-glow="true"] {
+  text-shadow: 0 0 2px var(--color-text);
+}
+
+[data-crt-glow="true"] .panel {
+  box-shadow:
+    inset 0 0 20px rgba(0, 170, 170, 0.1),
+    0 0 10px rgba(0, 170, 170, 0.2);
+}
+
+/* Dithering effect on images */
+[data-dithering="true"] img {
+  image-rendering: pixelated;
+  image-rendering: -moz-crisp-edges;
+  image-rendering: crisp-edges;
+}
+
+/* CRT screen curvature effect (subtle) */
+[data-crt-glow="true"] #root {
+  position: relative;
+}
+
+[data-crt-glow="true"] #root::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 9998;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 0%,
+    transparent 70%,
+    rgba(0, 0, 0, 0.3) 100%
+  );
+}
+
+/* Flicker animation for CRT */
+@keyframes flicker {
+  0% { opacity: 1; }
+  50% { opacity: 0.98; }
+  100% { opacity: 1; }
+}
+
+[data-crt-glow="true"] {
+  animation: flicker 0.1s infinite;
+}
+
+/* Modern shadow effects */
+[data-shadows="subtle"] {
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.1);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+}
+
+[data-shadows="strong"] {
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 10px 20px rgba(0, 0, 0, 0.3);
+}
+
+/* Hover effects for modern theme */
+[data-shadows="subtle"] button:hover,
+[data-shadows="strong"] button:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+[data-shadows="subtle"] button:active,
+[data-shadows="strong"] button:active {
+  transform: translateY(0);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Connection status indicator */
+.connection-status {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 0.5rem;
+}
+
+.connection-status.connected {
+  background-color: var(--color-success);
+}
+
+[data-crt-glow="true"] .connection-status.connected {
+  box-shadow: 0 0 4px var(--color-success);
+}
+
+.connection-status.connecting {
+  background-color: var(--color-highlight);
+  animation: pulse 1s infinite;
+}
+
+.connection-status.disconnected,
+.connection-status.error {
+  background-color: var(--color-error);
+}
+
+[data-crt-glow="true"] .connection-status.error {
+  box-shadow: 0 0 4px var(--color-error);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Terminal cursor blink */
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.cursor {
+  display: inline-block;
+  width: 0.6em;
+  height: 1em;
+  background-color: var(--color-primary);
+  animation: blink 1s step-end infinite;
+  vertical-align: text-bottom;
+}
+
+[data-crt-glow="true"] .cursor {
+  box-shadow: 0 0 4px var(--color-primary);
+}

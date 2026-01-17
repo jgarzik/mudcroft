@@ -1,6 +1,7 @@
 //! HTTP API module - REST endpoints and WebSocket
 
 mod auth;
+mod images;
 mod universe;
 mod websocket;
 
@@ -12,9 +13,11 @@ use tokio::sync::RwLock;
 
 use crate::credits::CreditManager;
 use crate::db::Database;
+use crate::images::ImageStore;
 use crate::lua::{ActionRegistry, MessageQueue};
 use crate::objects::{ClassRegistry, ObjectStore};
 use crate::permissions::PermissionManager;
+use crate::theme::ThemeRegistry;
 use crate::timers::TimerManager;
 use crate::venice::VeniceClient;
 pub use websocket::{ConnectionManager, PlayerSession, ServerMessage};
@@ -32,6 +35,8 @@ pub struct AppState {
     pub timers: Arc<TimerManager>,
     pub credits: Arc<CreditManager>,
     pub venice: Arc<VeniceClient>,
+    pub image_store: Arc<ImageStore>,
+    pub themes: Arc<ThemeRegistry>,
 }
 
 /// Build the API router
@@ -44,7 +49,9 @@ pub async fn router(db: Arc<Database>) -> Router {
     let permissions = Arc::new(PermissionManager::with_db(db.pool().clone()));
     let timers = Arc::new(TimerManager::new(Some(db.pool().clone())));
     let credits = Arc::new(CreditManager::new(Some(db.pool().clone())));
-    let venice = Arc::new(VeniceClient::new()); // No API key
+    let venice = Arc::new(VeniceClient::new());
+    let image_store = Arc::new(ImageStore::new(db.pool().clone()));
+    let themes = Arc::new(ThemeRegistry::new());
 
     // Load persisted data on startup
     if let Err(e) = timers.load_from_db().await {
@@ -70,12 +77,15 @@ pub async fn router(db: Arc<Database>) -> Router {
         timers,
         credits,
         venice,
+        image_store,
+        themes,
     };
 
     Router::new()
         .route("/health", get(health_check))
         .route("/", get(root))
         .route("/ws", get(websocket::ws_handler))
+        .nest("/images", images::router())
         .merge(auth::router())
         .merge(universe::router())
         .with_state(state)
