@@ -15,9 +15,9 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     bind: SocketAddr,
 
-    /// Database file path (uses in-memory if not specified)
+    /// Database file path (required - must be pre-initialized with mudd_init)
     #[arg(short, long)]
-    database: Option<String>,
+    database: String,
 }
 
 #[tokio::main]

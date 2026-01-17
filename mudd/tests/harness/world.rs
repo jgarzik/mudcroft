@@ -9,8 +9,10 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
-use mudd::db::Database;
 use mudd::objects::{Object, ObjectStore};
+use serde_json::json;
+
+use super::server::TestServer;
 
 /// Pre-configured test world with universe, region, rooms, and accounts
 pub struct TestWorld {
@@ -32,56 +34,103 @@ pub struct TestWorld {
 }
 
 impl TestWorld {
-    /// Create a fully populated test world using Database reference
-    pub async fn create(db: &Database) -> Result<Self> {
-        Self::create_with_pool(db.pool()).await
-    }
+    /// Create a fully populated test world using TestServer reference
+    /// Uses HTTP API for account and universe creation
+    pub async fn create(server: &TestServer) -> Result<Self> {
+        let store = ObjectStore::new(server.pool().clone());
 
-    /// Create a fully populated test world using raw pool
-    pub async fn create_with_pool(pool: &sqlx::SqlitePool) -> Result<Self> {
-        let store = ObjectStore::new(pool.clone());
+        // Create wizard account via API
+        let wizard_resp = server
+            .post(
+                "/auth/register",
+                &json!({
+                    "username": "test_wizard",
+                    "password": "test123"
+                }),
+            )
+            .await?;
 
-        // Create wizard account
-        let wizard_account_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO accounts (id, username, access_level) VALUES (?, ?, ?)")
-            .bind(&wizard_account_id)
-            .bind("test_wizard")
+        let wizard_account_id = if wizard_resp.status().is_success() {
+            let body: serde_json::Value = wizard_resp.json().await?;
+            body["account_id"].as_str().unwrap().to_string()
+        } else {
+            // Account may already exist (unlikely in fresh test), try to get it
+            let row: (String,) = sqlx::query_as("SELECT id FROM accounts WHERE username = ?")
+                .bind("test_wizard")
+                .fetch_one(server.pool())
+                .await?;
+            row.0
+        };
+
+        // Promote to wizard level
+        sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
             .bind("wizard")
-            .execute(pool)
-            .await?;
-
-        // Create builder account
-        let builder_account_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO accounts (id, username, access_level) VALUES (?, ?, ?)")
-            .bind(&builder_account_id)
-            .bind("test_builder")
-            .bind("builder")
-            .execute(pool)
-            .await?;
-
-        // Create test universe
-        let universe_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES (?, ?, ?)")
-            .bind(&universe_id)
-            .bind("Test Universe")
             .bind(&wizard_account_id)
-            .execute(pool)
+            .execute(server.pool())
             .await?;
+
+        // Create builder account via API
+        let builder_resp = server
+            .post(
+                "/auth/register",
+                &json!({
+                    "username": "test_builder",
+                    "password": "test123"
+                }),
+            )
+            .await?;
+
+        let builder_account_id = if builder_resp.status().is_success() {
+            let body: serde_json::Value = builder_resp.json().await?;
+            body["account_id"].as_str().unwrap().to_string()
+        } else {
+            // Account may already exist (unlikely in fresh test), try to get it
+            let row: (String,) = sqlx::query_as("SELECT id FROM accounts WHERE username = ?")
+                .bind("test_builder")
+                .fetch_one(server.pool())
+                .await?;
+            row.0
+        };
+
+        // Promote to builder level
+        sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
+            .bind("builder")
+            .bind(&builder_account_id)
+            .execute(server.pool())
+            .await?;
+
+        // Create test universe via API
+        let universe_id = uuid::Uuid::new_v4().to_string();
+        let universe_resp = server
+            .post(
+                "/universe/create",
+                &json!({
+                    "id": universe_id,
+                    "name": "Test Universe",
+                    "owner_id": wizard_account_id
+                }),
+            )
+            .await?;
+
+        if !universe_resp.status().is_success() {
+            let body = universe_resp.text().await?;
+            anyhow::bail!("Failed to create test universe: {}", body);
+        }
 
         // Create test region
         let mut region = Object::new(&universe_id, "region");
-        region.set_property("name", serde_json::json!("Test Region"));
-        region.set_property("description", serde_json::json!("A region for testing"));
+        region.set_property("name", json!("Test Region"));
+        region.set_property("description", json!("A region for testing"));
         store.create(&region).await?;
         let region_id = region.id.clone();
 
         // Create spawn room
         let mut spawn_room = Object::new(&universe_id, "room");
         spawn_room.parent_id = Some(region_id.clone());
-        spawn_room.set_property("name", serde_json::json!("Spawn Room"));
+        spawn_room.set_property("name", json!("Spawn Room"));
         spawn_room.set_property(
             "description",
-            serde_json::json!("You stand in the spawn room. The arena is to the north."),
+            json!("You stand in the spawn room. The arena is to the north."),
         );
         store.create(&spawn_room).await?;
         let spawn_room_id = spawn_room.id.clone();
@@ -89,12 +138,12 @@ impl TestWorld {
         // Create arena room (PvP enabled)
         let mut arena_room = Object::new(&universe_id, "room");
         arena_room.parent_id = Some(region_id.clone());
-        arena_room.set_property("name", serde_json::json!("Arena"));
+        arena_room.set_property("name", json!("Arena"));
         arena_room.set_property(
             "description",
-            serde_json::json!("A combat arena where PvP is permitted."),
+            json!("A combat arena where PvP is permitted."),
         );
-        arena_room.set_property("is_arena", serde_json::json!(true));
+        arena_room.set_property("is_arena", json!(true));
         store.create(&arena_room).await?;
         let arena_room_id = arena_room.id.clone();
 
@@ -121,8 +170,8 @@ impl TestWorld {
     pub async fn create_room(&self, name: &str, description: &str) -> Result<String> {
         let mut room = Object::new(&self.universe_id, "room");
         room.parent_id = Some(self.region_id.clone());
-        room.set_property("name", serde_json::json!(name));
-        room.set_property("description", serde_json::json!(description));
+        room.set_property("name", json!(name));
+        room.set_property("description", json!(description));
         self.store.create(&room).await?;
         Ok(room.id)
     }
@@ -131,7 +180,7 @@ impl TestWorld {
     pub async fn create_item(&self, class: &str, name: &str, location: &str) -> Result<String> {
         let mut item = Object::new(&self.universe_id, class);
         item.parent_id = Some(location.to_string());
-        item.set_property("name", serde_json::json!(name));
+        item.set_property("name", json!(name));
         self.store.create(&item).await?;
         Ok(item.id)
     }
@@ -140,9 +189,9 @@ impl TestWorld {
     pub async fn create_npc(&self, name: &str, location: &str) -> Result<String> {
         let mut npc = Object::new(&self.universe_id, "npc");
         npc.parent_id = Some(location.to_string());
-        npc.set_property("name", serde_json::json!(name));
-        npc.set_property("health", serde_json::json!(100));
-        npc.set_property("max_health", serde_json::json!(100));
+        npc.set_property("name", json!(name));
+        npc.set_property("health", json!(100));
+        npc.set_property("max_health", json!(100));
         self.store.create(&npc).await?;
         Ok(npc.id)
     }

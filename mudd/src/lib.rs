@@ -8,6 +8,7 @@ pub mod combat;
 pub mod credits;
 pub mod db;
 pub mod images;
+pub mod init;
 pub mod lua;
 pub mod objects;
 pub mod permissions;
@@ -31,14 +32,15 @@ use db::Database;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
-    pub db_path: Option<String>,
+    /// Path to pre-initialized database (created by mudd_init)
+    pub db_path: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:8080".parse().unwrap(),
-            db_path: None, // None = in-memory
+            db_path: String::new(),
         }
     }
 }
@@ -53,13 +55,16 @@ pub struct Server {
 
 impl Server {
     /// Create a new server instance
+    /// Requires a pre-initialized database (created by mudd_init)
     pub async fn new(config: Config) -> Result<Self> {
-        let db = Database::new(config.db_path.as_deref()).await?;
+        let db = Database::open(&config.db_path).await?;
+        let db = Arc::new(db);
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Ok(Self {
             config,
-            db: Arc::new(db),
+            db,
             shutdown_tx,
             shutdown_rx,
         })

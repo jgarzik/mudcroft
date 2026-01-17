@@ -1,7 +1,8 @@
 //! Database module - SQLite with shared and per-universe schemas
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::path::Path;
 use std::str::FromStr;
 use tracing::info;
 
@@ -11,7 +12,8 @@ pub struct Database {
 }
 
 impl Database {
-    /// Create a new database connection
+    /// Create a new database connection and run migrations
+    /// Used by mudd_init for initial database creation
     /// If path is None, uses in-memory database (for testing)
     pub async fn new(path: Option<&str>) -> Result<Self> {
         let conn_str = match path {
@@ -33,6 +35,81 @@ impl Database {
         db.run_migrations().await?;
 
         Ok(db)
+    }
+
+    /// Open an existing database (does not create or run migrations)
+    /// Used by mudd server at runtime - requires pre-initialized database
+    pub async fn open(path: &str) -> Result<Self> {
+        // Verify file exists
+        if !Path::new(path).exists() {
+            bail!(
+                "Database file not found: {}. Run mudd_init to create it.",
+                path
+            );
+        }
+
+        let conn_str = format!("sqlite:{}?mode=rw", path);
+
+        let options = SqliteConnectOptions::from_str(&conn_str)?
+            .create_if_missing(false)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(10)
+            .connect_with(options)
+            .await?;
+
+        let db = Self { pool };
+
+        // Validate the database is properly initialized
+        db.validate().await?;
+
+        Ok(db)
+    }
+
+    /// Validate that the database has required tables and an admin account
+    pub async fn validate(&self) -> Result<()> {
+        // Check required tables exist
+        let required_tables = [
+            "accounts",
+            "universes",
+            "objects",
+            "code_store",
+            "credits",
+            "classes",
+            "timers",
+            "raft_log",
+            "raft_vote",
+            "raft_meta",
+        ];
+
+        for table in &required_tables {
+            let exists: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+                    .bind(table)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+            if exists.is_none() {
+                bail!(
+                    "Database is missing required table '{}'. Run mudd_init to create a valid database.",
+                    table
+                );
+            }
+        }
+
+        // Check that at least one admin account exists
+        let admin_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM accounts WHERE access_level = 'admin'")
+                .fetch_one(&self.pool)
+                .await?;
+
+        if admin_count.0 == 0 {
+            bail!("Database has no admin account. Run mudd_init to create a valid database.");
+        }
+
+        Ok(())
     }
 
     /// Run database migrations
@@ -221,6 +298,45 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Raft consensus tables
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS raft_log (
+                log_index INTEGER PRIMARY KEY,
+                term INTEGER NOT NULL,
+                entry_type TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS raft_vote (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                term INTEGER NOT NULL,
+                node_id INTEGER,
+                committed INTEGER NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS raft_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Create indexes
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_universe ON objects(universe_id)")
             .execute(&self.pool)
@@ -229,6 +345,9 @@ impl Database {
             .execute(&self.pool)
             .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timers_fire_at ON timers(fire_at)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_raft_log_term ON raft_log(term)")
             .execute(&self.pool)
             .await?;
 

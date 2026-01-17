@@ -74,11 +74,49 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_pool() -> SqlitePool {
-        SqlitePoolOptions::new()
+        let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
-            .unwrap()
+            .unwrap();
+
+        // Create raft tables (normally done by mudd_init)
+        sqlx::query(
+            "CREATE TABLE raft_log (
+                log_index INTEGER PRIMARY KEY,
+                term INTEGER NOT NULL,
+                entry_type TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE raft_vote (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                term INTEGER NOT NULL,
+                node_id INTEGER,
+                committed INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE raft_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        pool
     }
 
     #[test]

@@ -50,11 +50,27 @@ impl TestServer {
         let addr = listener.local_addr()?;
         drop(listener);
 
-        // Find the binary path
-        let binary_path = find_binary_path()?;
+        // Find the binary paths
+        let mudd_path = find_binary_path("mudd")?;
+        let init_path = find_binary_path("mudd_init")?;
+
+        // Run mudd_init to create the database
+        let init_status = Command::new(&init_path)
+            .arg("--database")
+            .arg(db_path.to_string_lossy().as_ref())
+            .env("MUDD_ADMIN_USERNAME", "test_admin")
+            .env("MUDD_ADMIN_PASSWORD", "testpass123")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .map_err(|e| anyhow::anyhow!("Failed to run mudd_init at {:?}: {}", init_path, e))?;
+
+        if !init_status.success() {
+            anyhow::bail!("mudd_init failed with exit code: {:?}", init_status.code());
+        }
 
         // Spawn the server process
-        let child = Command::new(&binary_path)
+        let child = Command::new(&mudd_path)
             .arg("--bind")
             .arg(addr.to_string())
             .arg("--database")
@@ -63,7 +79,7 @@ impl TestServer {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", binary_path, e)
+                anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", mudd_path, e)
             })?;
 
         // Wait for server to be ready
@@ -104,7 +120,7 @@ impl TestServer {
 
         // Create test world if requested
         if create_world {
-            let world = TestWorld::create_with_pool(&test_server.db_pool).await?;
+            let world = TestWorld::create(&test_server).await?;
             test_server.world = Some(world);
         }
 
@@ -228,18 +244,18 @@ impl TestServer {
     }
 }
 
-/// Find the mudd binary path
-fn find_binary_path() -> Result<PathBuf> {
+/// Find a binary path by name (e.g., "mudd" or "mudd_init")
+fn find_binary_path(name: &str) -> Result<PathBuf> {
     // Check common locations
     let candidates = [
         // Debug build (most common for tests)
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/mudd"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/debug/{}", name)),
         // Release build
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/mudd"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/release/{}", name)),
         // Workspace root debug
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mudd"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../target/debug/{}", name)),
         // Workspace root release
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release/mudd"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../target/release/{}", name)),
     ];
 
     for path in &candidates {
@@ -249,7 +265,8 @@ fn find_binary_path() -> Result<PathBuf> {
     }
 
     anyhow::bail!(
-        "Could not find mudd binary. Run 'cargo build' first. Searched: {:?}",
+        "Could not find {} binary. Run 'cargo build' first. Searched: {:?}",
+        name,
         candidates
     )
 }

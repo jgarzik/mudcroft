@@ -32,6 +32,9 @@ pub struct CombinedStorage {
 }
 
 impl CombinedStorage {
+    /// Create a new CombinedStorage
+    /// Requires raft tables (raft_log, raft_vote, raft_meta) to already exist.
+    /// Tables are created by mudd_init via Database migrations.
     pub async fn new(pool: SqlitePool) -> Result<Self, StorageError<NodeId>> {
         let storage = Self {
             pool,
@@ -41,57 +44,12 @@ impl CombinedStorage {
             membership: RwLock::new(StoredMembership::default()),
             current_snapshot: RwLock::new(None),
         };
-        storage.run_migrations().await?;
         storage.load_state().await?;
         Ok(storage)
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
-    }
-
-    async fn run_migrations(&self) -> Result<(), StorageError<NodeId>> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS raft_log (
-                log_index INTEGER PRIMARY KEY,
-                term INTEGER NOT NULL,
-                entry_type TEXT NOT NULL,
-                payload TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS raft_vote (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                term INTEGER NOT NULL,
-                node_id INTEGER,
-                committed INTEGER NOT NULL DEFAULT 0
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StorageIOError::write_vote(&io::Error::other(e)))?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS raft_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_raft_log_term ON raft_log(term)")
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-
-        Ok(())
     }
 
     async fn load_state(&self) -> Result<(), StorageError<NodeId>> {
@@ -520,11 +478,54 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_pool() -> SqlitePool {
-        SqlitePoolOptions::new()
+        let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
-            .unwrap()
+            .unwrap();
+
+        // Create raft tables (normally done by mudd_init)
+        sqlx::query(
+            "CREATE TABLE raft_log (
+                log_index INTEGER PRIMARY KEY,
+                term INTEGER NOT NULL,
+                entry_type TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE raft_vote (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                term INTEGER NOT NULL,
+                node_id INTEGER,
+                committed INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE raft_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("CREATE INDEX idx_raft_log_term ON raft_log(term)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        pool
     }
 
     #[tokio::test]

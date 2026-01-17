@@ -8,6 +8,10 @@ description = "HemiMUD server daemon"
 name = "mudd"
 path = "src/main.rs"
 
+[[bin]]
+name = "mudd_init"
+path = "src/bin/init.rs"
+
 [lib]
 name = "mudd"
 path = "src/lib.rs"
