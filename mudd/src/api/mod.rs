@@ -35,16 +35,29 @@ pub struct AppState {
 }
 
 /// Build the API router
-pub fn router(db: Arc<Database>) -> Router {
+pub async fn router(db: Arc<Database>) -> Router {
     let connections = Arc::new(ConnectionManager::new());
     let object_store = Arc::new(ObjectStore::new(db.pool().clone()));
-    let classes = Arc::new(RwLock::new(ClassRegistry::new()));
+    let mut class_registry = ClassRegistry::with_db(db.pool().clone());
     let actions = Arc::new(ActionRegistry::new());
     let messages = Arc::new(MessageQueue::new());
     let permissions = Arc::new(PermissionManager::with_db(db.pool().clone()));
     let timers = Arc::new(TimerManager::new(Some(db.pool().clone())));
     let credits = Arc::new(CreditManager::new(Some(db.pool().clone())));
     let venice = Arc::new(VeniceClient::new()); // No API key
+
+    // Load persisted data on startup
+    if let Err(e) = timers.load_from_db().await {
+        tracing::warn!("Failed to load timers from database: {}", e);
+    }
+    if let Err(e) = permissions.load_builder_regions().await {
+        tracing::warn!("Failed to load builder regions from database: {}", e);
+    }
+    if let Err(e) = class_registry.load_from_db().await {
+        tracing::warn!("Failed to load classes from database: {}", e);
+    }
+
+    let classes = Arc::new(RwLock::new(class_registry));
 
     let state = AppState {
         db,

@@ -15,5 +15,5 @@ mod state;
 
 pub use damage::{DamageModifier, DamageResult, DamageType};
 pub use dice::{parse_dice, roll_dice, DiceRoll};
-pub use effects::{EffectRegistry, EffectType, StatusEffect};
-pub use state::{CombatManager, CombatState};
+pub use effects::{EffectRegistry, EffectType, EntityEffects, StatusEffect};
+pub use state::{AttackResult, CombatManager, CombatState, PvpPolicy};

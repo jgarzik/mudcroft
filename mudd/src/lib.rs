@@ -69,8 +69,8 @@ impl Server {
     }
 
     /// Build the router
-    fn router(&self) -> Router {
-        api::router(self.db.clone())
+    async fn router(&self) -> Router {
+        api::router(self.db.clone()).await
     }
 
     /// Run the server until shutdown
@@ -79,7 +79,7 @@ impl Server {
         let local_addr = listener.local_addr()?;
         info!("mudd listening on {}", local_addr);
 
-        let router = self.router();
+        let router = self.router().await;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         axum::serve(listener, router)

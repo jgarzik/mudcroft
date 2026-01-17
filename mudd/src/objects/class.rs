@@ -1,7 +1,9 @@
 //! Class system with inheritance
 
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
+use tracing::{debug, warn};
 
 use super::Properties;
 
@@ -51,16 +53,30 @@ impl ClassDef {
 }
 
 /// Registry of all class definitions
-#[derive(Debug, Default)]
+#[derive(Debug)]
+#[derive(Default)]
 pub struct ClassRegistry {
     classes: HashMap<String, ClassDef>,
+    db_pool: Option<SqlitePool>,
 }
+
 
 impl ClassRegistry {
     /// Create a new registry with base classes
     pub fn new() -> Self {
         let mut registry = Self {
             classes: HashMap::new(),
+            db_pool: None,
+        };
+        registry.register_base_classes();
+        registry
+    }
+
+    /// Create a new registry with database pool
+    pub fn with_db(pool: SqlitePool) -> Self {
+        let mut registry = Self {
+            classes: HashMap::new(),
+            db_pool: Some(pool),
         };
         registry.register_base_classes();
         registry
@@ -242,7 +258,63 @@ impl ClassRegistry {
         for (prop_name, (_type_name, default_val)) in props_map {
             class.set_property(&prop_name, default_val);
         }
-        self.register(class);
+        self.register(class.clone());
+
+        // Persist to database (async called via spawn)
+        if let Some(ref pool) = self.db_pool {
+            let pool = pool.clone();
+            let name = name.to_string();
+            let parent = parent.map(|s| s.to_string());
+            let definition = serde_json::to_string(&class).unwrap_or_default();
+
+            tokio::spawn(async move {
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT OR REPLACE INTO classes (name, universe_id, parent, definition)
+                    VALUES (?, '', ?, ?)
+                    "#,
+                )
+                .bind(&name)
+                .bind(&parent)
+                .bind(&definition)
+                .execute(&pool)
+                .await
+                {
+                    warn!("Failed to persist class {}: {}", name, e);
+                }
+            });
+        }
+    }
+
+    /// Load custom classes from database on startup
+    pub async fn load_from_db(&mut self) -> anyhow::Result<()> {
+        let Some(ref pool) = self.db_pool else {
+            return Ok(());
+        };
+
+        let rows: Vec<(String, Option<String>, String)> =
+            sqlx::query_as("SELECT name, parent, definition FROM classes")
+                .fetch_all(pool)
+                .await?;
+
+        for (name, _parent, definition) in rows {
+            // Skip base classes that are already registered
+            if self.classes.contains_key(&name) {
+                continue;
+            }
+
+            match serde_json::from_str::<ClassDef>(&definition) {
+                Ok(class) => {
+                    self.classes.insert(name, class);
+                }
+                Err(e) => {
+                    warn!("Failed to parse class definition: {}", e);
+                }
+            }
+        }
+
+        debug!("Loaded {} classes from database", self.classes.len());
+        Ok(())
     }
 }
 

@@ -846,6 +846,364 @@ async fn test_eval_command_denied_for_player() {
         .contains("Permission denied"));
 }
 
+// =============================================================================
+// Persistence Tests
+// =============================================================================
+
+/// Test: Timer persistence across server restarts
+#[tokio::test]
+async fn test_timer_persistence() {
+    use mudd::timers::{Timer, TimerManager};
+
+    // Create a shared temp file for the database
+    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    let db_path = db_file.path().to_string_lossy().to_string();
+
+    // First phase: Create timer
+    {
+        // Create database directly
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        // Run migrations
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS timers (
+                id TEXT PRIMARY KEY,
+                universe_id TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                method TEXT NOT NULL,
+                fire_at INTEGER NOT NULL,
+                args TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create timers table");
+
+        let timer_mgr = TimerManager::new(Some(pool.clone()));
+        let timer = Timer::new(
+            "u1",
+            "obj1",
+            "on_timer",
+            60000,
+            Some("test_args".to_string()),
+        );
+        timer_mgr.add_timer(timer).await;
+
+        assert_eq!(timer_mgr.timer_count().await, 1);
+        // Pool dropped here
+    }
+
+    // Second phase: Verify timer loaded
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        let timer_mgr = TimerManager::new(Some(pool));
+        timer_mgr
+            .load_from_db()
+            .await
+            .expect("Failed to load timers");
+
+        assert_eq!(
+            timer_mgr.timer_count().await,
+            1,
+            "Timer should persist across restarts"
+        );
+    }
+}
+
+/// Test: Permission access level persistence
+#[tokio::test]
+async fn test_permission_persistence() {
+    use mudd::permissions::{AccessLevel, PermissionManager};
+
+    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    let db_path = db_file.path().to_string_lossy().to_string();
+
+    let account_id: String;
+
+    // First phase: Set access level
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        // Create accounts table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
+                salt TEXT,
+                token TEXT,
+                access_level TEXT NOT NULL DEFAULT 'player',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create accounts table");
+
+        // Create builder_regions table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS builder_regions (
+                account_id TEXT NOT NULL,
+                region_id TEXT NOT NULL,
+                PRIMARY KEY (account_id, region_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create builder_regions table");
+
+        // Create test account
+        account_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO accounts (id, username, access_level) VALUES (?, 'wizard_test', 'player')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create account");
+
+        let perms = PermissionManager::with_db(pool);
+        perms
+            .set_access_level(&account_id, AccessLevel::Wizard)
+            .await;
+
+        assert_eq!(
+            perms.get_access_level(&account_id).await,
+            AccessLevel::Wizard
+        );
+    }
+
+    // Second phase: Verify persistence
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        let perms = PermissionManager::with_db(pool);
+
+        // Should load from DB since not in cache
+        let level = perms.get_access_level(&account_id).await;
+        assert_eq!(
+            level,
+            AccessLevel::Wizard,
+            "Access level should persist to database"
+        );
+    }
+}
+
+/// Test: Builder region assignment persistence
+#[tokio::test]
+async fn test_builder_regions_persistence() {
+    use mudd::permissions::PermissionManager;
+
+    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    let db_path = db_file.path().to_string_lossy().to_string();
+
+    let account_id = "builder_test_account";
+
+    // First phase: Assign regions
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS builder_regions (
+                account_id TEXT NOT NULL,
+                region_id TEXT NOT NULL,
+                PRIMARY KEY (account_id, region_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create builder_regions table");
+
+        let perms = PermissionManager::with_db(pool);
+        perms.assign_region(account_id, "forest_region").await;
+        perms.assign_region(account_id, "dungeon_region").await;
+
+        let regions = perms.get_assigned_regions(account_id).await;
+        assert!(regions.contains("forest_region"));
+        assert!(regions.contains("dungeon_region"));
+    }
+
+    // Second phase: Verify persistence
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        let perms = PermissionManager::with_db(pool);
+        perms
+            .load_builder_regions()
+            .await
+            .expect("Failed to load regions");
+
+        let regions = perms.get_assigned_regions(account_id).await;
+        assert!(
+            regions.contains("forest_region"),
+            "forest_region should persist"
+        );
+        assert!(
+            regions.contains("dungeon_region"),
+            "dungeon_region should persist"
+        );
+    }
+}
+
+/// Test: Combat state (HP) persistence
+#[tokio::test]
+async fn test_combat_state_persistence() {
+    use mudd::combat::CombatManager;
+
+    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    let db_path = db_file.path().to_string_lossy().to_string();
+
+    // First phase: Take damage
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        // Create combat_state table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS combat_state (
+                entity_id TEXT PRIMARY KEY,
+                universe_id TEXT NOT NULL,
+                hp INTEGER NOT NULL,
+                max_hp INTEGER NOT NULL,
+                armor_class INTEGER NOT NULL DEFAULT 10,
+                attack_bonus INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create combat_state table");
+
+        let combat = CombatManager::with_db(pool);
+        combat
+            .init_entity_with_universe("player1", Some("universe1"), 100)
+            .await;
+
+        // Verify initial state
+        let state = combat.get_state("player1").await.expect("Entity not found");
+        assert_eq!(state.hp, 100);
+
+        // Take damage
+        combat
+            .deal_damage("player1", 30, mudd::combat::DamageType::Physical, false)
+            .await
+            .expect("Failed to deal damage");
+
+        let state = combat.get_state("player1").await.expect("Entity not found");
+        assert_eq!(state.hp, 70, "HP should be 70 after 30 damage");
+    }
+
+    // Second phase: Verify HP persisted
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        let combat = CombatManager::with_db(pool);
+        combat
+            .load_from_db()
+            .await
+            .expect("Failed to load combat state");
+
+        let state = combat.get_state("player1").await.expect("Entity not found");
+        assert_eq!(state.hp, 70, "HP should persist across restarts");
+        assert_eq!(state.max_hp, 100, "Max HP should persist");
+    }
+}
+
+/// Test: Active effects persistence
+#[tokio::test]
+async fn test_effects_persistence() {
+    use mudd::combat::{EffectRegistry, EffectType, StatusEffect};
+
+    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    let db_path = db_file.path().to_string_lossy().to_string();
+
+    // First phase: Apply effect
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        // Create active_effects table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS active_effects (
+                id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                effect_type TEXT NOT NULL,
+                remaining_ticks INTEGER NOT NULL,
+                magnitude INTEGER NOT NULL DEFAULT 0,
+                damage_type TEXT,
+                source_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create active_effects table");
+
+        let effects = EffectRegistry::with_db(pool);
+        effects
+            .add_effect("player1", StatusEffect::new(EffectType::Poisoned, 10, 5))
+            .await;
+        effects
+            .add_effect("player1", StatusEffect::new(EffectType::Stunned, 3, 0))
+            .await;
+
+        assert!(effects.has_effect("player1", EffectType::Poisoned).await);
+        assert!(effects.has_effect("player1", EffectType::Stunned).await);
+    }
+
+    // Second phase: Verify persistence
+    {
+        let db_url = format!("sqlite:{}?mode=rwc", db_path);
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("Failed to connect");
+
+        let effects = EffectRegistry::with_db(pool);
+        effects
+            .load_from_db()
+            .await
+            .expect("Failed to load effects");
+
+        assert!(
+            effects.has_effect("player1", EffectType::Poisoned).await,
+            "Poisoned effect should persist"
+        );
+        assert!(
+            effects.has_effect("player1", EffectType::Stunned).await,
+            "Stunned effect should persist"
+        );
+    }
+}
+
+// =============================================================================
+// Lua Eval Tests
+// =============================================================================
+
 /// Test: Wizard can create objects via eval
 #[tokio::test]
 async fn test_eval_create_object() {

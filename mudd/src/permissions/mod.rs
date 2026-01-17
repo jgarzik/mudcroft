@@ -226,6 +226,25 @@ impl PermissionManager {
 
     /// Set a user's access level
     pub async fn set_access_level(&self, account_id: &str, level: AccessLevel) {
+        // Persist to database if pool is available
+        if let Some(ref pool) = self.db_pool {
+            let level_str = match level {
+                AccessLevel::Player => "player",
+                AccessLevel::Builder => "builder",
+                AccessLevel::Wizard => "wizard",
+                AccessLevel::Admin => "admin",
+                AccessLevel::Owner => "owner",
+            };
+            if let Err(e) = sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
+                .bind(level_str)
+                .bind(account_id)
+                .execute(pool)
+                .await
+            {
+                tracing::warn!("Failed to persist access level for {}: {}", account_id, e);
+            }
+        }
+
         self.user_levels
             .write()
             .await
@@ -263,6 +282,24 @@ impl PermissionManager {
 
     /// Assign a region to a builder
     pub async fn assign_region(&self, account_id: &str, region_id: &str) {
+        // Persist to database if pool is available
+        if let Some(ref pool) = self.db_pool {
+            if let Err(e) = sqlx::query(
+                "INSERT OR REPLACE INTO builder_regions (account_id, region_id) VALUES (?, ?)",
+            )
+            .bind(account_id)
+            .bind(region_id)
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(
+                    "Failed to persist region assignment for {}: {}",
+                    account_id,
+                    e
+                );
+            }
+        }
+
         let mut regions = self.builder_regions.write().await;
         regions
             .entry(account_id.to_string())
@@ -272,10 +309,47 @@ impl PermissionManager {
 
     /// Remove a region assignment from a builder
     pub async fn unassign_region(&self, account_id: &str, region_id: &str) {
+        // Remove from database if pool is available
+        if let Some(ref pool) = self.db_pool {
+            if let Err(e) =
+                sqlx::query("DELETE FROM builder_regions WHERE account_id = ? AND region_id = ?")
+                    .bind(account_id)
+                    .bind(region_id)
+                    .execute(pool)
+                    .await
+            {
+                tracing::warn!(
+                    "Failed to remove region assignment for {}: {}",
+                    account_id,
+                    e
+                );
+            }
+        }
+
         let mut regions = self.builder_regions.write().await;
         if let Some(user_regions) = regions.get_mut(account_id) {
             user_regions.remove(region_id);
         }
+    }
+
+    /// Load builder regions from database on startup
+    pub async fn load_builder_regions(&self) -> anyhow::Result<()> {
+        let Some(ref pool) = self.db_pool else {
+            return Ok(());
+        };
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT account_id, region_id FROM builder_regions")
+                .fetch_all(pool)
+                .await?;
+
+        let mut regions = self.builder_regions.write().await;
+        for (account_id, region_id) in rows {
+            regions.entry(account_id).or_default().insert(region_id);
+        }
+
+        tracing::debug!("Loaded {} builder region assignments", regions.len());
+        Ok(())
     }
 
     /// Get a builder's assigned regions

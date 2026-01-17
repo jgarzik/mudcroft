@@ -6,10 +6,12 @@
 //! - Damage over time
 
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 use super::DamageType;
 
@@ -193,12 +195,10 @@ impl StatusEffect {
 
 /// Effects on a single entity
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct EntityEffects {
     effects: Vec<StatusEffect>,
 }
 
-#[allow(dead_code)]
 impl EntityEffects {
     /// Create new empty effects
     pub fn new() -> Self {
@@ -280,9 +280,19 @@ impl EntityEffects {
 }
 
 /// Global effect registry for tracking effects on all entities
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct EffectRegistry {
     entities: RwLock<HashMap<String, EntityEffects>>,
+    db_pool: Option<SqlitePool>,
+}
+
+impl Default for EffectRegistry {
+    fn default() -> Self {
+        Self {
+            entities: RwLock::new(HashMap::new()),
+            db_pool: None,
+        }
+    }
 }
 
 impl EffectRegistry {
@@ -291,13 +301,33 @@ impl EffectRegistry {
         Self::default()
     }
 
+    /// Create a new effect registry with database pool
+    pub fn with_db(pool: SqlitePool) -> Self {
+        Self {
+            entities: RwLock::new(HashMap::new()),
+            db_pool: Some(pool),
+        }
+    }
+
     /// Create a shared instance
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
     }
 
+    /// Create a shared instance with database pool
+    pub fn shared_with_db(pool: SqlitePool) -> Arc<Self> {
+        Arc::new(Self::with_db(pool))
+    }
+
     /// Add an effect to an entity
     pub async fn add_effect(&self, entity_id: &str, effect: StatusEffect) {
+        // Persist to database
+        if let Some(ref pool) = self.db_pool {
+            if let Err(e) = self.persist_effect(entity_id, &effect, pool).await {
+                warn!("Failed to persist effect for {}: {}", entity_id, e);
+            }
+        }
+
         let mut entities = self.entities.write().await;
         entities
             .entry(entity_id.to_string())
@@ -305,8 +335,55 @@ impl EffectRegistry {
             .add(effect);
     }
 
+    /// Persist an effect to database
+    async fn persist_effect(
+        &self,
+        entity_id: &str,
+        effect: &StatusEffect,
+        pool: &SqlitePool,
+    ) -> anyhow::Result<()> {
+        let effect_type_str = effect.effect_type.to_string();
+        let damage_type_str = effect.damage_type.map(|dt| format!("{:?}", dt));
+        let id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO active_effects
+            (id, entity_id, effect_type, remaining_ticks, magnitude, damage_type, source_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(entity_id)
+        .bind(&effect_type_str)
+        .bind(effect.remaining_ticks as i32)
+        .bind(effect.magnitude)
+        .bind(&damage_type_str)
+        .bind(&effect.source_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// Remove an effect from an entity
     pub async fn remove_effect(&self, entity_id: &str, effect_type: EffectType) {
+        // Remove from database
+        if let Some(ref pool) = self.db_pool {
+            let effect_type_str = effect_type.to_string();
+            if let Err(e) =
+                sqlx::query("DELETE FROM active_effects WHERE entity_id = ? AND effect_type = ?")
+                    .bind(entity_id)
+                    .bind(&effect_type_str)
+                    .execute(pool)
+                    .await
+            {
+                warn!(
+                    "Failed to remove effect {} for {}: {}",
+                    effect_type, entity_id, e
+                );
+            }
+        }
+
         let mut entities = self.entities.write().await;
         if let Some(effects) = entities.get_mut(entity_id) {
             effects.remove(effect_type);
@@ -327,16 +404,114 @@ impl EffectRegistry {
 
     /// Tick effects for an entity
     pub async fn tick(&self, entity_id: &str) -> Vec<(i32, DamageType)> {
-        let mut entities = self.entities.write().await;
-        if let Some(effects) = entities.get_mut(entity_id) {
-            effects.tick_all()
-        } else {
-            Vec::new()
+        let results = {
+            let mut entities = self.entities.write().await;
+            if let Some(effects) = entities.get_mut(entity_id) {
+                effects.tick_all()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Update remaining ticks in database
+        if let Some(ref pool) = self.db_pool {
+            if let Err(e) = self.sync_effects_to_db(entity_id, pool).await {
+                warn!("Failed to sync effects for {}: {}", entity_id, e);
+            }
         }
+
+        results
+    }
+
+    /// Sync effects to database after tick
+    async fn sync_effects_to_db(&self, entity_id: &str, pool: &SqlitePool) -> anyhow::Result<()> {
+        // Delete all effects for entity and re-insert active ones
+        sqlx::query("DELETE FROM active_effects WHERE entity_id = ?")
+            .bind(entity_id)
+            .execute(pool)
+            .await?;
+
+        let entities = self.entities.read().await;
+        if let Some(entity_effects) = entities.get(entity_id) {
+            for effect in entity_effects.active_effects() {
+                self.persist_effect(entity_id, effect, pool).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load effects from database on startup
+    pub async fn load_from_db(&self) -> anyhow::Result<()> {
+        let Some(ref pool) = self.db_pool else {
+            return Ok(());
+        };
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, String, i32, i32, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, entity_id, effect_type, remaining_ticks, magnitude, damage_type, source_id FROM active_effects",
+            )
+            .fetch_all(pool)
+            .await?;
+
+        let mut entities = self.entities.write().await;
+        for (
+            _id,
+            entity_id,
+            effect_type_str,
+            remaining_ticks,
+            magnitude,
+            damage_type_str,
+            source_id,
+        ) in rows
+        {
+            let effect_type = match EffectType::from_str(&effect_type_str) {
+                Ok(et) => et,
+                Err(_) => continue,
+            };
+
+            let damage_type = damage_type_str.and_then(|s| match s.as_str() {
+                "Physical" => Some(DamageType::Physical),
+                "Slashing" => Some(DamageType::Slashing),
+                "Piercing" => Some(DamageType::Piercing),
+                "Bludgeoning" => Some(DamageType::Bludgeoning),
+                "Fire" => Some(DamageType::Fire),
+                "Cold" => Some(DamageType::Cold),
+                "Lightning" => Some(DamageType::Lightning),
+                "Acid" => Some(DamageType::Acid),
+                "Poison" => Some(DamageType::Poison),
+                "Psychic" => Some(DamageType::Psychic),
+                "Radiant" => Some(DamageType::Radiant),
+                "Necrotic" => Some(DamageType::Necrotic),
+                "Force" => Some(DamageType::Force),
+                "Thunder" => Some(DamageType::Thunder),
+                _ => None,
+            });
+
+            let mut effect = StatusEffect::new(effect_type, remaining_ticks as u32, magnitude);
+            effect.damage_type = damage_type;
+            effect.source_id = source_id;
+
+            entities.entry(entity_id).or_default().add(effect);
+        }
+
+        debug!("Loaded effects for {} entities", entities.len());
+        Ok(())
     }
 
     /// Clear effects for an entity
     pub async fn clear(&self, entity_id: &str) {
+        // Remove from database
+        if let Some(ref pool) = self.db_pool {
+            if let Err(e) = sqlx::query("DELETE FROM active_effects WHERE entity_id = ?")
+                .bind(entity_id)
+                .execute(pool)
+                .await
+            {
+                warn!("Failed to clear effects for {}: {}", entity_id, e);
+            }
+        }
+
         let mut entities = self.entities.write().await;
         entities.remove(entity_id);
     }

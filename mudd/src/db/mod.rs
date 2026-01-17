@@ -149,6 +149,60 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Builder regions table (for permission persistence)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS builder_regions (
+                account_id TEXT NOT NULL,
+                region_id TEXT NOT NULL,
+                PRIMARY KEY (account_id, region_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Combat state table (HP persistence)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS combat_state (
+                entity_id TEXT PRIMARY KEY,
+                universe_id TEXT NOT NULL,
+                hp INTEGER NOT NULL,
+                max_hp INTEGER NOT NULL,
+                armor_class INTEGER NOT NULL DEFAULT 10,
+                attack_bonus INTEGER NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Active effects table (status effect persistence)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS active_effects (
+                id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                effect_type TEXT NOT NULL,
+                remaining_ticks INTEGER NOT NULL,
+                magnitude INTEGER NOT NULL DEFAULT 0,
+                damage_type TEXT,
+                source_id TEXT,
+                FOREIGN KEY (entity_id) REFERENCES combat_state(entity_id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Index for active effects lookup
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_active_effects_entity ON active_effects(entity_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Create indexes
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_universe ON objects(universe_id)")
             .execute(&self.pool)
