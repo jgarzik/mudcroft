@@ -219,6 +219,31 @@ impl ClassRegistry {
 
         handlers
     }
+
+    /// Get a class definition (alias for get, for Lua API)
+    pub fn get_class(&self, name: &str) -> Option<&ClassDef> {
+        self.get(name)
+    }
+
+    /// Get inheritance chain (alias for get_chain, for Lua API)
+    pub fn get_inheritance_chain(&self, name: &str) -> Vec<String> {
+        self.get_chain(name)
+    }
+
+    /// Define a class from Lua with typed properties
+    /// props_map contains (property_name -> (type_name, default_value))
+    pub fn define_class(
+        &mut self,
+        name: &str,
+        parent: Option<&str>,
+        props_map: std::collections::HashMap<String, (String, serde_json::Value)>,
+    ) {
+        let mut class = ClassDef::new(name, parent);
+        for (prop_name, (_type_name, default_val)) in props_map {
+            class.set_property(&prop_name, default_val);
+        }
+        self.register(class);
+    }
 }
 
 #[cfg(test)]

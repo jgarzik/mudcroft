@@ -41,6 +41,9 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 # Utilities
 thiserror = "2"
 anyhow = "1"

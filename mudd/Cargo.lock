@@ -1360,6 +1360,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "clap",
  "figment",
  "futures-util",
  "hex",

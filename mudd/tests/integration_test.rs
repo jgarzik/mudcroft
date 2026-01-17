@@ -1,8 +1,8 @@
-//! Integration tests using MuddTest harness
+//! Integration tests using TestServer harness
 
-mod common;
+mod harness;
 
-use common::MuddTest;
+use harness::{MuddTest, TestServer};
 use mudd::objects::{ClassRegistry, Object, ObjectStore};
 
 #[tokio::test]
@@ -58,14 +58,14 @@ async fn test_database_isolation() {
 
     // Insert into mudd1's database
     sqlx::query("INSERT INTO accounts (id, username) VALUES ('test1', 'alice')")
-        .execute(mudd1.db().pool())
+        .execute(mudd1.pool())
         .await
         .expect("Failed to insert");
 
     // Verify it exists in mudd1
     let result: Option<(String,)> =
         sqlx::query_as("SELECT username FROM accounts WHERE id = 'test1'")
-            .fetch_optional(mudd1.db().pool())
+            .fetch_optional(mudd1.pool())
             .await
             .expect("Failed to query");
     assert_eq!(result, Some(("alice".to_string(),)));
@@ -73,7 +73,7 @@ async fn test_database_isolation() {
     // Verify it does NOT exist in mudd2 (database isolation)
     let result: Option<(String,)> =
         sqlx::query_as("SELECT username FROM accounts WHERE id = 'test1'")
-            .fetch_optional(mudd2.db().pool())
+            .fetch_optional(mudd2.pool())
             .await
             .expect("Failed to query");
     assert_eq!(result, None);
@@ -92,7 +92,7 @@ async fn test_object_crud() {
         .await
         .unwrap();
 
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     // Create
     let mut obj = Object::new(&universe_id, "sword");
@@ -138,7 +138,7 @@ async fn test_object_hierarchy() {
         .await
         .unwrap();
 
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     // Create a room
     let mut room = Object::new(&universe_id, "room");
@@ -179,7 +179,7 @@ async fn test_object_hierarchy() {
 #[tokio::test]
 async fn test_code_store() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     let code = r#"
         function on_init(self)
@@ -237,7 +237,7 @@ async fn test_find_by_name() {
         .await
         .unwrap();
 
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     // Create a room
     let mut room = Object::new(&universe_id, "room");
@@ -278,7 +278,7 @@ async fn test_room_exits() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     // Create two rooms
     let mut room1 = Object::new(&universe_id, "room");
@@ -318,7 +318,7 @@ async fn test_environment_query() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     // Create room
     let mut room = Object::new(&universe_id, "room");
@@ -349,7 +349,7 @@ async fn test_get_living_in() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     // Create room
     let mut room = Object::new(&universe_id, "room");
@@ -391,7 +391,7 @@ async fn test_player_movement() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.db().pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone());
 
     // Create two connected rooms
     let mut room1 = Object::new(&universe_id, "room");
@@ -593,4 +593,236 @@ async fn test_websocket_unknown_command() {
     assert!(text.contains("Unknown command"));
 
     ws.close().await.ok();
+}
+
+// New Harness Tests - Phase 13
+
+#[tokio::test]
+async fn test_harness_testworld_creation() {
+    // TestServer::start() automatically creates a TestWorld
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Verify the world was created
+    let world = server.world();
+    assert!(!world.universe_id.is_empty(), "Universe should be created");
+    assert!(!world.region_id.is_empty(), "Region should be created");
+    assert!(!world.spawn_room_id.is_empty(), "Spawn room should be created");
+    assert!(!world.arena_room_id.is_empty(), "Arena room should be created");
+    assert!(!world.wizard_account_id.is_empty(), "Wizard account should be created");
+    assert!(!world.builder_account_id.is_empty(), "Builder account should be created");
+}
+
+#[tokio::test]
+async fn test_harness_connect_as_player() {
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Connect as a player (should auto-register)
+    let player = server.connect_as(harness::Role::Player {
+        username: "testplayer".to_string(),
+    }).await.expect("Failed to connect as player");
+
+    // Verify we got a player ID from the welcome message
+    assert!(player.player_id().is_some(), "Should have player ID");
+    assert!(player.account_id().is_some(), "Should have account ID");
+    assert!(player.auth_token().is_some(), "Should have auth token");
+}
+
+#[tokio::test]
+async fn test_harness_connect_as_wizard() {
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Connect as a wizard
+    let wizard = server.connect_as(harness::Role::Wizard {
+        username: "testwizard".to_string(),
+    }).await.expect("Failed to connect as wizard");
+
+    // Verify wizard account
+    assert!(wizard.account_id().is_some(), "Wizard should have account ID");
+
+    // Verify access level was set to wizard
+    let account_id = wizard.account_id().unwrap();
+    let level: (String,) = sqlx::query_as("SELECT access_level FROM accounts WHERE id = ?")
+        .bind(account_id)
+        .fetch_one(server.pool())
+        .await
+        .expect("Failed to query account");
+    assert_eq!(level.0, "wizard", "Account should have wizard access level");
+}
+
+#[tokio::test]
+async fn test_harness_multiple_clients() {
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Connect multiple players
+    let mut player1 = server.connect_as(harness::Role::Player {
+        username: "player1".to_string(),
+    }).await.expect("Failed to connect player1");
+
+    let mut player2 = server.connect_as(harness::Role::Player {
+        username: "player2".to_string(),
+    }).await.expect("Failed to connect player2");
+
+    // Both should have different player IDs
+    assert_ne!(player1.player_id(), player2.player_id(), "Players should have different IDs");
+
+    // Both can send commands
+    player1.command("look").await.expect("player1 failed to send command");
+    player2.command("look").await.expect("player2 failed to send command");
+
+    // Both should receive responses
+    let resp1 = player1.expect("output").await.expect("player1 didn't get output");
+    let resp2 = player2.expect("output").await.expect("player2 didn't get output");
+
+    assert_eq!(resp1["type"], "output");
+    assert_eq!(resp2["type"], "output");
+}
+
+// Race Condition Tests
+
+#[tokio::test]
+async fn test_race_concurrent_commands() {
+    // Test that multiple clients can send commands concurrently
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Create two players
+    let mut player1 = server.connect_as(harness::Role::Player {
+        username: "racer1".to_string(),
+    }).await.expect("Failed to connect player1");
+
+    let mut player2 = server.connect_as(harness::Role::Player {
+        username: "racer2".to_string(),
+    }).await.expect("Failed to connect player2");
+
+    // Race: both send commands simultaneously using tokio::join!
+    let (r1, r2) = tokio::join!(
+        player1.command("look"),
+        player2.command("look"),
+    );
+
+    r1.expect("player1 command should succeed");
+    r2.expect("player2 command should succeed");
+
+    // Both should receive responses
+    let (msg1, msg2) = tokio::join!(
+        player1.expect("output"),
+        player2.expect("output"),
+    );
+
+    assert!(msg1.is_ok(), "player1 should get output");
+    assert!(msg2.is_ok(), "player2 should get output");
+}
+
+#[tokio::test]
+async fn test_race_mixed_roles() {
+    // Test that wizard and player can interact concurrently
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    let mut wizard = server.connect_as(harness::Role::Wizard {
+        username: "mixwiz".to_string(),
+    }).await.expect("Failed to connect wizard");
+
+    let mut player = server.connect_as(harness::Role::Player {
+        username: "mixplayer".to_string(),
+    }).await.expect("Failed to connect player");
+
+    // Race: different roles, concurrent operations
+    let (w, p) = tokio::join!(
+        wizard.command("help"),
+        player.command("look"),
+    );
+
+    w.expect("wizard command should work");
+    p.expect("player command should work");
+
+    // Both get responses
+    let (wm, pm) = tokio::join!(
+        wizard.expect("output"),
+        player.expect("output"),
+    );
+
+    let wiz_output = wm.expect("wizard should get output");
+    let player_output = pm.expect("player should get output");
+
+    assert_eq!(wiz_output["type"], "output");
+    assert_eq!(player_output["type"], "output");
+}
+
+/// Test: Wizard can execute Lua via eval command
+#[tokio::test]
+async fn test_eval_command_basic() {
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Connect as wizard
+    let mut wizard = server.connect_as(harness::Role::Wizard {
+        username: "evalwizard".to_string(),
+    }).await.expect("Failed to connect as wizard");
+
+    // Execute simple Lua expression
+    wizard.command("eval return 1 + 2").await.expect("eval command should succeed");
+
+    // Get output
+    let output = wizard.expect("output").await.expect("should receive output");
+    assert_eq!(output["type"], "output");
+    assert_eq!(output["text"], "3");
+}
+
+/// Test: Player cannot use eval command
+#[tokio::test]
+async fn test_eval_command_denied_for_player() {
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Connect as player
+    let mut player = server.connect_as(harness::Role::Player {
+        username: "evalplayer".to_string(),
+    }).await.expect("Failed to connect as player");
+
+    // Try to execute Lua
+    player.command("eval return 1").await.expect("command should succeed");
+
+    // Should get error
+    let output = player.expect("error").await.expect("should receive error");
+    assert_eq!(output["type"], "error");
+    assert!(output["message"].as_str().unwrap().contains("Permission denied"));
+}
+
+/// Test: Wizard can create objects via eval
+#[tokio::test]
+async fn test_eval_create_object() {
+    let server = TestServer::start().await.expect("Failed to start server");
+
+    // Create the "default" universe that execute_lua uses
+    // Note: execute_lua in websocket.rs hardcodes "default" as universe_id
+    sqlx::query("INSERT INTO accounts (id, username) VALUES ('system', 'system')")
+        .execute(server.pool())
+        .await
+        .expect("Failed to create system account");
+    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('default', 'Default Universe', 'system')")
+        .execute(server.pool())
+        .await
+        .expect("Failed to create default universe");
+
+    // Connect as wizard
+    let mut wizard = server.connect_as(harness::Role::Wizard {
+        username: "createwizard".to_string(),
+    }).await.expect("Failed to connect as wizard");
+
+    // Create an object via Lua and return just the id
+    wizard.command("eval local obj = game.create_object('item', nil, {name = 'Test Sword'}); return obj and obj.id or 'no object'").await.expect("eval should succeed");
+
+    // Skip the echo message
+    let echo = wizard.expect("echo").await.expect("should receive echo");
+    assert_eq!(echo["type"], "echo");
+
+    // Get output or error
+    let output = wizard.expect_any().await.expect("should receive message");
+
+    if output["type"] == "error" {
+        panic!("Lua error: {}", output["message"]);
+    }
+
+    assert_eq!(output["type"], "output", "Expected output, got: {:?}", output);
+    let obj_id = output["text"].as_str().expect("should have text");
+    assert!(!obj_id.is_empty(), "Object ID should not be empty");
+    // UUID is 36 chars (with dashes) or could be "no object" if failed
+    assert!(obj_id != "no object", "Object creation failed: got '{}'", obj_id);
 }

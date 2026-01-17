@@ -118,11 +118,18 @@ impl GameApi {
     }
 
     fn register_object_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        let store = self.store.clone();
         let universe_id = self.universe_id.clone();
 
         // game.create_object(class, parent_id, props)
+        // Actually creates object in database
+        let store_clone = store.clone();
+        let universe_clone = universe_id.clone();
         let create_object = lua.create_function(
             move |lua, (class, parent_id, props): (String, Option<String>, Option<Table>)| {
+                let store = store_clone.clone();
+                let universe_id = universe_clone.clone();
+
                 let mut obj = Object::new(&universe_id, &class);
                 obj.parent_id = parent_id;
 
@@ -135,80 +142,355 @@ impl GameApi {
                     }
                 }
 
-                // Return the object as a table
-                object_to_lua(lua, &obj)
+                // Save to database
+                let obj_clone = obj.clone();
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        store.create(&obj_clone).await
+                    })
+                });
+
+                match result {
+                    Ok(()) => object_to_lua(lua, &obj),
+                    Err(e) => Err(mlua::Error::external(e)),
+                }
             },
         )?;
         game.set("create_object", create_object)?;
 
         // game.get_object(id)
-        let get_object = lua.create_function(|_lua, _id: String| {
-            // For now, return nil - actual DB access requires async
-            // In production, this would be handled via a different mechanism
-            Ok(Value::Nil)
+        // Actually fetches from database
+        let store_clone = store.clone();
+        let get_object = lua.create_function(move |lua, id: String| {
+            let store = store_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.get(&id).await
+                })
+            });
+
+            match result {
+                Ok(Some(obj)) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
+                Ok(None) => Ok(Value::Nil),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("get_object", get_object)?;
 
         // game.update_object(id, changes)
-        let update_object = lua.create_function(|_, (_id, _changes): (String, Table)| {
-            // Stub - requires async DB access
-            Ok(true)
+        // Actually updates object in database
+        let store_clone = store.clone();
+        let update_object = lua.create_function(move |_, (id, changes): (String, Table)| {
+            let store = store_clone.clone();
+
+            // Collect changes into a vec first (outside async)
+            let mut changes_vec = Vec::new();
+            for pair in changes.pairs::<String, Value>() {
+                let (k, v) = pair?;
+                let json_val = lua_to_json(v)?;
+                changes_vec.push((k, json_val));
+            }
+
+            let result: anyhow::Result<bool> = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    // First get the existing object
+                    let obj_result = store.get(&id).await?;
+                    match obj_result {
+                        Some(mut obj) => {
+                            // Apply changes
+                            for (k, v) in changes_vec {
+                                obj.properties.insert(k, v);
+                            }
+                            store.update(&obj).await?;
+                            Ok(true)
+                        }
+                        None => Ok(false),
+                    }
+                })
+            });
+
+            match result {
+                Ok(success) => Ok(success),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("update_object", update_object)?;
 
         // game.delete_object(id)
-        let delete_object = lua.create_function(|_, _id: String| {
-            // Stub - requires async DB access
-            Ok(true)
+        // Actually deletes from database
+        let store_clone = store.clone();
+        let delete_object = lua.create_function(move |_, id: String| {
+            let store = store_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.delete(&id).await
+                })
+            });
+
+            match result {
+                Ok(deleted) => Ok(deleted),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("delete_object", delete_object)?;
 
         // game.move_object(id, new_parent_id)
+        // Actually moves object in database
+        let store_clone = store.clone();
         let move_object =
-            lua.create_function(|_, (_id, _new_parent_id): (String, Option<String>)| {
-                // Stub - requires async DB access + init cascade
-                Ok(true)
+            lua.create_function(move |_, (id, new_parent_id): (String, Option<String>)| {
+                let store = store_clone.clone();
+
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        store.move_object(&id, new_parent_id.as_deref()).await
+                    })
+                });
+
+                match result {
+                    Ok(()) => Ok(true),
+                    Err(e) => Err(mlua::Error::external(e)),
+                }
             })?;
         game.set("move_object", move_object)?;
 
         // game.clone_object(id, new_parent_id)
+        // Actually clones object in database
+        let store_clone = store.clone();
         let clone_object =
-            lua.create_function(|_lua, (_id, _new_parent_id): (String, Option<String>)| {
-                // Stub - requires async DB access
-                Ok(Value::Nil)
+            lua.create_function(move |lua, (id, new_parent_id): (String, Option<String>)| {
+                let store = store_clone.clone();
+
+                let result: anyhow::Result<Option<Object>> = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let obj_result = store.get(&id).await?;
+                        match obj_result {
+                            Some(original) => {
+                                let mut cloned = original.clone();
+                                cloned.id = uuid::Uuid::new_v4().to_string();
+                                cloned.parent_id = new_parent_id;
+                                cloned.created_at = chrono::Utc::now().to_rfc3339();
+                                cloned.updated_at = cloned.created_at.clone();
+                                store.create(&cloned).await?;
+                                Ok(Some(cloned))
+                            }
+                            None => Ok(None),
+                        }
+                    })
+                });
+
+                match result {
+                    Ok(Some(obj)) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
+                    Ok(None) => Ok(Value::Nil),
+                    Err(e) => Err(mlua::Error::external(e)),
+                }
             })?;
         game.set("clone_object", clone_object)?;
+
+        // game.store_code(source) - returns hash
+        let store_clone = store.clone();
+        let store_code = lua.create_function(move |_, source: String| {
+            let store = store_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.store_code(&source).await
+                })
+            });
+
+            match result {
+                Ok(hash) => Ok(hash),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
+        })?;
+        game.set("store_code", store_code)?;
+
+        // game.get_code(hash) - returns source
+        let store_clone = store.clone();
+        let get_code = lua.create_function(move |lua, hash: String| {
+            let store = store_clone.clone();
+
+            let result: anyhow::Result<Option<String>> = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.get_code(&hash).await
+                })
+            });
+
+            match result {
+                Ok(Some(source)) => Ok(Value::String(lua.create_string(&source)?)),
+                Ok(None) => Ok(Value::Nil),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
+        })?;
+        game.set("get_code", get_code)?;
+
+        // game.get_children(parent_id, filter) - returns array of objects
+        let store_clone = store;
+        let get_children = lua.create_function(move |lua, (parent_id, filter): (String, Option<Table>)| {
+            let store = store_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.get_contents(&parent_id).await
+                })
+            });
+
+            match result {
+                Ok(objects) => {
+                    let table = lua.create_table()?;
+                    let mut idx = 1;
+
+                    // Optional class filter
+                    let class_filter: Option<String> = filter
+                        .as_ref()
+                        .and_then(|f| f.get::<String>("class").ok());
+
+                    for obj in objects {
+                        // Apply filter if specified
+                        if let Some(ref class) = class_filter {
+                            if &obj.class != class {
+                                continue;
+                            }
+                        }
+                        table.set(idx, object_to_lua(lua, &obj)?)?;
+                        idx += 1;
+                    }
+                    Ok(table)
+                }
+                Err(e) => Err(mlua::Error::external(e)),
+            }
+        })?;
+        game.set("get_children", get_children)?;
 
         Ok(())
     }
 
     fn register_class_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        let classes = self.classes.clone();
+        let store = self.store.clone();
+
         // game.define_class(name, definition)
-        let define_class = lua.create_function(|_, (_name, _definition): (String, Table)| {
-            // Stub - would register class with registry
+        // Registers a new class with parent and properties
+        let classes_clone = classes.clone();
+        let define_class = lua.create_function(move |_, (name, definition): (String, Table)| {
+            let classes = classes_clone.clone();
+
+            // Extract parent from definition
+            let parent: Option<String> = definition.get("parent").ok();
+
+            // Extract properties
+            let properties: Option<Table> = definition.get("properties").ok();
+            let mut props_map = std::collections::HashMap::new();
+            if let Some(props) = properties {
+                for pair in props.pairs::<String, Table>() {
+                    if let Ok((prop_name, prop_def)) = pair {
+                        let prop_type: String = prop_def.get("type").unwrap_or_else(|_| "string".to_string());
+                        let default_val = prop_def.get::<Value>("default").ok();
+                        let json_default = default_val
+                            .map(|v| lua_to_json(v).unwrap_or(serde_json::Value::Null))
+                            .unwrap_or(serde_json::Value::Null);
+                        props_map.insert(prop_name, (prop_type, json_default));
+                    }
+                }
+            }
+
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut registry = classes.write().await;
+                    registry.define_class(&name, parent.as_deref(), props_map);
+                })
+            });
+
             Ok(true)
         })?;
         game.set("define_class", define_class)?;
 
         // game.get_class(name)
-        let get_class = lua.create_function(|_lua, _name: String| {
-            // Stub - would look up class from registry
-            Ok(Value::Nil)
+        // Returns class definition as table
+        let classes_clone = classes.clone();
+        let get_class = lua.create_function(move |lua, name: String| {
+            let classes = classes_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let registry = classes.read().await;
+                    registry.get_class(&name).cloned()
+                })
+            });
+
+            match result {
+                Some(class_def) => {
+                    let table = lua.create_table()?;
+                    table.set("name", class_def.name.as_str())?;
+                    if let Some(parent) = &class_def.parent {
+                        table.set("parent", parent.as_str())?;
+                    }
+                    // Add properties (simplified - just name -> default value)
+                    let props_table = lua.create_table()?;
+                    for (prop_name, default_val) in &class_def.properties {
+                        props_table.set(prop_name.as_str(), json_to_lua(lua, default_val)?)?;
+                    }
+                    table.set("properties", props_table)?;
+                    // Add handlers
+                    let handlers_table = lua.create_table()?;
+                    for (i, handler) in class_def.handlers.iter().enumerate() {
+                        handlers_table.set(i + 1, handler.as_str())?;
+                    }
+                    table.set("handlers", handlers_table)?;
+                    Ok(Value::Table(table))
+                }
+                None => Ok(Value::Nil),
+            }
         })?;
         game.set("get_class", get_class)?;
 
         // game.is_a(obj_id, class_name)
-        let is_a = lua.create_function(|_, (_obj_id, _class_name): (String, String)| {
-            // Stub - requires object lookup + class check
-            Ok(false)
+        // Checks if object is of class or inherits from it
+        let store_clone = store.clone();
+        let classes_clone = classes.clone();
+        let is_a = lua.create_function(move |_, (obj_id, class_name): (String, String)| {
+            let store = store_clone.clone();
+            let classes = classes_clone.clone();
+
+            let result: anyhow::Result<bool> = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let obj = store.get(&obj_id).await?;
+                    match obj {
+                        Some(o) => {
+                            let registry = classes.read().await;
+                            Ok(registry.is_a(&o.class, &class_name))
+                        }
+                        None => Ok(false),
+                    }
+                })
+            });
+
+            match result {
+                Ok(is_match) => Ok(is_match),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("is_a", is_a)?;
 
         // game.get_class_chain(class_name)
-        let get_class_chain = lua.create_function(|lua, _name: String| {
-            // Stub - would return inheritance chain
-            let chain = lua.create_table()?;
-            Ok(chain)
+        // Returns inheritance chain as array
+        let get_class_chain = lua.create_function(move |lua, name: String| {
+            let classes = classes.clone();
+
+            let chain = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let registry = classes.read().await;
+                    registry.get_inheritance_chain(&name)
+                })
+            });
+
+            let table = lua.create_table()?;
+            for (i, class_name) in chain.iter().enumerate() {
+                table.set(i + 1, class_name.as_str())?;
+            }
+            Ok(table)
         })?;
         game.set("get_class_chain", get_class_chain)?;
 
@@ -216,33 +498,94 @@ impl GameApi {
     }
 
     fn register_query_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        let store = self.store.clone();
+
         // game.environment(obj_id)
-        let environment = lua.create_function(|_, _obj_id: String| {
-            // Stub - returns parent_id
-            Ok(Value::Nil)
+        // Returns the parent object (container/room)
+        let store_clone = store.clone();
+        let environment = lua.create_function(move |lua, obj_id: String| {
+            let store = store_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.get_environment(&obj_id).await
+                })
+            });
+
+            match result {
+                Ok(Some(obj)) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
+                Ok(None) => Ok(Value::Nil),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("environment", environment)?;
 
         // game.all_inventory(obj_id)
-        let all_inventory = lua.create_function(|lua, _obj_id: String| {
-            // Stub - returns contents
-            let contents = lua.create_table()?;
-            Ok(contents)
+        // Returns all contents of an object
+        let store_clone = store.clone();
+        let all_inventory = lua.create_function(move |lua, obj_id: String| {
+            let store = store_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.get_contents(&obj_id).await
+                })
+            });
+
+            match result {
+                Ok(objects) => {
+                    let table = lua.create_table()?;
+                    for (i, obj) in objects.iter().enumerate() {
+                        table.set(i + 1, object_to_lua(lua, obj)?)?;
+                    }
+                    Ok(table)
+                }
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("all_inventory", all_inventory)?;
 
         // game.present(name, env_id)
-        let present = lua.create_function(|_, (_name, _env_id): (String, String)| {
-            // Stub - find by name in location
-            Ok(Value::Nil)
+        // Find object by name in a location
+        let store_clone = store.clone();
+        let present = lua.create_function(move |lua, (name, env_id): (String, String)| {
+            let store = store_clone.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.find_by_name(&env_id, &name).await
+                })
+            });
+
+            match result {
+                Ok(Some(obj)) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
+                Ok(None) => Ok(Value::Nil),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("present", present)?;
 
         // game.get_living_in(env_id)
-        let get_living_in = lua.create_function(|lua, _env_id: String| {
-            // Stub - returns living entities in location
-            let living = lua.create_table()?;
-            Ok(living)
+        // Returns living entities (players, npcs) in a location
+        let get_living_in = lua.create_function(move |lua, env_id: String| {
+            let store = store.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    store.get_living_in(&env_id).await
+                })
+            });
+
+            match result {
+                Ok(objects) => {
+                    let table = lua.create_table()?;
+                    for (i, obj) in objects.iter().enumerate() {
+                        table.set(i + 1, object_to_lua(lua, obj)?)?;
+                    }
+                    Ok(table)
+                }
+                Err(e) => Err(mlua::Error::external(e)),
+            }
         })?;
         game.set("get_living_in", get_living_in)?;
 

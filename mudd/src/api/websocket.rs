@@ -9,12 +9,15 @@ use axum::{
     },
     response::IntoResponse,
 };
+use mlua::Value;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
+use crate::lua::{GameApi, Sandbox, SandboxConfig};
+use crate::permissions::AccessLevel;
 
 /// A connected player session
 #[derive(Debug)]
@@ -23,6 +26,7 @@ pub struct PlayerSession {
     pub account_id: String,
     pub universe_id: String,
     pub room_id: Option<String>,
+    pub access_level: AccessLevel,
     pub sender: mpsc::Sender<ServerMessage>,
 }
 
@@ -156,13 +160,16 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
     let player_id = uuid::Uuid::new_v4().to_string();
     let player_id_clone = player_id.clone();
 
-    let (account_id, username) = match &account {
-        Some(acc) => (acc.id.clone(), Some(acc.username.clone())),
-        None => (String::new(), None),
+    let (account_id, username, access_level) = match &account {
+        Some(acc) => {
+            let access = AccessLevel::from_str(&acc.access_level);
+            (acc.id.clone(), Some(acc.username.clone()), access)
+        }
+        None => (String::new(), None, AccessLevel::Player),
     };
 
     if let Some(ref name) = username {
-        info!("WebSocket connected: {} ({})", player_id, name);
+        info!("WebSocket connected: {} ({}) access={:?}", player_id, name, access_level);
     } else {
         info!("WebSocket connected: {} (guest)", player_id);
     }
@@ -170,9 +177,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
     // Create session
     let session = PlayerSession {
         player_id: player_id.clone(),
-        account_id,
+        account_id: account_id.clone(),
         universe_id: String::new(), // TODO: from selection
         room_id: None,
+        access_level,
         sender: tx,
     };
 
@@ -202,7 +210,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
                 match result {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                            handle_client_message(&state, &player_id, client_msg).await;
+                            handle_client_message(&state, &player_id, &account_id, access_level, client_msg).await;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -218,7 +226,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
 }
 
 /// Handle a message from the client
-async fn handle_client_message(state: &AppState, player_id: &str, msg: ClientMessage) {
+async fn handle_client_message(
+    state: &AppState,
+    player_id: &str,
+    account_id: &str,
+    access_level: AccessLevel,
+    msg: ClientMessage,
+) {
     match msg {
         ClientMessage::Command { text } => {
             info!("Player {} command: {}", player_id, text);
@@ -235,7 +249,7 @@ async fn handle_client_message(state: &AppState, player_id: &str, msg: ClientMes
                 .await;
 
             // Parse and execute the command
-            let response = execute_command(state, player_id, &text).await;
+            let response = execute_command(state, player_id, account_id, access_level, &text).await;
             state.connections.send_to_player(player_id, response).await;
         }
         ClientMessage::Ping => {
@@ -245,7 +259,13 @@ async fn handle_client_message(state: &AppState, player_id: &str, msg: ClientMes
 }
 
 /// Parse and execute a player command
-async fn execute_command(_state: &AppState, _player_id: &str, command: &str) -> ServerMessage {
+async fn execute_command(
+    state: &AppState,
+    player_id: &str,
+    account_id: &str,
+    access_level: AccessLevel,
+    command: &str,
+) -> ServerMessage {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
     if parts.is_empty() {
@@ -273,10 +293,106 @@ async fn execute_command(_state: &AppState, _player_id: &str, command: &str) -> 
             }
         }
         "help" => ServerMessage::Output {
-            text: "Commands: look, north/south/east/west, say <message>, help".to_string(),
+            text: "Commands: look, north/south/east/west, say <message>, eval <lua>, help".to_string(),
         },
+        "eval" => {
+            // Wizard+ only
+            if access_level < AccessLevel::Wizard {
+                return ServerMessage::Error {
+                    message: "Permission denied: wizard+ required for eval".to_string(),
+                };
+            }
+
+            // Get the code after "eval "
+            let code = if command.len() > 5 {
+                &command[5..]
+            } else {
+                return ServerMessage::Error {
+                    message: "Usage: eval <lua code>".to_string(),
+                };
+            };
+
+            // Execute Lua code
+            execute_lua(state, player_id, account_id, code).await
+        }
         _ => ServerMessage::Output {
             text: format!("Unknown command: {}", verb),
         },
+    }
+}
+
+/// Execute Lua code in sandbox with game API
+async fn execute_lua(
+    state: &AppState,
+    _player_id: &str,
+    account_id: &str,
+    code: &str,
+) -> ServerMessage {
+    // Create game API with all managers
+    let mut game_api = GameApi::new(
+        state.object_store.clone(),
+        state.classes.clone(),
+        state.actions.clone(),
+        state.messages.clone(),
+        state.permissions.clone(),
+        state.timers.clone(),
+        state.credits.clone(),
+        state.venice.clone(),
+        "default", // TODO: universe from session
+    );
+    game_api.set_user_context(Some(account_id.to_string()));
+
+    // Create sandbox with generous limits for wizards
+    let config = SandboxConfig {
+        max_instructions: 10_000_000, // 10M instructions
+        timeout: std::time::Duration::from_secs(5),
+        ..Default::default()
+    };
+
+    let mut sandbox = match Sandbox::new(config) {
+        Ok(s) => s,
+        Err(e) => {
+            return ServerMessage::Error {
+                message: format!("Failed to create sandbox: {}", e),
+            };
+        }
+    };
+
+    // Register game API
+    if let Err(e) = game_api.register(sandbox.lua()) {
+        return ServerMessage::Error {
+            message: format!("Failed to register game API: {}", e),
+        };
+    }
+
+    // Execute the code
+    let result: Result<Value, _> = sandbox.execute(code);
+
+    match result {
+        Ok(value) => {
+            let text = lua_value_to_string(&value);
+            ServerMessage::Output { text }
+        }
+        Err(e) => ServerMessage::Error {
+            message: format!("Lua error: {}", e),
+        },
+    }
+}
+
+/// Convert Lua value to displayable string
+fn lua_value_to_string(value: &Value) -> String {
+    match value {
+        Value::Nil => "nil".to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_else(|_| "<invalid utf8>".to_string()),
+        Value::Table(_) => "[table]".to_string(),
+        Value::Function(_) => "[function]".to_string(),
+        Value::Thread(_) => "[thread]".to_string(),
+        Value::UserData(_) => "[userdata]".to_string(),
+        Value::LightUserData(_) => "[lightuserdata]".to_string(),
+        Value::Error(e) => format!("[error: {}]", e),
+        _ => "[unknown]".to_string(),
     }
 }

@@ -1,8 +1,24 @@
 //! mudd - HemiMUD server daemon
 
+use std::net::SocketAddr;
+
 use anyhow::Result;
+use clap::Parser;
 use mudd::{Config, Server};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// HemiMUD server daemon
+#[derive(Parser, Debug)]
+#[command(name = "mudd", version, about)]
+struct Args {
+    /// Address to bind to
+    #[arg(short, long, default_value = "127.0.0.1:8080")]
+    bind: SocketAddr,
+
+    /// Database file path (uses in-memory if not specified)
+    #[arg(short, long)]
+    database: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,8 +31,14 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load config (TODO: from file/env)
-    let config = Config::default();
+    // Parse CLI arguments
+    let args = Args::parse();
+
+    // Build config from CLI args
+    let config = Config {
+        bind_addr: args.bind,
+        db_path: args.database,
+    };
 
     // Create and run server
     let server = Server::new(config).await?;

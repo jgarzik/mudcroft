@@ -33,6 +33,18 @@ pub enum AccessLevel {
 }
 
 impl AccessLevel {
+    /// Parse access level from string
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "player" => AccessLevel::Player,
+            "builder" => AccessLevel::Builder,
+            "wizard" => AccessLevel::Wizard,
+            "admin" => AccessLevel::Admin,
+            "owner" => AccessLevel::Owner,
+            _ => AccessLevel::Player,
+        }
+    }
+
     /// Check if this level can perform builder actions
     pub fn can_build(&self) -> bool {
         *self >= AccessLevel::Builder
