@@ -78,6 +78,8 @@ impl Database {
             "code_store",
             "credits",
             "classes",
+            "class_properties",
+            "class_handlers",
             "timers",
             "raft_log",
             "raft_vote",
@@ -201,9 +203,38 @@ impl Database {
             CREATE TABLE IF NOT EXISTS classes (
                 name TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL REFERENCES universes(id),
-                parent TEXT,
-                definition TEXT NOT NULL,
+                parent TEXT REFERENCES classes(name),
+                code_hash TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Class properties table (normalized from JSON blob)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS class_properties (
+                class_name TEXT NOT NULL REFERENCES classes(name) ON DELETE CASCADE,
+                universe_id TEXT NOT NULL REFERENCES universes(id),
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (class_name, key)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Class handlers table (normalized from JSON blob)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS class_handlers (
+                class_name TEXT NOT NULL REFERENCES classes(name) ON DELETE CASCADE,
+                universe_id TEXT NOT NULL REFERENCES universes(id),
+                handler TEXT NOT NULL,
+                PRIMARY KEY (class_name, handler)
             )
             "#,
         )
@@ -364,6 +395,16 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_raft_log_term ON raft_log(term)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_class_props_universe ON class_properties(universe_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_class_handlers_universe ON class_handlers(universe_id)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         info!("Database migrations complete");
         Ok(())

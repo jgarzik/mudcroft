@@ -253,8 +253,8 @@ impl ClassRegistry {
         props_map: std::collections::HashMap<String, (String, serde_json::Value)>,
     ) {
         let mut class = ClassDef::new(name, parent);
-        for (prop_name, (_type_name, default_val)) in props_map {
-            class.set_property(&prop_name, default_val);
+        for (prop_name, (_type_name, default_val)) in props_map.iter() {
+            class.set_property(prop_name, default_val.clone());
         }
         self.register(class.clone());
 
@@ -263,22 +263,106 @@ impl ClassRegistry {
             let pool = pool.clone();
             let name = name.to_string();
             let parent = parent.map(|s| s.to_string());
-            let definition = serde_json::to_string(&class).unwrap_or_default();
+            let code_hash = class.code_hash.clone();
+            let properties: Vec<(String, String)> = props_map
+                .into_iter()
+                .map(|(k, (_, v))| (k, serde_json::to_string(&v).unwrap_or_default()))
+                .collect();
+            let handlers = class.handlers.clone();
 
             tokio::spawn(async move {
+                // Use a transaction for atomicity
+                let mut tx = match pool.begin().await {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        warn!("Failed to begin transaction for class {}: {}", name, e);
+                        return;
+                    }
+                };
+
+                // 1. INSERT OR REPLACE into classes
                 if let Err(e) = sqlx::query(
                     r#"
-                    INSERT OR REPLACE INTO classes (name, universe_id, parent, definition)
+                    INSERT OR REPLACE INTO classes (name, universe_id, parent, code_hash)
                     VALUES (?, '', ?, ?)
                     "#,
                 )
                 .bind(&name)
                 .bind(&parent)
-                .bind(&definition)
-                .execute(&pool)
+                .bind(&code_hash)
+                .execute(&mut *tx)
                 .await
                 {
-                    warn!("Failed to persist class {}: {}", name, e);
+                    warn!("Failed to insert class {}: {}", name, e);
+                    return;
+                }
+
+                // 2. DELETE old properties
+                if let Err(e) = sqlx::query("DELETE FROM class_properties WHERE class_name = ?")
+                    .bind(&name)
+                    .execute(&mut *tx)
+                    .await
+                {
+                    warn!("Failed to delete old properties for class {}: {}", name, e);
+                    return;
+                }
+
+                // 3. INSERT properties
+                for (key, value) in &properties {
+                    if let Err(e) = sqlx::query(
+                        r#"
+                        INSERT INTO class_properties (class_name, universe_id, key, value)
+                        VALUES (?, '', ?, ?)
+                        "#,
+                    )
+                    .bind(&name)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        warn!(
+                            "Failed to insert property {} for class {}: {}",
+                            key, name, e
+                        );
+                        return;
+                    }
+                }
+
+                // 4. DELETE old handlers
+                if let Err(e) = sqlx::query("DELETE FROM class_handlers WHERE class_name = ?")
+                    .bind(&name)
+                    .execute(&mut *tx)
+                    .await
+                {
+                    warn!("Failed to delete old handlers for class {}: {}", name, e);
+                    return;
+                }
+
+                // 5. INSERT handlers
+                for handler in &handlers {
+                    if let Err(e) = sqlx::query(
+                        r#"
+                        INSERT INTO class_handlers (class_name, universe_id, handler)
+                        VALUES (?, '', ?)
+                        "#,
+                    )
+                    .bind(&name)
+                    .bind(handler)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        warn!(
+                            "Failed to insert handler {} for class {}: {}",
+                            handler, name, e
+                        );
+                        return;
+                    }
+                }
+
+                // Commit the transaction
+                if let Err(e) = tx.commit().await {
+                    warn!("Failed to commit class {}: {}", name, e);
                 }
             });
         }
@@ -290,25 +374,65 @@ impl ClassRegistry {
             return Ok(());
         };
 
-        let rows: Vec<(String, Option<String>, String)> =
-            sqlx::query_as("SELECT name, parent, definition FROM classes")
+        // 1. Load class definitions
+        let class_rows: Vec<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT name, parent, code_hash FROM classes")
                 .fetch_all(pool)
                 .await?;
 
-        for (name, _parent, definition) in rows {
+        // 2. Load properties
+        let prop_rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT class_name, key, value FROM class_properties")
+                .fetch_all(pool)
+                .await?;
+
+        // 3. Load handlers
+        let handler_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT class_name, handler FROM class_handlers")
+                .fetch_all(pool)
+                .await?;
+
+        // Group properties and handlers by class name
+        let mut props_by_class: HashMap<String, Properties> = HashMap::new();
+        for (class_name, key, value) in prop_rows {
+            let props = props_by_class.entry(class_name).or_default();
+            match serde_json::from_str(&value) {
+                Ok(v) => {
+                    props.insert(key, v);
+                }
+                Err(e) => {
+                    warn!("Failed to parse property value: {}", e);
+                }
+            }
+        }
+
+        let mut handlers_by_class: HashMap<String, Vec<String>> = HashMap::new();
+        for (class_name, handler) in handler_rows {
+            handlers_by_class
+                .entry(class_name)
+                .or_default()
+                .push(handler);
+        }
+
+        // Reconstruct ClassDef objects
+        for (name, parent, code_hash) in class_rows {
             // Skip base classes that are already registered
             if self.classes.contains_key(&name) {
                 continue;
             }
 
-            match serde_json::from_str::<ClassDef>(&definition) {
-                Ok(class) => {
-                    self.classes.insert(name, class);
-                }
-                Err(e) => {
-                    warn!("Failed to parse class definition: {}", e);
-                }
+            let mut class = ClassDef::new(&name, parent.as_deref());
+            class.code_hash = code_hash;
+
+            if let Some(props) = props_by_class.remove(&name) {
+                class.properties = props;
             }
+
+            if let Some(handlers) = handlers_by_class.remove(&name) {
+                class.handlers = handlers;
+            }
+
+            self.classes.insert(name, class);
         }
 
         debug!("Loaded {} classes from database", self.classes.len());
