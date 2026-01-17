@@ -8,12 +8,12 @@
 //! - Status effects (poisoned, stunned, etc.)
 //! - Combat state tracking
 
-mod dice;
 mod damage;
+mod dice;
 mod effects;
 mod state;
 
-pub use dice::{DiceRoll, roll_dice, parse_dice};
-pub use damage::{DamageType, DamageModifier, DamageResult};
-pub use effects::{StatusEffect, EffectType, EffectRegistry};
-pub use state::{CombatState, CombatManager};
+pub use damage::{DamageModifier, DamageResult, DamageType};
+pub use dice::{parse_dice, roll_dice, DiceRoll};
+pub use effects::{EffectRegistry, EffectType, StatusEffect};
+pub use state::{CombatManager, CombatState};

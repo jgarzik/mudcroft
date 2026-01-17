@@ -136,10 +136,10 @@ impl Database {
             CREATE TABLE IF NOT EXISTS timers (
                 id TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL REFERENCES universes(id),
-                object_id TEXT NOT NULL REFERENCES objects(id),
+                object_id TEXT NOT NULL,
                 method TEXT NOT NULL,
-                fire_at TEXT NOT NULL,
-                args TEXT NOT NULL DEFAULT '[]',
+                fire_at INTEGER NOT NULL,
+                args TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
             "#,

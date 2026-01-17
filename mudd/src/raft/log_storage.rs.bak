@@ -1,0 +1,531 @@
+//! Raft log storage backed by SQLite
+//!
+//! Implements persistent storage for Raft log entries, vote state,
+//! and metadata using SQLite.
+
+use std::fmt::Debug;
+use std::io;
+use std::ops::RangeBounds;
+
+use openraft::storage::LogFlushed;
+use openraft::storage::RaftLogStorage;
+use openraft::{
+    BasicNode, Entry, EntryPayload, LogId, LogState, OptionalSend, RaftLogReader, StorageError,
+    StorageIOError, Vote,
+};
+use sqlx::sqlite::SqlitePool;
+use tokio::sync::RwLock;
+use tracing::debug;
+
+use super::types::{NodeId, Request, TypeConfig};
+
+/// SQLite-backed Raft log storage
+pub struct SqliteLogStorage {
+    pool: SqlitePool,
+    /// Cached vote (also persisted)
+    vote: RwLock<Option<Vote<NodeId>>>,
+    /// Last purged log ID
+    last_purged: RwLock<Option<LogId<NodeId>>>,
+}
+
+impl SqliteLogStorage {
+    /// Create new log storage with the given connection pool
+    pub async fn new(pool: SqlitePool) -> Result<Self, StorageError<NodeId>> {
+        let storage = Self {
+            pool,
+            vote: RwLock::new(None),
+            last_purged: RwLock::new(None),
+        };
+
+        // Run migrations
+        storage.run_migrations().await?;
+
+        // Load cached state
+        storage.load_cached_state().await?;
+
+        Ok(storage)
+    }
+
+    /// Run Raft-specific migrations
+    async fn run_migrations(&self) -> Result<(), StorageError<NodeId>> {
+        // Log entries table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS raft_log (
+                log_index INTEGER PRIMARY KEY,
+                term INTEGER NOT NULL,
+                entry_type TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        // Vote persistence (singleton table)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS raft_vote (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                term INTEGER NOT NULL,
+                node_id INTEGER,
+                committed INTEGER NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageIOError::write_vote(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        // Metadata (key-value for misc state)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS raft_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageIOError::write(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        // Index for faster range queries
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_raft_log_term ON raft_log(term)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        debug!("Raft log storage migrations complete");
+        Ok(())
+    }
+
+    /// Load cached state from database
+    async fn load_cached_state(&self) -> Result<(), StorageError<NodeId>> {
+        // Load vote
+        let vote_row: Option<(i64, Option<i64>, i64)> =
+            sqlx::query_as("SELECT term, node_id, committed FROM raft_vote WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageIOError::read_vote(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        if let Some((term, node_id, committed)) = vote_row {
+            let vote = Vote {
+                leader_id: openraft::LeaderId {
+                    term: term as u64,
+                    node_id: node_id.map(|n| n as u64).unwrap_or(0),
+                },
+                committed: committed != 0,
+            };
+            *self.vote.write().await = Some(vote);
+        }
+
+        // Load last purged
+        let purged: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM raft_meta WHERE key = 'last_purged'")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageIOError::read(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        if let Some((value,)) = purged {
+            if let Ok(log_id) = serde_json::from_str::<LogId<NodeId>>(&value) {
+                *self.last_purged.write().await = Some(log_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert database row to Entry
+    fn row_to_entry(
+        log_index: i64,
+        term: i64,
+        entry_type: &str,
+        payload: Option<&str>,
+    ) -> Result<Entry<TypeConfig>, StorageError<NodeId>> {
+        let log_id = LogId {
+            leader_id: openraft::LeaderId {
+                term: term as u64,
+                node_id: 0, // We don't store node_id separately
+            },
+            index: log_index as u64,
+        };
+
+        let entry_payload = match entry_type {
+            "blank" => EntryPayload::Blank,
+            "normal" => {
+                let request: Request = serde_json::from_str(payload.unwrap_or("{}"))
+                    .map_err(|e| StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+                EntryPayload::Normal(request)
+            }
+            "membership" => {
+                let membership: openraft::Membership<NodeId, BasicNode> =
+                    serde_json::from_str(payload.unwrap_or("{}"))
+                        .map_err(|e| StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+                EntryPayload::Membership(membership)
+            }
+            other => {
+                return Err(StorageIOError::read_logs(&io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown entry type: {}", other),
+                ))
+                .into())
+            }
+        };
+
+        Ok(Entry {
+            log_id,
+            payload: entry_payload,
+        })
+    }
+}
+
+impl RaftLogReader<TypeConfig> for SqliteLogStorage {
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&n) => n as i64,
+            std::ops::Bound::Excluded(&n) => (n + 1) as i64,
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&n) => (n + 1) as i64,
+            std::ops::Bound::Excluded(&n) => n as i64,
+            std::ops::Bound::Unbounded => i64::MAX,
+        };
+
+        let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT log_index, term, entry_type, payload FROM raft_log
+             WHERE log_index >= ? AND log_index < ?
+             ORDER BY log_index",
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for (log_index, term, entry_type, payload) in rows {
+            let entry = Self::row_to_entry(log_index, term, &entry_type, payload.as_deref())?;
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+}
+
+impl RaftLogStorage<TypeConfig> for SqliteLogStorage {
+    type LogReader = Self;
+
+    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
+        let last_purged = self.last_purged.read().await.clone();
+
+        // Get last log entry
+        let last_log: Option<(i64, i64)> =
+            sqlx::query_as("SELECT log_index, term FROM raft_log ORDER BY log_index DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        let last_log_id = last_log.map(|(index, term)| LogId {
+            leader_id: openraft::LeaderId {
+                term: term as u64,
+                node_id: 0,
+            },
+            index: index as u64,
+        });
+
+        Ok(LogState {
+            last_purged_log_id: last_purged,
+            last_log_id,
+        })
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        // Clone the storage for reading
+        // This is safe because SqlitePool is internally Arc'd
+        Self {
+            pool: self.pool.clone(),
+            vote: RwLock::new(self.vote.read().await.clone()),
+            last_purged: RwLock::new(self.last_purged.read().await.clone()),
+        }
+    }
+
+    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO raft_vote (id, term, node_id, committed)
+             VALUES (1, ?, ?, ?)",
+        )
+        .bind(vote.leader_id.term as i64)
+        .bind(vote.leader_id.node_id as i64)
+        .bind(if vote.committed { 1i64 } else { 0i64 })
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageIOError::write_vote(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        *self.vote.write().await = Some(vote.clone());
+        debug!("Saved vote: term={}, node={}", vote.leader_id.term, vote.leader_id.node_id);
+        Ok(())
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
+        Ok(self.vote.read().await.clone())
+    }
+
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<TypeConfig>,
+    ) -> Result<(), StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+    {
+        let entries: Vec<_> = entries.into_iter().collect();
+        if entries.is_empty() {
+            callback.log_io_completed(Ok(()));
+            return Ok(());
+        }
+
+        // Use a transaction for atomicity
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        for entry in &entries {
+            let (entry_type, payload) = match &entry.payload {
+                EntryPayload::Blank => ("blank", None),
+                EntryPayload::Normal(req) => {
+                    let json = serde_json::to_string(req)
+                        .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+                    ("normal", Some(json))
+                }
+                EntryPayload::Membership(m) => {
+                    let json =
+                        serde_json::to_string(m).map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+                    ("membership", Some(json))
+                }
+            };
+
+            sqlx::query(
+                "INSERT OR REPLACE INTO raft_log (log_index, term, entry_type, payload)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(entry.log_id.index as i64)
+            .bind(entry.log_id.leader_id.term as i64)
+            .bind(entry_type)
+            .bind(payload)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        debug!("Appended {} log entries", entries.len());
+        callback.log_io_completed(Ok(()));
+        Ok(())
+    }
+
+    async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        sqlx::query("DELETE FROM raft_log WHERE log_index >= ?")
+            .bind(log_id.index as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        debug!("Truncated logs from index {}", log_id.index);
+        Ok(())
+    }
+
+    async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        // Delete old entries
+        sqlx::query("DELETE FROM raft_log WHERE log_index <= ?")
+            .bind(log_id.index as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        // Update last_purged metadata
+        let json =
+            serde_json::to_string(&log_id).map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+        sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_purged', ?)")
+            .bind(&json)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+
+        *self.last_purged.write().await = Some(log_id);
+        debug!("Purged logs up to index {}", log_id.index);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_pool() -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_log_storage_creation() {
+        let pool = test_pool().await;
+        let storage = SqliteLogStorage::new(pool).await;
+        assert!(storage.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_vote_persistence() {
+        let pool = test_pool().await;
+        let mut storage = SqliteLogStorage::new(pool.clone()).await.unwrap();
+
+        let vote = Vote {
+            leader_id: openraft::LeaderId { term: 5, node_id: 2 },
+            committed: true,
+        };
+
+        storage.save_vote(&vote).await.unwrap();
+
+        // Read back
+        let loaded = storage.read_vote().await.unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.leader_id.term, 5);
+        assert!(loaded.committed);
+    }
+
+    #[tokio::test]
+    async fn test_log_append_and_read() {
+        let pool = test_pool().await;
+        let mut storage = SqliteLogStorage::new(pool).await.unwrap();
+
+        let entries = vec![
+            Entry {
+                log_id: LogId {
+                    leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+                    index: 1,
+                },
+                payload: EntryPayload::Normal(Request::simple("INSERT INTO test VALUES (1)")),
+            },
+            Entry {
+                log_id: LogId {
+                    leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+                    index: 2,
+                },
+                payload: EntryPayload::Normal(Request::simple("INSERT INTO test VALUES (2)")),
+            },
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let callback = LogFlushed::new(Some(LogId {
+            leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+            index: 2,
+        }), tx);
+
+        storage.append(entries, callback).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Read back
+        let read_entries = storage.try_get_log_entries(1..3).await.unwrap();
+        assert_eq!(read_entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_log_truncate() {
+        let pool = test_pool().await;
+        let mut storage = SqliteLogStorage::new(pool).await.unwrap();
+
+        // Append 3 entries
+        let entries: Vec<Entry<TypeConfig>> = (1..=3)
+            .map(|i| Entry {
+                log_id: LogId {
+                    leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+                    index: i,
+                },
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let callback = LogFlushed::new(Some(LogId {
+            leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+            index: 3,
+        }), tx);
+
+        storage.append(entries, callback).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Truncate from index 2
+        storage
+            .truncate(LogId {
+                leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+                index: 2,
+            })
+            .await
+            .unwrap();
+
+        // Only entry 1 should remain
+        let remaining = storage.try_get_log_entries(0..10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].log_id.index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_log_purge() {
+        let pool = test_pool().await;
+        let mut storage = SqliteLogStorage::new(pool).await.unwrap();
+
+        // Append 5 entries
+        let entries: Vec<Entry<TypeConfig>> = (1..=5)
+            .map(|i| Entry {
+                log_id: LogId {
+                    leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+                    index: i,
+                },
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let callback = LogFlushed::new(Some(LogId {
+            leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+            index: 5,
+        }), tx);
+
+        storage.append(entries, callback).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Purge up to index 3
+        storage
+            .purge(LogId {
+                leader_id: openraft::LeaderId { term: 1, node_id: 1 },
+                index: 3,
+            })
+            .await
+            .unwrap();
+
+        // Only entries 4 and 5 should remain
+        let remaining = storage.try_get_log_entries(0..10).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+
+        // Check last_purged is updated
+        let state = storage.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id.unwrap().index, 3);
+    }
+}

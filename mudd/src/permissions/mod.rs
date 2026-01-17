@@ -14,7 +14,9 @@ use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 /// Access levels for MUD users
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[repr(u8)]
 pub enum AccessLevel {
     /// Normal player - can interact with non-fixed objects
@@ -181,7 +183,10 @@ impl PermissionManager {
 
     /// Set a user's access level
     pub async fn set_access_level(&self, account_id: &str, level: AccessLevel) {
-        self.user_levels.write().await.insert(account_id.to_string(), level);
+        self.user_levels
+            .write()
+            .await
+            .insert(account_id.to_string(), level);
     }
 
     /// Get a user's access level
@@ -268,10 +273,7 @@ impl PermissionManager {
                 if user.assigned_regions.contains(region_id) {
                     return PermissionResult::Allowed;
                 }
-                return PermissionResult::Denied(format!(
-                    "Not assigned to region {}",
-                    region_id
-                ));
+                return PermissionResult::Denied(format!("Not assigned to region {}", region_id));
             } else {
                 // Objects without a region require wizard access to modify
                 return PermissionResult::Denied("Object has no region assigned".to_string());
@@ -379,16 +381,24 @@ mod tests {
         };
 
         // Player can read
-        assert!(pm.check_permission(&user, Action::Read, &fixed_obj).is_allowed());
+        assert!(pm
+            .check_permission(&user, Action::Read, &fixed_obj)
+            .is_allowed());
 
         // Player cannot move fixed objects
-        assert!(!pm.check_permission(&user, Action::Move, &fixed_obj).is_allowed());
+        assert!(!pm
+            .check_permission(&user, Action::Move, &fixed_obj)
+            .is_allowed());
 
         // Player can move non-fixed objects
-        assert!(pm.check_permission(&user, Action::Move, &movable_obj).is_allowed());
+        assert!(pm
+            .check_permission(&user, Action::Move, &movable_obj)
+            .is_allowed());
 
         // Player cannot modify
-        assert!(!pm.check_permission(&user, Action::Modify, &movable_obj).is_allowed());
+        assert!(!pm
+            .check_permission(&user, Action::Modify, &movable_obj)
+            .is_allowed());
     }
 
     #[test]
@@ -414,10 +424,14 @@ mod tests {
         };
 
         // Builder can modify in their region
-        assert!(pm.check_permission(&user, Action::Modify, &obj_in_region).is_allowed());
+        assert!(pm
+            .check_permission(&user, Action::Modify, &obj_in_region)
+            .is_allowed());
 
         // Builder cannot modify outside their region
-        assert!(!pm.check_permission(&user, Action::Modify, &obj_outside_region).is_allowed());
+        assert!(!pm
+            .check_permission(&user, Action::Modify, &obj_outside_region)
+            .is_allowed());
     }
 
     #[test]
@@ -433,13 +447,19 @@ mod tests {
         };
 
         // Wizard can move fixed objects
-        assert!(pm.check_permission(&user, Action::Move, &fixed_obj).is_allowed());
+        assert!(pm
+            .check_permission(&user, Action::Move, &fixed_obj)
+            .is_allowed());
 
         // Wizard can modify anything
-        assert!(pm.check_permission(&user, Action::Modify, &fixed_obj).is_allowed());
+        assert!(pm
+            .check_permission(&user, Action::Modify, &fixed_obj)
+            .is_allowed());
 
         // But wizard cannot grant credits
-        assert!(!pm.check_permission(&user, Action::GrantCredits, &fixed_obj).is_allowed());
+        assert!(!pm
+            .check_permission(&user, Action::GrantCredits, &fixed_obj)
+            .is_allowed());
     }
 
     #[test]
@@ -455,7 +475,11 @@ mod tests {
         };
 
         // Admin can administer
-        assert!(pm.check_permission(&user, Action::AdminConfig, &obj).is_allowed());
-        assert!(pm.check_permission(&user, Action::GrantCredits, &obj).is_allowed());
+        assert!(pm
+            .check_permission(&user, Action::AdminConfig, &obj)
+            .is_allowed());
+        assert!(pm
+            .check_permission(&user, Action::GrantCredits, &obj)
+            .is_allowed());
     }
 }

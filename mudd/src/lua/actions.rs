@@ -135,7 +135,9 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].object_id, "lever_1");
 
-        registry.remove_room_action("room_1", "pull", "lever_1").await;
+        registry
+            .remove_room_action("room_1", "pull", "lever_1")
+            .await;
         let actions = registry.get_room_actions("room_1", "pull").await;
         assert!(actions.is_empty());
     }

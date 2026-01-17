@@ -4,10 +4,14 @@
 
 pub mod api;
 pub mod combat;
+pub mod credits;
 pub mod db;
 pub mod lua;
 pub mod objects;
 pub mod permissions;
+pub mod raft;
+pub mod timers;
+pub mod venice;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

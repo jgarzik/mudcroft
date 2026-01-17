@@ -163,11 +163,10 @@ impl ObjectStore {
 
     /// Get code by hash
     pub async fn get_code(&self, hash: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT source FROM code_store WHERE hash = ?")
-                .bind(hash)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT source FROM code_store WHERE hash = ?")
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|(s,)| s))
     }
@@ -250,7 +249,8 @@ impl ObjectStore {
     pub async fn set_exit(&self, room_id: &str, direction: &str, dest_room_id: &str) -> Result<()> {
         let room = self.get(room_id).await?;
         if let Some(mut r) = room {
-            let exits = r.properties
+            let exits = r
+                .properties
                 .entry("exits".to_string())
                 .or_insert_with(|| serde_json::json!({}));
 

@@ -87,7 +87,10 @@ async fn test_object_crud() {
 
     // Create test account and universe first
     let owner_id = mudd.create_test_account("testuser").await.unwrap();
-    let universe_id = mudd.create_test_universe("Test Universe", &owner_id).await.unwrap();
+    let universe_id = mudd
+        .create_test_universe("Test Universe", &owner_id)
+        .await
+        .unwrap();
 
     let store = ObjectStore::new(mudd.db().pool().clone());
 
@@ -130,7 +133,10 @@ async fn test_object_hierarchy() {
 
     // Create test account and universe first
     let owner_id = mudd.create_test_account("testuser").await.unwrap();
-    let universe_id = mudd.create_test_universe("Test Universe", &owner_id).await.unwrap();
+    let universe_id = mudd
+        .create_test_universe("Test Universe", &owner_id)
+        .await
+        .unwrap();
 
     let store = ObjectStore::new(mudd.db().pool().clone());
 
@@ -148,7 +154,10 @@ async fn test_object_hierarchy() {
     let mut shield = Object::new(&universe_id, "armor");
     shield.set_property("name", serde_json::json!("Wooden Shield"));
     shield.parent_id = Some(room.id.clone());
-    store.create(&shield).await.expect("Failed to create shield");
+    store
+        .create(&shield)
+        .await
+        .expect("Failed to create shield");
 
     // Get room contents
     let contents = store
@@ -223,7 +232,10 @@ async fn test_find_by_name() {
 
     // Create test account and universe first
     let owner_id = mudd.create_test_account("testuser").await.unwrap();
-    let universe_id = mudd.create_test_universe("Test Universe", &owner_id).await.unwrap();
+    let universe_id = mudd
+        .create_test_universe("Test Universe", &owner_id)
+        .await
+        .unwrap();
 
     let store = ObjectStore::new(mudd.db().pool().clone());
 
@@ -262,7 +274,10 @@ async fn test_find_by_name() {
 async fn test_room_exits() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
     let owner_id = mudd.create_test_account("testuser").await.unwrap();
-    let universe_id = mudd.create_test_universe("Test Universe", &owner_id).await.unwrap();
+    let universe_id = mudd
+        .create_test_universe("Test Universe", &owner_id)
+        .await
+        .unwrap();
     let store = ObjectStore::new(mudd.db().pool().clone());
 
     // Create two rooms
@@ -299,7 +314,10 @@ async fn test_room_exits() {
 async fn test_environment_query() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
     let owner_id = mudd.create_test_account("testuser").await.unwrap();
-    let universe_id = mudd.create_test_universe("Test Universe", &owner_id).await.unwrap();
+    let universe_id = mudd
+        .create_test_universe("Test Universe", &owner_id)
+        .await
+        .unwrap();
     let store = ObjectStore::new(mudd.db().pool().clone());
 
     // Create room
@@ -327,7 +345,10 @@ async fn test_environment_query() {
 async fn test_get_living_in() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
     let owner_id = mudd.create_test_account("testuser").await.unwrap();
-    let universe_id = mudd.create_test_universe("Test Universe", &owner_id).await.unwrap();
+    let universe_id = mudd
+        .create_test_universe("Test Universe", &owner_id)
+        .await
+        .unwrap();
     let store = ObjectStore::new(mudd.db().pool().clone());
 
     // Create room
@@ -357,10 +378,7 @@ async fn test_get_living_in() {
     let living = store.get_living_in(&room.id).await.unwrap();
     assert_eq!(living.len(), 2);
 
-    let names: Vec<_> = living
-        .iter()
-        .filter_map(|o| o.get_string("name"))
-        .collect();
+    let names: Vec<_> = living.iter().filter_map(|o| o.get_string("name")).collect();
     assert!(names.contains(&"Hero"));
     assert!(names.contains(&"Goblin"));
 }
@@ -369,7 +387,10 @@ async fn test_get_living_in() {
 async fn test_player_movement() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
     let owner_id = mudd.create_test_account("testuser").await.unwrap();
-    let universe_id = mudd.create_test_universe("Test Universe", &owner_id).await.unwrap();
+    let universe_id = mudd
+        .create_test_universe("Test Universe", &owner_id)
+        .await
+        .unwrap();
     let store = ObjectStore::new(mudd.db().pool().clone());
 
     // Create two connected rooms
@@ -415,7 +436,10 @@ async fn test_player_movement() {
 async fn test_websocket_connect() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
 
-    let mut ws = mudd.connect_ws().await.expect("Failed to connect WebSocket");
+    let mut ws = mudd
+        .connect_ws()
+        .await
+        .expect("Failed to connect WebSocket");
 
     // Should receive welcome message
     let msg = ws
@@ -433,7 +457,10 @@ async fn test_websocket_connect() {
 async fn test_websocket_command() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
 
-    let mut ws = mudd.connect_ws().await.expect("Failed to connect WebSocket");
+    let mut ws = mudd
+        .connect_ws()
+        .await
+        .expect("Failed to connect WebSocket");
 
     // Receive welcome
     let _welcome = ws
@@ -442,7 +469,9 @@ async fn test_websocket_command() {
         .unwrap();
 
     // Send a command
-    ws.send_command("look").await.expect("Failed to send command");
+    ws.send_command("look")
+        .await
+        .expect("Failed to send command");
 
     // Should receive echo
     let echo = ws
@@ -467,7 +496,10 @@ async fn test_websocket_command() {
 async fn test_websocket_help_command() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
 
-    let mut ws = mudd.connect_ws().await.expect("Failed to connect WebSocket");
+    let mut ws = mudd
+        .connect_ws()
+        .await
+        .expect("Failed to connect WebSocket");
 
     // Receive welcome
     let _welcome = ws
@@ -479,7 +511,10 @@ async fn test_websocket_help_command() {
     ws.send_command("help").await.expect("Failed to send help");
 
     // Skip echo
-    let _echo = ws.recv_json_timeout(std::time::Duration::from_secs(5)).await.unwrap();
+    let _echo = ws
+        .recv_json_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
 
     // Get help output
     let output = ws
@@ -525,16 +560,27 @@ async fn test_websocket_multiple_connections() {
 async fn test_websocket_unknown_command() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
 
-    let mut ws = mudd.connect_ws().await.expect("Failed to connect WebSocket");
+    let mut ws = mudd
+        .connect_ws()
+        .await
+        .expect("Failed to connect WebSocket");
 
     // Receive welcome
-    let _welcome = ws.recv_json_timeout(std::time::Duration::from_secs(5)).await.unwrap();
+    let _welcome = ws
+        .recv_json_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
 
     // Send unknown command
-    ws.send_command("xyzzy").await.expect("Failed to send xyzzy");
+    ws.send_command("xyzzy")
+        .await
+        .expect("Failed to send xyzzy");
 
     // Skip echo
-    let _echo = ws.recv_json_timeout(std::time::Duration::from_secs(5)).await.unwrap();
+    let _echo = ws
+        .recv_json_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
 
     // Get output
     let output = ws

@@ -5,10 +5,10 @@
 //! - Buffs and debuffs
 //! - Damage over time
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
 
 use super::DamageType;
 
@@ -202,7 +202,11 @@ impl EntityEffects {
     /// Add an effect (stacks or refreshes based on type)
     pub fn add(&mut self, effect: StatusEffect) {
         // For most effects, just refresh duration if already present
-        if let Some(existing) = self.effects.iter_mut().find(|e| e.effect_type == effect.effect_type) {
+        if let Some(existing) = self
+            .effects
+            .iter_mut()
+            .find(|e| e.effect_type == effect.effect_type)
+        {
             existing.remaining_ticks = existing.remaining_ticks.max(effect.remaining_ticks);
             existing.magnitude = existing.magnitude.max(effect.magnitude);
         } else {
@@ -217,17 +221,24 @@ impl EntityEffects {
 
     /// Check if entity has a specific effect
     pub fn has(&self, effect_type: EffectType) -> bool {
-        self.effects.iter().any(|e| e.effect_type == effect_type && !e.is_expired())
+        self.effects
+            .iter()
+            .any(|e| e.effect_type == effect_type && !e.is_expired())
     }
 
     /// Get an effect if present
     pub fn get(&self, effect_type: EffectType) -> Option<&StatusEffect> {
-        self.effects.iter().find(|e| e.effect_type == effect_type && !e.is_expired())
+        self.effects
+            .iter()
+            .find(|e| e.effect_type == effect_type && !e.is_expired())
     }
 
     /// Check if entity can act (not stunned/paralyzed)
     pub fn can_act(&self) -> bool {
-        !self.effects.iter().any(|e| e.effect_type.prevents_action() && !e.is_expired())
+        !self
+            .effects
+            .iter()
+            .any(|e| e.effect_type.prevents_action() && !e.is_expired())
     }
 
     /// Tick all effects and return damage/healing to apply
@@ -299,9 +310,7 @@ impl EffectRegistry {
     /// Check if entity has an effect
     pub async fn has_effect(&self, entity_id: &str, effect_type: EffectType) -> bool {
         let entities = self.entities.read().await;
-        entities
-            .get(entity_id)
-            .is_some_and(|e| e.has(effect_type))
+        entities.get(entity_id).is_some_and(|e| e.has(effect_type))
     }
 
     /// Check if entity can act
@@ -387,7 +396,12 @@ mod tests {
     #[test]
     fn test_dot_damage() {
         let mut effects = EntityEffects::new();
-        effects.add(StatusEffect::dot(EffectType::Burning, 2, 10, DamageType::Fire));
+        effects.add(StatusEffect::dot(
+            EffectType::Burning,
+            2,
+            10,
+            DamageType::Fire,
+        ));
 
         let damage = effects.tick_all();
         assert_eq!(damage.len(), 1);
@@ -416,7 +430,9 @@ mod tests {
         let registry = EffectRegistry::new();
 
         // Add effect
-        registry.add_effect("player1", StatusEffect::new(EffectType::Stunned, 2, 0)).await;
+        registry
+            .add_effect("player1", StatusEffect::new(EffectType::Stunned, 2, 0))
+            .await;
         assert!(registry.has_effect("player1", EffectType::Stunned).await);
         assert!(!registry.can_act("player1").await);
 

@@ -19,7 +19,11 @@ pub struct DiceRoll {
 impl DiceRoll {
     /// Create a new dice roll
     pub fn new(count: u32, sides: u32, modifier: i32) -> Self {
-        Self { count, sides, modifier }
+        Self {
+            count,
+            sides,
+            modifier,
+        }
     }
 
     /// Roll the dice and return the total
@@ -92,7 +96,9 @@ pub fn parse_dice(notation: &str) -> Result<DiceRoll, String> {
     let count: u32 = if count_str.is_empty() {
         1 // "d6" means "1d6"
     } else {
-        count_str.parse().map_err(|_| format!("Invalid dice count: {}", count_str))?
+        count_str
+            .parse()
+            .map_err(|_| format!("Invalid dice count: {}", count_str))?
     };
 
     if count == 0 {
@@ -106,7 +112,9 @@ pub fn parse_dice(notation: &str) -> Result<DiceRoll, String> {
     let (sides_str, modifier) = if let Some(plus_pos) = rest.find('+') {
         let sides = &rest[..plus_pos];
         let mod_str = &rest[plus_pos + 1..];
-        let modifier: i32 = mod_str.parse().map_err(|_| format!("Invalid modifier: {}", mod_str))?;
+        let modifier: i32 = mod_str
+            .parse()
+            .map_err(|_| format!("Invalid modifier: {}", mod_str))?;
         (sides, modifier)
     } else if let Some(minus_pos) = rest.rfind('-') {
         // Use rfind to handle negative modifier
@@ -116,20 +124,28 @@ pub fn parse_dice(notation: &str) -> Result<DiceRoll, String> {
         } else {
             let sides = &rest[..minus_pos];
             let mod_str = &rest[minus_pos..]; // includes the minus sign
-            let modifier: i32 = mod_str.parse().map_err(|_| format!("Invalid modifier: {}", mod_str))?;
+            let modifier: i32 = mod_str
+                .parse()
+                .map_err(|_| format!("Invalid modifier: {}", mod_str))?;
             (sides, modifier)
         }
     } else {
         (rest, 0)
     };
 
-    let sides: u32 = sides_str.parse().map_err(|_| format!("Invalid die sides: {}", sides_str))?;
+    let sides: u32 = sides_str
+        .parse()
+        .map_err(|_| format!("Invalid die sides: {}", sides_str))?;
 
     if sides == 0 {
         return Err("Die sides must be at least 1".to_string());
     }
 
-    Ok(DiceRoll { count, sides, modifier })
+    Ok(DiceRoll {
+        count,
+        sides,
+        modifier,
+    })
 }
 
 /// Roll dice with the given parameters
@@ -244,7 +260,7 @@ mod tests {
     #[test]
     fn test_min_max_average() {
         let roll = DiceRoll::new(2, 6, 3);
-        assert_eq!(roll.min(), 5);  // 2 + 3
+        assert_eq!(roll.min(), 5); // 2 + 3
         assert_eq!(roll.max(), 15); // 12 + 3
         assert_eq!(roll.average(), 10); // 7 + 3
     }

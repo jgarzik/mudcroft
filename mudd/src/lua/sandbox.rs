@@ -364,9 +364,7 @@ mod tests {
     #[test]
     fn test_string_operations() {
         let mut sandbox = Sandbox::new(SandboxConfig::default()).unwrap();
-        let result: String = sandbox
-            .execute(r#"return string.upper("hello")"#)
-            .unwrap();
+        let result: String = sandbox.execute(r#"return string.upper("hello")"#).unwrap();
         assert_eq!(result, "HELLO");
     }
 

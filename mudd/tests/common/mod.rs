@@ -43,9 +43,7 @@ impl MuddTest {
         });
 
         // Wait for server to be ready
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?;
+        let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
         // Poll until server is ready (max 2 seconds)
         let mut ready = false;
@@ -170,7 +168,9 @@ impl WsClient {
             "type": "command",
             "text": text
         });
-        self.write.send(Message::Text(msg.to_string().into())).await?;
+        self.write
+            .send(Message::Text(msg.to_string().into()))
+            .await?;
         Ok(())
     }
 
@@ -179,7 +179,9 @@ impl WsClient {
         let msg = serde_json::json!({
             "type": "ping"
         });
-        self.write.send(Message::Text(msg.to_string().into())).await?;
+        self.write
+            .send(Message::Text(msg.to_string().into()))
+            .await?;
         Ok(())
     }
 

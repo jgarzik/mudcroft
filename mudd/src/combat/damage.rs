@@ -196,7 +196,10 @@ impl DamageProfile {
 
     /// Get the modifier for a damage type
     pub fn get(&self, dtype: DamageType) -> DamageModifier {
-        self.modifiers.get(&dtype).copied().unwrap_or(DamageModifier::Normal)
+        self.modifiers
+            .get(&dtype)
+            .copied()
+            .unwrap_or(DamageModifier::Normal)
     }
 
     /// Add an immunity

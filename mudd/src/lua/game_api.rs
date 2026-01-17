@@ -7,8 +7,11 @@ use tokio::sync::RwLock;
 
 use super::actions::{Action, ActionRegistry};
 use super::messaging::MessageQueue;
+use crate::credits::CreditManager;
 use crate::objects::{ClassRegistry, Object, ObjectStore};
 use crate::permissions::{AccessLevel, Action as PermAction, ObjectContext, PermissionManager};
+use crate::timers::{HeartBeat, Timer, TimerManager};
+use crate::venice::{ChatMessage, ImageSize, ImageStyle, ModelTier, VeniceClient};
 
 /// Game API context shared with Lua
 #[allow(dead_code)]
@@ -18,19 +21,27 @@ pub struct GameApi {
     actions: Arc<ActionRegistry>,
     messages: Arc<MessageQueue>,
     permissions: Arc<PermissionManager>,
+    timers: Arc<TimerManager>,
+    credits: Arc<CreditManager>,
+    venice: Arc<VeniceClient>,
     universe_id: String,
     current_room_id: Option<String>,
     current_user_id: Option<String>,
+    current_object_id: Option<String>,
 }
 
 impl GameApi {
     /// Create a new game API for a universe
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<ObjectStore>,
         classes: Arc<RwLock<ClassRegistry>>,
         actions: Arc<ActionRegistry>,
         messages: Arc<MessageQueue>,
         permissions: Arc<PermissionManager>,
+        timers: Arc<TimerManager>,
+        credits: Arc<CreditManager>,
+        venice: Arc<VeniceClient>,
         universe_id: &str,
     ) -> Self {
         Self {
@@ -39,9 +50,13 @@ impl GameApi {
             actions,
             messages,
             permissions,
+            timers,
+            credits,
+            venice,
             universe_id: universe_id.to_string(),
             current_room_id: None,
             current_user_id: None,
+            current_object_id: None,
         }
     }
 
@@ -58,6 +73,16 @@ impl GameApi {
     /// Set the current room context for action registration
     pub fn set_room_context(&mut self, room_id: Option<String>) {
         self.current_room_id = room_id;
+    }
+
+    /// Set the current object context for timer registration
+    pub fn set_object_context(&mut self, object_id: Option<String>) {
+        self.current_object_id = object_id;
+    }
+
+    /// Get the timer manager
+    pub fn timer_manager(&self) -> Arc<TimerManager> {
+        self.timers.clone()
     }
 
     /// Get the message queue for draining after execution
@@ -84,6 +109,9 @@ impl GameApi {
         self.register_action_functions(lua, &game)?;
         self.register_message_functions(lua, &game)?;
         self.register_permission_functions(lua, &game)?;
+        self.register_timer_functions(lua, &game)?;
+        self.register_credit_functions(lua, &game)?;
+        self.register_venice_functions(lua, &game)?;
 
         globals.set("game", game)?;
         Ok(())
@@ -93,22 +121,24 @@ impl GameApi {
         let universe_id = self.universe_id.clone();
 
         // game.create_object(class, parent_id, props)
-        let create_object = lua.create_function(move |lua, (class, parent_id, props): (String, Option<String>, Option<Table>)| {
-            let mut obj = Object::new(&universe_id, &class);
-            obj.parent_id = parent_id;
+        let create_object = lua.create_function(
+            move |lua, (class, parent_id, props): (String, Option<String>, Option<Table>)| {
+                let mut obj = Object::new(&universe_id, &class);
+                obj.parent_id = parent_id;
 
-            // Copy properties from Lua table if provided
-            if let Some(props_table) = props {
-                for pair in props_table.pairs::<String, Value>() {
-                    let (k, v) = pair?;
-                    let json_val = lua_to_json(v)?;
-                    obj.properties.insert(k, json_val);
+                // Copy properties from Lua table if provided
+                if let Some(props_table) = props {
+                    for pair in props_table.pairs::<String, Value>() {
+                        let (k, v) = pair?;
+                        let json_val = lua_to_json(v)?;
+                        obj.properties.insert(k, json_val);
+                    }
                 }
-            }
 
-            // Return the object as a table
-            object_to_lua(lua, &obj)
-        })?;
+                // Return the object as a table
+                object_to_lua(lua, &obj)
+            },
+        )?;
         game.set("create_object", create_object)?;
 
         // game.get_object(id)
@@ -134,17 +164,19 @@ impl GameApi {
         game.set("delete_object", delete_object)?;
 
         // game.move_object(id, new_parent_id)
-        let move_object = lua.create_function(|_, (_id, _new_parent_id): (String, Option<String>)| {
-            // Stub - requires async DB access + init cascade
-            Ok(true)
-        })?;
+        let move_object =
+            lua.create_function(|_, (_id, _new_parent_id): (String, Option<String>)| {
+                // Stub - requires async DB access + init cascade
+                Ok(true)
+            })?;
         game.set("move_object", move_object)?;
 
         // game.clone_object(id, new_parent_id)
-        let clone_object = lua.create_function(|_lua, (_id, _new_parent_id): (String, Option<String>)| {
-            // Stub - requires async DB access
-            Ok(Value::Nil)
-        })?;
+        let clone_object =
+            lua.create_function(|_lua, (_id, _new_parent_id): (String, Option<String>)| {
+                // Stub - requires async DB access
+                Ok(Value::Nil)
+            })?;
         game.set("clone_object", clone_object)?;
 
         Ok(())
@@ -225,57 +257,66 @@ impl GameApi {
         // Adds a contextual action for the current room
         let actions_clone = actions.clone();
         let room_id_clone = room_id.clone();
-        let add_action = lua.create_function(move |_, (verb, object_id, method): (String, String, String)| {
-            let actions = actions_clone.clone();
-            let room_id = room_id_clone.clone();
+        let add_action = lua.create_function(
+            move |_, (verb, object_id, method): (String, String, String)| {
+                let actions = actions_clone.clone();
+                let room_id = room_id_clone.clone();
 
-            // Use blocking task since we're in sync Lua context
-            // In production, this would be handled differently
-            let action = Action {
-                verb: verb.clone(),
-                object_id,
-                method,
-            };
+                // Use blocking task since we're in sync Lua context
+                // In production, this would be handled differently
+                let action = Action {
+                    verb: verb.clone(),
+                    object_id,
+                    method,
+                };
 
-            // Store action - for now we'll use the object_id as the scope
-            // The caller should set up proper room context before execution
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(rid) = room_id {
-                        actions.add_room_action(&rid, action).await;
-                    } else {
-                        // If no room context, add as object action
-                        actions.add_object_action(&action.object_id, action.clone()).await;
-                    }
-                });
-            }).join().ok();
+                // Store action - for now we'll use the object_id as the scope
+                // The caller should set up proper room context before execution
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        if let Some(rid) = room_id {
+                            actions.add_room_action(&rid, action).await;
+                        } else {
+                            // If no room context, add as object action
+                            actions
+                                .add_object_action(&action.object_id, action.clone())
+                                .await;
+                        }
+                    });
+                })
+                .join()
+                .ok();
 
-            Ok(true)
-        })?;
+                Ok(true)
+            },
+        )?;
         game.set("add_action", add_action)?;
 
         // game.remove_action(verb, object_id)
         // Removes a contextual action
         let actions_clone = actions.clone();
         let room_id_clone = room_id;
-        let remove_action = lua.create_function(move |_, (verb, object_id): (String, String)| {
-            let actions = actions_clone.clone();
-            let room_id = room_id_clone.clone();
+        let remove_action =
+            lua.create_function(move |_, (verb, object_id): (String, String)| {
+                let actions = actions_clone.clone();
+                let room_id = room_id_clone.clone();
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(rid) = room_id {
-                        actions.remove_room_action(&rid, &verb, &object_id).await;
-                    } else {
-                        actions.remove_object_action(&object_id, &verb).await;
-                    }
-                });
-            }).join().ok();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        if let Some(rid) = room_id {
+                            actions.remove_room_action(&rid, &verb, &object_id).await;
+                        } else {
+                            actions.remove_object_action(&object_id, &verb).await;
+                        }
+                    });
+                })
+                .join()
+                .ok();
 
-            Ok(true)
-        })?;
+                Ok(true)
+            })?;
         game.set("remove_action", remove_action)?;
 
         Ok(())
@@ -295,7 +336,9 @@ impl GameApi {
                 rt.block_on(async {
                     messages.send(&target_id, &message).await;
                 });
-            }).join().ok();
+            })
+            .join()
+            .ok();
 
             Ok(true)
         })?;
@@ -312,7 +355,9 @@ impl GameApi {
                 rt.block_on(async {
                     messages.broadcast(&room_id, &message).await;
                 });
-            }).join().ok();
+            })
+            .join()
+            .ok();
 
             Ok(true)
         })?;
@@ -320,18 +365,21 @@ impl GameApi {
 
         // game.broadcast_region(region_id, message)
         // Broadcast a message to all players in a region
-        let broadcast_region = lua.create_function(move |_, (region_id, message): (String, String)| {
-            let messages = messages.clone();
+        let broadcast_region =
+            lua.create_function(move |_, (region_id, message): (String, String)| {
+                let messages = messages.clone();
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    messages.broadcast_region(&region_id, &message).await;
-                });
-            }).join().ok();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        messages.broadcast_region(&region_id, &message).await;
+                    });
+                })
+                .join()
+                .ok();
 
-            Ok(true)
-        })?;
+                Ok(true)
+            })?;
         game.set("broadcast_region", broadcast_region)?;
 
         Ok(())
@@ -343,58 +391,68 @@ impl GameApi {
 
         // game.check_permission(action, target_id, is_fixed, region_id)
         // Returns true if permission is allowed, false and error message otherwise
-        let check_permission = lua.create_function(move |lua, (action_str, target_id, is_fixed, region_id): (String, String, Option<bool>, Option<String>)| {
-            let permissions = permissions.clone();
-            let current_user = current_user.clone();
+        let check_permission = lua.create_function(
+            move |lua,
+                  (action_str, target_id, is_fixed, region_id): (
+                String,
+                String,
+                Option<bool>,
+                Option<String>,
+            )| {
+                let permissions = permissions.clone();
+                let current_user = current_user.clone();
 
-            // Parse action string
-            let action = match action_str.as_str() {
-                "read" => PermAction::Read,
-                "modify" => PermAction::Modify,
-                "move" => PermAction::Move,
-                "delete" => PermAction::Delete,
-                "create" => PermAction::Create,
-                "execute" => PermAction::Execute,
-                "admin_config" => PermAction::AdminConfig,
-                "grant_credits" => PermAction::GrantCredits,
-                _ => {
-                    let result = lua.create_table()?;
-                    result.set("allowed", false)?;
-                    result.set("error", format!("Unknown action: {}", action_str))?;
-                    return Ok(result);
-                }
-            };
+                // Parse action string
+                let action = match action_str.as_str() {
+                    "read" => PermAction::Read,
+                    "modify" => PermAction::Modify,
+                    "move" => PermAction::Move,
+                    "delete" => PermAction::Delete,
+                    "create" => PermAction::Create,
+                    "execute" => PermAction::Execute,
+                    "admin_config" => PermAction::AdminConfig,
+                    "grant_credits" => PermAction::GrantCredits,
+                    _ => {
+                        let result = lua.create_table()?;
+                        result.set("allowed", false)?;
+                        result.set("error", format!("Unknown action: {}", action_str))?;
+                        return Ok(result);
+                    }
+                };
 
-            // Get user context
-            let user_id = current_user.unwrap_or_else(|| "anonymous".to_string());
+                // Get user context
+                let user_id = current_user.unwrap_or_else(|| "anonymous".to_string());
 
-            // Build contexts synchronously using thread spawn
-            let result_data = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let user_ctx = permissions.get_user_context(&user_id).await;
-                    let obj_ctx = ObjectContext {
-                        object_id: target_id,
-                        owner_id: None,
-                        is_fixed: is_fixed.unwrap_or(false),
-                        region_id,
-                    };
-                    permissions.check_permission(&user_ctx, action, &obj_ctx)
+                // Build contexts synchronously using thread spawn
+                let result_data = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let user_ctx = permissions.get_user_context(&user_id).await;
+                        let obj_ctx = ObjectContext {
+                            object_id: target_id,
+                            owner_id: None,
+                            is_fixed: is_fixed.unwrap_or(false),
+                            region_id,
+                        };
+                        permissions.check_permission(&user_ctx, action, &obj_ctx)
+                    })
                 })
-            }).join().expect("Thread panicked");
+                .join()
+                .expect("Thread panicked");
 
-            let result = lua.create_table()?;
-            match result_data {
-                crate::permissions::PermissionResult::Allowed => {
-                    result.set("allowed", true)?;
+                let result = lua.create_table()?;
+                match result_data {
+                    crate::permissions::PermissionResult::Allowed => {
+                        result.set("allowed", true)?;
+                    }
+                    crate::permissions::PermissionResult::Denied(reason) => {
+                        result.set("allowed", false)?;
+                        result.set("error", reason)?;
+                    }
                 }
-                crate::permissions::PermissionResult::Denied(reason) => {
-                    result.set("allowed", false)?;
-                    result.set("error", reason)?;
-                }
-            }
-            Ok(result)
-        })?;
+                Ok(result)
+            },
+        )?;
         game.set("check_permission", check_permission)?;
 
         // game.get_access_level(account_id)
@@ -405,10 +463,10 @@ impl GameApi {
 
             let level = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    permissions.get_access_level(&account_id).await
-                })
-            }).join().expect("Thread panicked");
+                rt.block_on(async { permissions.get_access_level(&account_id).await })
+            })
+            .join()
+            .expect("Thread panicked");
 
             let level_str = match level {
                 AccessLevel::Player => "player",
@@ -424,62 +482,385 @@ impl GameApi {
         // game.set_access_level(account_id, level_str)
         // Sets a user's access level (requires admin)
         let permissions_clone = self.permissions.clone();
-        let set_access_level = lua.create_function(move |_, (account_id, level_str): (String, String)| {
-            let permissions = permissions_clone.clone();
+        let set_access_level =
+            lua.create_function(move |_, (account_id, level_str): (String, String)| {
+                let permissions = permissions_clone.clone();
 
-            let level = match level_str.as_str() {
-                "player" => AccessLevel::Player,
-                "builder" => AccessLevel::Builder,
-                "wizard" => AccessLevel::Wizard,
-                "admin" => AccessLevel::Admin,
-                "owner" => AccessLevel::Owner,
-                _ => return Ok(false),
-            };
+                let level = match level_str.as_str() {
+                    "player" => AccessLevel::Player,
+                    "builder" => AccessLevel::Builder,
+                    "wizard" => AccessLevel::Wizard,
+                    "admin" => AccessLevel::Admin,
+                    "owner" => AccessLevel::Owner,
+                    _ => return Ok(false),
+                };
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    permissions.set_access_level(&account_id, level).await;
-                });
-            }).join().ok();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        permissions.set_access_level(&account_id, level).await;
+                    });
+                })
+                .join()
+                .ok();
 
-            Ok(true)
-        })?;
+                Ok(true)
+            })?;
         game.set("set_access_level", set_access_level)?;
 
         // game.assign_region(account_id, region_id)
         // Assigns a region to a builder
         let permissions_clone = self.permissions.clone();
-        let assign_region = lua.create_function(move |_, (account_id, region_id): (String, String)| {
-            let permissions = permissions_clone.clone();
+        let assign_region =
+            lua.create_function(move |_, (account_id, region_id): (String, String)| {
+                let permissions = permissions_clone.clone();
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    permissions.assign_region(&account_id, &region_id).await;
-                });
-            }).join().ok();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        permissions.assign_region(&account_id, &region_id).await;
+                    });
+                })
+                .join()
+                .ok();
 
-            Ok(true)
-        })?;
+                Ok(true)
+            })?;
         game.set("assign_region", assign_region)?;
 
         // game.unassign_region(account_id, region_id)
         // Removes a region assignment from a builder
         let permissions_clone = self.permissions.clone();
-        let unassign_region = lua.create_function(move |_, (account_id, region_id): (String, String)| {
-            let permissions = permissions_clone.clone();
+        let unassign_region =
+            lua.create_function(move |_, (account_id, region_id): (String, String)| {
+                let permissions = permissions_clone.clone();
+
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        permissions.unassign_region(&account_id, &region_id).await;
+                    });
+                })
+                .join()
+                .ok();
+
+                Ok(true)
+            })?;
+        game.set("unassign_region", unassign_region)?;
+
+        Ok(())
+    }
+
+    fn register_timer_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        let timers = self.timers.clone();
+        let universe_id = self.universe_id.clone();
+        let current_object = self.current_object_id.clone();
+
+        // game.call_out(delay_secs, method, ...)
+        // Schedule a one-shot timer to call a method after delay
+        // Returns timer_id
+        let timers_clone = timers.clone();
+        let universe_clone = universe_id.clone();
+        let object_clone = current_object.clone();
+        let call_out = lua.create_function(
+            move |_, (delay_secs, method, args): (f64, String, Option<String>)| {
+                let timers = timers_clone.clone();
+                let universe_id = universe_clone.clone();
+                let object_id = object_clone.clone();
+
+                let delay_ms = (delay_secs * 1000.0) as u64;
+
+                let timer_id = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        if let Some(obj_id) = object_id {
+                            let timer = Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
+                            timers.add_timer(timer).await
+                        } else {
+                            String::new()
+                        }
+                    })
+                })
+                .join()
+                .expect("Thread panicked");
+
+                Ok(timer_id)
+            },
+        )?;
+        game.set("call_out", call_out)?;
+
+        // game.remove_call_out(timer_id)
+        // Cancel a scheduled timer
+        let timers_clone = timers.clone();
+        let remove_call_out = lua.create_function(move |_, timer_id: String| {
+            let timers = timers_clone.clone();
+
+            let removed = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async { timers.remove_timer(&timer_id).await })
+            })
+            .join()
+            .expect("Thread panicked");
+
+            Ok(removed)
+        })?;
+        game.set("remove_call_out", remove_call_out)?;
+
+        // game.set_heart_beat(interval_ms)
+        // Set a recurring heartbeat for the current object
+        let timers_clone = timers.clone();
+        let universe_clone = universe_id.clone();
+        let object_clone = current_object.clone();
+        let set_heart_beat = lua.create_function(move |_, interval_ms: u64| {
+            let timers = timers_clone.clone();
+            let universe_id = universe_clone.clone();
+            let object_id = object_clone.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    permissions.unassign_region(&account_id, &region_id).await;
+                    if let Some(obj_id) = object_id {
+                        let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
+                        timers.set_heartbeat(hb).await;
+                    }
                 });
-            }).join().ok();
+            })
+            .join()
+            .ok();
 
             Ok(true)
         })?;
-        game.set("unassign_region", unassign_region)?;
+        game.set("set_heart_beat", set_heart_beat)?;
+
+        // game.remove_heart_beat()
+        // Remove the heartbeat for the current object
+        let object_clone = current_object;
+        let remove_heart_beat = lua.create_function(move |_, ()| {
+            let timers = timers.clone();
+            let object_id = object_clone.clone();
+
+            let removed = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Some(obj_id) = object_id {
+                        timers.remove_heartbeat(&obj_id).await
+                    } else {
+                        false
+                    }
+                })
+            })
+            .join()
+            .expect("Thread panicked");
+
+            Ok(removed)
+        })?;
+        game.set("remove_heart_beat", remove_heart_beat)?;
+
+        Ok(())
+    }
+
+    fn register_credit_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        let credits = self.credits.clone();
+        let universe_id = self.universe_id.clone();
+        let current_user = self.current_user_id.clone();
+        let permissions = self.permissions.clone();
+
+        // game.get_credits()
+        // Get the current player's credit balance
+        let credits_clone = credits.clone();
+        let universe_clone = universe_id.clone();
+        let user_clone = current_user.clone();
+        let get_credits = lua.create_function(move |_, ()| {
+            let credits = credits_clone.clone();
+            let universe_id = universe_clone.clone();
+            let user_id = user_clone.clone();
+
+            let balance = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Some(uid) = user_id {
+                        credits.get_balance(&universe_id, &uid).await
+                    } else {
+                        0
+                    }
+                })
+            })
+            .join()
+            .expect("Thread panicked");
+
+            Ok(balance)
+        })?;
+        game.set("get_credits", get_credits)?;
+
+        // game.deduct_credits(amount, reason)
+        // Deduct credits from the current player
+        // Returns true if successful, false if insufficient funds
+        let credits_clone = credits.clone();
+        let universe_clone = universe_id.clone();
+        let user_clone = current_user.clone();
+        let deduct_credits = lua.create_function(move |_, (amount, reason): (i64, String)| {
+            let credits = credits_clone.clone();
+            let universe_id = universe_clone.clone();
+            let user_id = user_clone.clone();
+
+            let result = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Some(uid) = user_id {
+                        credits.deduct(&universe_id, &uid, amount, &reason).await
+                    } else {
+                        false
+                    }
+                })
+            })
+            .join()
+            .expect("Thread panicked");
+
+            Ok(result)
+        })?;
+        game.set("deduct_credits", deduct_credits)?;
+
+        // game.admin_grant_credits(account_id, amount)
+        // Grant credits to a player (wizard+ only)
+        let credits_clone = credits;
+        let universe_clone = universe_id;
+        let user_clone = current_user;
+        let admin_grant_credits =
+            lua.create_function(move |_, (account_id, amount): (String, i64)| {
+                let credits = credits_clone.clone();
+                let universe_id = universe_clone.clone();
+                let user_id = user_clone.clone();
+                let permissions = permissions.clone();
+
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        // Check if current user is wizard+
+                        if let Some(ref uid) = user_id {
+                            let level = permissions.get_access_level(uid).await;
+                            if level < AccessLevel::Wizard {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+
+                        credits
+                            .grant(&universe_id, &account_id, amount, "admin_grant")
+                            .await;
+                        true
+                    })
+                })
+                .join()
+                .expect("Thread panicked");
+
+                Ok(result)
+            })?;
+        game.set("admin_grant_credits", admin_grant_credits)?;
+
+        Ok(())
+    }
+
+    fn register_venice_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        let venice = self.venice.clone();
+        let current_user = self.current_user_id.clone();
+
+        // game.llm_chat(messages, tier)
+        // Send a chat completion request to Venice AI
+        // messages: array of {role, content} tables
+        // tier: "fast", "balanced", or "quality"
+        // Returns response text or nil on error
+        let venice_clone = venice.clone();
+        let user_clone = current_user.clone();
+        let llm_chat = lua.create_function(
+            move |lua, (messages_table, tier_str): (Table, Option<String>)| {
+                let venice = venice_clone.clone();
+                let user_id = user_clone.clone();
+
+                // Parse messages from Lua table
+                let mut messages = Vec::new();
+                for pair in messages_table.sequence_values::<Table>() {
+                    let msg_table = pair?;
+                    let role: String = msg_table.get("role")?;
+                    let content: String = msg_table.get("content")?;
+                    messages.push(ChatMessage { role, content });
+                }
+
+                // Parse tier
+                let tier = tier_str
+                    .as_deref()
+                    .and_then(ModelTier::from_str)
+                    .unwrap_or(ModelTier::Balanced);
+
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let account_id = user_id.as_deref().unwrap_or("anonymous");
+                        venice.chat(account_id, messages, tier).await
+                    })
+                })
+                .join()
+                .expect("Thread panicked");
+
+                match result {
+                    Ok(response) => Ok(Value::String(lua.create_string(&response)?)),
+                    Err(e) => {
+                        // Return nil and error message
+                        let result = lua.create_table()?;
+                        result.set("error", e)?;
+                        Ok(Value::Table(result))
+                    }
+                }
+            },
+        )?;
+        game.set("llm_chat", llm_chat)?;
+
+        // game.llm_image(prompt, style, size)
+        // Generate an image using Venice AI
+        // prompt: text description
+        // style: "realistic", "anime", "digital", "painterly"
+        // size: "small", "medium", "large"
+        // Returns URL string or nil on error
+        let user_clone = current_user;
+        let llm_image = lua.create_function(
+            move |lua, (prompt, style_str, size_str): (String, Option<String>, Option<String>)| {
+                let venice = venice.clone();
+                let user_id = user_clone.clone();
+
+                // Parse style and size
+                let style = style_str
+                    .as_deref()
+                    .and_then(ImageStyle::from_str)
+                    .unwrap_or(ImageStyle::Realistic);
+                let size = size_str
+                    .as_deref()
+                    .and_then(ImageSize::from_str)
+                    .unwrap_or(ImageSize::Medium);
+
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let account_id = user_id.as_deref().unwrap_or("anonymous");
+                        venice
+                            .generate_image(account_id, &prompt, style, size)
+                            .await
+                    })
+                })
+                .join()
+                .expect("Thread panicked");
+
+                match result {
+                    Ok(url) => Ok(Value::String(lua.create_string(&url)?)),
+                    Err(e) => {
+                        // Return nil and error message
+                        let result = lua.create_table()?;
+                        result.set("error", e)?;
+                        Ok(Value::Table(result))
+                    }
+                }
+            },
+        )?;
+        game.set("llm_image", llm_image)?;
 
         Ok(())
     }

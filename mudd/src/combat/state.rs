@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::dice::{roll_d20, is_critical, is_fumble};
-use super::damage::{DamageType, DamageProfile, DamageResult};
+use super::damage::{DamageProfile, DamageResult, DamageType};
+use super::dice::{is_critical, is_fumble, roll_d20};
 
 /// PvP policy for a universe
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -333,9 +333,7 @@ impl CombatManager {
         }
 
         // Get who this entity was attacking
-        let target_id = states
-            .get(entity_id)
-            .and_then(|s| s.attacking.clone());
+        let target_id = states.get(entity_id).and_then(|s| s.attacking.clone());
 
         if let Some(ref tid) = target_id {
             if let Some(target) = states.get_mut(tid) {
@@ -459,7 +457,10 @@ mod tests {
         assert!(manager.is_in_combat("goblin").await);
 
         // Deal damage
-        let result = manager.deal_damage("goblin", 15, DamageType::Slashing, false).await.unwrap();
+        let result = manager
+            .deal_damage("goblin", 15, DamageType::Slashing, false)
+            .await
+            .unwrap();
         assert_eq!(result.final_damage, 15);
 
         let state = manager.get_state("goblin").await.unwrap();

@@ -124,10 +124,7 @@ pub enum ClientMessage {
 }
 
 /// Handle WebSocket upgrade
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -145,7 +142,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Create session
     let session = PlayerSession {
         player_id: player_id.clone(),
-        account_id: String::new(), // TODO: from auth
+        account_id: String::new(),  // TODO: from auth
         universe_id: String::new(), // TODO: from selection
         room_id: None,
         sender: tx,

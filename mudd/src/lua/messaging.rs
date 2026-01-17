@@ -9,20 +9,11 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone)]
 pub enum GameMessage {
     /// Send to a specific player
-    Send {
-        target_id: String,
-        message: String,
-    },
+    Send { target_id: String, message: String },
     /// Broadcast to all players in a room
-    Broadcast {
-        room_id: String,
-        message: String,
-    },
+    Broadcast { room_id: String, message: String },
     /// Broadcast to all players in a region
-    BroadcastRegion {
-        region_id: String,
-        message: String,
-    },
+    BroadcastRegion { region_id: String, message: String },
 }
 
 /// Queue for messages generated during Lua execution
