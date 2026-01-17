@@ -1,5 +1,6 @@
 //! HTTP API module - REST endpoints and WebSocket
 
+mod auth;
 mod websocket;
 
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .route("/health", get(health_check))
         .route("/", get(root))
         .route("/ws", get(websocket::ws_handler))
+        .merge(auth::router())
         .with_state(state)
 }
 

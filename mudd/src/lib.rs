@@ -3,6 +3,7 @@
 //! A modern MUD engine with Lua scripting, Raft replication, and AI integration.
 
 pub mod api;
+pub mod auth;
 pub mod combat;
 pub mod credits;
 pub mod db;

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
     response::IntoResponse,
 };
@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 use super::AppState;
+use crate::auth::accounts::{Account, AccountService};
 
 /// A connected player session
 #[derive(Debug)]
@@ -123,26 +124,53 @@ pub enum ClientMessage {
     Ping,
 }
 
-/// Handle WebSocket upgrade
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+/// WebSocket query parameters
+#[derive(Debug, Deserialize)]
+pub struct WsParams {
+    pub token: Option<String>,
+}
+
+/// Handle WebSocket upgrade with optional token authentication
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(params): Query<WsParams>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // Validate token if provided
+    let account = if let Some(token) = params.token {
+        let service = AccountService::new(state.db.pool().clone());
+        service.validate_token(&token).await.ok().flatten()
+    } else {
+        None
+    };
+
+    ws.on_upgrade(move |socket| handle_socket(socket, state, account))
 }
 
 /// Handle an individual WebSocket connection
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
+async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<Account>) {
     // Create message channel for this connection
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(32);
 
-    // Generate temporary player ID (would normally come from auth)
+    // Generate player ID (use account ID if authenticated, else random UUID)
     let player_id = uuid::Uuid::new_v4().to_string();
     let player_id_clone = player_id.clone();
 
-    info!("WebSocket connected: {}", player_id);
+    let (account_id, username) = match &account {
+        Some(acc) => (acc.id.clone(), Some(acc.username.clone())),
+        None => (String::new(), None),
+    };
+
+    if let Some(ref name) = username {
+        info!("WebSocket connected: {} ({})", player_id, name);
+    } else {
+        info!("WebSocket connected: {} (guest)", player_id);
+    }
 
     // Create session
     let session = PlayerSession {
         player_id: player_id.clone(),
-        account_id: String::new(),  // TODO: from auth
+        account_id,
         universe_id: String::new(), // TODO: from selection
         room_id: None,
         sender: tx,
