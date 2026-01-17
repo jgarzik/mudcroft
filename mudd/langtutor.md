@@ -4,6 +4,63 @@ A hands-on guide for programmers new to Lua and MUD development.
 
 ---
 
+## Getting Started: Universe Initialization
+
+Before players can enter your universe, you must set a **spawn portal** - the room where new players appear. Without this, players see "Universe not initialized" when connecting.
+
+### Step 1: Create Your World
+
+After uploading your universe (via API or ZIP), connect as a wizard and run your initialization script:
+
+```
+eval return init()
+```
+
+This creates your rooms, NPCs, and items.
+
+### Step 2: Find Your Entrance Room
+
+Use the `goto` command to teleport to a room by its ID:
+
+```
+goto <room_id>
+```
+
+If you don't know the room ID, use Lua to find it:
+
+```lua
+eval local rooms = game.get_children(nil, {class = "room"}); for _, r in ipairs(rooms) do print(r.id .. " = " .. r.name) end
+```
+
+### Step 3: Set the Portal
+
+Once you're in the room where players should spawn, run:
+
+```
+setportal
+```
+
+Or specify a room ID directly:
+
+```
+setportal <room_id>
+```
+
+You'll see confirmation: `Portal set to: Town Square (uuid-here)`
+
+### Wizard Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `goto <room_id>` | Teleport to any room by ID (wizard+) |
+| `setportal` | Set spawn portal to current room (wizard+) |
+| `setportal <room_id>` | Set spawn portal to specified room (wizard+) |
+| `eval <lua>` | Execute Lua code (wizard+) |
+
+Now players connecting to your universe will spawn at the portal room!
+
+---
+
 ## Part A: Simple Lessons
 
 ### Lesson 1: Your First Room
