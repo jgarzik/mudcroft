@@ -174,7 +174,8 @@ struct ImageResponse {
 
 #[derive(Debug, Deserialize)]
 struct ImageData {
-    url: String,
+    #[serde(default)]
+    b64_json: Option<String>,
 }
 
 /// Rate limiter using token bucket algorithm
@@ -336,14 +337,14 @@ impl VeniceClient {
             .ok_or_else(|| "No response from API".to_string())
     }
 
-    /// Generate an image
+    /// Generate an image (returns raw PNG bytes)
     pub async fn generate_image(
         &self,
         account_id: &str,
         prompt: &str,
         _style: ImageStyle,
         size: ImageSize,
-    ) -> Result<String, String> {
+    ) -> Result<Vec<u8>, String> {
         // Check API key
         let api_key = self
             .api_key
@@ -373,23 +374,36 @@ impl VeniceClient {
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+
+        if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             warn!("Venice API error: {} - {}", status, body);
-            return Err(format!("API error: {}", status));
+            return Err(format!("API error: {} - {}", status, body));
         }
 
-        let image_response: ImageResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        let body = response.text().await.unwrap_or_default();
+        let image_response: ImageResponse = serde_json::from_str(&body)
+            .map_err(|e| format!("Failed to parse response: {} - body: {}", e, body))?;
 
-        image_response
+        let image_data = image_response
             .data
             .first()
-            .map(|d| d.url.clone())
-            .ok_or_else(|| "No image generated".to_string())
+            .ok_or_else(|| "No image generated".to_string())?;
+
+        // Decode base64 to binary
+        let b64 = image_data
+            .b64_json
+            .as_ref()
+            .ok_or_else(|| "No base64 image data in response".to_string())?;
+
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let bytes = STANDARD
+            .decode(b64)
+            .map_err(|e| format!("Failed to decode base64: {}", e))?;
+
+        debug!("Decoded {} bytes of image data", bytes.len());
+        Ok(bytes)
     }
 }
 

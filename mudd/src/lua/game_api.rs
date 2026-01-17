@@ -28,6 +28,7 @@ pub struct GameApi {
     timers: Arc<TimerManager>,
     credits: Arc<CreditManager>,
     venice: Arc<VeniceClient>,
+    image_store: Arc<crate::images::ImageStore>,
     universe_id: String,
     current_room_id: Option<String>,
     current_user_id: Option<String>,
@@ -50,6 +51,7 @@ impl GameApi {
         timers: Arc<TimerManager>,
         credits: Arc<CreditManager>,
         venice: Arc<VeniceClient>,
+        image_store: Arc<crate::images::ImageStore>,
         universe_id: &str,
     ) -> Self {
         Self {
@@ -61,6 +63,7 @@ impl GameApi {
             timers,
             credits,
             venice,
+            image_store,
             universe_id: universe_id.to_string(),
             current_room_id: None,
             current_user_id: None,
@@ -1204,6 +1207,7 @@ impl GameApi {
 
     fn register_venice_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let venice = self.venice.clone();
+        let image_store = self.image_store.clone();
         let current_user = self.current_user_id.clone();
 
         // game.llm_chat(messages, tier)
@@ -1261,11 +1265,12 @@ impl GameApi {
         // prompt: text description
         // style: "realistic", "anime", "digital", "painterly"
         // size: "small", "medium", "large"
-        // Returns URL string or nil on error
+        // Returns image hash string (for use with /images/{hash}) or error table
         let user_clone = current_user;
         let llm_image = lua.create_function(
             move |lua, (prompt, style_str, size_str): (String, Option<String>, Option<String>)| {
                 let venice = venice.clone();
+                let image_store = image_store.clone();
                 let user_id = user_clone.clone();
 
                 // Parse style and size
@@ -1282,8 +1287,13 @@ impl GameApi {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async {
                         let account_id = user_id.as_deref().unwrap_or("anonymous");
-                        venice
+                        // Generate image (returns raw binary bytes)
+                        let image_bytes = venice
                             .generate_image(account_id, &prompt, style, size)
+                            .await?;
+                        // Store binary data and get hash
+                        image_store
+                            .store(&image_bytes, "image/png", "llm_image")
                             .await
                     })
                 })
@@ -1291,7 +1301,7 @@ impl GameApi {
                 .expect("Thread panicked");
 
                 match result {
-                    Ok(url) => Ok(Value::String(lua.create_string(&url)?)),
+                    Ok(hash) => Ok(Value::String(lua.create_string(&hash)?)),
                     Err(e) => {
                         // Return nil and error message
                         let result = lua.create_table()?;

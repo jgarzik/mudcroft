@@ -100,9 +100,9 @@ Respond with ONLY the image prompt, no explanations or preamble."#,
 
     debug!("Generated image prompt: {}", image_prompt);
 
-    // Step 2: Generate image
+    // Step 2: Generate image (returns raw binary data)
     debug!("Requesting image generation from Venice");
-    let image_url = venice
+    let image_bytes = venice
         .generate_image(
             account_id,
             &image_prompt,
@@ -112,11 +112,11 @@ Respond with ONLY the image prompt, no explanations or preamble."#,
         .await
         .map_err(|e| format!("Failed to generate image: {}", e))?;
 
-    debug!("Image generated at URL: {}", image_url);
+    debug!("Received {} bytes of image data", image_bytes.len());
 
-    // Step 3: Download and store locally
+    // Step 3: Store binary data directly
     let image_hash = image_store
-        .store_from_url(&image_url)
+        .store(&image_bytes, "image/png", "venice")
         .await
         .map_err(|e| format!("Failed to store image: {}", e))?;
 

@@ -63,6 +63,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 
 # Zip file handling
 zip = "2.2"
+base64 = "0.22.1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"

@@ -353,20 +353,28 @@ impl ObjectStore {
     }
 
     /// Get a universe setting by key
-    pub async fn get_universe_setting(&self, universe_id: &str, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT value FROM universe_settings WHERE universe_id = ? AND key = ?",
-        )
-        .bind(universe_id)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
+    pub async fn get_universe_setting(
+        &self,
+        universe_id: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM universe_settings WHERE universe_id = ? AND key = ?")
+                .bind(universe_id)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row.map(|(v,)| v))
     }
 
     /// Set a universe setting
-    pub async fn set_universe_setting(&self, universe_id: &str, key: &str, value: &str) -> Result<()> {
+    pub async fn set_universe_setting(
+        &self,
+        universe_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO universe_settings (universe_id, key, value) VALUES (?, ?, ?)",
         )
@@ -381,12 +389,14 @@ impl ObjectStore {
 
     /// Get portal room ID for a universe
     pub async fn get_portal(&self, universe_id: &str) -> Result<Option<String>> {
-        self.get_universe_setting(universe_id, "portal_room_id").await
+        self.get_universe_setting(universe_id, "portal_room_id")
+            .await
     }
 
     /// Set portal room ID for a universe
     pub async fn set_portal(&self, universe_id: &str, room_id: &str) -> Result<()> {
-        self.set_universe_setting(universe_id, "portal_room_id", room_id).await
+        self.set_universe_setting(universe_id, "portal_room_id", room_id)
+            .await
     }
 }
 

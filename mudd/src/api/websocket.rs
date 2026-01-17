@@ -608,6 +608,7 @@ async fn execute_lua(
         state.timers.clone(),
         state.credits.clone(),
         state.venice.clone(),
+        state.image_store.clone(),
         universe_id,
     );
     game_api.set_user_context(Some(account_id.to_string()));
