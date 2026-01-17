@@ -5,7 +5,8 @@ import './theme/base.css'
 import './theme/effects.css'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
+  // StrictMode disabled temporarily - causes WebSocket reconnection loop in dev mode
+  // <React.StrictMode>
     <App />
-  </React.StrictMode>
+  // </React.StrictMode>
 )
