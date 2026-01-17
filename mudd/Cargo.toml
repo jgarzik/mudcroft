@@ -52,9 +52,13 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9"
+parking_lot = "0.12"
 
 # HTTP client (for Venice AI)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Zip file handling
+zip = "2.2"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"

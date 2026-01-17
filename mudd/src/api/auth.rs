@@ -86,10 +86,7 @@ pub struct LoginRequest {
 }
 
 /// Login with username and password
-async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> impl IntoResponse {
+async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
     let service = AccountService::new(state.db.pool().clone());
 
     match service.login(&req.username, &req.password).await {

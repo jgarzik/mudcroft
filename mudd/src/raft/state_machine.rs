@@ -59,6 +59,7 @@ impl GameStateMachine {
     }
 
     /// Execute a SQL statement against the database
+    #[allow(dead_code)]
     async fn execute_sql(&self, request: &Request) -> Response {
         debug!("Executing SQL: {}", request.sql);
 
@@ -107,7 +108,7 @@ impl GameStateMachine {
 
     /// Create a snapshot of the current state
     pub async fn create_snapshot_data(&self) -> Result<SnapshotData, StorageError<NodeId>> {
-        let last_applied = self.last_applied_log.read().await.clone();
+        let last_applied = *self.last_applied_log.read().await;
         let membership = self.last_membership.read().await.clone();
 
         // For file-based databases, we'd checkpoint and copy the file
@@ -117,9 +118,7 @@ impl GameStateMachine {
             sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
                 .execute(&self.pool)
                 .await
-                .map_err(|e| {
-                    StorageIOError::read_snapshot(None, &io::Error::new(io::ErrorKind::Other, e))
-                })?;
+                .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
 
             // Read the database file
             tokio::fs::read(path)

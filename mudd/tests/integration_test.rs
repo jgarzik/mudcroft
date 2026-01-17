@@ -606,10 +606,22 @@ async fn test_harness_testworld_creation() {
     let world = server.world();
     assert!(!world.universe_id.is_empty(), "Universe should be created");
     assert!(!world.region_id.is_empty(), "Region should be created");
-    assert!(!world.spawn_room_id.is_empty(), "Spawn room should be created");
-    assert!(!world.arena_room_id.is_empty(), "Arena room should be created");
-    assert!(!world.wizard_account_id.is_empty(), "Wizard account should be created");
-    assert!(!world.builder_account_id.is_empty(), "Builder account should be created");
+    assert!(
+        !world.spawn_room_id.is_empty(),
+        "Spawn room should be created"
+    );
+    assert!(
+        !world.arena_room_id.is_empty(),
+        "Arena room should be created"
+    );
+    assert!(
+        !world.wizard_account_id.is_empty(),
+        "Wizard account should be created"
+    );
+    assert!(
+        !world.builder_account_id.is_empty(),
+        "Builder account should be created"
+    );
 }
 
 #[tokio::test]
@@ -617,9 +629,12 @@ async fn test_harness_connect_as_player() {
     let server = TestServer::start().await.expect("Failed to start server");
 
     // Connect as a player (should auto-register)
-    let player = server.connect_as(harness::Role::Player {
-        username: "testplayer".to_string(),
-    }).await.expect("Failed to connect as player");
+    let player = server
+        .connect_as(harness::Role::Player {
+            username: "testplayer".to_string(),
+        })
+        .await
+        .expect("Failed to connect as player");
 
     // Verify we got a player ID from the welcome message
     assert!(player.player_id().is_some(), "Should have player ID");
@@ -632,12 +647,18 @@ async fn test_harness_connect_as_wizard() {
     let server = TestServer::start().await.expect("Failed to start server");
 
     // Connect as a wizard
-    let wizard = server.connect_as(harness::Role::Wizard {
-        username: "testwizard".to_string(),
-    }).await.expect("Failed to connect as wizard");
+    let wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "testwizard".to_string(),
+        })
+        .await
+        .expect("Failed to connect as wizard");
 
     // Verify wizard account
-    assert!(wizard.account_id().is_some(), "Wizard should have account ID");
+    assert!(
+        wizard.account_id().is_some(),
+        "Wizard should have account ID"
+    );
 
     // Verify access level was set to wizard
     let account_id = wizard.account_id().unwrap();
@@ -654,24 +675,46 @@ async fn test_harness_multiple_clients() {
     let server = TestServer::start().await.expect("Failed to start server");
 
     // Connect multiple players
-    let mut player1 = server.connect_as(harness::Role::Player {
-        username: "player1".to_string(),
-    }).await.expect("Failed to connect player1");
+    let mut player1 = server
+        .connect_as(harness::Role::Player {
+            username: "player1".to_string(),
+        })
+        .await
+        .expect("Failed to connect player1");
 
-    let mut player2 = server.connect_as(harness::Role::Player {
-        username: "player2".to_string(),
-    }).await.expect("Failed to connect player2");
+    let mut player2 = server
+        .connect_as(harness::Role::Player {
+            username: "player2".to_string(),
+        })
+        .await
+        .expect("Failed to connect player2");
 
     // Both should have different player IDs
-    assert_ne!(player1.player_id(), player2.player_id(), "Players should have different IDs");
+    assert_ne!(
+        player1.player_id(),
+        player2.player_id(),
+        "Players should have different IDs"
+    );
 
     // Both can send commands
-    player1.command("look").await.expect("player1 failed to send command");
-    player2.command("look").await.expect("player2 failed to send command");
+    player1
+        .command("look")
+        .await
+        .expect("player1 failed to send command");
+    player2
+        .command("look")
+        .await
+        .expect("player2 failed to send command");
 
     // Both should receive responses
-    let resp1 = player1.expect("output").await.expect("player1 didn't get output");
-    let resp2 = player2.expect("output").await.expect("player2 didn't get output");
+    let resp1 = player1
+        .expect("output")
+        .await
+        .expect("player1 didn't get output");
+    let resp2 = player2
+        .expect("output")
+        .await
+        .expect("player2 didn't get output");
 
     assert_eq!(resp1["type"], "output");
     assert_eq!(resp2["type"], "output");
@@ -685,28 +728,28 @@ async fn test_race_concurrent_commands() {
     let server = TestServer::start().await.expect("Failed to start server");
 
     // Create two players
-    let mut player1 = server.connect_as(harness::Role::Player {
-        username: "racer1".to_string(),
-    }).await.expect("Failed to connect player1");
+    let mut player1 = server
+        .connect_as(harness::Role::Player {
+            username: "racer1".to_string(),
+        })
+        .await
+        .expect("Failed to connect player1");
 
-    let mut player2 = server.connect_as(harness::Role::Player {
-        username: "racer2".to_string(),
-    }).await.expect("Failed to connect player2");
+    let mut player2 = server
+        .connect_as(harness::Role::Player {
+            username: "racer2".to_string(),
+        })
+        .await
+        .expect("Failed to connect player2");
 
     // Race: both send commands simultaneously using tokio::join!
-    let (r1, r2) = tokio::join!(
-        player1.command("look"),
-        player2.command("look"),
-    );
+    let (r1, r2) = tokio::join!(player1.command("look"), player2.command("look"),);
 
     r1.expect("player1 command should succeed");
     r2.expect("player2 command should succeed");
 
     // Both should receive responses
-    let (msg1, msg2) = tokio::join!(
-        player1.expect("output"),
-        player2.expect("output"),
-    );
+    let (msg1, msg2) = tokio::join!(player1.expect("output"), player2.expect("output"),);
 
     assert!(msg1.is_ok(), "player1 should get output");
     assert!(msg2.is_ok(), "player2 should get output");
@@ -717,28 +760,28 @@ async fn test_race_mixed_roles() {
     // Test that wizard and player can interact concurrently
     let server = TestServer::start().await.expect("Failed to start server");
 
-    let mut wizard = server.connect_as(harness::Role::Wizard {
-        username: "mixwiz".to_string(),
-    }).await.expect("Failed to connect wizard");
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "mixwiz".to_string(),
+        })
+        .await
+        .expect("Failed to connect wizard");
 
-    let mut player = server.connect_as(harness::Role::Player {
-        username: "mixplayer".to_string(),
-    }).await.expect("Failed to connect player");
+    let mut player = server
+        .connect_as(harness::Role::Player {
+            username: "mixplayer".to_string(),
+        })
+        .await
+        .expect("Failed to connect player");
 
     // Race: different roles, concurrent operations
-    let (w, p) = tokio::join!(
-        wizard.command("help"),
-        player.command("look"),
-    );
+    let (w, p) = tokio::join!(wizard.command("help"), player.command("look"),);
 
     w.expect("wizard command should work");
     p.expect("player command should work");
 
     // Both get responses
-    let (wm, pm) = tokio::join!(
-        wizard.expect("output"),
-        player.expect("output"),
-    );
+    let (wm, pm) = tokio::join!(wizard.expect("output"), player.expect("output"),);
 
     let wiz_output = wm.expect("wizard should get output");
     let player_output = pm.expect("player should get output");
@@ -753,15 +796,24 @@ async fn test_eval_command_basic() {
     let server = TestServer::start().await.expect("Failed to start server");
 
     // Connect as wizard
-    let mut wizard = server.connect_as(harness::Role::Wizard {
-        username: "evalwizard".to_string(),
-    }).await.expect("Failed to connect as wizard");
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "evalwizard".to_string(),
+        })
+        .await
+        .expect("Failed to connect as wizard");
 
     // Execute simple Lua expression
-    wizard.command("eval return 1 + 2").await.expect("eval command should succeed");
+    wizard
+        .command("eval return 1 + 2")
+        .await
+        .expect("eval command should succeed");
 
     // Get output
-    let output = wizard.expect("output").await.expect("should receive output");
+    let output = wizard
+        .expect("output")
+        .await
+        .expect("should receive output");
     assert_eq!(output["type"], "output");
     assert_eq!(output["text"], "3");
 }
@@ -772,17 +824,26 @@ async fn test_eval_command_denied_for_player() {
     let server = TestServer::start().await.expect("Failed to start server");
 
     // Connect as player
-    let mut player = server.connect_as(harness::Role::Player {
-        username: "evalplayer".to_string(),
-    }).await.expect("Failed to connect as player");
+    let mut player = server
+        .connect_as(harness::Role::Player {
+            username: "evalplayer".to_string(),
+        })
+        .await
+        .expect("Failed to connect as player");
 
     // Try to execute Lua
-    player.command("eval return 1").await.expect("command should succeed");
+    player
+        .command("eval return 1")
+        .await
+        .expect("command should succeed");
 
     // Should get error
     let output = player.expect("error").await.expect("should receive error");
     assert_eq!(output["type"], "error");
-    assert!(output["message"].as_str().unwrap().contains("Permission denied"));
+    assert!(output["message"]
+        .as_str()
+        .unwrap()
+        .contains("Permission denied"));
 }
 
 /// Test: Wizard can create objects via eval
@@ -802,9 +863,12 @@ async fn test_eval_create_object() {
         .expect("Failed to create default universe");
 
     // Connect as wizard
-    let mut wizard = server.connect_as(harness::Role::Wizard {
-        username: "createwizard".to_string(),
-    }).await.expect("Failed to connect as wizard");
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "createwizard".to_string(),
+        })
+        .await
+        .expect("Failed to connect as wizard");
 
     // Create an object via Lua and return just the id
     wizard.command("eval local obj = game.create_object('item', nil, {name = 'Test Sword'}); return obj and obj.id or 'no object'").await.expect("eval should succeed");
@@ -820,9 +884,17 @@ async fn test_eval_create_object() {
         panic!("Lua error: {}", output["message"]);
     }
 
-    assert_eq!(output["type"], "output", "Expected output, got: {:?}", output);
+    assert_eq!(
+        output["type"], "output",
+        "Expected output, got: {:?}",
+        output
+    );
     let obj_id = output["text"].as_str().expect("should have text");
     assert!(!obj_id.is_empty(), "Object ID should not be empty");
     // UUID is 36 chars (with dashes) or could be "no object" if failed
-    assert!(obj_id != "no object", "Object creation failed: got '{}'", obj_id);
+    assert!(
+        obj_id != "no object",
+        "Object creation failed: got '{}'",
+        obj_id
+    );
 }

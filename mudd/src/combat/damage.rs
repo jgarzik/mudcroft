@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// Types of damage
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,25 +63,28 @@ impl DamageType {
             DamageType::Thunder,
         ]
     }
+}
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<DamageType> {
+impl FromStr for DamageType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "physical" => Some(DamageType::Physical),
-            "slashing" => Some(DamageType::Slashing),
-            "piercing" => Some(DamageType::Piercing),
-            "bludgeoning" => Some(DamageType::Bludgeoning),
-            "fire" => Some(DamageType::Fire),
-            "cold" | "ice" => Some(DamageType::Cold),
-            "lightning" | "electric" => Some(DamageType::Lightning),
-            "acid" => Some(DamageType::Acid),
-            "poison" => Some(DamageType::Poison),
-            "necrotic" | "death" => Some(DamageType::Necrotic),
-            "radiant" | "holy" => Some(DamageType::Radiant),
-            "psychic" | "mental" => Some(DamageType::Psychic),
-            "force" | "magic" => Some(DamageType::Force),
-            "thunder" | "sonic" => Some(DamageType::Thunder),
-            _ => None,
+            "physical" => Ok(DamageType::Physical),
+            "slashing" => Ok(DamageType::Slashing),
+            "piercing" => Ok(DamageType::Piercing),
+            "bludgeoning" => Ok(DamageType::Bludgeoning),
+            "fire" => Ok(DamageType::Fire),
+            "cold" | "ice" => Ok(DamageType::Cold),
+            "lightning" | "electric" => Ok(DamageType::Lightning),
+            "acid" => Ok(DamageType::Acid),
+            "poison" => Ok(DamageType::Poison),
+            "necrotic" | "death" => Ok(DamageType::Necrotic),
+            "radiant" | "holy" => Ok(DamageType::Radiant),
+            "psychic" | "mental" => Ok(DamageType::Psychic),
+            "force" | "magic" => Ok(DamageType::Force),
+            "thunder" | "sonic" => Ok(DamageType::Thunder),
+            _ => Err(()),
         }
     }
 }
@@ -325,10 +329,10 @@ mod tests {
 
     #[test]
     fn test_damage_type_parsing() {
-        assert_eq!(DamageType::from_str("fire"), Some(DamageType::Fire));
-        assert_eq!(DamageType::from_str("FIRE"), Some(DamageType::Fire));
-        assert_eq!(DamageType::from_str("ice"), Some(DamageType::Cold));
-        assert_eq!(DamageType::from_str("invalid"), None);
+        assert_eq!("fire".parse::<DamageType>(), Ok(DamageType::Fire));
+        assert_eq!("FIRE".parse::<DamageType>(), Ok(DamageType::Fire));
+        assert_eq!("ice".parse::<DamageType>(), Ok(DamageType::Cold));
+        assert!("invalid".parse::<DamageType>().is_err());
     }
 
     #[test]

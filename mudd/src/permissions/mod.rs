@@ -8,10 +8,12 @@
 //! - Owner: Universe owner, can grant admin access
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 
 /// Access levels for MUD users
 #[derive(
@@ -32,19 +34,22 @@ pub enum AccessLevel {
     Owner = 4,
 }
 
-impl AccessLevel {
-    /// Parse access level from string
-    pub fn from_str(s: &str) -> Self {
+impl FromStr for AccessLevel {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "player" => AccessLevel::Player,
-            "builder" => AccessLevel::Builder,
-            "wizard" => AccessLevel::Wizard,
-            "admin" => AccessLevel::Admin,
-            "owner" => AccessLevel::Owner,
-            _ => AccessLevel::Player,
+            "player" => Ok(AccessLevel::Player),
+            "builder" => Ok(AccessLevel::Builder),
+            "wizard" => Ok(AccessLevel::Wizard),
+            "admin" => Ok(AccessLevel::Admin),
+            "owner" => Ok(AccessLevel::Owner),
+            _ => Ok(AccessLevel::Player), // Default to player for unknown
         }
     }
+}
 
+impl AccessLevel {
     /// Check if this level can perform builder actions
     pub fn can_build(&self) -> bool {
         *self >= AccessLevel::Builder
@@ -174,12 +179,24 @@ pub struct ObjectContext {
 }
 
 /// Permission manager for a universe
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PermissionManager {
-    /// User access levels by account ID
+    /// User access levels by account ID (in-memory cache)
     user_levels: RwLock<HashMap<String, AccessLevel>>,
     /// Builder region assignments
     builder_regions: RwLock<HashMap<String, HashSet<String>>>,
+    /// Database pool for fallback lookups
+    db_pool: Option<SqlitePool>,
+}
+
+impl Default for PermissionManager {
+    fn default() -> Self {
+        Self {
+            user_levels: RwLock::new(HashMap::new()),
+            builder_regions: RwLock::new(HashMap::new()),
+            db_pool: None,
+        }
+    }
 }
 
 impl PermissionManager {
@@ -188,9 +205,23 @@ impl PermissionManager {
         Self::default()
     }
 
+    /// Create a new permission manager with database pool for fallback lookups
+    pub fn with_db(db_pool: SqlitePool) -> Self {
+        Self {
+            user_levels: RwLock::new(HashMap::new()),
+            builder_regions: RwLock::new(HashMap::new()),
+            db_pool: Some(db_pool),
+        }
+    }
+
     /// Create a shared instance
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
+    }
+
+    /// Create a shared instance with database pool
+    pub fn shared_with_db(db_pool: SqlitePool) -> Arc<Self> {
+        Arc::new(Self::with_db(db_pool))
     }
 
     /// Set a user's access level
@@ -202,13 +233,32 @@ impl PermissionManager {
     }
 
     /// Get a user's access level
+    /// Checks in-memory cache first, then falls back to database if available
     pub async fn get_access_level(&self, account_id: &str) -> AccessLevel {
-        self.user_levels
-            .read()
-            .await
-            .get(account_id)
-            .copied()
-            .unwrap_or(AccessLevel::Player)
+        // Check in-memory cache first
+        if let Some(level) = self.user_levels.read().await.get(account_id).copied() {
+            return level;
+        }
+
+        // Fall back to database lookup if pool is available
+        if let Some(ref pool) = self.db_pool {
+            if let Ok(Some(row)) =
+                sqlx::query_as::<_, (String,)>("SELECT access_level FROM accounts WHERE id = ?")
+                    .bind(account_id)
+                    .fetch_optional(pool)
+                    .await
+            {
+                let level = AccessLevel::from_str(&row.0).unwrap_or(AccessLevel::Player);
+                // Cache for future lookups
+                self.user_levels
+                    .write()
+                    .await
+                    .insert(account_id.to_string(), level);
+                return level;
+            }
+        }
+
+        AccessLevel::Player
     }
 
     /// Assign a region to a builder

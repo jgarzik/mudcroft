@@ -64,9 +64,8 @@ impl SnapshotStore {
         self.ensure_dir().await?;
 
         let path = self.snapshot_path(&meta.snapshot_id);
-        let bytes = serde_json::to_vec(data).map_err(|e| {
-            StorageIOError::write_snapshot(None, &io::Error::new(io::ErrorKind::Other, e))
-        })?;
+        let bytes = serde_json::to_vec(data)
+            .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?;
 
         let mut file = tokio::fs::File::create(&path)
             .await
@@ -106,9 +105,8 @@ impl SnapshotStore {
             .await
             .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
 
-        let data: SnapshotData = serde_json::from_slice(&bytes).map_err(|e| {
-            StorageIOError::read_snapshot(None, &io::Error::new(io::ErrorKind::Other, e))
-        })?;
+        let data: SnapshotData = serde_json::from_slice(&bytes)
+            .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
 
         debug!("Loaded snapshot {} from {}", snapshot_id, path);
         Ok(Some(data))
@@ -133,9 +131,8 @@ impl SnapshotStore {
             None => return Ok(None),
         };
 
-        let bytes = serde_json::to_vec(&data).map_err(|e| {
-            StorageIOError::read_snapshot(None, &io::Error::new(io::ErrorKind::Other, e))
-        })?;
+        let bytes = serde_json::to_vec(&data)
+            .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
 
         Ok(Some(Snapshot {
             meta,

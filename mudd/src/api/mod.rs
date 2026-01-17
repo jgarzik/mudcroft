@@ -1,6 +1,7 @@
 //! HTTP API module - REST endpoints and WebSocket
 
 mod auth;
+mod universe;
 mod websocket;
 
 use std::sync::Arc;
@@ -40,7 +41,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let classes = Arc::new(RwLock::new(ClassRegistry::new()));
     let actions = Arc::new(ActionRegistry::new());
     let messages = Arc::new(MessageQueue::new());
-    let permissions = Arc::new(PermissionManager::new());
+    let permissions = Arc::new(PermissionManager::with_db(db.pool().clone()));
     let timers = Arc::new(TimerManager::new(Some(db.pool().clone())));
     let credits = Arc::new(CreditManager::new(Some(db.pool().clone())));
     let venice = Arc::new(VeniceClient::new()); // No API key
@@ -63,6 +64,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .route("/", get(root))
         .route("/ws", get(websocket::ws_handler))
         .merge(auth::router())
+        .merge(universe::router())
         .with_state(state)
 }
 

@@ -150,10 +150,10 @@ impl RaftNetworkImpl {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             error!("RPC error from {}: {} - {}", self.target, status, body);
-            return Err(Unreachable::new(&io::Error::new(
-                io::ErrorKind::Other,
-                format!("HTTP {}: {}", status, body),
-            )));
+            return Err(Unreachable::new(&io::Error::other(format!(
+                "HTTP {}: {}",
+                status, body
+            ))));
         }
 
         response.json().await.map_err(|e| {

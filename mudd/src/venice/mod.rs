@@ -37,7 +37,7 @@ impl ModelTier {
     }
 
     /// Parse from string
-    pub fn from_str(s: &str) -> Option<ModelTier> {
+    pub fn parse(s: &str) -> Option<ModelTier> {
         match s.to_lowercase().as_str() {
             "fast" | "small" | "quick" => Some(ModelTier::Fast),
             "balanced" | "medium" | "default" => Some(ModelTier::Balanced),
@@ -63,7 +63,7 @@ pub enum ImageStyle {
 
 impl ImageStyle {
     /// Parse from string
-    pub fn from_str(s: &str) -> Option<ImageStyle> {
+    pub fn parse(s: &str) -> Option<ImageStyle> {
         match s.to_lowercase().as_str() {
             "realistic" | "photo" => Some(ImageStyle::Realistic),
             "anime" | "cartoon" => Some(ImageStyle::Anime),
@@ -97,7 +97,7 @@ impl ImageSize {
     }
 
     /// Parse from string
-    pub fn from_str(s: &str) -> Option<ImageSize> {
+    pub fn parse(s: &str) -> Option<ImageSize> {
         match s.to_lowercase().as_str() {
             "small" | "256" => Some(ImageSize::Small),
             "medium" | "512" => Some(ImageSize::Medium),
@@ -405,29 +405,26 @@ mod tests {
 
     #[test]
     fn test_model_tier_parsing() {
-        assert_eq!(ModelTier::from_str("fast"), Some(ModelTier::Fast));
-        assert_eq!(ModelTier::from_str("BALANCED"), Some(ModelTier::Balanced));
-        assert_eq!(ModelTier::from_str("quality"), Some(ModelTier::Quality));
-        assert_eq!(ModelTier::from_str("invalid"), None);
+        assert_eq!(ModelTier::parse("fast"), Some(ModelTier::Fast));
+        assert_eq!(ModelTier::parse("BALANCED"), Some(ModelTier::Balanced));
+        assert_eq!(ModelTier::parse("quality"), Some(ModelTier::Quality));
+        assert_eq!(ModelTier::parse("invalid"), None);
     }
 
     #[test]
     fn test_image_style_parsing() {
-        assert_eq!(
-            ImageStyle::from_str("realistic"),
-            Some(ImageStyle::Realistic)
-        );
-        assert_eq!(ImageStyle::from_str("ANIME"), Some(ImageStyle::Anime));
-        assert_eq!(ImageStyle::from_str("digital"), Some(ImageStyle::Digital));
-        assert_eq!(ImageStyle::from_str("invalid"), None);
+        assert_eq!(ImageStyle::parse("realistic"), Some(ImageStyle::Realistic));
+        assert_eq!(ImageStyle::parse("ANIME"), Some(ImageStyle::Anime));
+        assert_eq!(ImageStyle::parse("digital"), Some(ImageStyle::Digital));
+        assert_eq!(ImageStyle::parse("invalid"), None);
     }
 
     #[test]
     fn test_image_size_parsing() {
-        assert_eq!(ImageSize::from_str("small"), Some(ImageSize::Small));
-        assert_eq!(ImageSize::from_str("MEDIUM"), Some(ImageSize::Medium));
-        assert_eq!(ImageSize::from_str("large"), Some(ImageSize::Large));
-        assert_eq!(ImageSize::from_str("invalid"), None);
+        assert_eq!(ImageSize::parse("small"), Some(ImageSize::Small));
+        assert_eq!(ImageSize::parse("MEDIUM"), Some(ImageSize::Medium));
+        assert_eq!(ImageSize::parse("large"), Some(ImageSize::Large));
+        assert_eq!(ImageSize::parse("invalid"), None);
     }
 
     #[test]

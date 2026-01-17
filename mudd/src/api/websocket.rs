@@ -162,14 +162,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
 
     let (account_id, username, access_level) = match &account {
         Some(acc) => {
-            let access = AccessLevel::from_str(&acc.access_level);
+            let access = acc.access_level.parse().unwrap_or(AccessLevel::Player);
             (acc.id.clone(), Some(acc.username.clone()), access)
         }
         None => (String::new(), None, AccessLevel::Player),
     };
 
     if let Some(ref name) = username {
-        info!("WebSocket connected: {} ({}) access={:?}", player_id, name, access_level);
+        info!(
+            "WebSocket connected: {} ({}) access={:?}",
+            player_id, name, access_level
+        );
     } else {
         info!("WebSocket connected: {} (guest)", player_id);
     }
@@ -293,7 +296,8 @@ async fn execute_command(
             }
         }
         "help" => ServerMessage::Output {
-            text: "Commands: look, north/south/east/west, say <message>, eval <lua>, help".to_string(),
+            text: "Commands: look, north/south/east/west, say <message>, eval <lua>, help"
+                .to_string(),
         },
         "eval" => {
             // Wizard+ only
@@ -328,6 +332,18 @@ async fn execute_lua(
     account_id: &str,
     code: &str,
 ) -> ServerMessage {
+    let universe_id = "default"; // TODO: universe from session
+
+    // Pre-load universe libraries (before creating sandbox)
+    let lib_codes = match load_universe_lib_codes(state, universe_id).await {
+        Ok(codes) => codes,
+        Err(e) => {
+            return ServerMessage::Error {
+                message: format!("Failed to load universe libs: {}", e),
+            };
+        }
+    };
+
     // Create game API with all managers
     let mut game_api = GameApi::new(
         state.object_store.clone(),
@@ -338,7 +354,7 @@ async fn execute_lua(
         state.timers.clone(),
         state.credits.clone(),
         state.venice.clone(),
-        "default", // TODO: universe from session
+        universe_id,
     );
     game_api.set_user_context(Some(account_id.to_string()));
 
@@ -365,6 +381,16 @@ async fn execute_lua(
         };
     }
 
+    // Execute pre-loaded universe libraries
+    for (lib_name, lib_code) in &lib_codes {
+        let result: Result<(), _> = sandbox.execute(lib_code);
+        if let Err(e) = result {
+            return ServerMessage::Error {
+                message: format!("Failed to execute library {}: {}", lib_name, e),
+            };
+        }
+    }
+
     // Execute the code
     let result: Result<Value, _> = sandbox.execute(code);
 
@@ -386,7 +412,10 @@ fn lua_value_to_string(value: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Number(n) => n.to_string(),
-        Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_else(|_| "<invalid utf8>".to_string()),
+        Value::String(s) => s
+            .to_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "<invalid utf8>".to_string()),
         Value::Table(_) => "[table]".to_string(),
         Value::Function(_) => "[function]".to_string(),
         Value::Thread(_) => "[thread]".to_string(),
@@ -395,4 +424,64 @@ fn lua_value_to_string(value: &Value) -> String {
         Value::Error(e) => format!("[error: {}]", e),
         _ => "[unknown]".to_string(),
     }
+}
+
+/// Load universe library codes from database
+/// Returns Vec of (lib_name, code) pairs, sorted by name for determinism
+async fn load_universe_lib_codes(
+    state: &AppState,
+    universe_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    // Get universe config
+    let universe = match state.object_store.get_universe(universe_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Ok(Vec::new()), // No universe = no libs to load
+        Err(e) => return Err(format!("Failed to get universe: {}", e)),
+    };
+
+    // Get lib_hashes from config
+    let lib_hashes = match universe.config.get("lib_hashes") {
+        Some(hashes) => hashes,
+        None => return Ok(Vec::new()), // No libs defined
+    };
+
+    // Parse lib_hashes as object
+    let hashes_obj = match lib_hashes.as_object() {
+        Some(obj) => obj,
+        None => return Ok(Vec::new()), // Invalid format, skip
+    };
+
+    // Load each library in order (sorted for determinism)
+    let mut lib_names: Vec<_> = hashes_obj.keys().collect();
+    lib_names.sort();
+
+    let mut lib_codes = Vec::new();
+
+    for lib_name in lib_names {
+        let hash = match hashes_obj.get(lib_name).and_then(|v| v.as_str()) {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Get code from code_store
+        let code = match state.object_store.get_code(hash).await {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                tracing::warn!(
+                    "Library {} with hash {} not found in code_store",
+                    lib_name,
+                    hash
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load library {}: {}", lib_name, e);
+                continue;
+            }
+        };
+
+        lib_codes.push((lib_name.clone(), code));
+    }
+
+    Ok(lib_codes)
 }

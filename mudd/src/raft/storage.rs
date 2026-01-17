@@ -3,6 +3,9 @@
 //! OpenRaft 0.9 uses sealed v2 traits (RaftLogStorage, RaftStateMachine).
 //! The proper approach is to implement v1 RaftStorage and wrap with Adaptor.
 
+#![allow(clippy::type_complexity)]
+#![allow(clippy::result_large_err)]
+
 use std::io;
 use std::io::Cursor;
 
@@ -59,7 +62,7 @@ impl CombinedStorage {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+        .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS raft_vote (
@@ -71,7 +74,7 @@ impl CombinedStorage {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageIOError::write_vote(&io::Error::new(io::ErrorKind::Other, e)))?;
+        .map_err(|e| StorageIOError::write_vote(&io::Error::other(e)))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS raft_meta (
@@ -81,12 +84,12 @@ impl CombinedStorage {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageIOError::write(&io::Error::new(io::ErrorKind::Other, e)))?;
+        .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_raft_log_term ON raft_log(term)")
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
         Ok(())
     }
@@ -97,7 +100,7 @@ impl CombinedStorage {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageIOError::read_vote(&io::Error::new(io::ErrorKind::Other, e)))?
+        .map_err(|e| StorageIOError::read_vote(&io::Error::other(e)))?
         {
             *self.vote.write().await = Some(Vote {
                 leader_id: openraft::LeaderId {
@@ -112,7 +115,7 @@ impl CombinedStorage {
             sqlx::query_as::<_, (String,)>("SELECT value FROM raft_meta WHERE key = 'last_purged'")
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| StorageIOError::read(&io::Error::new(io::ErrorKind::Other, e)))?
+                .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
         {
             if let Ok(log_id) = serde_json::from_str(&value) {
                 *self.last_purged.write().await = Some(log_id);
@@ -123,7 +126,7 @@ impl CombinedStorage {
             sqlx::query_as::<_, (String,)>("SELECT value FROM raft_meta WHERE key = 'last_applied'")
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| StorageIOError::read(&io::Error::new(io::ErrorKind::Other, e)))?
+                .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
         {
             if let Ok(log_id) = serde_json::from_str(&value) {
                 *self.last_applied.write().await = Some(log_id);
@@ -150,16 +153,13 @@ impl CombinedStorage {
         let entry_payload = match entry_type {
             "blank" => EntryPayload::Blank,
             "normal" => {
-                let request: Request =
-                    serde_json::from_str(payload.unwrap_or("{}")).map_err(|e| {
-                        StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e))
-                    })?;
+                let request: Request = serde_json::from_str(payload.unwrap_or("{}"))
+                    .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
                 EntryPayload::Normal(request)
             }
             "membership" => {
-                let membership = serde_json::from_str(payload.unwrap_or("{}")).map_err(|e| {
-                    StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e))
-                })?;
+                let membership = serde_json::from_str(payload.unwrap_or("{}"))
+                    .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
                 EntryPayload::Membership(membership)
             }
             other => {
@@ -236,7 +236,7 @@ impl RaftLogReader<TypeConfig> for CombinedStorage {
         .bind(end)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+        .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
 
         rows.into_iter()
             .map(|(idx, term, etype, payload)| {
@@ -249,7 +249,7 @@ impl RaftLogReader<TypeConfig> for CombinedStorage {
 // Implement RaftSnapshotBuilder (not sealed)
 impl RaftSnapshotBuilder<TypeConfig> for CombinedStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let last_applied = self.last_applied.read().await.clone();
+        let last_applied = *self.last_applied.read().await;
         let membership = self.membership.read().await.clone();
 
         let data = SnapshotData {
@@ -258,9 +258,8 @@ impl RaftSnapshotBuilder<TypeConfig> for CombinedStorage {
             db_snapshot: vec![],
         };
 
-        let bytes = serde_json::to_vec(&data).map_err(|e| {
-            StorageIOError::read_snapshot(None, &io::Error::new(io::ErrorKind::Other, e))
-        })?;
+        let bytes = serde_json::to_vec(&data)
+            .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
 
         let snapshot_id = last_applied
             .map(|id| format!("{}-{}", id.leader_id.term, id.index))
@@ -288,13 +287,13 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
     type SnapshotBuilder = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let last_purged = self.last_purged.read().await.clone();
+        let last_purged = *self.last_purged.read().await;
 
         let last_log: Option<(i64, i64)> =
             sqlx::query_as("SELECT log_index, term FROM raft_log ORDER BY log_index DESC LIMIT 1")
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| StorageIOError::read_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+                .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
 
         let last_log_id = last_log.map(|(index, term)| LogId {
             leader_id: openraft::LeaderId {
@@ -319,22 +318,22 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
         .bind(if vote.committed { 1i64 } else { 0i64 })
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageIOError::write_vote(&io::Error::new(io::ErrorKind::Other, e)))?;
+        .map_err(|e| StorageIOError::write_vote(&io::Error::other(e)))?;
 
-        *self.vote.write().await = Some(vote.clone());
+        *self.vote.write().await = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(self.vote.read().await.clone())
+        Ok(*self.vote.read().await)
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
         CombinedStorage {
             pool: self.pool.clone(),
-            vote: RwLock::new(self.vote.read().await.clone()),
-            last_purged: RwLock::new(self.last_purged.read().await.clone()),
-            last_applied: RwLock::new(self.last_applied.read().await.clone()),
+            vote: RwLock::new(*self.vote.read().await),
+            last_purged: RwLock::new(*self.last_purged.read().await),
+            last_applied: RwLock::new(*self.last_applied.read().await),
             membership: RwLock::new(self.membership.read().await.clone()),
             current_snapshot: RwLock::new(self.current_snapshot.read().await.clone()),
         }
@@ -349,24 +348,23 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             return Ok(());
         }
 
-        let mut tx =
-            self.pool.begin().await.map_err(|e| {
-                StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e))
-            })?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
         for entry in &entries {
             let (entry_type, payload) = match &entry.payload {
                 EntryPayload::Blank => ("blank", None),
                 EntryPayload::Normal(req) => {
-                    let json = serde_json::to_string(req).map_err(|e| {
-                        StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e))
-                    })?;
+                    let json = serde_json::to_string(req)
+                        .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
                     ("normal", Some(json))
                 }
                 EntryPayload::Membership(m) => {
-                    let json = serde_json::to_string(m).map_err(|e| {
-                        StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e))
-                    })?;
+                    let json = serde_json::to_string(m)
+                        .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
                     ("membership", Some(json))
                 }
             };
@@ -380,12 +378,12 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             .bind(payload)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
         }
 
         tx.commit()
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
         Ok(())
     }
@@ -398,7 +396,7 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             .bind(log_id.index as i64)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
         Ok(())
     }
 
@@ -407,15 +405,15 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             .bind(log_id.index as i64)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
         let json = serde_json::to_string(&log_id)
-            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
         sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_purged', ?)")
             .bind(&json)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::new(io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
         *self.last_purged.write().await = Some(log_id);
         Ok(())
@@ -426,7 +424,7 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
     ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
     {
         Ok((
-            self.last_applied.read().await.clone(),
+            *self.last_applied.read().await,
             self.membership.read().await.clone(),
         ))
     }
@@ -457,12 +455,12 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
         // Persist last_applied
         if let Some(last) = self.last_applied.read().await.as_ref() {
             let json = serde_json::to_string(last)
-                .map_err(|e| StorageIOError::write(&io::Error::new(io::ErrorKind::Other, e)))?;
+                .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
             sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_applied', ?)")
                 .bind(&json)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| StorageIOError::write(&io::Error::new(io::ErrorKind::Other, e)))?;
+                .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
         }
 
         Ok(results)
@@ -471,9 +469,9 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         CombinedStorage {
             pool: self.pool.clone(),
-            vote: RwLock::new(self.vote.read().await.clone()),
-            last_purged: RwLock::new(self.last_purged.read().await.clone()),
-            last_applied: RwLock::new(self.last_applied.read().await.clone()),
+            vote: RwLock::new(*self.vote.read().await),
+            last_purged: RwLock::new(*self.last_purged.read().await),
+            last_applied: RwLock::new(*self.last_applied.read().await),
             membership: RwLock::new(self.membership.read().await.clone()),
             current_snapshot: RwLock::new(self.current_snapshot.read().await.clone()),
         }
@@ -493,9 +491,8 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
         let data = snapshot.into_inner();
 
         // Parse snapshot data
-        let snapshot_data: SnapshotData = serde_json::from_slice(&data).map_err(|e| {
-            StorageIOError::read_snapshot(None, &io::Error::new(io::ErrorKind::Other, e))
-        })?;
+        let snapshot_data: SnapshotData = serde_json::from_slice(&data)
+            .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
 
         // Apply snapshot state
         *self.last_applied.write().await = snapshot_data.last_applied_log;

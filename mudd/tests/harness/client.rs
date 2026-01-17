@@ -3,6 +3,8 @@
 //! Supports Guest, Player, Builder, Wizard, and Admin roles with
 //! automatic account creation and authentication.
 
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -20,7 +22,10 @@ pub enum Role {
     /// Regular player (creates account with password "test123")
     Player { username: String },
     /// Builder with assigned regions (creates account with password "test123")
-    Builder { username: String, regions: Vec<String> },
+    Builder {
+        username: String,
+        regions: Vec<String>,
+    },
     /// Wizard-level access (creates account with password "test123")
     Wizard { username: String },
     /// Admin-level access (creates account with password "test123")
@@ -86,10 +91,15 @@ impl TestClient {
                 let password = Role::password();
 
                 // Try to register (may already exist)
-                let reg_resp = server.post("/auth/register", &serde_json::json!({
-                    "username": username,
-                    "password": password
-                })).await?;
+                let reg_resp = server
+                    .post(
+                        "/auth/register",
+                        &serde_json::json!({
+                            "username": username,
+                            "password": password
+                        }),
+                    )
+                    .await?;
 
                 let (account_id, token) = if reg_resp.status().is_success() {
                     let body: Value = reg_resp.json().await?;
@@ -99,10 +109,15 @@ impl TestClient {
                     )
                 } else {
                     // Account exists, login instead
-                    let login_resp = server.post("/auth/login", &serde_json::json!({
-                        "username": username,
-                        "password": password
-                    })).await?;
+                    let login_resp = server
+                        .post(
+                            "/auth/login",
+                            &serde_json::json!({
+                                "username": username,
+                                "password": password
+                            }),
+                        )
+                        .await?;
 
                     if !login_resp.status().is_success() {
                         bail!("Failed to login as {}: {:?}", username, login_resp.status());
@@ -274,11 +289,10 @@ impl TestClient {
     /// Drain all pending messages (non-blocking)
     pub async fn drain(&mut self) -> Vec<Value> {
         let mut messages = Vec::new();
-        loop {
-            match tokio::time::timeout(Duration::from_millis(50), self.recv_json()).await {
-                Ok(Ok(msg)) => messages.push(msg),
-                _ => break,
-            }
+        while let Ok(Ok(msg)) =
+            tokio::time::timeout(Duration::from_millis(50), self.recv_json()).await
+        {
+            messages.push(msg);
         }
         messages
     }
@@ -289,4 +303,3 @@ impl TestClient {
         Ok(())
     }
 }
-

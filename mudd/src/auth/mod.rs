@@ -12,7 +12,12 @@ pub fn generate_token() -> String {
     let random_bytes: [u8; 32] = rand::rng().random();
     let mut hasher = Sha256::new();
     hasher.update(random_bytes);
-    hasher.update(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_le_bytes());
+    hasher.update(
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
     hex::encode(hasher.finalize())
 }
 

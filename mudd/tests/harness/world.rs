@@ -6,6 +6,8 @@
 //! - A spawn room and arena room
 //! - Wizard and builder accounts
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use mudd::db::Database;
 use mudd::objects::{Object, ObjectStore};
@@ -41,25 +43,21 @@ impl TestWorld {
 
         // Create wizard account
         let wizard_account_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO accounts (id, username, access_level) VALUES (?, ?, ?)"
-        )
-        .bind(&wizard_account_id)
-        .bind("test_wizard")
-        .bind("wizard")
-        .execute(pool)
-        .await?;
+        sqlx::query("INSERT INTO accounts (id, username, access_level) VALUES (?, ?, ?)")
+            .bind(&wizard_account_id)
+            .bind("test_wizard")
+            .bind("wizard")
+            .execute(pool)
+            .await?;
 
         // Create builder account
         let builder_account_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO accounts (id, username, access_level) VALUES (?, ?, ?)"
-        )
-        .bind(&builder_account_id)
-        .bind("test_builder")
-        .bind("builder")
-        .execute(pool)
-        .await?;
+        sqlx::query("INSERT INTO accounts (id, username, access_level) VALUES (?, ?, ?)")
+            .bind(&builder_account_id)
+            .bind("test_builder")
+            .bind("builder")
+            .execute(pool)
+            .await?;
 
         // Create test universe
         let universe_id = uuid::Uuid::new_v4().to_string();
@@ -81,7 +79,10 @@ impl TestWorld {
         let mut spawn_room = Object::new(&universe_id, "room");
         spawn_room.parent_id = Some(region_id.clone());
         spawn_room.set_property("name", serde_json::json!("Spawn Room"));
-        spawn_room.set_property("description", serde_json::json!("You stand in the spawn room. The arena is to the north."));
+        spawn_room.set_property(
+            "description",
+            serde_json::json!("You stand in the spawn room. The arena is to the north."),
+        );
         store.create(&spawn_room).await?;
         let spawn_room_id = spawn_room.id.clone();
 
@@ -89,14 +90,21 @@ impl TestWorld {
         let mut arena_room = Object::new(&universe_id, "room");
         arena_room.parent_id = Some(region_id.clone());
         arena_room.set_property("name", serde_json::json!("Arena"));
-        arena_room.set_property("description", serde_json::json!("A combat arena where PvP is permitted."));
+        arena_room.set_property(
+            "description",
+            serde_json::json!("A combat arena where PvP is permitted."),
+        );
         arena_room.set_property("is_arena", serde_json::json!(true));
         store.create(&arena_room).await?;
         let arena_room_id = arena_room.id.clone();
 
         // Link rooms with exits
-        store.set_exit(&spawn_room_id, "north", &arena_room_id).await?;
-        store.set_exit(&arena_room_id, "south", &spawn_room_id).await?;
+        store
+            .set_exit(&spawn_room_id, "north", &arena_room_id)
+            .await?;
+        store
+            .set_exit(&arena_room_id, "south", &spawn_room_id)
+            .await?;
 
         Ok(Self {
             universe_id,

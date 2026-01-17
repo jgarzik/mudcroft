@@ -24,14 +24,21 @@
 //! }
 //! ```
 
+#![allow(dead_code)]
+
 mod client;
 mod server;
 mod world;
 
 // Primary exports
-pub use client::{Role, TestClient};
+pub use client::Role;
+#[allow(unused_imports)]
+pub use client::TestClient;
+#[allow(unused_imports)]
 pub use server::{MuddTest, RawWsClient, TestServer};
+#[allow(unused_imports)]
 pub use world::TestWorld;
 
 // Backward compatibility alias - WsClient now points to RawWsClient
+#[allow(unused)]
 pub type WsClient = RawWsClient;

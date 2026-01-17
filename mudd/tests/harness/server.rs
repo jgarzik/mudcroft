@@ -4,6 +4,8 @@
 //! Uses a temporary directory for each test instance to ensure isolation
 //! while exercising the complete server binary including CLI parsing.
 
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -60,7 +62,9 @@ impl TestServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", binary_path, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", binary_path, e)
+            })?;
 
         // Wait for server to be ready
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
@@ -158,7 +162,9 @@ impl TestServer {
 
     /// Get the test world (panics if not created)
     pub fn world(&self) -> &TestWorld {
-        self.world.as_ref().expect("TestWorld not created - use start() instead of start_with_world(false)")
+        self.world
+            .as_ref()
+            .expect("TestWorld not created - use start() instead of start_with_world(false)")
     }
 
     /// Create a test account and return its ID

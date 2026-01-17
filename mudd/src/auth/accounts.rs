@@ -92,7 +92,11 @@ impl AccountService {
     }
 
     /// Login with username and password, returns token
-    pub async fn login(&self, username: &str, password: &str) -> Result<(Account, String), AuthError> {
+    pub async fn login(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<(Account, String), AuthError> {
         // Get account with password info
         let row: Option<(String, String, String, String, String)> = sqlx::query_as(
             "SELECT id, password_hash, salt, access_level, created_at FROM accounts WHERE username = ?",

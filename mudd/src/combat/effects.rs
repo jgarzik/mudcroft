@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -47,29 +48,32 @@ pub enum EffectType {
     Silenced,
 }
 
-impl EffectType {
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<EffectType> {
+impl FromStr for EffectType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "poisoned" | "poison" => Some(EffectType::Poisoned),
-            "stunned" | "stun" => Some(EffectType::Stunned),
-            "blinded" | "blind" => Some(EffectType::Blinded),
-            "burning" | "burn" => Some(EffectType::Burning),
-            "frozen" | "freeze" => Some(EffectType::Frozen),
-            "paralyzed" | "paralyze" => Some(EffectType::Paralyzed),
-            "slowed" | "slow" => Some(EffectType::Slowed),
-            "hasted" | "haste" => Some(EffectType::Hasted),
-            "strengthened" | "strength" => Some(EffectType::Strengthened),
-            "weakened" | "weak" => Some(EffectType::Weakened),
-            "protected" | "protect" => Some(EffectType::Protected),
-            "exposed" | "expose" => Some(EffectType::Exposed),
-            "invisible" | "invis" => Some(EffectType::Invisible),
-            "regenerating" | "regen" => Some(EffectType::Regenerating),
-            "silenced" | "silence" => Some(EffectType::Silenced),
-            _ => None,
+            "poisoned" | "poison" => Ok(EffectType::Poisoned),
+            "stunned" | "stun" => Ok(EffectType::Stunned),
+            "blinded" | "blind" => Ok(EffectType::Blinded),
+            "burning" | "burn" => Ok(EffectType::Burning),
+            "frozen" | "freeze" => Ok(EffectType::Frozen),
+            "paralyzed" | "paralyze" => Ok(EffectType::Paralyzed),
+            "slowed" | "slow" => Ok(EffectType::Slowed),
+            "hasted" | "haste" => Ok(EffectType::Hasted),
+            "strengthened" | "strength" => Ok(EffectType::Strengthened),
+            "weakened" | "weak" => Ok(EffectType::Weakened),
+            "protected" | "protect" => Ok(EffectType::Protected),
+            "exposed" | "expose" => Ok(EffectType::Exposed),
+            "invisible" | "invis" => Ok(EffectType::Invisible),
+            "regenerating" | "regen" => Ok(EffectType::Regenerating),
+            "silenced" | "silence" => Ok(EffectType::Silenced),
+            _ => Err(()),
         }
     }
+}
 
+impl EffectType {
     /// Whether this effect prevents actions
     pub fn prevents_action(&self) -> bool {
         matches!(self, EffectType::Stunned | EffectType::Paralyzed)
@@ -189,10 +193,12 @@ impl StatusEffect {
 
 /// Effects on a single entity
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct EntityEffects {
     effects: Vec<StatusEffect>,
 }
 
+#[allow(dead_code)]
 impl EntityEffects {
     /// Create new empty effects
     pub fn new() -> Self {
@@ -342,9 +348,9 @@ mod tests {
 
     #[test]
     fn test_effect_type_parsing() {
-        assert_eq!(EffectType::from_str("poisoned"), Some(EffectType::Poisoned));
-        assert_eq!(EffectType::from_str("STUN"), Some(EffectType::Stunned));
-        assert_eq!(EffectType::from_str("invalid"), None);
+        assert_eq!("poisoned".parse::<EffectType>(), Ok(EffectType::Poisoned));
+        assert_eq!("STUN".parse::<EffectType>(), Ok(EffectType::Stunned));
+        assert!("invalid".parse::<EffectType>().is_err());
     }
 
     #[test]

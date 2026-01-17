@@ -276,6 +276,81 @@ impl ObjectStore {
         }
         Ok(())
     }
+
+    /// Get universe config by ID
+    pub async fn get_universe(&self, universe_id: &str) -> Result<Option<UniverseInfo>> {
+        let row: Option<UniverseRow> = sqlx::query_as(
+            r#"
+            SELECT id, name, owner_id, config, created_at
+            FROM universes WHERE id = ?
+            "#,
+        )
+        .bind(universe_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(r.into_info()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Update universe config (merge with existing)
+    pub async fn update_universe(
+        &self,
+        universe_id: &str,
+        config: serde_json::Value,
+    ) -> Result<bool> {
+        // First get existing config
+        let existing = self.get_universe(universe_id).await?;
+        match existing {
+            Some(mut info) => {
+                // Merge new config into existing
+                if let (Some(existing_obj), Some(new_obj)) =
+                    (info.config.as_object_mut(), config.as_object())
+                {
+                    for (k, v) in new_obj {
+                        existing_obj.insert(k.clone(), v.clone());
+                    }
+                }
+
+                let config_str = serde_json::to_string(&info.config)?;
+                sqlx::query("UPDATE universes SET config = ? WHERE id = ?")
+                    .bind(&config_str)
+                    .bind(universe_id)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Create a new universe
+    pub async fn create_universe(
+        &self,
+        id: &str,
+        name: &str,
+        owner_id: &str,
+        config: serde_json::Value,
+    ) -> Result<()> {
+        let config_str = serde_json::to_string(&config)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO universes (id, name, owner_id, config, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(owner_id)
+        .bind(&config_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 /// Row type for SQLite queries
@@ -303,6 +378,40 @@ impl ObjectRow {
             code_hash: self.code_hash,
             created_at: self.created_at,
             updated_at: self.updated_at,
+        })
+    }
+}
+
+/// Universe information
+#[derive(Debug, Clone)]
+pub struct UniverseInfo {
+    pub id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub config: serde_json::Value,
+    pub created_at: String,
+}
+
+/// Row type for universe queries
+#[derive(sqlx::FromRow)]
+struct UniverseRow {
+    id: String,
+    name: String,
+    owner_id: String,
+    config: String,
+    created_at: String,
+}
+
+impl UniverseRow {
+    fn into_info(self) -> Result<UniverseInfo> {
+        let config: serde_json::Value =
+            serde_json::from_str(&self.config).unwrap_or_else(|_| serde_json::json!({}));
+        Ok(UniverseInfo {
+            id: self.id,
+            name: self.name,
+            owner_id: self.owner_id,
+            config,
+            created_at: self.created_at,
         })
     }
 }
