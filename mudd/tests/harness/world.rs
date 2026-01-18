@@ -1,9 +1,10 @@
-//! TestWorld - Pre-configured test universe with regions, rooms, and accounts
+//! TestWorld - Pre-configured test universe with cave adventure content
 //!
 //! Creates a standard test environment with:
-//! - A test universe
-//! - A test region
-//! - A spawn room and arena room
+//! - A test universe with dark-caves region
+//! - 4 rooms: entrance, passage, chamber, pool
+//! - 2 NPCs: Giant Bat, Cave Troll
+//! - Items: Rusty Sword, Glowing Mushroom
 //! - Wizard and builder accounts
 
 #![allow(dead_code)]
@@ -14,16 +15,36 @@ use serde_json::json;
 
 use super::server::TestServer;
 
-/// Pre-configured test world with universe, region, rooms, and accounts
+/// Pre-configured test world with cave adventure content
 pub struct TestWorld {
     /// The test universe ID
     pub universe_id: String,
-    /// The test region ID
+    /// The dark-caves region ID
     pub region_id: String,
-    /// The spawn room where players start
-    pub spawn_room_id: String,
-    /// The arena room (PvP-enabled)
-    pub arena_room_id: String,
+
+    // Room IDs
+    /// Cave entrance - starting room with rusty sword
+    pub entrance_id: String,
+    /// Narrow passage - contains Giant Bat
+    pub passage_id: String,
+    /// Treasure chamber - contains Cave Troll
+    pub chamber_id: String,
+    /// Underground pool - contains Glowing Mushroom
+    pub pool_id: String,
+
+    // NPC IDs
+    /// Giant Bat NPC (15 HP) in passage
+    pub bat_id: String,
+    /// Cave Troll NPC (50 HP) in chamber
+    pub troll_id: String,
+
+    // Item IDs
+    /// Rusty Sword weapon in entrance
+    pub sword_id: String,
+    /// Glowing Mushroom item in pool
+    pub mushroom_id: String,
+
+    // Account IDs
     /// The wizard account ID
     pub wizard_account_id: String,
     /// The builder account ID
@@ -112,46 +133,128 @@ impl TestWorld {
             .create_universe(&universe_id, "Test Universe", &wizard_account_id, config)
             .await?;
 
-        // Create test region
-        let mut region = Object::new("/regions/test-region", &universe_id, "region")?;
-        region.set_property("name", json!("Test Region"));
-        region.set_property("description", json!("A region for testing"));
+        // Create dark-caves region
+        let mut region = Object::new("/regions/dark-caves", &universe_id, "region")?;
+        region.set_property("name", json!("Dark Caves"));
+        region.set_property("environment_type", json!("cave"));
         store.create(&region).await?;
         let region_id = region.id.clone();
 
-        // Create spawn room
-        let mut spawn_room = Object::new("/rooms/spawn-room", &universe_id, "room")?;
-        spawn_room.parent_id = Some(region_id.clone());
-        spawn_room.set_property("name", json!("Spawn Room"));
-        spawn_room.set_property(
+        // Create cave entrance room
+        let mut entrance = Object::new("/rooms/cave-entrance", &universe_id, "room")?;
+        entrance.parent_id = Some(region_id.clone());
+        entrance.set_property("name", json!("Cave Entrance"));
+        entrance.set_property(
             "description",
-            json!("You stand in the spawn room. The arena is to the north."),
+            json!("A dark opening in the mountainside. Cold air flows from within."),
         );
-        store.create(&spawn_room).await?;
-        let spawn_room_id = spawn_room.id.clone();
+        store.create(&entrance).await?;
+        let entrance_id = entrance.id.clone();
 
-        // Create arena room (PvP enabled)
-        let mut arena_room = Object::new("/rooms/arena", &universe_id, "room")?;
-        arena_room.parent_id = Some(region_id.clone());
-        arena_room.set_property("name", json!("Arena"));
-        arena_room.set_property(
+        // Create narrow passage room
+        let mut passage = Object::new("/rooms/narrow-passage", &universe_id, "room")?;
+        passage.parent_id = Some(region_id.clone());
+        passage.set_property("name", json!("Narrow Passage"));
+        passage.set_property(
             "description",
-            json!("A combat arena where PvP is permitted."),
+            json!("A tight passage barely wide enough for one person. Water drips from stalactites above."),
         );
-        arena_room.set_property("is_arena", json!(true));
-        store.create(&arena_room).await?;
-        let arena_room_id = arena_room.id.clone();
+        store.create(&passage).await?;
+        let passage_id = passage.id.clone();
 
-        // Link rooms with exits
-        store
-            .set_exit(&spawn_room_id, "north", &arena_room_id)
-            .await?;
-        store
-            .set_exit(&arena_room_id, "south", &spawn_room_id)
-            .await?;
+        // Create treasure chamber room
+        let mut chamber = Object::new("/rooms/treasure-chamber", &universe_id, "room")?;
+        chamber.parent_id = Some(region_id.clone());
+        chamber.set_property("name", json!("Treasure Chamber"));
+        chamber.set_property(
+            "description",
+            json!("A vast underground chamber. Gold coins and gems glitter in the dim light."),
+        );
+        store.create(&chamber).await?;
+        let chamber_id = chamber.id.clone();
 
-        // Set portal to spawn room so players spawn there
-        store.set_portal(&universe_id, &spawn_room_id).await?;
+        // Create underground pool room
+        let mut pool = Object::new("/rooms/underground-pool", &universe_id, "room")?;
+        pool.parent_id = Some(region_id.clone());
+        pool.set_property("name", json!("Underground Pool"));
+        pool.set_property(
+            "description",
+            json!("A serene underground pool fed by a small waterfall. Bioluminescent fungi cast an eerie blue glow."),
+        );
+        store.create(&pool).await?;
+        let pool_id = pool.id.clone();
+
+        // Link rooms with exits (matching cave_adventure.lua)
+        // entrance -> north -> passage
+        store.set_exit(&entrance_id, "north", &passage_id).await?;
+        // passage -> south -> entrance, north -> chamber, east -> pool
+        store.set_exit(&passage_id, "south", &entrance_id).await?;
+        store.set_exit(&passage_id, "north", &chamber_id).await?;
+        store.set_exit(&passage_id, "east", &pool_id).await?;
+        // chamber -> south -> passage
+        store.set_exit(&chamber_id, "south", &passage_id).await?;
+        // pool -> west -> passage
+        store.set_exit(&pool_id, "west", &passage_id).await?;
+
+        // Create Giant Bat NPC in passage (15 HP)
+        let mut bat = Object::new("/npcs/giant-bat", &universe_id, "npc")?;
+        bat.parent_id = Some(passage_id.clone());
+        bat.set_property("name", json!("Giant Bat"));
+        bat.set_property(
+            "description",
+            json!("A bat the size of a dog with razor-sharp fangs."),
+        );
+        bat.set_property("hp", json!(15));
+        bat.set_property("max_hp", json!(15));
+        bat.set_property("attack_bonus", json!(1));
+        bat.set_property("armor_class", json!(12));
+        store.create(&bat).await?;
+        let bat_id = bat.id.clone();
+
+        // Create Cave Troll NPC in chamber (50 HP)
+        let mut troll = Object::new("/npcs/cave-troll", &universe_id, "npc")?;
+        troll.parent_id = Some(chamber_id.clone());
+        troll.set_property("name", json!("Cave Troll"));
+        troll.set_property(
+            "description",
+            json!("A massive troll with mottled grey skin and beady red eyes."),
+        );
+        troll.set_property("hp", json!(50));
+        troll.set_property("max_hp", json!(50));
+        troll.set_property("attack_bonus", json!(4));
+        troll.set_property("armor_class", json!(14));
+        store.create(&troll).await?;
+        let troll_id = troll.id.clone();
+
+        // Create Rusty Sword weapon in entrance
+        let mut sword = Object::new("/weapons/rusty-sword", &universe_id, "weapon")?;
+        sword.parent_id = Some(entrance_id.clone());
+        sword.set_property("name", json!("Rusty Short Sword"));
+        sword.set_property(
+            "description",
+            json!("A battered but serviceable short sword."),
+        );
+        sword.set_property("damage_dice", json!("1d6"));
+        sword.set_property("damage_bonus", json!(0));
+        sword.set_property("weight", json!(2));
+        store.create(&sword).await?;
+        let sword_id = sword.id.clone();
+
+        // Create Glowing Mushroom item in pool
+        let mut mushroom = Object::new("/items/glowing-mushroom", &universe_id, "item")?;
+        mushroom.parent_id = Some(pool_id.clone());
+        mushroom.set_property("name", json!("Glowing Mushroom"));
+        mushroom.set_property(
+            "description",
+            json!("A softly glowing blue mushroom. It pulses with an inner light."),
+        );
+        mushroom.set_property("value", json!(25));
+        mushroom.set_property("weight", json!(0.5));
+        store.create(&mushroom).await?;
+        let mushroom_id = mushroom.id.clone();
+
+        // Set portal to entrance so players spawn there
+        store.set_portal(&universe_id, &entrance_id).await?;
 
         // Force WAL checkpoint so server can see our writes
         sqlx::query("PRAGMA wal_checkpoint(FULL)")
@@ -161,8 +264,14 @@ impl TestWorld {
         Ok(Self {
             universe_id,
             region_id,
-            spawn_room_id,
-            arena_room_id,
+            entrance_id,
+            passage_id,
+            chamber_id,
+            pool_id,
+            bat_id,
+            troll_id,
+            sword_id,
+            mushroom_id,
             wizard_account_id,
             builder_account_id,
             store,

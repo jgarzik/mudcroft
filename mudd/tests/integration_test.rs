@@ -1,6 +1,7 @@
 //! Integration tests using TestServer harness
 
 mod harness;
+mod scenarios;
 
 use harness::{MuddTest, TestServer};
 use mudd::objects::{ClassRegistry, Object, ObjectStore};
@@ -620,18 +621,44 @@ async fn test_harness_testworld_creation() {
     // TestServer::start() automatically creates a TestWorld
     let server = TestServer::start().await.expect("Failed to start server");
 
-    // Verify the world was created
+    // Verify the world was created with cave adventure content
     let world = server.world();
     assert!(!world.universe_id.is_empty(), "Universe should be created");
     assert!(!world.region_id.is_empty(), "Region should be created");
+
+    // Verify cave rooms
     assert!(
-        !world.spawn_room_id.is_empty(),
-        "Spawn room should be created"
+        !world.entrance_id.is_empty(),
+        "Cave entrance should be created"
     );
     assert!(
-        !world.arena_room_id.is_empty(),
-        "Arena room should be created"
+        !world.passage_id.is_empty(),
+        "Narrow passage should be created"
     );
+    assert!(
+        !world.chamber_id.is_empty(),
+        "Treasure chamber should be created"
+    );
+    assert!(
+        !world.pool_id.is_empty(),
+        "Underground pool should be created"
+    );
+
+    // Verify NPCs
+    assert!(!world.bat_id.is_empty(), "Giant Bat NPC should be created");
+    assert!(
+        !world.troll_id.is_empty(),
+        "Cave Troll NPC should be created"
+    );
+
+    // Verify items
+    assert!(!world.sword_id.is_empty(), "Rusty Sword should be created");
+    assert!(
+        !world.mushroom_id.is_empty(),
+        "Glowing Mushroom should be created"
+    );
+
+    // Verify accounts
     assert!(
         !world.wizard_account_id.is_empty(),
         "Wizard account should be created"
