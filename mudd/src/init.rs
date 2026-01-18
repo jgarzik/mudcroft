@@ -11,57 +11,69 @@ use tracing::info;
 use crate::auth::accounts::AccountService;
 use crate::db::Database;
 
-/// Initialize a new game server database
+/// Initialize or upgrade a game server database (idempotent)
 ///
 /// # Arguments
-/// * `path` - Path to the SQLite database file (must not exist)
-/// * `admin_username` - Username for the admin account
-/// * `admin_password` - Password for the admin account (must be >= 8 chars)
+/// * `path` - Path to the SQLite database file (creates new or upgrades existing)
+/// * `admin_username` - Username for the admin account (required for new DB only)
+/// * `admin_password` - Password for the admin account (required for new DB only)
 /// * `libs` - Map of library name to Lua source code (additional libs)
 /// * `core_lib_dir` - Optional path to core mudlib directory (defaults to "lib/")
 ///
+/// # Behavior
+/// * If database doesn't exist: creates new DB, requires admin credentials
+/// * If database exists: runs migrations, refreshes mudlib, ignores credentials
+///
 /// # Errors
-/// * Database file already exists
-/// * Password too short
-/// * Database creation fails
+/// * New database without admin credentials
+/// * Password too short (for new database)
+/// * Database creation/migration fails
 pub async fn init_database(
     path: &Path,
-    admin_username: &str,
-    admin_password: &str,
+    admin_username: Option<&str>,
+    admin_password: Option<&str>,
     libs: HashMap<String, String>,
     core_lib_dir: Option<&Path>,
 ) -> Result<()> {
-    // Fail if database already exists
-    if path.exists() {
-        bail!(
-            "Database file already exists: {}. Remove it first or use a different path.",
-            path.display()
+    let db_exists = path.exists();
+
+    let db = if db_exists {
+        // Upgrade existing database
+        info!("Upgrading existing database at {}", path.display());
+        Database::open_for_migration(path.to_str().unwrap()).await?
+    } else {
+        // Create new database - require admin credentials
+        let admin_username = admin_username
+            .ok_or_else(|| anyhow::anyhow!("Admin username required for new database"))?;
+        let admin_password = admin_password
+            .ok_or_else(|| anyhow::anyhow!("Admin password required for new database"))?;
+
+        // Validate password
+        if admin_password.len() < 8 {
+            bail!("Admin password must be at least 8 characters");
+        }
+
+        info!("Creating new database at {}", path.display());
+
+        // Create the database (runs migrations)
+        let db = Database::new(Some(path.to_str().unwrap())).await?;
+
+        // Create admin account
+        let service = AccountService::new(db.pool().clone());
+        let account = service.create(admin_username, admin_password).await?;
+        info!(
+            "Created admin account '{}' ({})",
+            admin_username, account.id
         );
-    }
 
-    // Validate password
-    if admin_password.len() < 8 {
-        bail!("Admin password must be at least 8 characters");
-    }
+        // Promote to admin level
+        service.set_access_level(&account.id, "admin").await?;
+        info!("Promoted '{}' to admin level", admin_username);
 
-    info!("Creating new database at {}", path.display());
+        db
+    };
 
-    // Create the database (runs migrations)
-    let db = Database::new(Some(path.to_str().unwrap())).await?;
-
-    // Create admin account
-    let service = AccountService::new(db.pool().clone());
-    let account = service.create(admin_username, admin_password).await?;
-    info!(
-        "Created admin account '{}' ({})",
-        admin_username, account.id
-    );
-
-    // Promote to admin level
-    service.set_access_level(&account.id, "admin").await?;
-    info!("Promoted '{}' to admin level", admin_username);
-
-    // Load and store core mudlib from lib/ directory
+    // Load and store core mudlib from lib/ directory (always refresh)
     let lib_dir = core_lib_dir.unwrap_or(Path::new("lib"));
     if lib_dir.exists() && lib_dir.is_dir() {
         info!("Loading core mudlib from {}...", lib_dir.display());
@@ -107,7 +119,11 @@ pub async fn init_database(
         }
     }
 
-    info!("Database initialization complete");
+    if db_exists {
+        info!("Database upgrade complete");
+    } else {
+        info!("Database initialization complete");
+    }
     Ok(())
 }
 
@@ -153,9 +169,15 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        init_database(&db_path, "admin", "password123", HashMap::new(), None)
-            .await
-            .unwrap();
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
 
         // Verify file was created
         assert!(db_path.exists());
@@ -168,19 +190,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_init_database_fails_if_exists() {
+    async fn test_init_database_upgrade_existing() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
         // Create first
-        init_database(&db_path, "admin", "password123", HashMap::new(), None)
-            .await
-            .unwrap();
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
 
-        // Try again - should fail
-        let result = init_database(&db_path, "admin", "password123", HashMap::new(), None).await;
+        // Run again - should succeed (idempotent upgrade)
+        let result = init_database(&db_path, None, None, HashMap::new(), None).await;
+        assert!(result.is_ok());
+
+        // Verify admin account still exists
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let service = AccountService::new(db.pool().clone());
+        let account = service.get_by_username("admin").await.unwrap().unwrap();
+        assert_eq!(account.access_level, "admin");
+    }
+
+    #[tokio::test]
+    async fn test_init_database_new_requires_credentials() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Try without credentials - should fail
+        let result = init_database(&db_path, None, None, HashMap::new(), None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already exists"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("username required"));
     }
 
     #[tokio::test]
@@ -188,7 +235,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let result = init_database(&db_path, "admin", "short", HashMap::new(), None).await;
+        let result =
+            init_database(&db_path, Some("admin"), Some("short"), HashMap::new(), None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("8 characters"));
     }
@@ -205,8 +253,8 @@ mod tests {
 
         init_database(
             &db_path,
-            "admin",
-            "password123",
+            Some("admin"),
+            Some("password123"),
             libs,
             Some(empty_lib_dir.as_path()),
         )

@@ -583,58 +583,7 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-
-        // Create raft tables (normally done by mudd_init)
-        sqlx::query(
-            "CREATE TABLE raft_log (
-                log_index INTEGER PRIMARY KEY,
-                term INTEGER NOT NULL,
-                entry_type TEXT NOT NULL,
-                payload TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE TABLE raft_vote (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                term INTEGER NOT NULL,
-                node_id INTEGER,
-                committed INTEGER NOT NULL DEFAULT 0
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE TABLE raft_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query("CREATE INDEX idx_raft_log_term ON raft_log(term)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        pool
-    }
+    use crate::db::test_utils::test_pool;
 
     #[tokio::test]
     async fn test_storage_creation() {

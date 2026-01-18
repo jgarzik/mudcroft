@@ -23,7 +23,7 @@ mudd_init --version
 
 ## Database Initialization
 
-Initialize once before first server start.
+Initialize before first server start. `mudd_init` is idempotent - safe to run on new or existing databases.
 
 ```bash
 export MUDD_ADMIN_USERNAME=admin
@@ -42,11 +42,41 @@ mudd_init --database /var/lib/mudd/game.db \
 
 Libraries stored in `code_store` table by SHA256 hash.
 
+### Force Fresh Database
+
+Use `--force` to delete existing database and start fresh:
+
+```bash
+mudd_init --database /var/lib/mudd/game.db --force
+```
+
 ### Requirements
 
-- Database path must not exist
+**For new database:**
+- Admin credentials required (`MUDD_ADMIN_USERNAME`, `MUDD_ADMIN_PASSWORD`)
 - Password minimum 8 characters
 - Parent directory must exist and be writable
+
+**For upgrade:**
+- Admin credentials optional (ignored if provided)
+- Existing database must be valid
+
+## Database Upgrades
+
+To upgrade the database schema after updating the server:
+
+```bash
+# 1. Stop the server
+systemctl stop mudd
+
+# 2. Run init/upgrade (no credentials needed for existing DB)
+mudd_init --database /var/lib/mudd/game.db
+
+# 3. Start the server
+systemctl start mudd
+```
+
+Upgrades run migrations and refresh core mudlib files. Admin accounts and data are preserved.
 
 ## Server Configuration
 
@@ -352,13 +382,13 @@ Error: Database file not found: /path/to/game.db. Run mudd_init to create it.
 
 Solution: Run `mudd_init` first or check path.
 
-### Database Already Exists
+### Missing Admin Credentials
 
 ```
-Error: Database file already exists: /path/to/game.db
+Error: MUDD_ADMIN_USERNAME environment variable required for new database
 ```
 
-Solution: Remove existing file or use different path.
+Solution: Set `MUDD_ADMIN_USERNAME` and `MUDD_ADMIN_PASSWORD` for new databases. Not required for upgrades.
 
 ### Missing Admin Account
 

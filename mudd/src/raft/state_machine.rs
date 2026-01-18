@@ -167,27 +167,20 @@ impl GameStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::db::test_utils::test_pool;
 
-    async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+    /// Create a test-specific table for state machine tests
+    async fn setup_test_table(pool: &SqlitePool) {
+        sqlx::query("CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, value TEXT)")
+            .execute(pool)
             .await
             .unwrap();
-
-        // Create a test table
-        sqlx::query("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        pool
     }
 
     #[tokio::test]
     async fn test_execute_sql_insert() {
         let pool = test_pool().await;
+        setup_test_table(&pool).await;
         let sm = GameStateMachine::new(pool);
 
         let request = Request::new(
@@ -203,6 +196,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_sql_update() {
         let pool = test_pool().await;
+        setup_test_table(&pool).await;
         let sm = GameStateMachine::new(pool.clone());
 
         // Insert first
@@ -247,6 +241,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_roundtrip() {
         let pool = test_pool().await;
+        setup_test_table(&pool).await;
         let sm = GameStateMachine::new(pool.clone());
 
         // Insert some data

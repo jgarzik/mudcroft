@@ -219,33 +219,7 @@ impl AccountService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-
-        // Run migrations
-        sqlx::query(
-            "CREATE TABLE accounts (
-                id TEXT PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT,
-                salt TEXT,
-                token TEXT,
-                access_level TEXT NOT NULL DEFAULT 'player',
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        pool
-    }
+    use crate::db::test_utils::test_pool;
 
     #[tokio::test]
     async fn test_account_create() {

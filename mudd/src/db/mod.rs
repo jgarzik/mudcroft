@@ -1,5 +1,8 @@
 //! Database module - SQLite with shared and per-universe schemas
 
+#[cfg(test)]
+pub mod test_utils;
+
 use anyhow::{bail, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -32,6 +35,37 @@ impl Database {
             .await?;
 
         let db = Self { pool };
+        db.run_migrations().await?;
+
+        Ok(db)
+    }
+
+    /// Open an existing database for migration/upgrade
+    /// Used by mudd_init to upgrade existing databases
+    pub async fn open_for_migration(path: &str) -> Result<Self> {
+        // Verify file exists
+        if !Path::new(path).exists() {
+            bail!(
+                "Database file not found: {}. Cannot upgrade non-existent database.",
+                path
+            );
+        }
+
+        let conn_str = format!("sqlite:{}?mode=rw", path);
+
+        let options = SqliteConnectOptions::from_str(&conn_str)?
+            .create_if_missing(false)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(10)
+            .connect_with(options)
+            .await?;
+
+        let db = Self { pool };
+
+        // Run migrations to upgrade schema
         db.run_migrations().await?;
 
         Ok(db)

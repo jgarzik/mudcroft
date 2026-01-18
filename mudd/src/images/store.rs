@@ -35,27 +35,6 @@ impl ImageStore {
         Self { pool, raft_writer }
     }
 
-    /// Initialize the image_store table
-    pub async fn init(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS image_store (
-                hash TEXT PRIMARY KEY,
-                data BLOB NOT NULL,
-                mime_type TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                source TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                reference_count INTEGER DEFAULT 0
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
     /// Compute SHA-256 hash of data
     fn compute_hash(data: &[u8]) -> String {
         let mut hasher = Sha256::new();
