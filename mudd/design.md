@@ -115,10 +115,13 @@ Client -> TcpListener -> Axum Router
 ### WebSocket Connection
 
 ```
-Client -> /ws?token=<jwt>
-       -> ws_handler: validate token, upgrade
+Client -> /ws?universe=<id>&token=<jwt>
+       -> ws_handler:
+          1. Validate universe ID format (DNS-style: 3-64 chars, alphanumeric+hyphen)
+          2. Verify universe exists in database
+          3. Validate token if provided, upgrade connection
        -> handle_socket:
-          1. Create PlayerSession (player_id, sender channel)
+          1. Create PlayerSession (player_id, universe_id, sender channel)
           2. Register with ConnectionManager
           3. Send Welcome message
           4. Spawn at portal room (if set) or send "not initialized" message

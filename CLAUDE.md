@@ -50,7 +50,8 @@ SQLite with tables: accounts, universes, objects, code_store, permissions, comba
 
 ### WebSocket Protocol
 
-- Auth via JWT token query param: `/ws?token=...`
+- Connect with universe and optional auth: `/ws?universe=<id>&token=...`
+- Universe ID required (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens)
 - Commands: look, north/south/east/west, say, help
 - Messages: Server pushes room descriptions, messages, player status
 

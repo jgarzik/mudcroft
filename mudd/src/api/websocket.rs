@@ -18,6 +18,7 @@ use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
 use crate::lua::{GameApi, Sandbox, SandboxConfig};
 use crate::permissions::AccessLevel;
+use crate::universe::validate_universe_id;
 
 /// A connected player session
 #[derive(Debug)]
@@ -97,6 +98,15 @@ impl ConnectionManager {
             .get(player_id)
             .and_then(|s| s.room_id.clone())
     }
+
+    /// Get player's universe ID
+    pub async fn get_universe_id(&self, player_id: &str) -> Option<String> {
+        self.sessions
+            .read()
+            .await
+            .get(player_id)
+            .map(|s| s.universe_id.clone())
+    }
 }
 
 /// Messages sent from server to client
@@ -143,6 +153,7 @@ pub enum ClientMessage {
 #[derive(Debug, Deserialize)]
 pub struct WsParams {
     pub token: Option<String>,
+    pub universe: Option<String>,
 }
 
 /// Handle WebSocket upgrade with optional token authentication
@@ -151,6 +162,47 @@ pub async fn ws_handler(
     Query(params): Query<WsParams>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // Validate universe ID (required)
+    let universe_id = match &params.universe {
+        Some(id) => match validate_universe_id(id) {
+            Ok(validated) => validated,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("Invalid universe ID: {}", e),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Universe ID required in query param: ?universe=<id>",
+            )
+                .into_response();
+        }
+    };
+
+    // Verify universe exists
+    match state.object_store.universe_exists(&universe_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("Universe not found: {}", universe_id),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!("Error checking universe: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to verify universe",
+            )
+                .into_response();
+        }
+    }
+
     // Validate token if provided
     let account = if let Some(token) = params.token {
         let service = AccountService::new(state.db.pool().clone());
@@ -159,11 +211,16 @@ pub async fn ws_handler(
         None
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, account))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, account, universe_id))
 }
 
 /// Handle an individual WebSocket connection
-async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<Account>) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    account: Option<Account>,
+    universe_id: String,
+) {
     // Create message channel for this connection
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(32);
 
@@ -181,18 +238,21 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
 
     if let Some(ref name) = username {
         info!(
-            "WebSocket connected: {} ({}) access={:?}",
-            player_id, name, access_level
+            "WebSocket connected: {} ({}) universe={} access={:?}",
+            player_id, name, universe_id, access_level
         );
     } else {
-        info!("WebSocket connected: {} (guest)", player_id);
+        info!(
+            "WebSocket connected: {} (guest) universe={}",
+            player_id, universe_id
+        );
     }
 
     // Create session
     let session = PlayerSession {
         player_id: player_id.clone(),
         account_id: account_id.clone(),
-        universe_id: String::new(), // TODO: from selection
+        universe_id: universe_id.clone(),
         room_id: None,
         access_level,
         sender: tx,
@@ -201,7 +261,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
     state.connections.register(session).await;
 
     // Send welcome message with theme
-    // TODO: Get theme_id from universe config when universe selection is implemented
+    // TODO: Get theme_id from universe config
     let theme_id = crate::theme::DEFAULT_THEME_ID.to_string();
     let welcome = ServerMessage::Welcome {
         player_id: player_id.clone(),
@@ -212,8 +272,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, account: Option<A
     }
 
     // Spawn player at portal room (if set)
-    let universe_id = "default"; // TODO: from universe selection
-    if let Ok(Some(portal_id)) = state.object_store.get_portal(universe_id).await {
+    if let Ok(Some(portal_id)) = state.object_store.get_portal(&universe_id).await {
         state
             .connections
             .update_room(&player_id, Some(portal_id.clone()))
@@ -505,7 +564,15 @@ async fn execute_command(
                 };
             }
 
-            let universe_id = "default"; // TODO: from session
+            // Get universe from session
+            let universe_id = match state.connections.get_universe_id(player_id).await {
+                Some(id) => id,
+                None => {
+                    return ServerMessage::Error {
+                        message: "Session error: no universe".to_string(),
+                    };
+                }
+            };
 
             // Get room_id from args or current room
             let room_id = if parts.len() > 1 {
@@ -526,7 +593,7 @@ async fn execute_command(
             match state.object_store.get(&room_id).await {
                 Ok(Some(room)) if room.class == "room" => {
                     // Set portal
-                    if let Err(e) = state.object_store.set_portal(universe_id, &room_id).await {
+                    if let Err(e) = state.object_store.set_portal(&universe_id, &room_id).await {
                         return ServerMessage::Error {
                             message: format!("Failed to set portal: {}", e),
                         };
@@ -582,14 +649,22 @@ async fn execute_command(
 /// Execute Lua code in sandbox with game API
 async fn execute_lua(
     state: &AppState,
-    _player_id: &str,
+    player_id: &str,
     account_id: &str,
     code: &str,
 ) -> ServerMessage {
-    let universe_id = "default"; // TODO: universe from session
+    // Get universe from session
+    let universe_id = match state.connections.get_universe_id(player_id).await {
+        Some(id) => id,
+        None => {
+            return ServerMessage::Error {
+                message: "Session error: no universe".to_string(),
+            };
+        }
+    };
 
     // Pre-load universe libraries (before creating sandbox)
-    let lib_codes = match load_universe_lib_codes(state, universe_id).await {
+    let lib_codes = match load_universe_lib_codes(state, &universe_id).await {
         Ok(codes) => codes,
         Err(e) => {
             return ServerMessage::Error {
@@ -609,7 +684,7 @@ async fn execute_lua(
         state.credits.clone(),
         state.venice.clone(),
         state.image_store.clone(),
-        universe_id,
+        &universe_id,
     );
     game_api.set_user_context(Some(account_id.to_string()));
 

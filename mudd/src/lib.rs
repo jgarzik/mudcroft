@@ -15,6 +15,7 @@ pub mod permissions;
 pub mod raft;
 pub mod theme;
 pub mod timers;
+pub mod universe;
 pub mod venice;
 
 use std::net::SocketAddr;

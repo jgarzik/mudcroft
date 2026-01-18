@@ -149,10 +149,10 @@ main() {
         exit 2
     fi
 
-    echo "[START] Creating default universe..."
+    echo "[START] Creating test universe..."
     UNIVERSE_RESPONSE=$(curl -s -X POST "${SERVER_URL}/universe/create" \
         -H "Content-Type: application/json" \
-        -d "{\"id\":\"default\",\"name\":\"Test Universe\",\"owner_id\":\"${ADMIN_UUID}\"}")
+        -d "{\"id\":\"test-world\",\"name\":\"Test Universe\",\"owner_id\":\"${ADMIN_UUID}\"}")
 
     UNIVERSE_ID=$(echo "$UNIVERSE_RESPONSE" | jq -r '.id')
     if [ -z "$UNIVERSE_ID" ] || [ "$UNIVERSE_ID" = "null" ]; then
@@ -180,9 +180,12 @@ main() {
     echo "   READY FOR BROWSER TESTING"
     echo "========================================="
     echo ""
-    echo "  Server:  ${SERVER_URL}"
-    echo "  Client:  http://localhost:5173"
-    echo "  Admin:   ${ADMIN_USERNAME} / ${ADMIN_PASSWORD}"
+    echo "  Server:   ${SERVER_URL}"
+    echo "  Client:   http://localhost:5173"
+    echo "  Admin:    ${ADMIN_USERNAME} / ${ADMIN_PASSWORD}"
+    echo "  Universe: ${UNIVERSE_ID}"
+    echo ""
+    echo "  WebSocket: /ws?token=...&universe=${UNIVERSE_ID}"
     echo ""
     echo "  Press Ctrl+C to stop and cleanup"
     echo ""

@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use super::AppState;
+use crate::universe::validate_universe_id;
 
 /// Universe creation request - JSON with libs as code strings
 #[derive(Debug, Deserialize)]
 struct UniverseCreateRequest {
-    /// Optional universe ID (defaults to generated UUID)
-    #[serde(default)]
-    id: Option<String>,
+    /// Universe ID (required, DNS-subdomain style: 3-64 chars, lowercase alphanumeric and hyphens)
+    id: String,
     /// Universe name
     name: String,
     /// Owner account ID
@@ -68,10 +68,9 @@ async fn process_universe_request(
     request: UniverseCreateRequest,
     state: &AppState,
 ) -> Result<UniverseCreateResponse, String> {
-    // Use provided ID or generate one
-    let universe_id = request
-        .id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Validate and normalize the universe ID
+    let universe_id =
+        validate_universe_id(&request.id).map_err(|e| format!("Invalid universe ID: {}", e))?;
 
     // Store libs and collect hashes
     let mut lib_hashes: HashMap<String, String> = HashMap::new();
@@ -129,9 +128,8 @@ async fn create_universe_from_zip(
     /// Universe config parsed from universe.json in zipfile
     #[derive(Debug, Deserialize)]
     struct ZipUniverseConfig {
-        /// Optional ID (defaults to generated UUID)
-        #[serde(default)]
-        id: Option<String>,
+        /// Universe ID (required, DNS-subdomain style)
+        id: String,
         name: String,
         owner_id: String,
         #[serde(default)]
@@ -190,11 +188,9 @@ async fn create_universe_from_zip(
     };
     // ZipArchive is now dropped, safe to do async operations
 
-    // Use provided ID or generate one
-    let universe_id = universe_config
-        .id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Validate and normalize the universe ID
+    let universe_id = validate_universe_id(&universe_config.id)
+        .map_err(|e| format!("Invalid universe ID: {}", e))?;
 
     // Store Lua files and collect hashes (async)
     let mut lib_hashes: HashMap<String, String> = HashMap::new();

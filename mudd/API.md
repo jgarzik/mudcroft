@@ -169,20 +169,25 @@ GET /auth/validate?token=eyJhbGciOiJIUzI1NiIs...
 
 ### Connection
 
-Connect to the WebSocket endpoint with optional authentication.
+Connect to the WebSocket endpoint with authentication and universe selection.
 
 **Endpoint:**
 ```
-ws://localhost:8080/ws?token=<jwt_token>
+ws://localhost:8080/ws?universe=<universe_id>&token=<jwt_token>
 ```
 
 **Parameters:**
+- `universe` (required): Universe ID to connect to (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens)
 - `token` (optional): JWT token for authentication. If omitted, connects as guest.
 
 **Example (wscat):**
 ```bash
-wscat -c "ws://localhost:8080/ws?token=eyJhbGciOiJIUzI1NiIs..."
+wscat -c "ws://localhost:8080/ws?universe=my-game&token=eyJhbGciOiJIUzI1NiIs..."
 ```
+
+**Error Responses:**
+- `400 Bad Request`: Invalid universe ID format
+- `404 Not Found`: Universe does not exist
 
 ---
 
@@ -354,11 +359,17 @@ Create a new universe from JSON.
 ```
 
 **Fields:**
-- `id` (optional): Universe ID (auto-generated UUID if omitted)
+- `id` (required): Universe ID (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens, e.g., `my-game`, `test123`)
 - `name` (required): Display name
 - `owner_id` (required): Account ID of owner
 - `config` (optional): Configuration object
 - `libs` (optional): Map of library name to Lua source code
+
+**ID Validation Rules:**
+- Length: 3-64 characters
+- Characters: lowercase letters, numbers, and hyphens
+- Must start and end with alphanumeric character
+- No consecutive hyphens (`--`)
 
 **Response (201 Created):**
 ```json
@@ -399,17 +410,19 @@ universe.zip
 **universe.json format:**
 ```json
 {
-    "id": "optional-id",
+    "id": "my-universe",
     "name": "My Universe",
     "owner_id": "account-uuid",
     "config": { ... }
 }
 ```
 
+Note: The `id` field is required and must follow DNS-style naming (see `/universe/create`).
+
 **Response (201 Created):**
 ```json
 {
-    "id": "generated-uuid",
+    "id": "my-universe",
     "name": "My Universe",
     "libs_loaded": ["combat", "commands", "items"]
 }
@@ -518,8 +531,8 @@ curl -X POST http://localhost:8080/auth/register \
 # Response:
 # {"token":"eyJ...","account_id":"abc123","username":"hero","access_level":"player"}
 
-# 2. Connect via WebSocket
-wscat -c "ws://localhost:8080/ws?token=eyJ..."
+# 2. Connect via WebSocket (specify universe)
+wscat -c "ws://localhost:8080/ws?universe=my-game&token=eyJ..."
 
 # Server sends:
 # {"type":"welcome","player_id":"def456","theme_id":"default"}

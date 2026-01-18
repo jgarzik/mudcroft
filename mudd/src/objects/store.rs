@@ -308,6 +308,15 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Check if a universe exists
+    pub async fn universe_exists(&self, universe_id: &str) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM universes WHERE id = ?")
+            .bind(universe_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     /// Get universe config by ID
     pub async fn get_universe(&self, universe_id: &str) -> Result<Option<UniverseInfo>> {
         let row: Option<UniverseRow> = sqlx::query_as(

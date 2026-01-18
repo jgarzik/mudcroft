@@ -98,12 +98,21 @@ systemctl start mudd
 
 ## Creating Universes
 
+Universe IDs must be DNS-style identifiers:
+- 3-64 characters
+- Lowercase alphanumeric and hyphens only
+- Must start and end with alphanumeric
+- No consecutive hyphens (`--`)
+
+Examples: `my-game`, `test123`, `rpg-world-2`
+
 ### Via JSON API
 
 ```bash
 curl -X POST http://localhost:8080/universe/create \
   -H "Content-Type: application/json" \
   -d '{
+    "id": "my-game",
     "name": "My World",
     "owner_id": "<admin_account_id>",
     "config": {
@@ -119,7 +128,7 @@ curl -X POST http://localhost:8080/universe/create \
 Response:
 ```json
 {
-  "id": "uuid-here",
+  "id": "my-game",
   "name": "My World",
   "libs_loaded": ["combat", "commands"]
 }
@@ -139,6 +148,7 @@ universe.zip
 `universe.json`:
 ```json
 {
+  "id": "my-game",
   "name": "My World",
   "owner_id": "<admin_account_id>",
   "config": {}
@@ -187,11 +197,11 @@ Portal is stored in `universe_settings` table:
 
 ```sql
 -- Check current portal
-SELECT * FROM universe_settings WHERE universe_id = 'default' AND key = 'portal_room_id';
+SELECT * FROM universe_settings WHERE universe_id = 'my-game' AND key = 'portal_room_id';
 
 -- Manually set portal (emergency use)
 INSERT OR REPLACE INTO universe_settings (universe_id, key, value)
-VALUES ('default', 'portal_room_id', '<room_uuid>');
+VALUES ('my-game', 'portal_room_id', '<room_uuid>');
 ```
 
 ### Universe Settings API

@@ -69,14 +69,15 @@ impl TestServer {
             anyhow::bail!("mudd_init failed with exit code: {:?}", init_status.code());
         }
 
-        // Spawn the server process
+        // Spawn the server process (inherit stderr to see server logs)
         let child = Command::new(&mudd_path)
             .arg("--bind")
             .arg(addr.to_string())
             .arg("--database")
             .arg(db_path.to_string_lossy().as_ref())
+            .env("RUST_LOG", "info")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| {
                 anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", mudd_path, e)
@@ -105,8 +106,18 @@ impl TestServer {
         }
 
         // Open a separate database connection for test setup
+        // Configure with foreign keys enabled to match server behavior
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let db_pool = sqlx::SqlitePool::connect(&db_url).await?;
+        let options = SqliteConnectOptions::from_str(&db_url)?
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let db_pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
 
         let mut test_server = Self {
             addr,
@@ -206,14 +217,24 @@ impl TestServer {
         Ok(id)
     }
 
-    /// Get the WebSocket URL for the server
-    pub fn ws_url(&self) -> String {
-        format!("ws://{}/ws", self.addr)
+    /// Get the universe ID (panics if world not created)
+    pub fn universe_id(&self) -> &str {
+        &self.world().universe_id
     }
 
-    /// Get the WebSocket URL with auth token
+    /// Get the WebSocket URL for the server (includes universe)
+    pub fn ws_url(&self) -> String {
+        format!("ws://{}/ws?universe={}", self.addr, self.universe_id())
+    }
+
+    /// Get the WebSocket URL with auth token (includes universe)
     pub fn ws_url_with_token(&self, token: &str) -> String {
-        format!("ws://{}/ws?token={}", self.addr, token)
+        format!(
+            "ws://{}/ws?token={}&universe={}",
+            self.addr,
+            token,
+            self.universe_id()
+        )
     }
 
     /// Connect a guest (unauthenticated) client
