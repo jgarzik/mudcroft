@@ -1,16 +1,16 @@
 #!/bin/bash
 #
-# E2E Test Server Setup Script
+# Start Test Server Script
 #
 # Sets up the server infrastructure for browser-based E2E testing.
 # After running this script, use Claude Chrome browser automation
 # to perform the actual tests.
 #
 # Usage:
-#   ./scripts/test-client-server-e2e.sh
+#   ./scripts/start-testsrv.sh
 #
 # What it does:
-#   1. Cleans test directory
+#   1. Stops any existing test server (via stop-testsrv.sh)
 #   2. Initializes database with admin user
 #   3. Starts server
 #   4. Creates default universe
@@ -23,6 +23,12 @@
 
 set -e
 
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Stop any existing test server first
+"${SCRIPT_DIR}/stop-testsrv.sh"
+
 # Configuration
 TESTDIR="${TESTDIR:-/tmp/mudcroft-e2e-test}"
 ADMIN_USERNAME="admin"
@@ -31,8 +37,7 @@ SERVER_HOST="127.0.0.1"
 SERVER_PORT="8080"
 SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
 
-# Script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Project root
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # PIDs for cleanup
@@ -98,9 +103,8 @@ main() {
         exit 1
     fi
 
-    # Phase 1: Setup
-    echo "[SETUP] Cleaning test directory..."
-    rm -rf "$TESTDIR"
+    # Phase 1: Setup (stop-testsrv.sh already cleaned up)
+    echo "[SETUP] Creating test directory..."
     mkdir -p "$TESTDIR"
 
     # Phase 2: Initialize Database
