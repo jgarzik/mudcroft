@@ -54,7 +54,7 @@ impl ObjectStore {
         let properties = serde_json::to_string(&obj.properties)?;
 
         self.execute_write(
-            "INSERT INTO objects (id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO objects (id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 serde_json::json!(&obj.id),
                 serde_json::json!(&obj.universe_id),
@@ -62,6 +62,7 @@ impl ObjectStore {
                 serde_json::json!(&obj.parent_id),
                 serde_json::json!(&properties),
                 serde_json::json!(&obj.code_hash),
+                serde_json::json!(&obj.owner_id),
                 serde_json::json!(&obj.created_at),
                 serde_json::json!(&obj.updated_at),
             ],
@@ -75,7 +76,7 @@ impl ObjectStore {
     pub async fn get(&self, id: &str) -> Result<Option<Object>> {
         let row: Option<ObjectRow> = sqlx::query_as(
             r#"
-            SELECT id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at
+            SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects WHERE id = ?
             "#,
         )
@@ -127,7 +128,7 @@ impl ObjectStore {
     pub async fn get_contents(&self, parent_id: &str) -> Result<Vec<Object>> {
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
-            SELECT id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at
+            SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects WHERE parent_id = ?
             "#,
         )
@@ -160,7 +161,7 @@ impl ObjectStore {
     pub async fn get_by_class(&self, universe_id: &str, class: &str) -> Result<Vec<Object>> {
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
-            SELECT id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at
+            SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects WHERE universe_id = ? AND class = ?
             "#,
         )
@@ -214,7 +215,7 @@ impl ObjectStore {
         // SQLite JSON extraction
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
-            SELECT id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at
+            SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects
             WHERE parent_id = ? AND json_extract(properties, '$.name') = ?
             "#,
@@ -246,7 +247,7 @@ impl ObjectStore {
     pub async fn get_living_in(&self, parent_id: &str) -> Result<Vec<Object>> {
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
-            SELECT id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at
+            SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects
             WHERE parent_id = ? AND (class = 'player' OR class = 'npc' OR class = 'living')
             "#,
@@ -463,6 +464,7 @@ struct ObjectRow {
     parent_id: Option<String>,
     properties: String,
     code_hash: Option<String>,
+    owner_id: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -477,6 +479,7 @@ impl ObjectRow {
             parent_id: self.parent_id,
             properties,
             code_hash: self.code_hash,
+            owner_id: self.owner_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

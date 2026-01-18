@@ -1021,17 +1021,19 @@ async fn test_permission_persistence() {
     }
 }
 
-/// Test: Builder region assignment persistence
+/// Test: Path grants persistence
 #[tokio::test]
-async fn test_builder_regions_persistence() {
-    use mudd::permissions::PermissionManager;
+async fn test_path_grants_persistence() {
+    use mudd::permissions::{PermissionManager, UserContext};
 
     let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
     let db_path = db_file.path().to_string_lossy().to_string();
 
-    let account_id = "builder_test_account";
+    let grantee_id = "builder_test_account";
+    let grantor_id = "admin_test_account";
+    let universe_id = "test-universe";
 
-    // First phase: Assign regions
+    // First phase: Grant paths
     {
         let db_url = format!("sqlite:{}?mode=rwc", db_path);
         let pool = sqlx::SqlitePool::connect(&db_url)
@@ -1039,23 +1041,37 @@ async fn test_builder_regions_persistence() {
             .expect("Failed to connect");
 
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS builder_regions (
-                account_id TEXT NOT NULL,
-                region_id TEXT NOT NULL,
-                PRIMARY KEY (account_id, region_id)
+            "CREATE TABLE IF NOT EXISTS path_grants (
+                id TEXT PRIMARY KEY,
+                universe_id TEXT NOT NULL,
+                grantee_id TEXT NOT NULL,
+                path_prefix TEXT NOT NULL,
+                can_delegate BOOLEAN NOT NULL DEFAULT FALSE,
+                granted_by TEXT NOT NULL,
+                granted_at TEXT NOT NULL,
+                UNIQUE(universe_id, grantee_id, path_prefix)
             )",
         )
         .execute(&pool)
         .await
-        .expect("Failed to create builder_regions table");
+        .expect("Failed to create path_grants table");
 
         let perms = PermissionManager::with_db(pool, None);
-        perms.assign_region(account_id, "forest_region").await;
-        perms.assign_region(account_id, "dungeon_region").await;
 
-        let regions = perms.get_assigned_regions(account_id).await;
-        assert!(regions.contains("forest_region"));
-        assert!(regions.contains("dungeon_region"));
+        // Wizard can grant any path
+        let wizard_ctx = UserContext::wizard(grantor_id, universe_id);
+
+        perms.grant_path(&wizard_ctx, grantee_id, universe_id, "/d/forest", true)
+            .await
+            .expect("Failed to grant forest path");
+        perms.grant_path(&wizard_ctx, grantee_id, universe_id, "/d/dungeon", false)
+            .await
+            .expect("Failed to grant dungeon path");
+
+        let grants = perms.get_path_grants(grantee_id, universe_id).await;
+        assert_eq!(grants.len(), 2);
+        assert!(grants.iter().any(|g| g.path_prefix == "/d/forest"));
+        assert!(grants.iter().any(|g| g.path_prefix == "/d/dungeon"));
     }
 
     // Second phase: Verify persistence
@@ -1067,19 +1083,24 @@ async fn test_builder_regions_persistence() {
 
         let perms = PermissionManager::with_db(pool, None);
         perms
-            .load_builder_regions()
+            .load_path_grants()
             .await
-            .expect("Failed to load regions");
+            .expect("Failed to load path grants");
 
-        let regions = perms.get_assigned_regions(account_id).await;
-        assert!(
-            regions.contains("forest_region"),
-            "forest_region should persist"
+        let grants = perms.get_path_grants(grantee_id, universe_id).await;
+        assert_eq!(
+            grants.len(),
+            2,
+            "Both path grants should persist"
         );
-        assert!(
-            regions.contains("dungeon_region"),
-            "dungeon_region should persist"
-        );
+
+        let forest_grant = grants.iter().find(|g| g.path_prefix == "/d/forest");
+        assert!(forest_grant.is_some(), "/d/forest grant should persist");
+        assert!(forest_grant.unwrap().can_delegate, "/d/forest should have can_delegate=true");
+
+        let dungeon_grant = grants.iter().find(|g| g.path_prefix == "/d/dungeon");
+        assert!(dungeon_grant.is_some(), "/d/dungeon grant should persist");
+        assert!(!dungeon_grant.unwrap().can_delegate, "/d/dungeon should have can_delegate=false");
     }
 }
 

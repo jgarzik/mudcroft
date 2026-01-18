@@ -74,8 +74,8 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
     if let Err(e) = timers.load_from_db().await {
         tracing::warn!("Failed to load timers from database: {}", e);
     }
-    if let Err(e) = permissions.load_builder_regions().await {
-        tracing::warn!("Failed to load builder regions from database: {}", e);
+    if let Err(e) = permissions.load_path_grants().await {
+        tracing::warn!("Failed to load path grants from database: {}", e);
     }
     if let Err(e) = class_registry.load_from_db().await {
         tracing::warn!("Failed to load classes from database: {}", e);

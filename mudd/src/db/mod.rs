@@ -258,7 +258,50 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Builder regions table (for permission persistence)
+        // Path grants table (for path-based permission delegation)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS path_grants (
+                id TEXT PRIMARY KEY,
+                universe_id TEXT NOT NULL REFERENCES universes(id),
+                grantee_id TEXT NOT NULL REFERENCES accounts(id),
+                path_prefix TEXT NOT NULL,
+                can_delegate BOOLEAN NOT NULL DEFAULT FALSE,
+                granted_by TEXT NOT NULL REFERENCES accounts(id),
+                granted_at TEXT NOT NULL,
+                UNIQUE(universe_id, grantee_id, path_prefix)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Index for path grants lookup by grantee
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_path_grants_grantee ON path_grants(universe_id, grantee_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Add owner_id column to objects if not exists (migration)
+        // SQLite doesn't have IF NOT EXISTS for ALTER TABLE, so we check manually
+        let has_owner_id: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('objects') WHERE name = 'owner_id'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if has_owner_id.is_none() {
+            sqlx::query("ALTER TABLE objects ADD COLUMN owner_id TEXT REFERENCES accounts(id)")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_owner ON objects(owner_id)")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Legacy: Builder regions table (for backward compatibility during migration)
+        // TODO: Remove after migration is complete
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS builder_regions (

@@ -40,13 +40,16 @@ cargo run -- --bind 127.0.0.1:8080 --database /tmp/mudcroft.db
 - **combat/** - Combat system with damage types, effects, PvP policies
 - **raft/** - OpenRaft consensus for multi-node replication
 - **timers/** - call_out (one-shot) and heartbeat (recurring) callbacks
-- **permissions/** - Role-based access (player < builder < wizard < admin < owner)
+- **permissions/** - LPMud-style path-based access control
+  - Access levels: player < builder < wizard < admin < owner
+  - Path grants: `/d/forest` grants access to all objects under that prefix
+  - Ownership: creators can always modify their own objects
 - **credits/** - Economy system
 - **venice/** - AI integration (LLM chat, image generation)
 
 ### Database
 
-SQLite with tables: accounts, universes, objects, code_store, permissions, combat_state, timers, heartbeats, credits, raft_logs, raft_votes, snapshots
+SQLite with tables: accounts, universes, objects, code_store, permissions, path_grants, combat_state, timers, heartbeats, credits, raft_logs, raft_votes, snapshots
 
 ### WebSocket Protocol
 
@@ -67,3 +70,8 @@ The `tests/harness/` directory provides:
 - `design.md` - Full architectural specification
 - `plan.md` - Implementation phases 1-13
 - `igor-history.md` - LP-MUD theory and historical context
+- `mudd/docs/langtutor.md` - Content creator tutorial (Lua, rooms, NPCs, permissions)
+- `mudd/docs/langref.md` - Lua API reference
+- `mudd/docs/permissions.md` - Permission system technical reference
+- `mudd/docs/API.md` - HTTP/WebSocket API reference
+- `mudd/docs/admin.md` - Administration guide

@@ -211,7 +211,7 @@ impl GameApi {
         let universe_id = self.universe_id.clone();
 
         // game.create_object(path, class, parent_id, props)
-        // Actually creates object in database
+        // Actually creates object in database with current user as owner
         // Returns object on success, or {error = "message"} on path validation failure
         let store_clone = store.clone();
         let universe_clone = universe_id.clone();
@@ -226,6 +226,11 @@ impl GameApi {
                 let store = store_clone.clone();
                 let universe_id = universe_clone.clone();
 
+                // Get current user for ownership
+                let globals = lua.globals();
+                let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+                let owner_id = actor_override;
+
                 // Create object with path validation
                 let mut obj = match Object::new(&path, &universe_id, &class) {
                     Ok(obj) => obj,
@@ -237,6 +242,7 @@ impl GameApi {
                     }
                 };
                 obj.parent_id = parent_id;
+                obj.owner_id = owner_id; // Set creator as owner
 
                 // Copy properties from Lua table if provided
                 if let Some(props_table) = props {
@@ -834,6 +840,7 @@ impl GameApi {
     fn register_permission_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let permissions = self.permissions.clone();
         let current_user = self.current_user_id.clone();
+        let universe_id = self.universe_id.clone();
 
         // game.set_actor(actor_id)
         // Sets the current actor for permission checks in this Lua context
@@ -857,18 +864,22 @@ impl GameApi {
         })?;
         game.set("get_actor", get_actor)?;
 
-        // game.check_permission(action, target_id, is_fixed, region_id)
-        // Returns true if permission is allowed, false and error message otherwise
+        // game.check_permission(action, target_id, is_fixed, owner_id)
+        // Returns {allowed: bool, error?: string}
+        let permissions_clone = permissions.clone();
+        let current_user_clone = current_user.clone();
+        let universe_clone = universe_id.clone();
         let check_permission = lua.create_function(
             move |lua,
-                  (action_str, target_id, is_fixed, region_id): (
+                  (action_str, target_id, is_fixed, owner_id): (
                 String,
                 String,
                 Option<bool>,
                 Option<String>,
             )| {
-                let permissions = permissions.clone();
-                let current_user = current_user.clone();
+                let permissions = permissions_clone.clone();
+                let current_user = current_user_clone.clone();
+                let universe_id = universe_clone.clone();
 
                 // Parse action string
                 let action = match action_str.as_str() {
@@ -878,6 +889,7 @@ impl GameApi {
                     "delete" => PermAction::Delete,
                     "create" => PermAction::Create,
                     "execute" => PermAction::Execute,
+                    "store_code" => PermAction::StoreCode,
                     "admin_config" => PermAction::AdminConfig,
                     "grant_credits" => PermAction::GrantCredits,
                     _ => {
@@ -899,12 +911,11 @@ impl GameApi {
                 let result_data = std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async {
-                        let user_ctx = permissions.get_user_context(&user_id).await;
+                        let user_ctx = permissions.get_user_context(&user_id, &universe_id).await;
                         let obj_ctx = ObjectContext {
                             object_id: target_id,
-                            owner_id: None,
+                            owner_id,
                             is_fixed: is_fixed.unwrap_or(false),
-                            region_id,
                         };
                         permissions.check_permission(&user_ctx, action, &obj_ctx)
                     })
@@ -927,9 +938,38 @@ impl GameApi {
         )?;
         game.set("check_permission", check_permission)?;
 
+        // game.can_access_path(path)
+        // Returns true if the current user can access the given path
+        let permissions_clone = permissions.clone();
+        let current_user_clone = current_user.clone();
+        let universe_clone = universe_id.clone();
+        let can_access_path = lua.create_function(move |lua, path: String| {
+            let permissions = permissions_clone.clone();
+            let current_user = current_user_clone.clone();
+            let universe_id = universe_clone.clone();
+
+            let globals = lua.globals();
+            let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+            let user_id = actor_override
+                .or(current_user)
+                .unwrap_or_else(|| "anonymous".to_string());
+
+            let result = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    permissions.can_access_path(&user_id, &universe_id, &path).await
+                })
+            })
+            .join()
+            .expect("Thread panicked");
+
+            Ok(result)
+        })?;
+        game.set("can_access_path", can_access_path)?;
+
         // game.get_access_level(account_id)
         // Returns the access level of a user as a string
-        let permissions_clone = self.permissions.clone();
+        let permissions_clone = permissions.clone();
         let get_access_level = lua.create_function(move |_, account_id: String| {
             let permissions = permissions_clone.clone();
 
@@ -953,7 +993,7 @@ impl GameApi {
 
         // game.set_access_level(account_id, level_str)
         // Sets a user's access level (requires admin)
-        let permissions_clone = self.permissions.clone();
+        let permissions_clone = permissions.clone();
         let set_access_level =
             lua.create_function(move |_, (account_id, level_str): (String, String)| {
                 let permissions = permissions_clone.clone();
@@ -980,45 +1020,134 @@ impl GameApi {
             })?;
         game.set("set_access_level", set_access_level)?;
 
-        // game.assign_region(account_id, region_id)
-        // Assigns a region to a builder
-        let permissions_clone = self.permissions.clone();
-        let assign_region =
-            lua.create_function(move |_, (account_id, region_id): (String, String)| {
+        // game.grant_path(grantee_id, path_prefix, can_delegate)
+        // Grant path access to a user. Returns grant info table or {error: string}
+        let permissions_clone = permissions.clone();
+        let current_user_clone = current_user.clone();
+        let universe_clone = universe_id.clone();
+        let grant_path = lua.create_function(
+            move |lua, (grantee_id, path_prefix, can_delegate): (String, String, Option<bool>)| {
                 let permissions = permissions_clone.clone();
+                let current_user = current_user_clone.clone();
+                let universe_id = universe_clone.clone();
 
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        permissions.assign_region(&account_id, &region_id).await;
-                    });
+                let globals = lua.globals();
+                let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+                let user_id = actor_override
+                    .or(current_user)
+                    .unwrap_or_else(|| "anonymous".to_string());
+
+                let result: Result<crate::permissions::PathGrant, String> =
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            let grantor_ctx =
+                                permissions.get_user_context(&user_id, &universe_id).await;
+                            permissions
+                                .grant_path(
+                                    &grantor_ctx,
+                                    &grantee_id,
+                                    &universe_id,
+                                    &path_prefix,
+                                    can_delegate.unwrap_or(false),
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                    })
+                    .join()
+                    .expect("Thread panicked");
+
+                match result {
+                    Ok(grant) => {
+                        let table = lua.create_table()?;
+                        table.set("id", grant.id.as_str())?;
+                        table.set("grantee_id", grant.grantee_id.as_str())?;
+                        table.set("path_prefix", grant.path_prefix.as_str())?;
+                        table.set("can_delegate", grant.can_delegate)?;
+                        table.set("granted_by", grant.granted_by.as_str())?;
+                        table.set("granted_at", grant.granted_at.as_str())?;
+                        Ok(Value::Table(table))
+                    }
+                    Err(e) => {
+                        let table = lua.create_table()?;
+                        table.set("error", e)?;
+                        Ok(Value::Table(table))
+                    }
+                }
+            },
+        )?;
+        game.set("grant_path", grant_path)?;
+
+        // game.revoke_path(grant_id)
+        // Revoke a path grant. Returns true if revoked, false if not found, or {error: string}
+        let permissions_clone = permissions.clone();
+        let current_user_clone = current_user.clone();
+        let universe_clone = universe_id.clone();
+        let revoke_path = lua.create_function(move |lua, grant_id: String| {
+            let permissions = permissions_clone.clone();
+            let current_user = current_user_clone.clone();
+            let universe_id = universe_clone.clone();
+
+            let globals = lua.globals();
+            let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+            let user_id = actor_override
+                .or(current_user)
+                .unwrap_or_else(|| "anonymous".to_string());
+
+            let result: Result<bool, String> = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let revoker_ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                    permissions
+                        .revoke_path(&revoker_ctx, &grant_id, &universe_id)
+                        .await
+                        .map_err(|e| e.to_string())
                 })
-                .join()
-                .ok();
+            })
+            .join()
+            .expect("Thread panicked");
 
-                Ok(true)
-            })?;
-        game.set("assign_region", assign_region)?;
+            match result {
+                Ok(revoked) => Ok(Value::Boolean(revoked)),
+                Err(e) => {
+                    let table = lua.create_table()?;
+                    table.set("error", e)?;
+                    Ok(Value::Table(table))
+                }
+            }
+        })?;
+        game.set("revoke_path", revoke_path)?;
 
-        // game.unassign_region(account_id, region_id)
-        // Removes a region assignment from a builder
-        let permissions_clone = self.permissions.clone();
-        let unassign_region =
-            lua.create_function(move |_, (account_id, region_id): (String, String)| {
-                let permissions = permissions_clone.clone();
+        // game.get_path_grants(account_id)
+        // Get all path grants for a user. Returns array of grant info tables.
+        let permissions_clone = permissions;
+        let universe_clone = universe_id;
+        let get_path_grants = lua.create_function(move |lua, account_id: String| {
+            let permissions = permissions_clone.clone();
+            let universe_id = universe_clone.clone();
 
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        permissions.unassign_region(&account_id, &region_id).await;
-                    });
-                })
-                .join()
-                .ok();
+            let grants = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async { permissions.get_path_grants(&account_id, &universe_id).await })
+            })
+            .join()
+            .expect("Thread panicked");
 
-                Ok(true)
-            })?;
-        game.set("unassign_region", unassign_region)?;
+            let table = lua.create_table()?;
+            for (i, grant) in grants.iter().enumerate() {
+                let grant_table = lua.create_table()?;
+                grant_table.set("id", grant.id.as_str())?;
+                grant_table.set("grantee_id", grant.grantee_id.as_str())?;
+                grant_table.set("path_prefix", grant.path_prefix.as_str())?;
+                grant_table.set("can_delegate", grant.can_delegate)?;
+                grant_table.set("granted_by", grant.granted_by.as_str())?;
+                grant_table.set("granted_at", grant.granted_at.as_str())?;
+                table.set(i + 1, grant_table)?;
+            }
+            Ok(table)
+        })?;
+        game.set("get_path_grants", get_path_grants)?;
 
         Ok(())
     }
@@ -1730,6 +1859,7 @@ fn object_to_lua(lua: &Lua, obj: &Object) -> LuaResult<Table> {
     table.set("universe_id", obj.universe_id.as_str())?;
     table.set("class", obj.class.as_str())?;
     table.set("parent_id", obj.parent_id.clone())?;
+    table.set("owner_id", obj.owner_id.clone())?;
 
     // Flatten common properties to root level
     if let Some(name) = obj.properties.get("name") {

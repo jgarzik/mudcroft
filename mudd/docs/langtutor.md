@@ -455,14 +455,20 @@ announce_action(room_id, player_id,
 
 ### Lesson 8: Permissions
 
-Control who can modify what.
+Control who can modify what using path-based grants.
 
 ```lua
 -- Check if player can modify an object
-local result = game.check_permission("modify", object_id, false, nil)
+local obj = game.get_object(object_id)
+local result = game.check_permission("modify", object_id, obj.fixed or false, obj.owner_id)
 if not result.allowed then
     game.send(player_id, "Permission denied: " .. result.error)
     return
+end
+
+-- Check if user can access a path
+if game.can_access_path("/d/forest") then
+    -- User has a path grant covering /d/forest
 end
 
 -- Get someone's access level
@@ -471,22 +477,48 @@ if level == "wizard" or level == "admin" or level == "owner" then
     -- Allow special commands
 end
 
--- Set up a builder with region access
+-- Grant path access to a builder (requires wizard+ or delegation rights)
 game.set_access_level(new_builder_id, "builder")
-game.assign_region(new_builder_id, my_region_id)
+local grant = game.grant_path(new_builder_id, "/d/forest", true)  -- true = can_delegate
+if grant.error then
+    print("Grant failed: " .. grant.error)
+else
+    print("Granted path: " .. grant.path_prefix)
+end
+
+-- List someone's path grants
+local grants = game.get_path_grants(builder_id)
+for _, g in ipairs(grants) do
+    print(g.path_prefix .. " (can_delegate=" .. tostring(g.can_delegate) .. ")")
+end
+
+-- Revoke a grant
+game.revoke_path(grant.id)
 
 -- Access level hierarchy (lowest to highest):
 -- player < builder < wizard < admin < owner
 ```
 
+**Permission Check Order:**
+1. Wizard+ bypass → Allowed
+2. Owner check (creator of object) → Allowed
+3. Path grant covers object path → Allowed
+4. Player actions (read/execute/move-non-fixed) → Allowed
+5. Default → Denied
+
 **Permission Levels:**
 | Level | Can Do |
 |-------|--------|
 | Player | Read, interact with non-fixed objects |
-| Builder | Create/modify in assigned regions |
-| Wizard | Full object control, eval command |
+| Builder | Create/modify under granted path prefixes |
+| Wizard | Full object control, eval command (like UNIX root) |
 | Admin | Universe config, grant credits |
 | Owner | Grant admin access |
+
+**Path Grant Rules:**
+- A grant for `/d/forest` covers `/d/forest/*` (all objects with that prefix)
+- Builders can only grant subpaths of their own grants (if `can_delegate=true`)
+- You can always modify objects you created (ownership persists even after grant revoked)
 
 ---
 

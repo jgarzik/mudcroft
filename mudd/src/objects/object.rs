@@ -25,6 +25,8 @@ pub struct Object {
     pub properties: Properties,
     /// SHA-256 hash of attached code, if any
     pub code_hash: Option<String>,
+    /// Account ID of the creator (for ownership-based permissions)
+    pub owner_id: Option<String>,
     /// Creation timestamp
     pub created_at: String,
     /// Last update timestamp
@@ -52,9 +54,22 @@ impl Object {
             parent_id: None,
             properties: Properties::new(),
             code_hash: None,
+            owner_id: None,
             created_at: now.clone(),
             updated_at: now,
         })
+    }
+
+    /// Create a new object with an owner
+    pub fn new_with_owner(
+        id: &str,
+        universe_id: &str,
+        class: &str,
+        owner_id: &str,
+    ) -> Result<Self, PathValidationError> {
+        let mut obj = Self::new(id, universe_id, class)?;
+        obj.owner_id = Some(owner_id.to_string());
+        Ok(obj)
     }
 
     /// Get a property value, returning None if not set
