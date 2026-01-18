@@ -335,6 +335,15 @@ impl ObjectStore {
         }
     }
 
+    /// List all universes (basic info only - id and name)
+    pub async fn list_universes(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, name FROM universes ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
     /// Update universe config (merge with existing)
     pub async fn update_universe(
         &self,

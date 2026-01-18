@@ -4,13 +4,18 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 use axum::{
-    body::Bytes, extract::State, http::StatusCode, response::IntoResponse, routing::post, Json,
-    Router,
+    body::Bytes,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use super::AppState;
+use crate::lua::{GameApi, Sandbox, SandboxConfig};
 use crate::universe::validate_universe_id;
 
 /// Universe creation request - JSON with libs as code strings
@@ -38,17 +43,62 @@ struct UniverseCreateResponse {
     libs_loaded: Vec<String>,
 }
 
+/// Response for universe list
+#[derive(Debug, Serialize)]
+struct UniverseListItem {
+    id: String,
+    name: String,
+}
+
 /// Error response
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
 
+/// Request to run a script file
+#[derive(Debug, Deserialize)]
+struct RunScriptRequest {
+    /// Script filename (relative to scripts/ directory)
+    script: String,
+    /// Optional account ID for permission context
+    account_id: Option<String>,
+}
+
+/// Response from running a script
+#[derive(Debug, Serialize)]
+struct RunScriptResponse {
+    result: String,
+}
+
 /// Build the universe router
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/universe/list", get(list_universes))
         .route("/universe/create", post(create_universe))
         .route("/universe/upload", post(upload_universe))
+        .route("/universe/{id}/run_script", post(run_script))
+}
+
+/// GET /universe/list
+/// Returns a list of all available universes
+async fn list_universes(State(state): State<AppState>) -> impl IntoResponse {
+    match state.object_store.list_universes().await {
+        Ok(universes) => {
+            let items: Vec<UniverseListItem> = universes
+                .into_iter()
+                .map(|(id, name)| UniverseListItem { id, name })
+                .collect();
+            Json(items).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to list universes: {}", e),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /universe/create
@@ -234,4 +284,119 @@ async fn create_universe_from_zip(
         name: universe_config.name,
         libs_loaded,
     })
+}
+
+/// POST /universe/:id/run_script
+/// Run a Lua script file from the scripts/ directory in the context of a universe
+async fn run_script(
+    State(state): State<AppState>,
+    Path(universe_id): Path<String>,
+    Json(request): Json<RunScriptRequest>,
+) -> impl IntoResponse {
+    // Validate universe exists
+    match state.object_store.get_universe(&universe_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Universe not found: {}", universe_id),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Database error: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    // Security: only allow scripts from the scripts/ directory, no path traversal
+    let script_name = &request.script;
+    if script_name.contains("..") || script_name.starts_with('/') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid script path".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Read script file
+    let script_path = format!("scripts/{}", script_name);
+    let script_content = match std::fs::read_to_string(&script_path) {
+        Ok(content) => content,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Script not found: {} ({})", script_name, e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Create sandbox and game API
+    let mut sandbox = match Sandbox::new(SandboxConfig::default()) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to create sandbox: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let mut game_api = GameApi::new(
+        state.object_store.clone(),
+        state.classes.clone(),
+        state.actions.clone(),
+        state.messages.clone(),
+        state.permissions.clone(),
+        state.timers.clone(),
+        state.credits.clone(),
+        state.venice.clone(),
+        state.image_store.clone(),
+        &universe_id,
+    );
+
+    // Set user context if provided
+    if let Some(account_id) = request.account_id {
+        game_api.set_user_context(Some(account_id));
+    }
+
+    // Register game API
+    if let Err(e) = game_api.register(sandbox.lua()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to register game API: {}", e),
+            }),
+        )
+            .into_response();
+    }
+
+    // Execute script
+    let result: Result<String, _> = sandbox.execute(&script_content);
+
+    match result {
+        Ok(output) => (StatusCode::OK, Json(RunScriptResponse { result: output })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Script error: {}", e),
+            }),
+        )
+            .into_response(),
+    }
 }

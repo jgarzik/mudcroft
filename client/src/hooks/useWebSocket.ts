@@ -15,6 +15,7 @@ export function useWebSocket() {
 
   const {
     token,
+    universe,
     isAuthenticated,
     setConnectionStatus,
     addMessage,
@@ -77,12 +78,12 @@ export function useWebSocket() {
   }, [addMessage, setRoom, setPlayerId, setThemeId])
 
   const connect = useCallback(() => {
-    if (!token || !isAuthenticated) return
+    if (!token || !universe || !isAuthenticated) return
 
     cleanup()
     setConnectionStatus('connecting')
 
-    const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`)
+    const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}&universe=${encodeURIComponent(universe)}`)
     wsRef.current = ws
 
     ws.onopen = () => {
@@ -110,7 +111,7 @@ export function useWebSocket() {
       addMessage('Disconnected from server', 'system')
 
       // Schedule reconnect with exponential backoff
-      if (isAuthenticated && token) {
+      if (isAuthenticated && token && universe) {
         reconnectTimeoutRef.current = window.setTimeout(() => {
           reconnectDelayRef.current = Math.min(
             reconnectDelayRef.current * 2,
@@ -120,7 +121,7 @@ export function useWebSocket() {
         }, reconnectDelayRef.current)
       }
     }
-  }, [token, isAuthenticated, cleanup, setConnectionStatus, addMessage, handleMessage])
+  }, [token, universe, isAuthenticated, cleanup, setConnectionStatus, addMessage, handleMessage])
 
   const sendCommand = useCallback((text: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -134,16 +135,16 @@ export function useWebSocket() {
     setConnectionStatus('disconnected')
   }, [cleanup, setConnectionStatus])
 
-  // Connect when authenticated
+  // Connect when authenticated and universe selected
   useEffect(() => {
-    if (isAuthenticated && token) {
+    if (isAuthenticated && token && universe) {
       connect()
     } else {
       disconnect()
     }
 
     return cleanup
-  }, [isAuthenticated, token, connect, disconnect, cleanup])
+  }, [isAuthenticated, token, universe, connect, disconnect, cleanup])
 
   return { sendCommand, disconnect }
 }

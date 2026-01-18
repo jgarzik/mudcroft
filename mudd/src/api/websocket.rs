@@ -16,8 +16,11 @@ use tracing::{info, warn};
 
 use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
+use crate::combat::DamageType;
+use crate::images::generate_room_image;
 use crate::lua::{GameApi, Sandbox, SandboxConfig};
 use crate::permissions::AccessLevel;
+use crate::theme::DEFAULT_THEME_ID;
 use crate::universe::validate_universe_id;
 
 /// A connected player session
@@ -279,7 +282,12 @@ async fn handle_socket(
             .await;
 
         // Send initial room description
-        if let Some(room_msg) = build_room_message(&state, &portal_id).await {
+        let acct_ref = if account_id.is_empty() {
+            None
+        } else {
+            Some(account_id.as_str())
+        };
+        if let Some(room_msg) = build_room_message(&state, &portal_id, acct_ref).await {
             if let Ok(json) = serde_json::to_string(&room_msg) {
                 let _ = socket.send(Message::Text(json.into())).await;
             }
@@ -359,7 +367,12 @@ async fn handle_client_message(
 }
 
 /// Build a Room message from a room object
-async fn build_room_message(state: &AppState, room_id: &str) -> Option<ServerMessage> {
+/// Also triggers background image generation if room has no image and Venice is configured
+async fn build_room_message(
+    state: &AppState,
+    room_id: &str,
+    account_id: Option<&str>,
+) -> Option<ServerMessage> {
     // Get room object
     let room = state.object_store.get(room_id).await.ok()??;
 
@@ -411,6 +424,46 @@ async fn build_room_message(state: &AppState, room_id: &str) -> Option<ServerMes
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Trigger background image generation if room has no image and Venice is configured
+    if image_hash.is_none() && state.venice.is_configured() {
+        if let Some(acct_id) = account_id {
+            let venice = state.venice.clone();
+            let image_store = state.image_store.clone();
+            let object_store = state.object_store.clone();
+            let themes = state.themes.clone();
+            let room_id_owned = room_id.to_string();
+            let account_id_owned = acct_id.to_string();
+
+            // Spawn background task for image generation
+            tokio::spawn(async move {
+                let theme = themes.get(DEFAULT_THEME_ID);
+                match generate_room_image(
+                    &venice,
+                    &image_store,
+                    &object_store,
+                    &room_id_owned,
+                    &theme,
+                    &account_id_owned,
+                )
+                .await
+                {
+                    Ok(hash) => {
+                        info!(
+                            "Background image generation complete for room {}: {}",
+                            room_id_owned, hash
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Background image generation failed for room {}: {}",
+                            room_id_owned, e
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     Some(ServerMessage::Room {
         name,
         description,
@@ -442,7 +495,12 @@ async fn execute_command(
         "look" | "l" => {
             // Get player's current room
             if let Some(room_id) = state.connections.get_room_id(player_id).await {
-                if let Some(room_msg) = build_room_message(state, &room_id).await {
+                let acct_ref = if account_id.is_empty() {
+                    None
+                } else {
+                    Some(account_id)
+                };
+                if let Some(room_msg) = build_room_message(state, &room_id, acct_ref).await {
                     return room_msg;
                 }
             }
@@ -493,7 +551,12 @@ async fn execute_command(
                 .await;
 
             // Return new room description
-            if let Some(room_msg) = build_room_message(state, &dest_room_id).await {
+            let acct_ref = if account_id.is_empty() {
+                None
+            } else {
+                Some(account_id)
+            };
+            if let Some(room_msg) = build_room_message(state, &dest_room_id, acct_ref).await {
                 return room_msg;
             }
 
@@ -508,7 +571,7 @@ async fn execute_command(
             }
         }
         "help" => ServerMessage::Output {
-            text: "Commands: look, north/south/east/west, say <message>, eval <lua>, goto <room_id>, setportal [room_id], help"
+            text: "Commands: look, north/south/east/west, say <message>, attack <target>, eval <lua>, goto <room_id>, setportal [room_id], help"
                 .to_string(),
         },
         "goto" => {
@@ -538,7 +601,12 @@ async fn execute_command(
                         .await;
 
                     // Return room description
-                    if let Some(room_msg) = build_room_message(state, &room_id).await {
+                    let acct_ref = if account_id.is_empty() {
+                        None
+                    } else {
+                        Some(account_id)
+                    };
+                    if let Some(room_msg) = build_room_message(state, &room_id, acct_ref).await {
                         return room_msg;
                     }
                     ServerMessage::Output {
@@ -639,6 +707,188 @@ async fn execute_command(
 
             // Execute Lua code
             execute_lua(state, player_id, account_id, code).await
+        }
+        "attack" | "kill" => {
+            // Get target name from args
+            let target_name = if parts.len() > 1 {
+                parts[1..].join(" ").to_lowercase()
+            } else {
+                return ServerMessage::Error {
+                    message: "Attack what?".to_string(),
+                };
+            };
+
+            // Get player's current room
+            let room_id = match state.connections.get_room_id(player_id).await {
+                Some(id) => id,
+                None => {
+                    return ServerMessage::Error {
+                        message: "You are nowhere.".to_string(),
+                    };
+                }
+            };
+
+            // Find target in room
+            let contents = state
+                .object_store
+                .get_contents(&room_id)
+                .await
+                .unwrap_or_default();
+
+            let target = contents.iter().find(|obj| {
+                obj.properties
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| n.to_lowercase().contains(&target_name))
+                    .unwrap_or(false)
+            });
+
+            let target = match target {
+                Some(t) => t,
+                None => {
+                    return ServerMessage::Error {
+                        message: format!("You don't see '{}' here.", target_name),
+                    };
+                }
+            };
+
+            let target_id = target.id.clone();
+            let target_display_name = target
+                .properties
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("something")
+                .to_string();
+
+            // Check if target is attackable (NPC or PvP-flagged player)
+            let is_npc = target.class == "npc" || target.class == "monster";
+            if !is_npc {
+                return ServerMessage::Error {
+                    message: format!("You can't attack {}.", target_display_name),
+                };
+            }
+
+            // Get target HP (initialize combat state if needed)
+            let target_hp = target
+                .properties
+                .get("hp")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(10) as i32;
+            let target_max_hp = target
+                .properties
+                .get("max_hp")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(target_hp as i64) as i32;
+
+            // Initialize combat states if needed
+            if state.combat.get_state(&target_id).await.is_none() {
+                state
+                    .combat
+                    .init_entity_with_universe(
+                        &target_id,
+                        state.connections.get_universe_id(player_id).await.as_deref(),
+                        target_max_hp,
+                    )
+                    .await;
+                // Set current HP to match object property
+                if let Some(mut combat_state) = state.combat.get_state(&target_id).await {
+                    combat_state.hp = target_hp;
+                    state.combat.update_state(&target_id, combat_state).await;
+                }
+            }
+            if state.combat.get_state(player_id).await.is_none() {
+                state
+                    .combat
+                    .init_entity_with_universe(
+                        player_id,
+                        state.connections.get_universe_id(player_id).await.as_deref(),
+                        100, // Default player HP
+                    )
+                    .await;
+            }
+
+            // Initiate combat
+            if let Err(e) = state.combat.initiate(player_id, &target_id).await {
+                return ServerMessage::Error {
+                    message: format!("Combat error: {}", e),
+                };
+            }
+
+            // Perform attack (basic 1d6 physical damage)
+            let attack_result = match state
+                .combat
+                .attack(player_id, &target_id, 6, DamageType::Physical)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    return ServerMessage::Error {
+                        message: format!("Attack failed: {}", e),
+                    };
+                }
+            };
+
+            // Build result message
+            let mut messages = Vec::new();
+
+            if attack_result.hit {
+                let damage = attack_result.damage.as_ref().map(|d| d.final_damage).unwrap_or(0);
+                if attack_result.critical {
+                    messages.push(format!(
+                        "CRITICAL HIT! You strike {} for {} damage!",
+                        target_display_name, damage
+                    ));
+                } else {
+                    messages.push(format!(
+                        "You hit {} for {} damage.",
+                        target_display_name, damage
+                    ));
+                }
+
+                // Check if target is dead
+                if state.combat.is_dead(&target_id).await {
+                    messages.push(format!("{} is slain!", target_display_name));
+
+                    // End combat and remove target from room
+                    state.combat.end_combat(player_id).await;
+                    state.combat.remove_entity(&target_id).await;
+
+                    // Remove NPC from room (set parent_id to None)
+                    if let Ok(Some(mut dead_target)) = state.object_store.get(&target_id).await {
+                        dead_target.parent_id = None;
+                        let _ = state.object_store.update(&dead_target).await;
+                    }
+                } else {
+                    // Show remaining HP
+                    if let Some(target_state) = state.combat.get_state(&target_id).await {
+                        messages.push(format!(
+                            "{} has {} HP remaining.",
+                            target_display_name, target_state.hp
+                        ));
+                    }
+                }
+            } else if attack_result.fumble {
+                messages.push(format!(
+                    "You fumble your attack against {}!",
+                    target_display_name
+                ));
+            } else {
+                messages.push(format!(
+                    "You miss {} (rolled {} vs AC {}).",
+                    target_display_name, attack_result.attack_total, attack_result.target_ac
+                ));
+            }
+
+            // Broadcast combat message to room
+            let combat_msg = ServerMessage::Output {
+                text: messages.join("\n"),
+            };
+            state
+                .connections
+                .broadcast_room(&room_id, combat_msg.clone())
+                .await;
+
+            combat_msg
         }
         _ => ServerMessage::Output {
             text: format!("Unknown command: {}", verb),

@@ -2,6 +2,7 @@ import { ThemeProvider } from './theme/ThemeProvider'
 import { useGameStore } from './store/gameStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { AuthScreen } from './components/AuthScreen'
+import { UniverseSelect } from './components/UniverseSelect'
 import { Terminal } from './components/Terminal'
 import { RoomPanel } from './components/RoomPanel'
 
@@ -57,11 +58,17 @@ function GameScreen() {
 
 export function App() {
   const isAuthenticated = useGameStore((s) => s.isAuthenticated)
+  const universe = useGameStore((s) => s.universe)
   const themeId = useGameStore((s) => s.themeId)
 
-  return (
-    <ThemeProvider themeId={themeId}>
-      {isAuthenticated ? <GameScreen /> : <AuthScreen />}
-    </ThemeProvider>
-  )
+  let content
+  if (!isAuthenticated) {
+    content = <AuthScreen />
+  } else if (!universe) {
+    content = <UniverseSelect />
+  } else {
+    content = <GameScreen />
+  }
+
+  return <ThemeProvider themeId={themeId}>{content}</ThemeProvider>
 }

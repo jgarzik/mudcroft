@@ -11,6 +11,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use serde::Serialize;
 use tokio::sync::RwLock;
 
+use crate::combat::CombatManager;
 use crate::credits::CreditManager;
 use crate::db::Database;
 use crate::images::ImageStore;
@@ -39,6 +40,7 @@ pub struct AppState {
     pub venice: Arc<VeniceClient>,
     pub image_store: Arc<ImageStore>,
     pub themes: Arc<ThemeRegistry>,
+    pub combat: Arc<CombatManager>,
 }
 
 /// Build the API router
@@ -66,6 +68,7 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
     let venice = Arc::new(VeniceClient::new());
     let image_store = Arc::new(ImageStore::new(db.pool().clone(), raft_writer.clone()));
     let themes = Arc::new(ThemeRegistry::new());
+    let combat = Arc::new(CombatManager::with_db(db.pool().clone()));
 
     // Load persisted data on startup
     if let Err(e) = timers.load_from_db().await {
@@ -76,6 +79,9 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
     }
     if let Err(e) = class_registry.load_from_db().await {
         tracing::warn!("Failed to load classes from database: {}", e);
+    }
+    if let Err(e) = combat.load_from_db().await {
+        tracing::warn!("Failed to load combat states from database: {}", e);
     }
 
     let classes = Arc::new(RwLock::new(class_registry));
@@ -94,6 +100,7 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
         venice,
         image_store,
         themes,
+        combat,
     };
 
     Router::new()

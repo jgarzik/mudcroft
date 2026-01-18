@@ -8,6 +8,7 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 interface AuthState {
   token: string | null
   username: string | null
+  universe: string | null
   isAuthenticated: boolean
 }
 
@@ -22,6 +23,7 @@ interface GameState {
 interface GameActions {
   // Auth
   login: (token: string, username: string) => void
+  setUniverse: (universe: string) => void
   logout: () => void
 
   // Game
@@ -43,6 +45,7 @@ export const useGameStore = create<GameStore>()(
       // Auth state
       token: null,
       username: null,
+      universe: null,
       isAuthenticated: false,
 
       // Game state
@@ -56,10 +59,14 @@ export const useGameStore = create<GameStore>()(
       login: (token, username) =>
         set({ token, username, isAuthenticated: true }),
 
+      setUniverse: (universe) =>
+        set({ universe }),
+
       logout: () =>
         set({
           token: null,
           username: null,
+          universe: null,
           isAuthenticated: false,
           messages: [],
           currentRoom: null,
