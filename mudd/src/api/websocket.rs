@@ -571,9 +571,53 @@ async fn execute_command(
             }
         }
         "help" => ServerMessage::Output {
-            text: "Commands: look, north/south/east/west, say <message>, attack <target>, eval <lua>, goto <room_id>, setportal [room_id], help"
+            text: "Commands: look, north/south/east/west, say <message>, get/take <item>, drop <item>, inventory/i, attack <target>, eval <lua>, goto <room_id>, setportal [room_id], help"
                 .to_string(),
         },
+        "get" | "take" => {
+            // Get item name from args
+            let item_name = if parts.len() > 1 {
+                parts[1..].join(" ")
+            } else {
+                return ServerMessage::Error {
+                    message: "Take what?".to_string(),
+                };
+            };
+
+            // Execute Commands.take() via Lua
+            let code = format!(
+                r#"local r = Commands.take("{}", "{}"); return r.message"#,
+                player_id.replace('"', r#"\""#),
+                item_name.replace('"', r#"\""#)
+            );
+            execute_lua(state, player_id, account_id, &code).await
+        }
+        "drop" => {
+            // Get item name from args
+            let item_name = if parts.len() > 1 {
+                parts[1..].join(" ")
+            } else {
+                return ServerMessage::Error {
+                    message: "Drop what?".to_string(),
+                };
+            };
+
+            // Execute Commands.drop() via Lua
+            let code = format!(
+                r#"local r = Commands.drop("{}", "{}"); return r.message"#,
+                player_id.replace('"', r#"\""#),
+                item_name.replace('"', r#"\""#)
+            );
+            execute_lua(state, player_id, account_id, &code).await
+        }
+        "inventory" | "inv" | "i" => {
+            // Execute Commands.inventory() via Lua
+            let code = format!(
+                r#"local r = Commands.inventory("{}"); return r.message"#,
+                player_id.replace('"', r#"\""#)
+            );
+            execute_lua(state, player_id, account_id, &code).await
+        }
         "goto" => {
             // Wizard+ only
             if access_level < AccessLevel::Wizard {

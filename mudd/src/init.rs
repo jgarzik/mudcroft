@@ -17,7 +17,8 @@ use crate::db::Database;
 /// * `path` - Path to the SQLite database file (must not exist)
 /// * `admin_username` - Username for the admin account
 /// * `admin_password` - Password for the admin account (must be >= 8 chars)
-/// * `libs` - Map of library name to Lua source code
+/// * `libs` - Map of library name to Lua source code (additional libs)
+/// * `core_lib_dir` - Optional path to core mudlib directory (defaults to "lib/")
 ///
 /// # Errors
 /// * Database file already exists
@@ -28,6 +29,7 @@ pub async fn init_database(
     admin_username: &str,
     admin_password: &str,
     libs: HashMap<String, String>,
+    core_lib_dir: Option<&Path>,
 ) -> Result<()> {
     // Fail if database already exists
     if path.exists() {
@@ -59,9 +61,46 @@ pub async fn init_database(
     service.set_access_level(&account.id, "admin").await?;
     info!("Promoted '{}' to admin level", admin_username);
 
-    // Store any provided Lua libraries
+    // Load and store core mudlib from lib/ directory
+    let lib_dir = core_lib_dir.unwrap_or(Path::new("lib"));
+    if lib_dir.exists() && lib_dir.is_dir() {
+        info!("Loading core mudlib from {}...", lib_dir.display());
+        let mut core_lib_count = 0;
+
+        for entry in std::fs::read_dir(lib_dir)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+
+            if entry_path.extension().map(|e| e == "lua").unwrap_or(false) {
+                let name = entry_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("Invalid lib filename"))?;
+
+                let source = std::fs::read_to_string(&entry_path)?;
+                let hash = store_code(db.pool(), &source).await?;
+
+                // Store the core lib hash mapping
+                store_core_lib_hash(db.pool(), name, &hash).await?;
+
+                info!("  {} -> {}", name, &hash[..12]);
+                core_lib_count += 1;
+            }
+        }
+
+        if core_lib_count > 0 {
+            info!("Loaded {} core mudlib files", core_lib_count);
+        }
+    } else {
+        info!(
+            "No core mudlib directory found at {} (skipping)",
+            lib_dir.display()
+        );
+    }
+
+    // Store any additional provided Lua libraries
     if !libs.is_empty() {
-        info!("Storing {} Lua library files...", libs.len());
+        info!("Storing {} additional Lua library files...", libs.len());
         for (name, source) in &libs {
             let hash = store_code(db.pool(), source).await?;
             info!("  {} -> {}", name, &hash[..12]);
@@ -90,6 +129,20 @@ async fn store_code(pool: &sqlx::SqlitePool, source: &str) -> Result<String> {
     Ok(hash)
 }
 
+/// Store a core lib hash mapping in core_lib_hashes table
+async fn store_core_lib_hash(pool: &sqlx::SqlitePool, name: &str, hash: &str) -> Result<()> {
+    let updated_at = chrono::Utc::now().to_rfc3339();
+
+    sqlx::query("INSERT OR REPLACE INTO core_lib_hashes (name, hash, updated_at) VALUES (?, ?, ?)")
+        .bind(name)
+        .bind(hash)
+        .bind(&updated_at)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,7 +153,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        init_database(&db_path, "admin", "password123", HashMap::new())
+        init_database(&db_path, "admin", "password123", HashMap::new(), None)
             .await
             .unwrap();
 
@@ -120,12 +173,12 @@ mod tests {
         let db_path = temp_dir.path().join("test.db");
 
         // Create first
-        init_database(&db_path, "admin", "password123", HashMap::new())
+        init_database(&db_path, "admin", "password123", HashMap::new(), None)
             .await
             .unwrap();
 
         // Try again - should fail
-        let result = init_database(&db_path, "admin", "password123", HashMap::new()).await;
+        let result = init_database(&db_path, "admin", "password123", HashMap::new(), None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
     }
@@ -135,7 +188,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let result = init_database(&db_path, "admin", "short", HashMap::new()).await;
+        let result = init_database(&db_path, "admin", "short", HashMap::new(), None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("8 characters"));
     }
@@ -144,15 +197,23 @@ mod tests {
     async fn test_init_database_with_libs() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
+        // Use a non-existent path for core_lib_dir so no core libs are loaded
+        let empty_lib_dir = temp_dir.path().join("no_libs");
 
         let mut libs = HashMap::new();
         libs.insert("test".to_string(), "-- Test lib\nreturn {}".to_string());
 
-        init_database(&db_path, "admin", "password123", libs)
-            .await
-            .unwrap();
+        init_database(
+            &db_path,
+            "admin",
+            "password123",
+            libs,
+            Some(empty_lib_dir.as_path()),
+        )
+        .await
+        .unwrap();
 
-        // Verify lib was stored
+        // Verify lib was stored (only the additional lib, no core libs)
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM code_store")
             .fetch_one(db.pool())

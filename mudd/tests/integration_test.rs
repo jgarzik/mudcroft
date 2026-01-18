@@ -1061,10 +1061,12 @@ async fn test_path_grants_persistence() {
         // Wizard can grant any path
         let wizard_ctx = UserContext::wizard(grantor_id, universe_id);
 
-        perms.grant_path(&wizard_ctx, grantee_id, universe_id, "/d/forest", true)
+        perms
+            .grant_path(&wizard_ctx, grantee_id, universe_id, "/d/forest", true)
             .await
             .expect("Failed to grant forest path");
-        perms.grant_path(&wizard_ctx, grantee_id, universe_id, "/d/dungeon", false)
+        perms
+            .grant_path(&wizard_ctx, grantee_id, universe_id, "/d/dungeon", false)
             .await
             .expect("Failed to grant dungeon path");
 
@@ -1088,19 +1090,21 @@ async fn test_path_grants_persistence() {
             .expect("Failed to load path grants");
 
         let grants = perms.get_path_grants(grantee_id, universe_id).await;
-        assert_eq!(
-            grants.len(),
-            2,
-            "Both path grants should persist"
-        );
+        assert_eq!(grants.len(), 2, "Both path grants should persist");
 
         let forest_grant = grants.iter().find(|g| g.path_prefix == "/d/forest");
         assert!(forest_grant.is_some(), "/d/forest grant should persist");
-        assert!(forest_grant.unwrap().can_delegate, "/d/forest should have can_delegate=true");
+        assert!(
+            forest_grant.unwrap().can_delegate,
+            "/d/forest should have can_delegate=true"
+        );
 
         let dungeon_grant = grants.iter().find(|g| g.path_prefix == "/d/dungeon");
         assert!(dungeon_grant.is_some(), "/d/dungeon grant should persist");
-        assert!(!dungeon_grant.unwrap().can_delegate, "/d/dungeon should have can_delegate=false");
+        assert!(
+            !dungeon_grant.unwrap().can_delegate,
+            "/d/dungeon should have can_delegate=false"
+        );
     }
 }
 

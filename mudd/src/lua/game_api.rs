@@ -957,7 +957,9 @@ impl GameApi {
             let result = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    permissions.can_access_path(&user_id, &universe_id, &path).await
+                    permissions
+                        .can_access_path(&user_id, &universe_id, &path)
+                        .await
                 })
             })
             .join()

@@ -54,10 +54,15 @@ impl TestServer {
         let mudd_path = find_binary_path("mudd")?;
         let init_path = find_binary_path("mudd_init")?;
 
-        // Run mudd_init to create the database
+        // Find the core mudlib directory (lib/ relative to mudd crate root)
+        let lib_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+
+        // Run mudd_init to create the database with core mudlib
         let init_status = Command::new(&init_path)
             .arg("--database")
             .arg(db_path.to_string_lossy().as_ref())
+            .arg("--lib-dir")
+            .arg(lib_dir.to_string_lossy().as_ref())
             .env("MUDD_ADMIN_USERNAME", "test_admin")
             .env("MUDD_ADMIN_PASSWORD", "testpass123")
             .stdout(Stdio::piped())
@@ -266,15 +271,21 @@ impl TestServer {
 }
 
 /// Find a binary path by name (e.g., "mudd" or "mudd_init")
+/// Uses the same build profile as the test: debug for `cargo test`, release for `cargo test --release`
 fn find_binary_path(name: &str) -> Result<PathBuf> {
-    // Check common locations
+    // Match the build profile of the test runner
+    #[cfg(debug_assertions)]
     let candidates = [
-        // Debug build (most common for tests)
+        // Debug build (matches `cargo test`)
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/debug/{}", name)),
-        // Release build
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/release/{}", name)),
         // Workspace root debug
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../target/debug/{}", name)),
+    ];
+
+    #[cfg(not(debug_assertions))]
+    let candidates = [
+        // Release build (matches `cargo test --release`)
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/release/{}", name)),
         // Workspace root release
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../target/release/{}", name)),
     ];
@@ -285,9 +296,15 @@ fn find_binary_path(name: &str) -> Result<PathBuf> {
         }
     }
 
+    #[cfg(debug_assertions)]
+    let build_cmd = "cargo build";
+    #[cfg(not(debug_assertions))]
+    let build_cmd = "cargo build --release";
+
     anyhow::bail!(
-        "Could not find {} binary. Run 'cargo build' first. Searched: {:?}",
+        "Could not find {} binary. Run '{}' first. Searched: {:?}",
         name,
+        build_cmd,
         candidates
     )
 }

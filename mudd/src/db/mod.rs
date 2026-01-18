@@ -285,11 +285,10 @@ impl Database {
 
         // Add owner_id column to objects if not exists (migration)
         // SQLite doesn't have IF NOT EXISTS for ALTER TABLE, so we check manually
-        let has_owner_id: Option<(String,)> = sqlx::query_as(
-            "SELECT name FROM pragma_table_info('objects') WHERE name = 'owner_id'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let has_owner_id: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('objects') WHERE name = 'owner_id'")
+                .fetch_optional(&self.pool)
+                .await?;
 
         if has_owner_id.is_none() {
             sqlx::query("ALTER TABLE objects ADD COLUMN owner_id TEXT REFERENCES accounts(id)")
@@ -419,6 +418,20 @@ impl Database {
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY (universe_id, key)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Core lib hashes table (maps lib name to content hash)
+        // This stores the canonical mudlib version loaded at init time
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS core_lib_hashes (
+                name TEXT PRIMARY KEY,
+                hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
             "#,
         )

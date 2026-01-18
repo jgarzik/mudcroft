@@ -500,10 +500,7 @@ impl PermissionManager {
             raft_writer
                 .execute(
                     "DELETE FROM path_grants WHERE id = ? AND universe_id = ?",
-                    vec![
-                        serde_json::json!(grant_id),
-                        serde_json::json!(universe_id),
-                    ],
+                    vec![serde_json::json!(grant_id), serde_json::json!(universe_id)],
                 )
                 .await?;
         } else if let Some(ref pool) = self.db_pool {
@@ -751,7 +748,11 @@ impl PermissionManager {
     }
 
     /// Check permission to create an object at a path
-    pub fn check_create_permission(&self, user: &UserContext, object_path: &str) -> PermissionResult {
+    pub fn check_create_permission(
+        &self,
+        user: &UserContext,
+        object_path: &str,
+    ) -> PermissionResult {
         // Wizard+ bypass
         if user.access_level >= AccessLevel::Wizard {
             return PermissionResult::Allowed;

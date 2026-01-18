@@ -21,7 +21,11 @@ struct Args {
     #[arg(short, long)]
     database: PathBuf,
 
-    /// Lua library files to store (can be specified multiple times)
+    /// Core mudlib directory containing *.lua files (default: lib/)
+    #[arg(long = "lib-dir")]
+    lib_dir: Option<PathBuf>,
+
+    /// Additional Lua library files to store (can be specified multiple times)
     #[arg(long = "lib")]
     libs: Vec<PathBuf>,
 }
@@ -47,7 +51,7 @@ async fn main() -> Result<()> {
     let admin_password = std::env::var("MUDD_ADMIN_PASSWORD")
         .map_err(|_| anyhow::anyhow!("MUDD_ADMIN_PASSWORD environment variable is required"))?;
 
-    // Load Lua library files
+    // Load additional Lua library files
     let mut libs = HashMap::new();
     for lib_path in &args.libs {
         if !lib_path.exists() {
@@ -66,8 +70,15 @@ async fn main() -> Result<()> {
         libs.insert(name, source);
     }
 
-    // Initialize the database
-    mudd::init::init_database(&args.database, &admin_username, &admin_password, libs).await?;
+    // Initialize the database (core libs loaded from lib_dir, defaults to "lib/")
+    mudd::init::init_database(
+        &args.database,
+        &admin_username,
+        &admin_password,
+        libs,
+        args.lib_dir.as_deref(),
+    )
+    .await?;
 
     Ok(())
 }

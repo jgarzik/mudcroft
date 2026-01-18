@@ -453,6 +453,29 @@ impl ObjectStore {
         self.set_universe_setting(universe_id, "portal_room_id", room_id)
             .await
     }
+
+    /// Get all core lib hashes (canonical mudlib versions)
+    pub async fn get_core_lib_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, hash FROM core_lib_hashes")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Store a core lib hash (used during init)
+    pub async fn store_core_lib_hash(&self, name: &str, hash: &str) -> Result<()> {
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        self.execute_write(
+            "INSERT OR REPLACE INTO core_lib_hashes (name, hash, updated_at) VALUES (?, ?, ?)",
+            vec![
+                serde_json::json!(name),
+                serde_json::json!(hash),
+                serde_json::json!(&updated_at),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// Row type for SQLite queries

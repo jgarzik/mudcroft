@@ -99,23 +99,18 @@ impl TestWorld {
             .execute(server.pool())
             .await?;
 
-        // Create test universe via API with DNS-style ID
+        // Create test universe directly via store (with core lib hashes)
         let universe_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let universe_resp = server
-            .post(
-                "/universe/create",
-                &json!({
-                    "id": universe_id,
-                    "name": "Test Universe",
-                    "owner_id": wizard_account_id
-                }),
-            )
-            .await?;
 
-        if !universe_resp.status().is_success() {
-            let body = universe_resp.text().await?;
-            anyhow::bail!("Failed to create test universe: {}", body);
-        }
+        // Get core lib hashes to include in universe config
+        let core_lib_hashes = store.get_core_lib_hashes().await?;
+        let config = json!({
+            "lib_hashes": core_lib_hashes
+        });
+
+        store
+            .create_universe(&universe_id, "Test Universe", &wizard_account_id, config)
+            .await?;
 
         // Create test region
         let mut region = Object::new("/regions/test-region", &universe_id, "region")?;

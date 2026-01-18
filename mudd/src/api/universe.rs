@@ -21,7 +21,10 @@ use crate::permissions::AccessLevel;
 use crate::universe::validate_universe_id;
 
 /// Extract and validate bearer token from Authorization header
-async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Account, (StatusCode, Json<ErrorResponse>)> {
+async fn authenticate(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<Account, (StatusCode, Json<ErrorResponse>)> {
     let auth_header = headers
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
@@ -34,16 +37,15 @@ async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Account, 
             )
         })?;
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "Invalid Authorization header format (expected 'Bearer <token>')".to_string(),
-                }),
-            )
-        })?;
+    let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Invalid Authorization header format (expected 'Bearer <token>')"
+                    .to_string(),
+            }),
+        )
+    })?;
 
     let service = AccountService::new(state.db.pool().clone());
     service
@@ -139,10 +141,7 @@ pub fn router() -> Router<AppState> {
 
 /// GET /universe/list
 /// Returns a list of all available universes (requires authentication)
-async fn list_universes(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn list_universes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Require authenticated user
     if let Err(e) = authenticate(&headers, &state).await {
         return e.into_response();
@@ -197,10 +196,17 @@ async fn process_universe_request(
     let universe_id =
         validate_universe_id(&request.id).map_err(|e| format!("Invalid universe ID: {}", e))?;
 
-    // Store libs and collect hashes
-    let mut lib_hashes: HashMap<String, String> = HashMap::new();
-    let mut libs_loaded = Vec::new();
+    // Start with core lib hashes as defaults
+    let mut lib_hashes: HashMap<String, String> = state
+        .object_store
+        .get_core_lib_hashes()
+        .await
+        .map_err(|e| format!("Failed to get core lib hashes: {}", e))?;
 
+    let mut libs_loaded: Vec<String> = lib_hashes.keys().cloned().collect();
+    libs_loaded.sort(); // Deterministic ordering
+
+    // Store request libs and merge (request libs override core libs)
     for (name, source) in &request.libs {
         let hash = state
             .object_store
@@ -208,8 +214,12 @@ async fn process_universe_request(
             .await
             .map_err(|e| format!("Failed to store lib {}: {}", name, e))?;
 
+        // If this is a new lib (not overriding core), add to libs_loaded
+        if !lib_hashes.contains_key(name) {
+            libs_loaded.push(name.clone());
+        }
+
         lib_hashes.insert(name.clone(), hash);
-        libs_loaded.push(name.clone());
     }
 
     // Build final config with lib hashes
@@ -330,10 +340,17 @@ async fn create_universe_from_zip(
     let universe_id = validate_universe_id(&universe_config.id)
         .map_err(|e| format!("Invalid universe ID: {}", e))?;
 
-    // Store Lua files and collect hashes (async)
-    let mut lib_hashes: HashMap<String, String> = HashMap::new();
-    let mut libs_loaded = Vec::new();
+    // Start with core lib hashes as defaults
+    let mut lib_hashes: HashMap<String, String> = state
+        .object_store
+        .get_core_lib_hashes()
+        .await
+        .map_err(|e| format!("Failed to get core lib hashes: {}", e))?;
 
+    let mut libs_loaded: Vec<String> = lib_hashes.keys().cloned().collect();
+    libs_loaded.sort(); // Deterministic ordering
+
+    // Store ZIP Lua files and merge (ZIP libs override core libs)
     for (name, source) in lua_files {
         let hash = state
             .object_store
@@ -341,8 +358,12 @@ async fn create_universe_from_zip(
             .await
             .map_err(|e| format!("Failed to store {}: {}", name, e))?;
 
-        lib_hashes.insert(name.clone(), hash);
-        libs_loaded.push(name);
+        // If this is a new lib (not overriding core), add to libs_loaded
+        if !lib_hashes.contains_key(&name) {
+            libs_loaded.push(name.clone());
+        }
+
+        lib_hashes.insert(name, hash);
     }
 
     // Build final config with lib hashes
