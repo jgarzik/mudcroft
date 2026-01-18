@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { useGameStore } from '../store/gameStore'
 
 interface Universe {
@@ -16,16 +16,27 @@ export function UniverseSelect() {
   const setUniverse = useGameStore((s) => s.setUniverse)
   const logout = useGameStore((s) => s.logout)
   const username = useGameStore((s) => s.username)
+  const token = useGameStore((s) => s.token)
 
   useEffect(() => {
     fetchUniverses()
-  }, [])
+  }, [token])
 
   const fetchUniverses = async () => {
+    if (!token) {
+      setError('Not authenticated')
+      setLoading(false)
+      return
+    }
     try {
-      const response = await fetch('/universe/list')
+      const response = await fetch('/universe/list', {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      })
       if (!response.ok) {
-        throw new Error('Failed to fetch universes')
+        const errData = await response.json().catch(() => ({}))
+        throw new Error(errData.error || 'Failed to fetch universes')
       }
       const data: Universe[] = await response.json()
       setUniverses(data)

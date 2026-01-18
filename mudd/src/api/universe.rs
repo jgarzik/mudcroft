@@ -6,7 +6,7 @@ use std::io::{Cursor, Read};
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -15,8 +15,65 @@ use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use super::AppState;
+use crate::auth::accounts::{Account, AccountService};
 use crate::lua::{GameApi, Sandbox, SandboxConfig};
+use crate::permissions::AccessLevel;
 use crate::universe::validate_universe_id;
+
+/// Extract and validate bearer token from Authorization header
+async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Account, (StatusCode, Json<ErrorResponse>)> {
+    let auth_header = headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Missing Authorization header".to_string(),
+                }),
+            )
+        })?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Invalid Authorization header format (expected 'Bearer <token>')".to_string(),
+                }),
+            )
+        })?;
+
+    let service = AccountService::new(state.db.pool().clone());
+    service
+        .validate_token(token)
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Invalid or expired token".to_string(),
+                }),
+            )
+        })
+}
+
+/// Check if account has admin access
+fn require_admin(account: &Account) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let level: AccessLevel = account.access_level.parse().unwrap_or_default();
+    if !level.can_admin() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Admin access required".to_string(),
+            }),
+        ));
+    }
+    Ok(())
+}
 
 /// Universe creation request - JSON with libs as code strings
 #[derive(Debug, Deserialize)]
@@ -81,8 +138,16 @@ pub fn router() -> Router<AppState> {
 }
 
 /// GET /universe/list
-/// Returns a list of all available universes
-async fn list_universes(State(state): State<AppState>) -> impl IntoResponse {
+/// Returns a list of all available universes (requires authentication)
+async fn list_universes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Require authenticated user
+    if let Err(e) = authenticate(&headers, &state).await {
+        return e.into_response();
+    }
+
     match state.object_store.list_universes().await {
         Ok(universes) => {
             let items: Vec<UniverseListItem> = universes
@@ -102,11 +167,21 @@ async fn list_universes(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /universe/create
-/// Accepts JSON with universe config and optional Lua libraries
+/// Accepts JSON with universe config and optional Lua libraries (requires admin)
 async fn create_universe(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<UniverseCreateRequest>,
 ) -> impl IntoResponse {
+    // Require admin access
+    let account = match authenticate(&headers, &state).await {
+        Ok(acc) => acc,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_admin(&account) {
+        return e.into_response();
+    }
+
     match process_universe_request(request, &state).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
@@ -162,8 +237,21 @@ async fn process_universe_request(
 }
 
 /// POST /universe/upload
-/// Accepts ZIP file with universe.json and Lua libraries
-async fn upload_universe(State(state): State<AppState>, body: Bytes) -> axum::response::Response {
+/// Accepts ZIP file with universe.json and Lua libraries (requires admin)
+async fn upload_universe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    // Require admin access
+    let account = match authenticate(&headers, &state).await {
+        Ok(acc) => acc,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_admin(&account) {
+        return e.into_response();
+    }
+
     match create_universe_from_zip(&body, &state).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
@@ -288,14 +376,22 @@ async fn create_universe_from_zip(
 
 /// POST /universe/:id/run_script
 /// Run a Lua script file from the scripts/ directory in the context of a universe
+/// Requires admin access OR universe ownership
 async fn run_script(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(universe_id): Path<String>,
     Json(request): Json<RunScriptRequest>,
 ) -> impl IntoResponse {
-    // Validate universe exists
-    match state.object_store.get_universe(&universe_id).await {
-        Ok(Some(_)) => {}
+    // Require authentication
+    let account = match authenticate(&headers, &state).await {
+        Ok(acc) => acc,
+        Err(e) => return e.into_response(),
+    };
+
+    // Validate universe exists and check ownership
+    let universe = match state.object_store.get_universe(&universe_id).await {
+        Ok(Some(u)) => u,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -314,6 +410,19 @@ async fn run_script(
             )
                 .into_response();
         }
+    };
+
+    // Must be admin OR universe owner
+    let level: AccessLevel = account.access_level.parse().unwrap_or_default();
+    let is_owner = universe.owner_id == account.id;
+    if !level.can_admin() && !is_owner {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Admin access or universe ownership required".to_string(),
+            }),
+        )
+            .into_response();
     }
 
     // Security: only allow scripts from the scripts/ directory, no path traversal
