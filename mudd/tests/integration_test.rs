@@ -95,7 +95,7 @@ async fn test_object_crud() {
     let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create
-    let mut obj = Object::new(&universe_id, "sword");
+    let mut obj = Object::new("/items/excalibur", &universe_id, "sword").unwrap();
     obj.set_property("name", serde_json::json!("Excalibur"));
     obj.set_property("damage_dice", serde_json::json!("2d6"));
 
@@ -141,17 +141,17 @@ async fn test_object_hierarchy() {
     let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create a room
-    let mut room = Object::new(&universe_id, "room");
+    let mut room = Object::new("/rooms/town-square", &universe_id, "room").unwrap();
     room.set_property("name", serde_json::json!("Town Square"));
     store.create(&room).await.expect("Failed to create room");
 
     // Create items in the room
-    let mut sword = Object::new(&universe_id, "sword");
+    let mut sword = Object::new("/items/rusty-sword", &universe_id, "sword").unwrap();
     sword.set_property("name", serde_json::json!("Rusty Sword"));
     sword.parent_id = Some(room.id.clone());
     store.create(&sword).await.expect("Failed to create sword");
 
-    let mut shield = Object::new(&universe_id, "armor");
+    let mut shield = Object::new("/items/wooden-shield", &universe_id, "armor").unwrap();
     shield.set_property("name", serde_json::json!("Wooden Shield"));
     shield.parent_id = Some(room.id.clone());
     store
@@ -240,17 +240,17 @@ async fn test_find_by_name() {
     let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create a room
-    let mut room = Object::new(&universe_id, "room");
+    let mut room = Object::new("/rooms/test-room", &universe_id, "room").unwrap();
     room.set_property("name", serde_json::json!("Test Room"));
     store.create(&room).await.unwrap();
 
     // Create objects in room
-    let mut sword = Object::new(&universe_id, "sword");
+    let mut sword = Object::new("/items/magic-sword", &universe_id, "sword").unwrap();
     sword.set_property("name", serde_json::json!("Magic Sword"));
     sword.parent_id = Some(room.id.clone());
     store.create(&sword).await.unwrap();
 
-    let mut key = Object::new(&universe_id, "item");
+    let mut key = Object::new("/items/golden-key", &universe_id, "item").unwrap();
     key.set_property("name", serde_json::json!("Golden Key"));
     key.parent_id = Some(room.id.clone());
     store.create(&key).await.unwrap();
@@ -281,11 +281,11 @@ async fn test_room_exits() {
     let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create two rooms
-    let mut room1 = Object::new(&universe_id, "room");
+    let mut room1 = Object::new("/rooms/town-square2", &universe_id, "room").unwrap();
     room1.set_property("name", serde_json::json!("Town Square"));
     store.create(&room1).await.unwrap();
 
-    let mut room2 = Object::new(&universe_id, "room");
+    let mut room2 = Object::new("/rooms/market", &universe_id, "room").unwrap();
     room2.set_property("name", serde_json::json!("Market"));
     store.create(&room2).await.unwrap();
 
@@ -321,12 +321,12 @@ async fn test_environment_query() {
     let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create room
-    let mut room = Object::new(&universe_id, "room");
+    let mut room = Object::new("/rooms/test-room3", &universe_id, "room").unwrap();
     room.set_property("name", serde_json::json!("Test Room"));
     store.create(&room).await.unwrap();
 
     // Create player in room
-    let mut player = Object::new(&universe_id, "player");
+    let mut player = Object::new("/players/alice", &universe_id, "player").unwrap();
     player.set_property("name", serde_json::json!("Alice"));
     player.parent_id = Some(room.id.clone());
     store.create(&player).await.unwrap();
@@ -352,24 +352,24 @@ async fn test_get_living_in() {
     let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create room
-    let mut room = Object::new(&universe_id, "room");
+    let mut room = Object::new("/rooms/arena2", &universe_id, "room").unwrap();
     room.set_property("name", serde_json::json!("Arena"));
     store.create(&room).await.unwrap();
 
     // Create player in room
-    let mut player = Object::new(&universe_id, "player");
+    let mut player = Object::new("/players/hero", &universe_id, "player").unwrap();
     player.set_property("name", serde_json::json!("Hero"));
     player.parent_id = Some(room.id.clone());
     store.create(&player).await.unwrap();
 
     // Create NPC in room
-    let mut npc = Object::new(&universe_id, "npc");
+    let mut npc = Object::new("/npcs/goblin", &universe_id, "npc").unwrap();
     npc.set_property("name", serde_json::json!("Goblin"));
     npc.parent_id = Some(room.id.clone());
     store.create(&npc).await.unwrap();
 
     // Create item in room (not living)
-    let mut sword = Object::new(&universe_id, "sword");
+    let mut sword = Object::new("/items/rusty-sword2", &universe_id, "sword").unwrap();
     sword.set_property("name", serde_json::json!("Rusty Sword"));
     sword.parent_id = Some(room.id.clone());
     store.create(&sword).await.unwrap();
@@ -394,18 +394,18 @@ async fn test_player_movement() {
     let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create two connected rooms
-    let mut room1 = Object::new(&universe_id, "room");
+    let mut room1 = Object::new("/rooms/start", &universe_id, "room").unwrap();
     room1.set_property("name", serde_json::json!("Start"));
     store.create(&room1).await.unwrap();
 
-    let mut room2 = Object::new(&universe_id, "room");
+    let mut room2 = Object::new("/rooms/end", &universe_id, "room").unwrap();
     room2.set_property("name", serde_json::json!("End"));
     store.create(&room2).await.unwrap();
 
     store.set_exit(&room1.id, "east", &room2.id).await.unwrap();
 
     // Create player in room1
-    let mut player = Object::new(&universe_id, "player");
+    let mut player = Object::new("/players/adventurer", &universe_id, "player").unwrap();
     player.set_property("name", serde_json::json!("Adventurer"));
     player.parent_id = Some(room1.id.clone());
     store.create(&player).await.unwrap();
@@ -1237,7 +1237,8 @@ async fn test_eval_create_object() {
         .expect("Failed to connect as wizard");
 
     // Create an object via Lua and return just the id
-    wizard.command("eval local obj = game.create_object('item', nil, {name = 'Test Sword'}); return obj and obj.id or 'no object'").await.expect("eval should succeed");
+    // New API: game.create_object(path, class, parent_id, props)
+    wizard.command("eval local obj = game.create_object('/items/test-sword', 'item', nil, {name = 'Test Sword'}); return obj and obj.id or (obj and obj.error or 'no object')").await.expect("eval should succeed");
 
     // Skip the echo message
     let echo = wizard.expect("echo").await.expect("should receive echo");
@@ -1257,9 +1258,9 @@ async fn test_eval_create_object() {
     );
     let obj_id = output["text"].as_str().expect("should have text");
     assert!(!obj_id.is_empty(), "Object ID should not be empty");
-    // UUID is 36 chars (with dashes) or could be "no object" if failed
+    // Path-based ID should start with '/' or could be "no object" or error message if failed
     assert!(
-        obj_id != "no object",
+        obj_id.starts_with('/'),
         "Object creation failed: got '{}'",
         obj_id
     );

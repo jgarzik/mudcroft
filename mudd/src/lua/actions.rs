@@ -3,7 +3,7 @@
 //! Objects can register actions (verbs) that players can use when in context.
 //! For example, a lever might add a "pull" action when a player enters the room.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -23,9 +23,9 @@ pub struct Action {
 #[derive(Debug, Default)]
 pub struct ActionRegistry {
     /// Room-scoped actions: room_id -> verb -> list of actions
-    room_actions: RwLock<HashMap<String, HashMap<String, Vec<Action>>>>,
+    room_actions: RwLock<BTreeMap<String, BTreeMap<String, Vec<Action>>>>,
     /// Object-scoped actions: object_id -> verb -> action (for inventory items)
-    object_actions: RwLock<HashMap<String, HashMap<String, Action>>>,
+    object_actions: RwLock<BTreeMap<String, BTreeMap<String, Action>>>,
 }
 
 impl ActionRegistry {

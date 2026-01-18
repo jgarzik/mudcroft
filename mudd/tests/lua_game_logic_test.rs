@@ -48,9 +48,10 @@ function Test.assert_eq(a, b, msg)
 end
 
 -- Test 1: Basic object creation
+-- New API: game.create_object(path, class, parent_id, props)
 local function test_basic_object()
-    local obj = game.create_object("item", nil, {name = "Test Sword", description = "A test item"})
-    Test.assert(obj ~= nil, "Object should be created")
+    local obj = game.create_object("/items/test-sword", "item", nil, {name = "Test Sword", description = "A test item"})
+    Test.assert(obj ~= nil and obj.error == nil, "Object should be created")
     Test.assert_eq(obj.name, "Test Sword", "Object name should match")
     Test.assert_eq(obj.class, "item", "Object class should be item")
     return obj
@@ -58,7 +59,7 @@ end
 
 -- Test 2: Get object
 local function test_get_object()
-    local obj = game.create_object("item", nil, {name = "Retrieval Test"})
+    local obj = game.create_object("/items/retrieval-test", "item", nil, {name = "Retrieval Test"})
     local retrieved = game.get_object(obj.id)
     Test.assert(retrieved ~= nil, "Should retrieve object")
     Test.assert_eq(retrieved.name, "Retrieval Test", "Retrieved name should match")
@@ -66,7 +67,7 @@ end
 
 -- Test 3: Update object
 local function test_update_object()
-    local obj = game.create_object("item", nil, {name = "Update Test"})
+    local obj = game.create_object("/items/update-test", "item", nil, {name = "Update Test"})
     local success = game.update_object(obj.id, {description = "Updated description"})
     Test.assert(success, "Update should succeed")
     local updated = game.get_object(obj.id)
@@ -75,7 +76,7 @@ end
 
 -- Test 4: Delete object
 local function test_delete_object()
-    local obj = game.create_object("item", nil, {name = "Delete Test"})
+    local obj = game.create_object("/items/delete-test", "item", nil, {name = "Delete Test"})
     local deleted = game.delete_object(obj.id)
     Test.assert(deleted, "Delete should succeed")
     local gone = game.get_object(obj.id)
@@ -84,8 +85,8 @@ end
 
 -- Test 5: Parent/child relationships
 local function test_parent_child()
-    local parent = game.create_object("room", nil, {name = "Parent Room"})
-    local child = game.create_object("item", parent.id, {name = "Child Item"})
+    local parent = game.create_object("/rooms/parent-room", "room", nil, {name = "Parent Room"})
+    local child = game.create_object("/items/child-item", "item", parent.id, {name = "Child Item"})
     Test.assert_eq(child.parent_id, parent.id, "Child should have parent_id set")
 
     local children = game.get_children(parent.id)
@@ -94,9 +95,9 @@ end
 
 -- Test 6: Move object
 local function test_move_object()
-    local room1 = game.create_object("room", nil, {name = "Room 1"})
-    local room2 = game.create_object("room", nil, {name = "Room 2"})
-    local item = game.create_object("item", room1.id, {name = "Movable Item"})
+    local room1 = game.create_object("/rooms/room1", "room", nil, {name = "Room 1"})
+    local room2 = game.create_object("/rooms/room2", "room", nil, {name = "Room 2"})
+    local item = game.create_object("/items/movable-item", "item", room1.id, {name = "Movable Item"})
 
     game.move_object(item.id, room2.id)
     local moved = game.get_object(item.id)

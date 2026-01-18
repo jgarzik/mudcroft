@@ -100,7 +100,7 @@ impl TestWorld {
             .await?;
 
         // Create test universe via API with DNS-style ID
-        let universe_id = format!("test-{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+        let universe_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let universe_resp = server
             .post(
                 "/universe/create",
@@ -118,14 +118,14 @@ impl TestWorld {
         }
 
         // Create test region
-        let mut region = Object::new(&universe_id, "region");
+        let mut region = Object::new("/regions/test-region", &universe_id, "region")?;
         region.set_property("name", json!("Test Region"));
         region.set_property("description", json!("A region for testing"));
         store.create(&region).await?;
         let region_id = region.id.clone();
 
         // Create spawn room
-        let mut spawn_room = Object::new(&universe_id, "room");
+        let mut spawn_room = Object::new("/rooms/spawn-room", &universe_id, "room")?;
         spawn_room.parent_id = Some(region_id.clone());
         spawn_room.set_property("name", json!("Spawn Room"));
         spawn_room.set_property(
@@ -136,7 +136,7 @@ impl TestWorld {
         let spawn_room_id = spawn_room.id.clone();
 
         // Create arena room (PvP enabled)
-        let mut arena_room = Object::new(&universe_id, "room");
+        let mut arena_room = Object::new("/rooms/arena", &universe_id, "room")?;
         arena_room.parent_id = Some(region_id.clone());
         arena_room.set_property("name", json!("Arena"));
         arena_room.set_property(
@@ -176,7 +176,10 @@ impl TestWorld {
 
     /// Create a new room in the test region
     pub async fn create_room(&self, name: &str, description: &str) -> Result<String> {
-        let mut room = Object::new(&self.universe_id, "room");
+        // Generate path from name (lowercase, spaces to hyphens)
+        let path_name = name.to_lowercase().replace(' ', "-");
+        let path = format!("/rooms/{}", path_name);
+        let mut room = Object::new(&path, &self.universe_id, "room")?;
         room.parent_id = Some(self.region_id.clone());
         room.set_property("name", json!(name));
         room.set_property("description", json!(description));
@@ -186,7 +189,10 @@ impl TestWorld {
 
     /// Create an item in a specific location
     pub async fn create_item(&self, class: &str, name: &str, location: &str) -> Result<String> {
-        let mut item = Object::new(&self.universe_id, class);
+        // Generate path from class and name
+        let path_name = name.to_lowercase().replace(' ', "-");
+        let path = format!("/items/{}", path_name);
+        let mut item = Object::new(&path, &self.universe_id, class)?;
         item.parent_id = Some(location.to_string());
         item.set_property("name", json!(name));
         self.store.create(&item).await?;
@@ -195,7 +201,10 @@ impl TestWorld {
 
     /// Create an NPC in a specific location
     pub async fn create_npc(&self, name: &str, location: &str) -> Result<String> {
-        let mut npc = Object::new(&self.universe_id, "npc");
+        // Generate path from name
+        let path_name = name.to_lowercase().replace(' ', "-");
+        let path = format!("/npcs/{}", path_name);
+        let mut npc = Object::new(&path, &self.universe_id, "npc")?;
         npc.parent_id = Some(location.to_string());
         npc.set_property("name", json!(name));
         npc.set_property("health", json!(100));

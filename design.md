@@ -826,15 +826,15 @@ end
 
 ### Inheritance Resolution
 
-When `game.create_object("fire_sword", room.id, props)` is called:
+When `game.create_object("/items/fire-sword-1", "fire_sword", room.id, props)` is called:
 
 1. **Property resolution:** Merge defaults from chain (thing → item → weapon → sword → fire_sword)
 2. **Handler resolution:** Each handler checks parent chain at runtime via `parent()`
 3. **Instance creation:** Store merged properties + class reference in SQLite
 
 ```lua
--- Creating an instance
-local flaming = game.create_object("fire_sword", room.id, {
+-- Creating an instance with path-based ID
+local flaming = game.create_object("/items/inferno-blade", "fire_sword", room.id, {
     name = "Inferno Blade",
     description = "A sword wreathed in eternal flames.",
     metadata = {
@@ -1007,8 +1007,8 @@ Per-bot: 60 Venice calls/min
 
 ```lua
 game.get_object(id) -> object
-game.create_object(class, parent_id, props) -> object
-game.clone_object(obj_id, new_parent_id) -> object  -- Copy from existing
+game.create_object(path, class, parent_id, props) -> object  -- Path-based ID (e.g., "/items/sword")
+game.clone_object(obj_id, new_path, new_parent_id) -> object  -- Copy with new path
 game.update_object(id, changes)
 game.delete_object(id)
 game.move_object(id, new_parent_id)  -- Triggers init() cascade
@@ -2128,7 +2128,7 @@ fn test_game_random_is_deterministic() {
 
 **Tasks**:
 - Implement `MutationCollector` for batching SQL
-- Implement `game.create_object(class, parent_id, props) -> id`
+- Implement `game.create_object(path, class, parent_id, props) -> object` (path-based ID)
 - Implement `game.get_object(id) -> table`
 - Implement `game.update_object(id, changes)`
 - Implement `game.delete_object(id)`
@@ -2141,10 +2141,10 @@ fn test_game_random_is_deterministic() {
 async fn test_create_and_get_object() {
     let (db, sandbox) = setup_test_env().await;
     sandbox.eval(r#"
-        local id = game.create_object("item", "room1", {name = "sword", damage = 10})
-        local obj = game.get_object(id)
-        assert(obj.name == "sword")
-        assert(obj.metadata.damage == 10)
+        local obj = game.create_object("/items/sword", "item", "/rooms/room1", {name = "sword", damage = 10})
+        local loaded = game.get_object(obj.id)
+        assert(loaded.name == "sword")
+        assert(loaded.metadata.damage == 10)
     "#).unwrap();
 }
 
@@ -2152,10 +2152,10 @@ async fn test_create_and_get_object() {
 async fn test_move_object() {
     let (db, sandbox) = setup_test_env().await;
     sandbox.eval(r#"
-        local sword = game.create_object("item", "room1", {name = "sword"})
-        game.move_object(sword, "room2")
-        local obj = game.get_object(sword)
-        assert(obj.parent_id == "room2")
+        local sword = game.create_object("/items/sword", "item", "/rooms/room1", {name = "sword"})
+        game.move_object(sword.id, "/rooms/room2")
+        local obj = game.get_object(sword.id)
+        assert(obj.parent_id == "/rooms/room2")
     "#).unwrap();
 }
 
@@ -2163,10 +2163,10 @@ async fn test_move_object() {
 async fn test_get_children_with_filter() {
     let (db, sandbox) = setup_test_env().await;
     sandbox.eval(r#"
-        game.create_object("item", "room1", {name = "sword"})
-        game.create_object("item", "room1", {name = "shield"})
-        game.create_object("bot", "room1", {name = "goblin"})
-        local items = game.get_children("room1", {class = "item"})
+        game.create_object("/items/sword", "item", "/rooms/room1", {name = "sword"})
+        game.create_object("/items/shield", "item", "/rooms/room1", {name = "shield"})
+        game.create_object("/npcs/goblin", "bot", "/rooms/room1", {name = "goblin"})
+        local items = game.get_children("/rooms/room1", {class = "item"})
         assert(#items == 2)
     "#).unwrap();
 }
@@ -2175,8 +2175,8 @@ async fn test_get_children_with_filter() {
 async fn test_mutations_are_collected() {
     let (db, sandbox, collector) = setup_test_env_with_collector().await;
     sandbox.eval(r#"
-        game.create_object("item", "room1", {name = "sword"})
-        game.update_object("room1", {description = "A dark room"})
+        game.create_object("/items/sword", "item", "/rooms/room1", {name = "sword"})
+        game.update_object("/rooms/room1", {description = "A dark room"})
     "#).unwrap();
     let mutations = collector.into_sql();
     assert_eq!(mutations.len(), 2);

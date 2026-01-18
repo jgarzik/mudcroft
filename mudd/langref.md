@@ -162,27 +162,28 @@ All game functions are accessed via the `game` table.
 
 ### Object CRUD Operations
 
-#### `game.create_object(class, parent_id, props)`
+#### `game.create_object(path, class, parent_id, props)`
 
-Create a new object in the database.
+Create a new object in the database with a path-based ID.
 
 ```lua
 -- Create a sword in a room
-local sword = game.create_object("weapon", "room_001", {
+local sword = game.create_object("/items/iron-sword", "weapon", "/rooms/armory", {
     name = "Iron Sword",
     description = "A sturdy iron blade",
     damage_dice = "1d8",
     damage_type = "physical"
 })
-print(sword.id)  -- UUID of created object
+print(sword.id)  -- "/items/iron-sword"
 ```
 
 **Parameters:**
+- `path` (string): Path-based ID (e.g., "/items/sword", "/rooms/tavern"). Must start with `/`, use lowercase, segments `[a-z][a-z0-9-]*`
 - `class` (string): Class name (e.g., "item", "weapon", "npc")
 - `parent_id` (string|nil): Container object ID (room, player inventory)
 - `props` (table|nil): Property overrides
 
-**Returns:** Object table with `id`, `class`, `parent_id`, `name`, `description`, `metadata`
+**Returns:** Object table with `id`, `class`, `parent_id`, `name`, `description`, `metadata`. On path validation error, returns `{error = "message"}`
 
 ---
 
@@ -253,16 +254,21 @@ game.move_object(sword_id, nil)
 
 ---
 
-#### `game.clone_object(id, new_parent_id)`
+#### `game.clone_object(id, new_path, new_parent_id)`
 
-Create a copy of an object.
+Create a copy of an object with a new path-based ID.
 
 ```lua
-local copy = game.clone_object(template_sword_id, chest_id)
-print(copy.id)  -- New UUID
+local copy = game.clone_object("/items/template-sword", "/items/player-sword", "/rooms/chest")
+print(copy.id)  -- "/items/player-sword"
 ```
 
-**Returns:** New object table or `nil` if source not found
+**Parameters:**
+- `id` (string): Source object ID to clone
+- `new_path` (string): Path-based ID for the clone (e.g., "/items/sword-copy")
+- `new_parent_id` (string|nil): Container for the clone
+
+**Returns:** New object table, `nil` if source not found, or `{error = "message"}` on path validation error
 
 ---
 

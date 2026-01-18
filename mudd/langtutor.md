@@ -68,45 +68,45 @@ Now players connecting to your universe will spawn at the portal room!
 Rooms are containers that hold players, NPCs, and items. They have exits that connect to other rooms.
 
 ```lua
--- Create a simple room
-local room = game.create_object("room", nil, {
+-- Create a simple room with path-based ID
+local room = game.create_object("/rooms/town-square", "room", nil, {
     name = "Town Square",
     description = "A bustling square at the heart of town. Cobblestones are worn smooth by centuries of foot traffic. A fountain burbles in the center.",
     exits = {
-        north = "tavern_room_id",
-        south = "gate_room_id",
-        east = "market_room_id"
+        north = "/rooms/tavern",
+        south = "/rooms/gate",
+        east = "/rooms/market"
     },
     lighting = "bright"
 })
 
-print("Created room: " .. room.id)
+print("Created room: " .. room.id)  -- "/rooms/town-square"
 ```
 
 **Key Points:**
+- First argument is the path-based ID (e.g., "/rooms/town-square")
 - `parent_id` is `nil` for top-level rooms
-- `exits` maps directions to destination room IDs
-- Replace `"tavern_room_id"` with actual UUIDs of connected rooms
+- `exits` maps directions to destination room paths
 
 **Creating Connected Rooms:**
 
 ```lua
 -- Create a region first
-local region = game.create_object("region", nil, {
+local region = game.create_object("/regions/town-district", "region", nil, {
     name = "Town District",
     environment_type = "urban",
     danger_level = 1
 })
 
 -- Create connected rooms
-local square = game.create_object("room", nil, {
+local square = game.create_object("/rooms/town-square", "room", nil, {
     name = "Town Square",
     description = "The central square.",
     region_id = region.id,
     exits = {}  -- We'll update this after creating other rooms
 })
 
-local tavern = game.create_object("room", nil, {
+local tavern = game.create_object("/rooms/rusty-tankard", "room", nil, {
     name = "The Rusty Tankard",
     description = "A warm tavern filled with the smell of ale and roasting meat.",
     region_id = region.id,
@@ -126,8 +126,8 @@ game.update_object(square.id, {
 Items are objects that can be picked up, dropped, and used.
 
 ```lua
--- Create a basic item in a room
-local torch = game.create_object("item", room_id, {
+-- Create a basic item in a room (path, class, parent_id, props)
+local torch = game.create_object("/items/wooden-torch", "item", room_id, {
     name = "Wooden Torch",
     description = "A simple wooden torch wrapped in oil-soaked rags.",
     weight = 1,
@@ -136,7 +136,7 @@ local torch = game.create_object("item", room_id, {
 })
 
 -- Create a fixed item (scenery)
-local fountain = game.create_object("item", room_id, {
+local fountain = game.create_object("/items/stone-fountain", "item", room_id, {
     name = "Stone Fountain",
     description = "An ornate fountain depicting a dragon. Water flows from its mouth.",
     weight = 1000,
@@ -145,7 +145,7 @@ local fountain = game.create_object("item", room_id, {
 })
 
 -- Create a valuable item
-local gem = game.create_object("item", chest_id, {
+local gem = game.create_object("/items/ruby", "item", chest_id, {
     name = "Ruby",
     description = "A brilliant red gemstone that catches the light.",
     weight = 0,
@@ -165,8 +165,8 @@ local gem = game.create_object("item", chest_id, {
 NPCs inherit from `living` and have combat-related properties.
 
 ```lua
--- Create a basic NPC
-local guard = game.create_object("npc", room_id, {
+-- Create a basic NPC (path, class, parent_id, props)
+local guard = game.create_object("/npcs/town-guard", "npc", room_id, {
     name = "Town Guard",
     description = "A bored-looking guard in chain mail, leaning on his spear.",
     hp = 50,
@@ -178,7 +178,7 @@ local guard = game.create_object("npc", room_id, {
 })
 
 -- Create an aggressive monster
-local goblin = game.create_object("npc", dungeon_room_id, {
+local goblin = game.create_object("/npcs/goblin-scout", "npc", dungeon_room_id, {
     name = "Goblin Scout",
     description = "A small, green-skinned creature with sharp teeth and beady eyes.",
     hp = 15,
@@ -190,7 +190,7 @@ local goblin = game.create_object("npc", dungeon_room_id, {
 })
 
 -- Create a tough boss
-local boss = game.create_object("npc", boss_room_id, {
+local boss = game.create_object("/npcs/ogre-chieftain", "npc", boss_room_id, {
     name = "Ogre Chieftain",
     description = "A massive ogre wielding a tree trunk as a club.",
     hp = 150,
@@ -245,14 +245,14 @@ game.define_class("undead", {
 })
 
 -- Now create instances of custom classes
-local health_potion = game.create_object("potion", chest_id, {
+local health_potion = game.create_object("/items/health-potion", "potion", chest_id, {
     name = "Health Potion",
     description = "A red liquid that shimmers with healing energy.",
     heal_amount = 30,
     uses = 1
 })
 
-local flame_sword = game.create_object("magic_sword", armory_id, {
+local flame_sword = game.create_object("/items/flamebrand", "magic_sword", armory_id, {
     name = "Flamebrand",
     description = "A blade wreathed in magical fire.",
     damage_dice = "1d8",
@@ -302,7 +302,7 @@ return {
 local hash = game.store_code(potion_code)
 
 -- Create potion with this code
-local potion = game.create_object("potion", room_id, {
+local potion = game.create_object("/items/health-potion-1", "potion", room_id, {
     name = "Health Potion",
     description = "A bubbling red liquid.",
     heal_amount = 30,
@@ -547,8 +547,8 @@ game.define_class("skeleton_warrior", {
 ### Region and Rooms
 
 ```lua
--- Create the crypt region
-local crypt_region = game.create_object("region", nil, {
+-- Create the crypt region (path, class, parent_id, props)
+local crypt_region = game.create_object("/regions/cursed-crypt", "region", nil, {
     name = "The Cursed Crypt",
     description = "An ancient burial ground corrupted by dark magic.",
     environment_type = "dungeon",
@@ -557,7 +557,7 @@ local crypt_region = game.create_object("region", nil, {
 })
 
 -- Room 1: Crypt Entrance
-local entrance = game.create_object("room", nil, {
+local entrance = game.create_object("/rooms/crypt-entrance", "room", nil, {
     name = "Crypt Entrance",
     description = "Stone stairs descend into darkness. The air is thick with the smell of decay and ancient dust. Faded warnings are carved into the archway above.",
     region_id = crypt_region.id,
@@ -566,7 +566,7 @@ local entrance = game.create_object("room", nil, {
 })
 
 -- Room 2: Antechamber
-local antechamber = game.create_object("room", nil, {
+local antechamber = game.create_object("/rooms/burial-antechamber", "room", nil, {
     name = "Burial Antechamber",
     description = "Alcoves line the walls, each containing a skeletal corpse wrapped in rotting cloth. A cold draft whispers through the chamber.",
     region_id = crypt_region.id,
@@ -575,7 +575,7 @@ local antechamber = game.create_object("room", nil, {
 })
 
 -- Room 3: Hall of Bones
-local hall = game.create_object("room", nil, {
+local hall = game.create_object("/rooms/hall-of-bones", "room", nil, {
     name = "Hall of Bones",
     description = "The walls are constructed entirely of skulls and bones, arranged in macabre patterns. Two passages lead deeper into the crypt.",
     region_id = crypt_region.id,
@@ -584,7 +584,7 @@ local hall = game.create_object("room", nil, {
 })
 
 -- Room 4: Trap Corridor
-local trap_corridor = game.create_object("room", nil, {
+local trap_corridor = game.create_object("/rooms/trap-corridor", "room", nil, {
     name = "Trapped Corridor",
     description = "A long narrow passage. The floor tiles look suspiciously uniform. Scratch marks on the walls suggest others have met their end here.",
     region_id = crypt_region.id,
@@ -594,7 +594,7 @@ local trap_corridor = game.create_object("room", nil, {
 })
 
 -- Room 5: Treasury
-local treasury = game.create_object("room", nil, {
+local treasury = game.create_object("/rooms/crypt-treasury", "room", nil, {
     name = "Crypt Treasury",
     description = "A chamber filled with dusty coffers and ancient artifacts. Gold coins are scattered across the floor, but something feels wrong.",
     region_id = crypt_region.id,
@@ -603,7 +603,7 @@ local treasury = game.create_object("room", nil, {
 })
 
 -- Room 6: Boss Chamber
-local boss_chamber = game.create_object("room", nil, {
+local boss_chamber = game.create_object("/rooms/throne-of-crypt-lord", "room", nil, {
     name = "Throne of the Crypt Lord",
     description = "A vast chamber with a throne of blackened bone at its center. Dark energy crackles in the air, and ancient runes glow with sickly green light.",
     region_id = crypt_region.id,
@@ -665,8 +665,8 @@ return {
 
 local potion_hash = game.store_code(potion_code)
 
--- Create potions
-local potion1 = game.create_object("healing_potion", antechamber.id, {
+-- Create potions (path, class, parent_id, props)
+local potion1 = game.create_object("/items/minor-healing-potion", "healing_potion", antechamber.id, {
     name = "Minor Healing Potion",
     description = "A small vial of red liquid that shimmers with restorative magic.",
     heal_dice = "2d4+2",
@@ -713,7 +713,7 @@ return {
 
             -- Spawn random treasure
             local gold = game.roll_dice("3d6") * 10
-            game.create_object("item", args.object_id, {
+            game.create_object("/items/gold-coins-" .. gold, "item", args.object_id, {
                 name = gold .. " Gold Coins",
                 description = "A pile of ancient gold coins.",
                 value = gold,
@@ -734,7 +734,7 @@ return {
 local chest_hash = game.store_code(chest_code)
 
 -- Create the key first
-local crypt_key = game.create_object("item", entrance.id, {
+local crypt_key = game.create_object("/items/rusty-crypt-key", "item", entrance.id, {
     name = "Rusty Crypt Key",
     description = "An ancient iron key, covered in rust but still functional.",
     weight = 0,
@@ -742,7 +742,7 @@ local crypt_key = game.create_object("item", entrance.id, {
 })
 
 -- Create locked chest
-local treasure_chest = game.create_object("locked_chest", treasury.id, {
+local treasure_chest = game.create_object("/items/ancient-treasure-chest", "locked_chest", treasury.id, {
     name = "Ancient Treasure Chest",
     description = "A heavy iron chest covered in dust. It appears to be locked.",
     locked = true,
@@ -913,8 +913,8 @@ return {
 
 local skeleton_hash = game.store_code(skeleton_code)
 
--- Create skeleton guards
-local skeleton1 = game.create_object("skeleton_warrior", antechamber.id, {
+-- Create skeleton guards (path, class, parent_id, props)
+local skeleton1 = game.create_object("/npcs/skeleton-guard", "skeleton_warrior", antechamber.id, {
     name = "Skeleton Guard",
     description = "An animated skeleton in rusted armor, eye sockets glowing with unholy light.",
     hp = 25,
@@ -926,7 +926,7 @@ local skeleton1 = game.create_object("skeleton_warrior", antechamber.id, {
     code_hash = skeleton_hash
 })
 
-local skeleton2 = game.create_object("skeleton_warrior", hall.id, {
+local skeleton2 = game.create_object("/npcs/skeleton-warrior", "skeleton_warrior", hall.id, {
     name = "Skeleton Warrior",
     description = "A larger skeleton wielding a notched greatsword.",
     hp = 35,
@@ -1037,8 +1037,8 @@ return {
         game.broadcast(room.id, "")
         game.broadcast(room.id, "His form dissolves into shadows, leaving behind his crown...")
 
-        -- Drop epic loot
-        game.create_object("cursed_weapon", room.id, {
+        -- Drop epic loot (path, class, parent_id, props)
+        game.create_object("/items/soulreaver", "cursed_weapon", room.id, {
             name = "Soulreaver",
             description = "The Crypt Lord's blade, still pulsing with dark energy.",
             damage_dice = "2d6",
@@ -1048,7 +1048,7 @@ return {
             bonus_damage_type = "necrotic"
         })
 
-        game.create_object("item", room.id, {
+        game.create_object("/items/crown-of-crypt-lord", "item", room.id, {
             name = "Crown of the Crypt Lord",
             description = "A crown of black iron, set with a single blood-red gem.",
             value = 5000,
@@ -1081,8 +1081,8 @@ end
 
 local boss_hash = game.store_code(boss_code)
 
--- Create the boss
-local crypt_lord = game.create_object("npc", boss_chamber.id, {
+-- Create the boss (path, class, parent_id, props)
+local crypt_lord = game.create_object("/npcs/valdris-crypt-lord", "npc", boss_chamber.id, {
     name = "Valdris the Crypt Lord",
     description = "A towering skeletal figure in ornate black armor. A crown of twisted iron sits upon his skull, and his eye sockets burn with baleful green fire. He grips a massive sword that drips with shadow.",
     hp = 200,
@@ -1124,7 +1124,7 @@ return {
 local cursed_hash = game.store_code(cursed_weapon_code)
 
 -- Flamebrand in treasury as bonus loot
-game.create_object("cursed_weapon", treasury.id, {
+game.create_object("/items/flamebrand", "cursed_weapon", treasury.id, {
     name = "Flamebrand",
     description = "A longsword with flames dancing along its blade. The hilt is warm to the touch.",
     damage_dice = "1d8",

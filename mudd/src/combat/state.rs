@@ -5,7 +5,7 @@
 //! - Attack queues
 //! - Combat initiation and ending
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -53,7 +53,7 @@ pub struct CombatState {
     /// Entity currently being attacked (ephemeral, not persisted)
     pub attacking: Option<String>,
     /// Set of entities attacking this entity (ephemeral, not persisted)
-    pub attackers: HashSet<String>,
+    pub attackers: BTreeSet<String>,
     /// Whether entity is flagged for PvP (ephemeral, not persisted)
     pub pvp_flagged: bool,
     /// Damage profile (resistances/immunities)
@@ -75,7 +75,7 @@ impl CombatState {
             universe_id: None,
             in_combat: false,
             attacking: None,
-            attackers: HashSet::new(),
+            attackers: BTreeSet::new(),
             pvp_flagged: false,
             damage_profile: DamageProfile::new(),
             hp: max_hp,
@@ -91,7 +91,7 @@ impl CombatState {
             universe_id: Some(universe_id.to_string()),
             in_combat: false,
             attacking: None,
-            attackers: HashSet::new(),
+            attackers: BTreeSet::new(),
             pvp_flagged: false,
             damage_profile: DamageProfile::new(),
             hp: max_hp,
@@ -207,7 +207,7 @@ impl AttackResult {
 #[derive(Debug)]
 pub struct CombatManager {
     /// Combat states by entity ID
-    states: RwLock<HashMap<String, CombatState>>,
+    states: RwLock<BTreeMap<String, CombatState>>,
     /// Universe PvP policy
     pvp_policy: RwLock<PvpPolicy>,
     /// Database pool for persistence
@@ -217,7 +217,7 @@ pub struct CombatManager {
 impl Default for CombatManager {
     fn default() -> Self {
         Self {
-            states: RwLock::new(HashMap::new()),
+            states: RwLock::new(BTreeMap::new()),
             pvp_policy: RwLock::new(PvpPolicy::default()),
             db_pool: None,
         }
@@ -233,7 +233,7 @@ impl CombatManager {
     /// Create a new combat manager with database pool
     pub fn with_db(pool: SqlitePool) -> Self {
         Self {
-            states: RwLock::new(HashMap::new()),
+            states: RwLock::new(BTreeMap::new()),
             pvp_policy: RwLock::new(PvpPolicy::default()),
             db_pool: Some(pool),
         }

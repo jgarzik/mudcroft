@@ -5,7 +5,7 @@
 //! - heartbeat: Periodic callbacks for NPCs/objects
 //! - Persistence: Timers survive server restart
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -120,9 +120,9 @@ pub struct TimerFired {
 /// Timer manager for a universe
 pub struct TimerManager {
     /// One-shot timers (in memory)
-    timers: RwLock<HashMap<String, Timer>>,
+    timers: RwLock<BTreeMap<String, Timer>>,
     /// Heartbeats (in memory only, not persisted)
-    heartbeats: RwLock<HashMap<String, HeartBeat>>,
+    heartbeats: RwLock<BTreeMap<String, HeartBeat>>,
     /// Database pool for persistence
     pool: Option<SqlitePool>,
     /// Raft writer for consensus
@@ -142,8 +142,8 @@ impl TimerManager {
     /// Create a new timer manager
     pub fn new(pool: Option<SqlitePool>, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self {
-            timers: RwLock::new(HashMap::new()),
-            heartbeats: RwLock::new(HashMap::new()),
+            timers: RwLock::new(BTreeMap::new()),
+            heartbeats: RwLock::new(BTreeMap::new()),
             pool,
             raft_writer,
         }

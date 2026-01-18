@@ -210,16 +210,32 @@ impl GameApi {
         let store = self.store.clone();
         let universe_id = self.universe_id.clone();
 
-        // game.create_object(class, parent_id, props)
+        // game.create_object(path, class, parent_id, props)
         // Actually creates object in database
+        // Returns object on success, or {error = "message"} on path validation failure
         let store_clone = store.clone();
         let universe_clone = universe_id.clone();
         let create_object = lua.create_function(
-            move |lua, (class, parent_id, props): (String, Option<String>, Option<Table>)| {
+            move |lua,
+                  (path, class, parent_id, props): (
+                String,
+                String,
+                Option<String>,
+                Option<Table>,
+            )| {
                 let store = store_clone.clone();
                 let universe_id = universe_clone.clone();
 
-                let mut obj = Object::new(&universe_id, &class);
+                // Create object with path validation
+                let mut obj = match Object::new(&path, &universe_id, &class) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        // Return error table for path validation failure
+                        let error_table = lua.create_table()?;
+                        error_table.set("error", e.to_string())?;
+                        return Ok(Value::Table(error_table));
+                    }
+                };
                 obj.parent_id = parent_id;
 
                 // Copy properties from Lua table if provided
@@ -239,7 +255,7 @@ impl GameApi {
                 });
 
                 match result {
-                    Ok(()) => object_to_lua(lua, &obj),
+                    Ok(()) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
                     Err(e) => Err(mlua::Error::external(e)),
                 }
             },
@@ -339,12 +355,23 @@ impl GameApi {
             })?;
         game.set("move_object", move_object)?;
 
-        // game.clone_object(id, new_parent_id)
+        // game.clone_object(id, new_path, new_parent_id)
         // Actually clones object in database
+        // Returns object on success, nil if not found, or {error = "message"} on path validation failure
         let store_clone = store.clone();
-        let clone_object =
-            lua.create_function(move |lua, (id, new_parent_id): (String, Option<String>)| {
+        let clone_object = lua.create_function(
+            move |lua, (id, new_path, new_parent_id): (String, String, Option<String>)| {
                 let store = store_clone.clone();
+
+                // Validate new path first
+                let validated_path = match crate::objects::validate_object_path(&new_path) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        let error_table = lua.create_table()?;
+                        error_table.set("error", e.to_string())?;
+                        return Ok(Value::Table(error_table));
+                    }
+                };
 
                 let result: anyhow::Result<Option<Object>> = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
@@ -352,7 +379,7 @@ impl GameApi {
                         match obj_result {
                             Some(original) => {
                                 let mut cloned = original.clone();
-                                cloned.id = uuid::Uuid::new_v4().to_string();
+                                cloned.id = validated_path;
                                 cloned.parent_id = new_parent_id;
                                 cloned.created_at = chrono::Utc::now().to_rfc3339();
                                 cloned.updated_at = cloned.created_at.clone();
@@ -369,7 +396,8 @@ impl GameApi {
                     Ok(None) => Ok(Value::Nil),
                     Err(e) => Err(mlua::Error::external(e)),
                 }
-            })?;
+            },
+        )?;
         game.set("clone_object", clone_object)?;
 
         // game.store_code(source) - returns hash

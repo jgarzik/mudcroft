@@ -180,7 +180,7 @@ ClientMessage::Command{text}
 **Game API** (`game.*`):
 | Function | Description |
 |----------|-------------|
-| `create_object(class, parent_id, props)` | Create object in DB |
+| `create_object(path, class, parent_id, props)` | Create object with path-based ID |
 | `get_object(id)` | Fetch object |
 | `update_object(id, changes)` | Update properties |
 | `delete_object(id)` | Remove object |

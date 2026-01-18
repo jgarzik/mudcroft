@@ -1,9 +1,10 @@
 //! Object types and core structures
 
+use super::path::{validate_object_path, PathValidationError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Unique object identifier
+/// Unique object identifier (path-based, e.g., "/rooms/dark-cave")
 pub type ObjectId = String;
 
 /// Properties are stored as JSON-compatible key-value pairs
@@ -12,7 +13,7 @@ pub type Properties = HashMap<String, serde_json::Value>;
 /// An in-game object instance
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Object {
-    /// Unique identifier
+    /// Path-based identifier (e.g., "/rooms/dark-cave")
     pub id: ObjectId,
     /// Universe this object belongs to
     pub universe_id: String,
@@ -31,11 +32,21 @@ pub struct Object {
 }
 
 impl Object {
-    /// Create a new object with the given class
-    pub fn new(universe_id: &str, class: &str) -> Self {
+    /// Create a new object with the given path and class
+    ///
+    /// # Arguments
+    /// * `id` - Path-based identifier (e.g., "/rooms/dark-cave")
+    /// * `universe_id` - Universe this object belongs to
+    /// * `class` - Class name (e.g., "sword", "room", "player")
+    ///
+    /// # Returns
+    /// * `Ok(Object)` - New object with validated path
+    /// * `Err(PathValidationError)` - If path is invalid
+    pub fn new(id: &str, universe_id: &str, class: &str) -> Result<Self, PathValidationError> {
+        let validated_id = validate_object_path(id)?;
         let now = chrono::Utc::now().to_rfc3339();
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
+        Ok(Self {
+            id: validated_id,
             universe_id: universe_id.to_string(),
             class: class.to_string(),
             parent_id: None,
@@ -43,7 +54,7 @@ impl Object {
             code_hash: None,
             created_at: now.clone(),
             updated_at: now,
-        }
+        })
     }
 
     /// Get a property value, returning None if not set
@@ -98,7 +109,8 @@ mod tests {
 
     #[test]
     fn test_object_creation() {
-        let obj = Object::new("test-universe", "sword");
+        let obj = Object::new("/items/sword", "test-universe", "sword").unwrap();
+        assert_eq!(obj.id, "/items/sword");
         assert_eq!(obj.class, "sword");
         assert_eq!(obj.universe_id, "test-universe");
         assert!(obj.parent_id.is_none());
@@ -106,8 +118,24 @@ mod tests {
     }
 
     #[test]
+    fn test_object_creation_invalid_path() {
+        // Missing leading slash
+        assert!(Object::new("invalid", "test-universe", "item").is_err());
+        // Empty path
+        assert!(Object::new("", "test-universe", "item").is_err());
+        // Invalid characters
+        assert!(Object::new("/bad_path", "test-universe", "item").is_err());
+    }
+
+    #[test]
+    fn test_object_path_normalization() {
+        let obj = Object::new("/Items/Sword", "test-universe", "sword").unwrap();
+        assert_eq!(obj.id, "/items/sword"); // Normalized to lowercase
+    }
+
+    #[test]
     fn test_properties() {
-        let mut obj = Object::new("test-universe", "item");
+        let mut obj = Object::new("/items/magic-sword", "test-universe", "item").unwrap();
 
         obj.set_property("name", serde_json::json!("Magic Sword"));
         obj.set_property("damage", serde_json::json!(10));
@@ -122,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_remove_property() {
-        let mut obj = Object::new("test-universe", "item");
+        let mut obj = Object::new("/items/temp-item", "test-universe", "item").unwrap();
         obj.set_property("temp", serde_json::json!(42));
 
         let removed = obj.remove_property("temp");

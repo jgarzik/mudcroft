@@ -1,6 +1,6 @@
 //! WebSocket handler for real-time player connections
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use axum::{
     extract::{
@@ -34,7 +34,7 @@ pub struct PlayerSession {
 /// Connection manager for all active WebSocket connections
 #[derive(Default)]
 pub struct ConnectionManager {
-    sessions: RwLock<HashMap<String, PlayerSession>>,
+    sessions: RwLock<BTreeMap<String, PlayerSession>>,
 }
 
 impl ConnectionManager {
