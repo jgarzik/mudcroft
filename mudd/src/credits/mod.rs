@@ -12,6 +12,8 @@ use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use crate::raft::RaftWriter;
+
 /// Credit balance for a player in a universe
 #[derive(Debug, Clone)]
 pub struct CreditBalance {
@@ -39,26 +41,37 @@ pub struct CreditTransaction {
 }
 
 /// Credit manager for handling in-game currency
-#[derive(Debug)]
 pub struct CreditManager {
     /// In-memory cache of balances: (universe_id, account_id) -> balance
     balances: RwLock<HashMap<(String, String), i64>>,
     /// Database pool for persistence
     pool: Option<SqlitePool>,
+    /// Raft writer for consensus
+    raft_writer: Option<Arc<RaftWriter>>,
+}
+
+impl std::fmt::Debug for CreditManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreditManager")
+            .field("pool", &self.pool.is_some())
+            .field("raft_writer", &self.raft_writer.is_some())
+            .finish()
+    }
 }
 
 impl CreditManager {
     /// Create a new credit manager
-    pub fn new(pool: Option<SqlitePool>) -> Self {
+    pub fn new(pool: Option<SqlitePool>, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self {
             balances: RwLock::new(HashMap::new()),
             pool,
+            raft_writer,
         }
     }
 
     /// Create a shared instance
-    pub fn shared(pool: Option<SqlitePool>) -> Arc<Self> {
-        Arc::new(Self::new(pool))
+    pub fn shared(pool: Option<SqlitePool>, raft_writer: Option<Arc<RaftWriter>>) -> Arc<Self> {
+        Arc::new(Self::new(pool, raft_writer))
     }
 
     /// Get balance for a player in a universe
@@ -116,16 +129,14 @@ impl CreditManager {
         let new_balance = current - amount;
         balances.insert(key, new_balance);
 
-        // Persist to DB
-        if let Some(ref pool) = self.pool {
+        // Persist via Raft
+        if let Some(ref raft_writer) = self.raft_writer {
             if let Err(e) = self
-                .save_balance(universe_id, account_id, new_balance, pool)
+                .save_balance(universe_id, account_id, new_balance, raft_writer)
                 .await
             {
                 warn!("Failed to persist credit balance: {}", e);
             }
-            self.log_transaction(universe_id, account_id, -amount, reason, pool)
-                .await;
         }
 
         debug!(
@@ -149,16 +160,14 @@ impl CreditManager {
         let new_balance = current + amount;
         balances.insert(key, new_balance);
 
-        // Persist to DB
-        if let Some(ref pool) = self.pool {
+        // Persist via Raft
+        if let Some(ref raft_writer) = self.raft_writer {
             if let Err(e) = self
-                .save_balance(universe_id, account_id, new_balance, pool)
+                .save_balance(universe_id, account_id, new_balance, raft_writer)
                 .await
             {
                 warn!("Failed to persist credit balance: {}", e);
             }
-            self.log_transaction(universe_id, account_id, amount, reason, pool)
-                .await;
         }
 
         debug!(
@@ -172,9 +181,9 @@ impl CreditManager {
         let key = (universe_id.to_string(), account_id.to_string());
         self.balances.write().await.insert(key, balance);
 
-        if let Some(ref pool) = self.pool {
+        if let Some(ref raft_writer) = self.raft_writer {
             if let Err(e) = self
-                .save_balance(universe_id, account_id, balance, pool)
+                .save_balance(universe_id, account_id, balance, raft_writer)
                 .await
             {
                 warn!("Failed to persist credit balance: {}", e);
@@ -199,47 +208,31 @@ impl CreditManager {
         Ok(row.map(|(b,)| b).unwrap_or(0))
     }
 
-    /// Save balance to database
+    /// Save balance to database via Raft
     async fn save_balance(
         &self,
         universe_id: &str,
         account_id: &str,
         balance: i64,
-        pool: &SqlitePool,
+        raft_writer: &RaftWriter,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO credits (id, universe_id, player_id, balance)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(universe_id, player_id) DO UPDATE SET balance = ?
-            "#,
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(universe_id)
-        .bind(account_id)
-        .bind(balance)
-        .bind(balance)
-        .execute(pool)
-        .await?;
+        // Pre-compute UUID for deterministic replication
+        let id = uuid::Uuid::new_v4().to_string();
+
+        raft_writer
+            .execute(
+                "INSERT INTO credits (id, universe_id, player_id, balance) VALUES (?, ?, ?, ?) ON CONFLICT(universe_id, player_id) DO UPDATE SET balance = ?",
+                vec![
+                    serde_json::json!(&id),
+                    serde_json::json!(universe_id),
+                    serde_json::json!(account_id),
+                    serde_json::json!(balance),
+                    serde_json::json!(balance),
+                ],
+            )
+            .await?;
 
         Ok(())
-    }
-
-    /// Log a transaction for auditing
-    async fn log_transaction(
-        &self,
-        universe_id: &str,
-        account_id: &str,
-        amount: i64,
-        reason: &str,
-        pool: &SqlitePool,
-    ) {
-        // For now, just log to tracing - could add a transactions table later
-        debug!(
-            "Credit transaction: universe={}, account={}, amount={}, reason={}",
-            universe_id, account_id, amount, reason
-        );
-        let _ = pool; // Silence unused warning
     }
 }
 
@@ -249,14 +242,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_balance_default() {
-        let manager = CreditManager::new(None);
+        let manager = CreditManager::new(None, None);
         let balance = manager.get_balance("u1", "player1").await;
         assert_eq!(balance, 0);
     }
 
     #[tokio::test]
     async fn test_set_balance() {
-        let manager = CreditManager::new(None);
+        let manager = CreditManager::new(None, None);
         manager.set_balance("u1", "player1", 100).await;
         let balance = manager.get_balance("u1", "player1").await;
         assert_eq!(balance, 100);
@@ -264,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grant() {
-        let manager = CreditManager::new(None);
+        let manager = CreditManager::new(None, None);
         manager.grant("u1", "player1", 50, "admin grant").await;
         let balance = manager.get_balance("u1", "player1").await;
         assert_eq!(balance, 50);
@@ -276,7 +269,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deduct_success() {
-        let manager = CreditManager::new(None);
+        let manager = CreditManager::new(None, None);
         manager.set_balance("u1", "player1", 100).await;
 
         let result = manager.deduct("u1", "player1", 30, "purchase").await;
@@ -288,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deduct_insufficient() {
-        let manager = CreditManager::new(None);
+        let manager = CreditManager::new(None, None);
         manager.set_balance("u1", "player1", 20).await;
 
         let result = manager.deduct("u1", "player1", 50, "purchase").await;
@@ -301,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deduct_invalid_amount() {
-        let manager = CreditManager::new(None);
+        let manager = CreditManager::new(None, None);
         manager.set_balance("u1", "player1", 100).await;
 
         // Zero amount
@@ -319,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_universes() {
-        let manager = CreditManager::new(None);
+        let manager = CreditManager::new(None, None);
 
         manager.set_balance("u1", "player1", 100).await;
         manager.set_balance("u2", "player1", 200).await;

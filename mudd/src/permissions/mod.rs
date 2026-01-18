@@ -15,6 +15,8 @@ use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::raft::RaftWriter;
+
 /// Access levels for MUD users
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
@@ -179,7 +181,6 @@ pub struct ObjectContext {
 }
 
 /// Permission manager for a universe
-#[derive(Debug)]
 pub struct PermissionManager {
     /// User access levels by account ID (in-memory cache)
     user_levels: RwLock<HashMap<String, AccessLevel>>,
@@ -187,6 +188,17 @@ pub struct PermissionManager {
     builder_regions: RwLock<HashMap<String, HashSet<String>>>,
     /// Database pool for fallback lookups
     db_pool: Option<SqlitePool>,
+    /// Raft writer for consensus
+    raft_writer: Option<Arc<RaftWriter>>,
+}
+
+impl std::fmt::Debug for PermissionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermissionManager")
+            .field("db_pool", &self.db_pool.is_some())
+            .field("raft_writer", &self.raft_writer.is_some())
+            .finish()
+    }
 }
 
 impl Default for PermissionManager {
@@ -195,6 +207,7 @@ impl Default for PermissionManager {
             user_levels: RwLock::new(HashMap::new()),
             builder_regions: RwLock::new(HashMap::new()),
             db_pool: None,
+            raft_writer: None,
         }
     }
 }
@@ -205,12 +218,13 @@ impl PermissionManager {
         Self::default()
     }
 
-    /// Create a new permission manager with database pool for fallback lookups
-    pub fn with_db(db_pool: SqlitePool) -> Self {
+    /// Create a new permission manager with database pool and optional raft writer
+    pub fn with_db(db_pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self {
             user_levels: RwLock::new(HashMap::new()),
             builder_regions: RwLock::new(HashMap::new()),
             db_pool: Some(db_pool),
+            raft_writer,
         }
     }
 
@@ -219,22 +233,34 @@ impl PermissionManager {
         Arc::new(Self::new())
     }
 
-    /// Create a shared instance with database pool
-    pub fn shared_with_db(db_pool: SqlitePool) -> Arc<Self> {
-        Arc::new(Self::with_db(db_pool))
+    /// Create a shared instance with database pool and raft writer
+    pub fn shared_with_db(db_pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Arc<Self> {
+        Arc::new(Self::with_db(db_pool, raft_writer))
     }
 
     /// Set a user's access level
     pub async fn set_access_level(&self, account_id: &str, level: AccessLevel) {
-        // Persist to database if pool is available
-        if let Some(ref pool) = self.db_pool {
-            let level_str = match level {
-                AccessLevel::Player => "player",
-                AccessLevel::Builder => "builder",
-                AccessLevel::Wizard => "wizard",
-                AccessLevel::Admin => "admin",
-                AccessLevel::Owner => "owner",
-            };
+        let level_str = match level {
+            AccessLevel::Player => "player",
+            AccessLevel::Builder => "builder",
+            AccessLevel::Wizard => "wizard",
+            AccessLevel::Admin => "admin",
+            AccessLevel::Owner => "owner",
+        };
+
+        // Persist via Raft if available, otherwise direct SQL
+        if let Some(ref raft_writer) = self.raft_writer {
+            if let Err(e) = raft_writer
+                .execute(
+                    "UPDATE accounts SET access_level = ? WHERE id = ?",
+                    vec![serde_json::json!(level_str), serde_json::json!(account_id)],
+                )
+                .await
+            {
+                tracing::warn!("Failed to persist access level for {}: {}", account_id, e);
+            }
+        } else if let Some(ref pool) = self.db_pool {
+            // Direct SQL fallback (for tests)
             if let Err(e) = sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
                 .bind(level_str)
                 .bind(account_id)
@@ -282,8 +308,23 @@ impl PermissionManager {
 
     /// Assign a region to a builder
     pub async fn assign_region(&self, account_id: &str, region_id: &str) {
-        // Persist to database if pool is available
-        if let Some(ref pool) = self.db_pool {
+        // Persist via Raft if available, otherwise direct SQL
+        if let Some(ref raft_writer) = self.raft_writer {
+            if let Err(e) = raft_writer
+                .execute(
+                    "INSERT OR REPLACE INTO builder_regions (account_id, region_id) VALUES (?, ?)",
+                    vec![serde_json::json!(account_id), serde_json::json!(region_id)],
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to persist region assignment for {}: {}",
+                    account_id,
+                    e
+                );
+            }
+        } else if let Some(ref pool) = self.db_pool {
+            // Direct SQL fallback (for tests)
             if let Err(e) = sqlx::query(
                 "INSERT OR REPLACE INTO builder_regions (account_id, region_id) VALUES (?, ?)",
             )
@@ -309,8 +350,23 @@ impl PermissionManager {
 
     /// Remove a region assignment from a builder
     pub async fn unassign_region(&self, account_id: &str, region_id: &str) {
-        // Remove from database if pool is available
-        if let Some(ref pool) = self.db_pool {
+        // Remove via Raft if available, otherwise direct SQL
+        if let Some(ref raft_writer) = self.raft_writer {
+            if let Err(e) = raft_writer
+                .execute(
+                    "DELETE FROM builder_regions WHERE account_id = ? AND region_id = ?",
+                    vec![serde_json::json!(account_id), serde_json::json!(region_id)],
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to remove region assignment for {}: {}",
+                    account_id,
+                    e
+                );
+            }
+        } else if let Some(ref pool) = self.db_pool {
+            // Direct SQL fallback (for tests)
             if let Err(e) =
                 sqlx::query("DELETE FROM builder_regions WHERE account_id = ? AND region_id = ?")
                     .bind(account_id)

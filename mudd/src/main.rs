@@ -18,6 +18,18 @@ struct Args {
     /// Database file path (required - must be pre-initialized with mudd_init)
     #[arg(short, long)]
     database: String,
+
+    /// Raft node ID (unique within cluster)
+    #[arg(long, default_value = "1")]
+    node_id: u64,
+
+    /// Raft port for inter-node communication
+    #[arg(long, default_value = "9000")]
+    raft_port: u16,
+
+    /// Cluster peers (format: "1=host1:9000,2=host2:9001"). Omit for single-node.
+    #[arg(long)]
+    peers: Option<String>,
 }
 
 #[tokio::main]
@@ -38,6 +50,9 @@ async fn main() -> Result<()> {
     let config = Config {
         bind_addr: args.bind,
         db_path: args.database,
+        node_id: args.node_id,
+        raft_port: args.raft_port,
+        peers: args.peers,
     };
 
     // Create and run server

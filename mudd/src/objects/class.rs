@@ -1,11 +1,14 @@
 //! Class system with inheritance
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use super::Properties;
+use crate::raft::RaftWriter;
 
 /// A class definition with properties and handlers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,10 +56,16 @@ impl ClassDef {
 }
 
 /// Registry of all class definitions
-#[derive(Debug, Default)]
 pub struct ClassRegistry {
     classes: HashMap<String, ClassDef>,
     db_pool: Option<SqlitePool>,
+    raft_writer: Option<Arc<RaftWriter>>,
+}
+
+impl Default for ClassRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClassRegistry {
@@ -65,16 +74,18 @@ impl ClassRegistry {
         let mut registry = Self {
             classes: HashMap::new(),
             db_pool: None,
+            raft_writer: None,
         };
         registry.register_base_classes();
         registry
     }
 
-    /// Create a new registry with database pool
-    pub fn with_db(pool: SqlitePool) -> Self {
+    /// Create a new registry with database pool and raft writer
+    pub fn with_db(pool: SqlitePool, raft_writer: Arc<RaftWriter>) -> Self {
         let mut registry = Self {
             classes: HashMap::new(),
             db_pool: Some(pool),
+            raft_writer: Some(raft_writer),
         };
         registry.register_base_classes();
         registry
@@ -258,9 +269,9 @@ impl ClassRegistry {
         }
         self.register(class.clone());
 
-        // Persist to database (async called via spawn)
-        if let Some(ref pool) = self.db_pool {
-            let pool = pool.clone();
+        // Persist to database via Raft (async called via spawn)
+        if let Some(ref raft_writer) = self.raft_writer {
+            let raft_writer = raft_writer.clone();
             let name = name.to_string();
             let parent = parent.map(|s| s.to_string());
             let code_hash = class.code_hash.clone();
@@ -271,98 +282,57 @@ impl ClassRegistry {
             let handlers = class.handlers.clone();
 
             tokio::spawn(async move {
-                // Use a transaction for atomicity
-                let mut tx = match pool.begin().await {
-                    Ok(tx) => tx,
-                    Err(e) => {
-                        warn!("Failed to begin transaction for class {}: {}", name, e);
-                        return;
-                    }
-                };
+                // Build batch of statements
+                let mut statements: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
 
                 // 1. INSERT OR REPLACE into classes
-                if let Err(e) = sqlx::query(
-                    r#"
-                    INSERT OR REPLACE INTO classes (name, universe_id, parent, code_hash)
-                    VALUES (?, '', ?, ?)
-                    "#,
-                )
-                .bind(&name)
-                .bind(&parent)
-                .bind(&code_hash)
-                .execute(&mut *tx)
-                .await
-                {
-                    warn!("Failed to insert class {}: {}", name, e);
-                    return;
-                }
+                statements.push((
+                    "INSERT OR REPLACE INTO classes (name, universe_id, parent, code_hash) VALUES (?, '', ?, ?)".to_string(),
+                    vec![
+                        serde_json::json!(&name),
+                        serde_json::json!(&parent),
+                        serde_json::json!(&code_hash),
+                    ],
+                ));
 
                 // 2. DELETE old properties
-                if let Err(e) = sqlx::query("DELETE FROM class_properties WHERE class_name = ?")
-                    .bind(&name)
-                    .execute(&mut *tx)
-                    .await
-                {
-                    warn!("Failed to delete old properties for class {}: {}", name, e);
-                    return;
-                }
+                statements.push((
+                    "DELETE FROM class_properties WHERE class_name = ?".to_string(),
+                    vec![serde_json::json!(&name)],
+                ));
 
                 // 3. INSERT properties
                 for (key, value) in &properties {
-                    if let Err(e) = sqlx::query(
-                        r#"
-                        INSERT INTO class_properties (class_name, universe_id, key, value)
-                        VALUES (?, '', ?, ?)
-                        "#,
-                    )
-                    .bind(&name)
-                    .bind(key)
-                    .bind(value)
-                    .execute(&mut *tx)
-                    .await
-                    {
-                        warn!(
-                            "Failed to insert property {} for class {}: {}",
-                            key, name, e
-                        );
-                        return;
-                    }
+                    statements.push((
+                        "INSERT INTO class_properties (class_name, universe_id, key, value) VALUES (?, '', ?, ?)".to_string(),
+                        vec![
+                            serde_json::json!(&name),
+                            serde_json::json!(key),
+                            serde_json::json!(value),
+                        ],
+                    ));
                 }
 
                 // 4. DELETE old handlers
-                if let Err(e) = sqlx::query("DELETE FROM class_handlers WHERE class_name = ?")
-                    .bind(&name)
-                    .execute(&mut *tx)
-                    .await
-                {
-                    warn!("Failed to delete old handlers for class {}: {}", name, e);
-                    return;
-                }
+                statements.push((
+                    "DELETE FROM class_handlers WHERE class_name = ?".to_string(),
+                    vec![serde_json::json!(&name)],
+                ));
 
                 // 5. INSERT handlers
                 for handler in &handlers {
-                    if let Err(e) = sqlx::query(
-                        r#"
-                        INSERT INTO class_handlers (class_name, universe_id, handler)
-                        VALUES (?, '', ?)
-                        "#,
-                    )
-                    .bind(&name)
-                    .bind(handler)
-                    .execute(&mut *tx)
-                    .await
-                    {
-                        warn!(
-                            "Failed to insert handler {} for class {}: {}",
-                            handler, name, e
-                        );
-                        return;
-                    }
+                    statements.push((
+                        "INSERT INTO class_handlers (class_name, universe_id, handler) VALUES (?, '', ?)".to_string(),
+                        vec![
+                            serde_json::json!(&name),
+                            serde_json::json!(handler),
+                        ],
+                    ));
                 }
 
-                // Commit the transaction
-                if let Err(e) = tx.commit().await {
-                    warn!("Failed to commit class {}: {}", name, e);
+                // Execute batch through Raft
+                if let Err(e) = raft_writer.execute_batch(statements).await {
+                    warn!("Failed to persist class {} via Raft: {}", name, e);
                 }
             });
         }

@@ -23,7 +23,8 @@ use super::types::{NodeId, Request, Response, TypeConfig};
 
 /// Combined Raft storage implementing v1 RaftStorage trait
 pub struct CombinedStorage {
-    pool: SqlitePool,
+    pool: RwLock<SqlitePool>,
+    db_path: Option<String>,
     vote: RwLock<Option<Vote<NodeId>>>,
     last_purged: RwLock<Option<LogId<NodeId>>>,
     last_applied: RwLock<Option<LogId<NodeId>>>,
@@ -37,7 +38,8 @@ impl CombinedStorage {
     /// Tables are created by mudd_init via Database migrations.
     pub async fn new(pool: SqlitePool) -> Result<Self, StorageError<NodeId>> {
         let storage = Self {
-            pool,
+            pool: RwLock::new(pool),
+            db_path: None,
             vote: RwLock::new(None),
             last_purged: RwLock::new(None),
             last_applied: RwLock::new(None),
@@ -48,15 +50,36 @@ impl CombinedStorage {
         Ok(storage)
     }
 
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    /// Create a new CombinedStorage with database path for snapshots
+    pub async fn with_db_path(
+        pool: SqlitePool,
+        db_path: String,
+    ) -> Result<Self, StorageError<NodeId>> {
+        let storage = Self {
+            pool: RwLock::new(pool),
+            db_path: Some(db_path),
+            vote: RwLock::new(None),
+            last_purged: RwLock::new(None),
+            last_applied: RwLock::new(None),
+            membership: RwLock::new(StoredMembership::default()),
+            current_snapshot: RwLock::new(None),
+        };
+        storage.load_state().await?;
+        Ok(storage)
+    }
+
+    /// Get a reference to the pool (read lock)
+    pub async fn pool(&self) -> tokio::sync::RwLockReadGuard<'_, SqlitePool> {
+        self.pool.read().await
     }
 
     async fn load_state(&self) -> Result<(), StorageError<NodeId>> {
+        let pool = self.pool.read().await;
+
         if let Some((term, node_id, committed)) = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
             "SELECT term, node_id, committed FROM raft_vote WHERE id = 1",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&*pool)
         .await
         .map_err(|e| StorageIOError::read_vote(&io::Error::other(e)))?
         {
@@ -71,7 +94,7 @@ impl CombinedStorage {
 
         if let Some((value,)) =
             sqlx::query_as::<_, (String,)>("SELECT value FROM raft_meta WHERE key = 'last_purged'")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&*pool)
                 .await
                 .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
         {
@@ -82,7 +105,7 @@ impl CombinedStorage {
 
         if let Some((value,)) =
             sqlx::query_as::<_, (String,)>("SELECT value FROM raft_meta WHERE key = 'last_applied'")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&*pool)
                 .await
                 .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
         {
@@ -136,7 +159,11 @@ impl CombinedStorage {
     }
 
     async fn execute_sql(&self, request: &Request) -> Response {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
         debug!("Executing SQL: {}", request.sql);
+
+        let pool = self.pool.read().await;
 
         let mut query = sqlx::query(&request.sql);
         for param in &request.params {
@@ -152,12 +179,25 @@ impl CombinedStorage {
                         query.bind(n.to_string())
                     }
                 }
-                serde_json::Value::String(s) => query.bind(s.clone()),
+                serde_json::Value::String(s) => {
+                    // Handle "blob:" prefix for binary data
+                    if let Some(b64_data) = s.strip_prefix("blob:") {
+                        match BASE64.decode(b64_data) {
+                            Ok(bytes) => query.bind(bytes),
+                            Err(e) => {
+                                error!("Failed to decode base64 blob: {}", e);
+                                query.bind(s.clone())
+                            }
+                        }
+                    } else {
+                        query.bind(s.clone())
+                    }
+                }
                 _ => query.bind(param.to_string()),
             };
         }
 
-        match query.execute(&self.pool).await {
+        match query.execute(&*pool).await {
             Ok(result) => Response::ok(result.rows_affected()),
             Err(e) => {
                 error!("SQL execution failed: {}", e);
@@ -186,13 +226,15 @@ impl RaftLogReader<TypeConfig> for CombinedStorage {
             std::ops::Bound::Unbounded => i64::MAX,
         };
 
+        let pool = self.pool.read().await;
+
         let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(
             "SELECT log_index, term, entry_type, payload FROM raft_log
              WHERE log_index >= ? AND log_index < ? ORDER BY log_index",
         )
         .bind(start)
         .bind(end)
-        .fetch_all(&self.pool)
+        .fetch_all(&*pool)
         .await
         .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
 
@@ -210,10 +252,28 @@ impl RaftSnapshotBuilder<TypeConfig> for CombinedStorage {
         let last_applied = *self.last_applied.read().await;
         let membership = self.membership.read().await.clone();
 
+        // Read the database file if path is set
+        let db_snapshot = if let Some(ref db_path) = self.db_path {
+            // Checkpoint WAL to ensure all data is in the main DB file
+            let pool = self.pool.read().await;
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&*pool)
+                .await
+                .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
+            drop(pool);
+
+            // Read the database file
+            tokio::fs::read(db_path)
+                .await
+                .map_err(|e| StorageIOError::read_snapshot(None, &e))?
+        } else {
+            vec![]
+        };
+
         let data = SnapshotData {
             last_applied_log: last_applied,
             last_membership: membership.clone(),
-            db_snapshot: vec![],
+            db_snapshot,
         };
 
         let bytes = serde_json::to_vec(&data)
@@ -232,6 +292,8 @@ impl RaftSnapshotBuilder<TypeConfig> for CombinedStorage {
         // Store snapshot
         *self.current_snapshot.write().await = Some((meta.clone(), bytes.clone()));
 
+        debug!("Built snapshot at {:?}", last_applied);
+
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(bytes)),
@@ -246,10 +308,11 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
         let last_purged = *self.last_purged.read().await;
+        let pool = self.pool.read().await;
 
         let last_log: Option<(i64, i64)> =
             sqlx::query_as("SELECT log_index, term FROM raft_log ORDER BY log_index DESC LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&*pool)
                 .await
                 .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
 
@@ -268,13 +331,14 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
+        let pool = self.pool.read().await;
         sqlx::query(
             "INSERT OR REPLACE INTO raft_vote (id, term, node_id, committed) VALUES (1, ?, ?, ?)",
         )
         .bind(vote.leader_id.term as i64)
         .bind(vote.leader_id.node_id as i64)
         .bind(if vote.committed { 1i64 } else { 0i64 })
-        .execute(&self.pool)
+        .execute(&*pool)
         .await
         .map_err(|e| StorageIOError::write_vote(&io::Error::other(e)))?;
 
@@ -288,7 +352,8 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
         CombinedStorage {
-            pool: self.pool.clone(),
+            pool: RwLock::new(self.pool.read().await.clone()),
+            db_path: self.db_path.clone(),
             vote: RwLock::new(*self.vote.read().await),
             last_purged: RwLock::new(*self.last_purged.read().await),
             last_applied: RwLock::new(*self.last_applied.read().await),
@@ -306,8 +371,8 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             return Ok(());
         }
 
-        let mut tx = self
-            .pool
+        let pool = self.pool.read().await;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
@@ -350,18 +415,20 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
+        let pool = self.pool.read().await;
         sqlx::query("DELETE FROM raft_log WHERE log_index >= ?")
             .bind(log_id.index as i64)
-            .execute(&self.pool)
+            .execute(&*pool)
             .await
             .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        let pool = self.pool.read().await;
         sqlx::query("DELETE FROM raft_log WHERE log_index <= ?")
             .bind(log_id.index as i64)
-            .execute(&self.pool)
+            .execute(&*pool)
             .await
             .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
@@ -369,7 +436,7 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
         sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_purged', ?)")
             .bind(&json)
-            .execute(&self.pool)
+            .execute(&*pool)
             .await
             .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
 
@@ -412,11 +479,12 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
 
         // Persist last_applied
         if let Some(last) = self.last_applied.read().await.as_ref() {
+            let pool = self.pool.read().await;
             let json = serde_json::to_string(last)
                 .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
             sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_applied', ?)")
                 .bind(&json)
-                .execute(&self.pool)
+                .execute(&*pool)
                 .await
                 .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
         }
@@ -426,7 +494,8 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         CombinedStorage {
-            pool: self.pool.clone(),
+            pool: RwLock::new(self.pool.read().await.clone()),
+            db_path: self.db_path.clone(),
             vote: RwLock::new(*self.vote.read().await),
             last_purged: RwLock::new(*self.last_purged.read().await),
             last_applied: RwLock::new(*self.last_applied.read().await),
@@ -446,11 +515,50 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
         let data = snapshot.into_inner();
 
         // Parse snapshot data
         let snapshot_data: SnapshotData = serde_json::from_slice(&data)
             .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
+
+        // If there's a database snapshot and we have a db_path, restore it
+        if !snapshot_data.db_snapshot.is_empty() {
+            if let Some(ref db_path) = self.db_path {
+                debug!(
+                    "Installing snapshot database ({} bytes)",
+                    snapshot_data.db_snapshot.len()
+                );
+
+                // Close current pool connections
+                {
+                    let pool = self.pool.read().await;
+                    pool.close().await;
+                }
+
+                // Write the new database file
+                tokio::fs::write(db_path, &snapshot_data.db_snapshot)
+                    .await
+                    .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+
+                // Reopen the pool
+                let conn_str = format!("sqlite:{}?mode=rw", db_path);
+                let options = SqliteConnectOptions::from_str(&conn_str)
+                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                    .foreign_keys(true);
+
+                let new_pool = SqlitePoolOptions::new()
+                    .max_connections(10)
+                    .connect_with(options)
+                    .await
+                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?;
+
+                *self.pool.write().await = new_pool;
+            }
+        }
 
         // Apply snapshot state
         *self.last_applied.write().await = snapshot_data.last_applied_log;

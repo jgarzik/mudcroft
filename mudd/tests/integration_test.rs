@@ -92,7 +92,7 @@ async fn test_object_crud() {
         .await
         .unwrap();
 
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create
     let mut obj = Object::new(&universe_id, "sword");
@@ -138,7 +138,7 @@ async fn test_object_hierarchy() {
         .await
         .unwrap();
 
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create a room
     let mut room = Object::new(&universe_id, "room");
@@ -179,7 +179,7 @@ async fn test_object_hierarchy() {
 #[tokio::test]
 async fn test_code_store() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     let code = r#"
         function on_init(self)
@@ -237,7 +237,7 @@ async fn test_find_by_name() {
         .await
         .unwrap();
 
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create a room
     let mut room = Object::new(&universe_id, "room");
@@ -278,7 +278,7 @@ async fn test_room_exits() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create two rooms
     let mut room1 = Object::new(&universe_id, "room");
@@ -318,7 +318,7 @@ async fn test_environment_query() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create room
     let mut room = Object::new(&universe_id, "room");
@@ -349,7 +349,7 @@ async fn test_get_living_in() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create room
     let mut room = Object::new(&universe_id, "room");
@@ -391,7 +391,7 @@ async fn test_player_movement() {
         .create_test_universe("Test Universe", &owner_id)
         .await
         .unwrap();
-    let store = ObjectStore::new(mudd.pool().clone());
+    let store = ObjectStore::new(mudd.pool().clone(), None);
 
     // Create two connected rooms
     let mut room1 = Object::new(&universe_id, "room");
@@ -901,7 +901,7 @@ async fn test_timer_persistence() {
         .await
         .expect("Failed to create timers table");
 
-        let timer_mgr = TimerManager::new(Some(pool.clone()));
+        let timer_mgr = TimerManager::new(Some(pool.clone()), None);
         let timer = Timer::new(
             "u1",
             "obj1",
@@ -922,7 +922,7 @@ async fn test_timer_persistence() {
             .await
             .expect("Failed to connect");
 
-        let timer_mgr = TimerManager::new(Some(pool));
+        let timer_mgr = TimerManager::new(Some(pool), None);
         timer_mgr
             .load_from_db()
             .await
@@ -991,7 +991,7 @@ async fn test_permission_persistence() {
         .await
         .expect("Failed to create account");
 
-        let perms = PermissionManager::with_db(pool);
+        let perms = PermissionManager::with_db(pool, None);
         perms
             .set_access_level(&account_id, AccessLevel::Wizard)
             .await;
@@ -1009,7 +1009,7 @@ async fn test_permission_persistence() {
             .await
             .expect("Failed to connect");
 
-        let perms = PermissionManager::with_db(pool);
+        let perms = PermissionManager::with_db(pool, None);
 
         // Should load from DB since not in cache
         let level = perms.get_access_level(&account_id).await;
@@ -1049,7 +1049,7 @@ async fn test_builder_regions_persistence() {
         .await
         .expect("Failed to create builder_regions table");
 
-        let perms = PermissionManager::with_db(pool);
+        let perms = PermissionManager::with_db(pool, None);
         perms.assign_region(account_id, "forest_region").await;
         perms.assign_region(account_id, "dungeon_region").await;
 
@@ -1065,7 +1065,7 @@ async fn test_builder_regions_persistence() {
             .await
             .expect("Failed to connect");
 
-        let perms = PermissionManager::with_db(pool);
+        let perms = PermissionManager::with_db(pool, None);
         perms
             .load_builder_regions()
             .await

@@ -37,7 +37,7 @@ impl TestWorld {
     /// Create a fully populated test world using TestServer reference
     /// Uses HTTP API for account and universe creation
     pub async fn create(server: &TestServer) -> Result<Self> {
-        let store = ObjectStore::new(server.pool().clone());
+        let store = ObjectStore::new(server.pool().clone(), None);
 
         // Create wizard account via API
         let wizard_resp = server

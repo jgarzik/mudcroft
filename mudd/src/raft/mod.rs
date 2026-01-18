@@ -17,6 +17,7 @@ pub mod snapshot;
 pub mod state_machine;
 pub mod storage;
 pub mod types;
+pub mod writer;
 
 // Note: log_storage.rs is kept for reference but not compiled
 // It contains the original attempt to implement RaftLogStorage
@@ -29,6 +30,7 @@ pub use snapshot::SnapshotStore;
 pub use state_machine::SnapshotData;
 pub use storage::CombinedStorage;
 pub use types::{NodeId, Request, Response, TypeConfig};
+pub use writer::RaftWriter;
 
 use openraft::storage::Adaptor;
 use openraft::Raft;

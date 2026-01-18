@@ -67,6 +67,20 @@ impl NetworkConfig {
         }
     }
 
+    /// Create from RaftNodeConfig
+    pub fn from_raft_config(config: &super::config::RaftNodeConfig) -> Self {
+        let nodes: BTreeMap<NodeId, String> = config
+            .peers
+            .iter()
+            .map(|(&id, (host, port))| (id, format!("{}:{}", host, port)))
+            .collect();
+
+        Self {
+            nodes,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
     /// Get address for a node
     pub fn get_addr(&self, node_id: NodeId) -> Option<&String> {
         self.nodes.get(&node_id)

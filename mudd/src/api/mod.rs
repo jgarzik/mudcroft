@@ -17,6 +17,7 @@ use crate::images::ImageStore;
 use crate::lua::{ActionRegistry, MessageQueue};
 use crate::objects::{ClassRegistry, ObjectStore};
 use crate::permissions::PermissionManager;
+use crate::raft::RaftWriter;
 use crate::theme::ThemeRegistry;
 use crate::timers::TimerManager;
 use crate::venice::VeniceClient;
@@ -26,6 +27,7 @@ pub use websocket::{ConnectionManager, PlayerSession, ServerMessage};
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>,
+    pub raft_writer: Arc<RaftWriter>,
     pub connections: Arc<ConnectionManager>,
     pub object_store: Arc<ObjectStore>,
     pub classes: Arc<RwLock<ClassRegistry>>,
@@ -40,17 +42,29 @@ pub struct AppState {
 }
 
 /// Build the API router
-pub async fn router(db: Arc<Database>) -> Router {
+pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
     let connections = Arc::new(ConnectionManager::new());
-    let object_store = Arc::new(ObjectStore::new(db.pool().clone()));
-    let mut class_registry = ClassRegistry::with_db(db.pool().clone());
+    let object_store = Arc::new(ObjectStore::new(
+        db.pool().clone(),
+        Some(raft_writer.clone()),
+    ));
+    let mut class_registry = ClassRegistry::with_db(db.pool().clone(), raft_writer.clone());
     let actions = Arc::new(ActionRegistry::new());
     let messages = Arc::new(MessageQueue::new());
-    let permissions = Arc::new(PermissionManager::with_db(db.pool().clone()));
-    let timers = Arc::new(TimerManager::new(Some(db.pool().clone())));
-    let credits = Arc::new(CreditManager::new(Some(db.pool().clone())));
+    let permissions = Arc::new(PermissionManager::with_db(
+        db.pool().clone(),
+        Some(raft_writer.clone()),
+    ));
+    let timers = Arc::new(TimerManager::new(
+        Some(db.pool().clone()),
+        Some(raft_writer.clone()),
+    ));
+    let credits = Arc::new(CreditManager::new(
+        Some(db.pool().clone()),
+        Some(raft_writer.clone()),
+    ));
     let venice = Arc::new(VeniceClient::new());
-    let image_store = Arc::new(ImageStore::new(db.pool().clone()));
+    let image_store = Arc::new(ImageStore::new(db.pool().clone(), raft_writer.clone()));
     let themes = Arc::new(ThemeRegistry::new());
 
     // Load persisted data on startup
@@ -68,6 +82,7 @@ pub async fn router(db: Arc<Database>) -> Router {
 
     let state = AppState {
         db,
+        raft_writer,
         connections,
         object_store,
         classes,

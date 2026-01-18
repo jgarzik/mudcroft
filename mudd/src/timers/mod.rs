@@ -14,6 +14,8 @@ use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use crate::raft::RaftWriter;
+
 /// A one-shot timer that fires after a delay
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timer {
@@ -116,7 +118,6 @@ pub struct TimerFired {
 }
 
 /// Timer manager for a universe
-#[derive(Debug)]
 pub struct TimerManager {
     /// One-shot timers (in memory)
     timers: RwLock<HashMap<String, Timer>>,
@@ -124,30 +125,58 @@ pub struct TimerManager {
     heartbeats: RwLock<HashMap<String, HeartBeat>>,
     /// Database pool for persistence
     pool: Option<SqlitePool>,
+    /// Raft writer for consensus
+    raft_writer: Option<Arc<RaftWriter>>,
+}
+
+impl std::fmt::Debug for TimerManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimerManager")
+            .field("pool", &self.pool.is_some())
+            .field("raft_writer", &self.raft_writer.is_some())
+            .finish()
+    }
 }
 
 impl TimerManager {
     /// Create a new timer manager
-    pub fn new(pool: Option<SqlitePool>) -> Self {
+    pub fn new(pool: Option<SqlitePool>, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self {
             timers: RwLock::new(HashMap::new()),
             heartbeats: RwLock::new(HashMap::new()),
             pool,
+            raft_writer,
         }
     }
 
     /// Create a shared instance
-    pub fn shared(pool: Option<SqlitePool>) -> Arc<Self> {
-        Arc::new(Self::new(pool))
+    pub fn shared(pool: Option<SqlitePool>, raft_writer: Option<Arc<RaftWriter>>) -> Arc<Self> {
+        Arc::new(Self::new(pool, raft_writer))
     }
 
     /// Add a one-shot timer
     pub async fn add_timer(&self, timer: Timer) -> String {
         let id = timer.id.clone();
 
-        // Persist to DB if available
-        if let Some(ref pool) = self.pool {
-            if let Err(e) = self.persist_timer(&timer, pool).await {
+        // Persist via Raft if available, otherwise direct SQL
+        if let Some(ref raft_writer) = self.raft_writer {
+            if let Err(e) = self.persist_timer(&timer, raft_writer).await {
+                warn!("Failed to persist timer: {}", e);
+            }
+        } else if let Some(ref pool) = self.pool {
+            // Direct SQL fallback (for tests)
+            if let Err(e) = sqlx::query(
+                "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&timer.id)
+            .bind(&timer.universe_id)
+            .bind(&timer.object_id)
+            .bind(&timer.method)
+            .bind(timer.fire_at)
+            .bind(&timer.args)
+            .execute(pool)
+            .await
+            {
                 warn!("Failed to persist timer: {}", e);
             }
         }
@@ -158,9 +187,18 @@ impl TimerManager {
 
     /// Remove a timer by ID
     pub async fn remove_timer(&self, timer_id: &str) -> bool {
-        // Remove from DB if available
-        if let Some(ref pool) = self.pool {
-            if let Err(e) = self.delete_timer_db(timer_id, pool).await {
+        // Remove from DB via Raft if available, otherwise direct SQL
+        if let Some(ref raft_writer) = self.raft_writer {
+            if let Err(e) = self.delete_timer_db(timer_id, raft_writer).await {
+                warn!("Failed to delete timer from DB: {}", e);
+            }
+        } else if let Some(ref pool) = self.pool {
+            // Direct SQL fallback (for tests)
+            if let Err(e) = sqlx::query("DELETE FROM timers WHERE id = ?")
+                .bind(timer_id)
+                .execute(pool)
+                .await
+            {
                 warn!("Failed to delete timer from DB: {}", e);
             }
         }
@@ -179,8 +217,17 @@ impl TimerManager {
 
         for id in &ids_to_remove {
             timers.remove(id);
-            if let Some(ref pool) = self.pool {
-                if let Err(e) = self.delete_timer_db(id, pool).await {
+            if let Some(ref raft_writer) = self.raft_writer {
+                if let Err(e) = self.delete_timer_db(id, raft_writer).await {
+                    warn!("Failed to delete timer from DB: {}", e);
+                }
+            } else if let Some(ref pool) = self.pool {
+                // Direct SQL fallback (for tests)
+                if let Err(e) = sqlx::query("DELETE FROM timers WHERE id = ?")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                {
                     warn!("Failed to delete timer from DB: {}", e);
                 }
             }
@@ -269,31 +316,36 @@ impl TimerManager {
         Ok(())
     }
 
-    /// Persist a timer to database
-    async fn persist_timer(&self, timer: &Timer, pool: &SqlitePool) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args)
-            VALUES (?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&timer.id)
-        .bind(&timer.universe_id)
-        .bind(&timer.object_id)
-        .bind(&timer.method)
-        .bind(timer.fire_at)
-        .bind(&timer.args)
-        .execute(pool)
-        .await?;
+    /// Persist a timer to database via Raft
+    async fn persist_timer(&self, timer: &Timer, raft_writer: &RaftWriter) -> anyhow::Result<()> {
+        raft_writer
+            .execute(
+                "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    serde_json::json!(&timer.id),
+                    serde_json::json!(&timer.universe_id),
+                    serde_json::json!(&timer.object_id),
+                    serde_json::json!(&timer.method),
+                    serde_json::json!(timer.fire_at),
+                    serde_json::json!(&timer.args),
+                ],
+            )
+            .await?;
 
         Ok(())
     }
 
-    /// Delete a timer from database
-    async fn delete_timer_db(&self, timer_id: &str, pool: &SqlitePool) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM timers WHERE id = ?")
-            .bind(timer_id)
-            .execute(pool)
+    /// Delete a timer from database via Raft
+    async fn delete_timer_db(
+        &self,
+        timer_id: &str,
+        raft_writer: &RaftWriter,
+    ) -> anyhow::Result<()> {
+        raft_writer
+            .execute(
+                "DELETE FROM timers WHERE id = ?",
+                vec![serde_json::json!(timer_id)],
+            )
             .await?;
         Ok(())
     }
@@ -338,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timer_manager_add_remove() {
-        let manager = TimerManager::new(None);
+        let manager = TimerManager::new(None, None);
 
         let timer = Timer::new("u1", "obj1", "test_method", 10000, None);
         let id = manager.add_timer(timer).await;
@@ -352,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_heartbeat_add_remove() {
-        let manager = TimerManager::new(None);
+        let manager = TimerManager::new(None, None);
 
         let hb = HeartBeat::new("u1", "obj1", 100);
         manager.set_heartbeat(hb).await;
@@ -366,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tick_fires_due_timers() {
-        let manager = TimerManager::new(None);
+        let manager = TimerManager::new(None, None);
 
         // Create a timer that's already due
         let mut timer = Timer::new("u1", "obj1", "on_fire", 0, Some("test_arg".to_string()));
@@ -385,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_timers_for_object() {
-        let manager = TimerManager::new(None);
+        let manager = TimerManager::new(None, None);
 
         manager
             .add_timer(Timer::new("u1", "obj1", "m1", 10000, None))

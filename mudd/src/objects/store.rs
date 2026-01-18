@@ -1,41 +1,71 @@
 //! Object persistence and CRUD operations
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use super::{Object, Properties};
+use crate::raft::RaftWriter;
 
 /// Object storage with database backing
 pub struct ObjectStore {
     pool: SqlitePool,
+    raft_writer: Option<Arc<RaftWriter>>,
 }
 
 impl ObjectStore {
     /// Create a new object store with the given connection pool
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Self {
+        Self { pool, raft_writer }
+    }
+
+    /// Execute a write operation either through Raft (if available) or directly
+    async fn execute_write(&self, sql: &str, params: Vec<serde_json::Value>) -> Result<u64> {
+        if let Some(ref raft_writer) = self.raft_writer {
+            let result = raft_writer.execute(sql, params).await?;
+            Ok(result.rows_affected)
+        } else {
+            // Direct execution fallback (for tests)
+            let mut query = sqlx::query(sql);
+            for param in &params {
+                match param {
+                    serde_json::Value::String(s) => query = query.bind(s.clone()),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            query = query.bind(i);
+                        } else if let Some(f) = n.as_f64() {
+                            query = query.bind(f);
+                        }
+                    }
+                    serde_json::Value::Bool(b) => query = query.bind(*b),
+                    serde_json::Value::Null => query = query.bind(Option::<String>::None),
+                    _ => query = query.bind(param.to_string()),
+                }
+            }
+            let result = query.execute(&self.pool).await?;
+            Ok(result.rows_affected())
+        }
     }
 
     /// Create a new object in the database
     pub async fn create(&self, obj: &Object) -> Result<()> {
         let properties = serde_json::to_string(&obj.properties)?;
 
-        sqlx::query(
-            r#"
-            INSERT INTO objects (id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+        self.execute_write(
+            "INSERT INTO objects (id, universe_id, class, parent_id, properties, code_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                serde_json::json!(&obj.id),
+                serde_json::json!(&obj.universe_id),
+                serde_json::json!(&obj.class),
+                serde_json::json!(&obj.parent_id),
+                serde_json::json!(&properties),
+                serde_json::json!(&obj.code_hash),
+                serde_json::json!(&obj.created_at),
+                serde_json::json!(&obj.updated_at),
+            ],
         )
-        .bind(&obj.id)
-        .bind(&obj.universe_id)
-        .bind(&obj.class)
-        .bind(&obj.parent_id)
-        .bind(&properties)
-        .bind(&obj.code_hash)
-        .bind(&obj.created_at)
-        .bind(&obj.updated_at)
-        .execute(&self.pool)
         .await?;
 
         Ok(())
@@ -62,22 +92,20 @@ impl ObjectStore {
     /// Update an existing object
     pub async fn update(&self, obj: &Object) -> Result<()> {
         let properties = serde_json::to_string(&obj.properties)?;
+        // Pre-compute timestamp for deterministic replication
         let updated_at = chrono::Utc::now().to_rfc3339();
 
-        sqlx::query(
-            r#"
-            UPDATE objects
-            SET class = ?, parent_id = ?, properties = ?, code_hash = ?, updated_at = ?
-            WHERE id = ?
-            "#,
+        self.execute_write(
+            "UPDATE objects SET class = ?, parent_id = ?, properties = ?, code_hash = ?, updated_at = ? WHERE id = ?",
+            vec![
+                serde_json::json!(&obj.class),
+                serde_json::json!(&obj.parent_id),
+                serde_json::json!(&properties),
+                serde_json::json!(&obj.code_hash),
+                serde_json::json!(&updated_at),
+                serde_json::json!(&obj.id),
+            ],
         )
-        .bind(&obj.class)
-        .bind(&obj.parent_id)
-        .bind(&properties)
-        .bind(&obj.code_hash)
-        .bind(&updated_at)
-        .bind(&obj.id)
-        .execute(&self.pool)
         .await?;
 
         Ok(())
@@ -85,12 +113,14 @@ impl ObjectStore {
 
     /// Delete an object
     pub async fn delete(&self, id: &str) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM objects WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        let rows = self
+            .execute_write(
+                "DELETE FROM objects WHERE id = ?",
+                vec![serde_json::json!(id)],
+            )
             .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(rows > 0)
     }
 
     /// Get all objects with a given parent (contents of a room/container)
@@ -110,17 +140,17 @@ impl ObjectStore {
 
     /// Move an object to a new parent
     pub async fn move_object(&self, id: &str, new_parent_id: Option<&str>) -> Result<()> {
+        // Pre-compute timestamp for deterministic replication
         let updated_at = chrono::Utc::now().to_rfc3339();
 
-        sqlx::query(
-            r#"
-            UPDATE objects SET parent_id = ?, updated_at = ? WHERE id = ?
-            "#,
+        self.execute_write(
+            "UPDATE objects SET parent_id = ?, updated_at = ? WHERE id = ?",
+            vec![
+                serde_json::json!(new_parent_id),
+                serde_json::json!(&updated_at),
+                serde_json::json!(id),
+            ],
         )
-        .bind(new_parent_id)
-        .bind(&updated_at)
-        .bind(id)
-        .execute(&self.pool)
         .await?;
 
         Ok(())
@@ -145,17 +175,18 @@ impl ObjectStore {
     /// Store code by content hash (content-addressed storage)
     pub async fn store_code(&self, source: &str) -> Result<String> {
         let hash = Self::hash_code(source);
+        // Pre-compute timestamp for deterministic replication
+        let created_at = chrono::Utc::now().to_rfc3339();
 
         // Insert or ignore if already exists
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO code_store (hash, source, created_at)
-            VALUES (?, ?, datetime('now'))
-            "#,
+        self.execute_write(
+            "INSERT OR IGNORE INTO code_store (hash, source, created_at) VALUES (?, ?, ?)",
+            vec![
+                serde_json::json!(&hash),
+                serde_json::json!(source),
+                serde_json::json!(&created_at),
+            ],
         )
-        .bind(&hash)
-        .bind(source)
-        .execute(&self.pool)
         .await?;
 
         Ok(hash)
@@ -315,11 +346,14 @@ impl ObjectStore {
                 }
 
                 let config_str = serde_json::to_string(&info.config)?;
-                sqlx::query("UPDATE universes SET config = ? WHERE id = ?")
-                    .bind(&config_str)
-                    .bind(universe_id)
-                    .execute(&self.pool)
-                    .await?;
+                self.execute_write(
+                    "UPDATE universes SET config = ? WHERE id = ?",
+                    vec![
+                        serde_json::json!(&config_str),
+                        serde_json::json!(universe_id),
+                    ],
+                )
+                .await?;
                 Ok(true)
             }
             None => Ok(false),
@@ -335,18 +369,19 @@ impl ObjectStore {
         config: serde_json::Value,
     ) -> Result<()> {
         let config_str = serde_json::to_string(&config)?;
+        // Pre-compute timestamp for deterministic replication
+        let created_at = chrono::Utc::now().to_rfc3339();
 
-        sqlx::query(
-            r#"
-            INSERT INTO universes (id, name, owner_id, config, created_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
-            "#,
+        self.execute_write(
+            "INSERT INTO universes (id, name, owner_id, config, created_at) VALUES (?, ?, ?, ?, ?)",
+            vec![
+                serde_json::json!(id),
+                serde_json::json!(name),
+                serde_json::json!(owner_id),
+                serde_json::json!(&config_str),
+                serde_json::json!(&created_at),
+            ],
         )
-        .bind(id)
-        .bind(name)
-        .bind(owner_id)
-        .bind(&config_str)
-        .execute(&self.pool)
         .await?;
 
         Ok(())
@@ -375,13 +410,14 @@ impl ObjectStore {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        sqlx::query(
+        self.execute_write(
             "INSERT OR REPLACE INTO universe_settings (universe_id, key, value) VALUES (?, ?, ?)",
+            vec![
+                serde_json::json!(universe_id),
+                serde_json::json!(key),
+                serde_json::json!(value),
+            ],
         )
-        .bind(universe_id)
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
         .await?;
 
         Ok(())
