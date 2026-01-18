@@ -87,7 +87,9 @@ impl Database {
         let options = SqliteConnectOptions::from_str(&conn_str)?
             .create_if_missing(false)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .shared_cache(true);
 
         let pool = SqlitePoolOptions::new()
             .max_connections(10)

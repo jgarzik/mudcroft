@@ -12,6 +12,7 @@ pub mod init;
 pub mod lua;
 pub mod objects;
 pub mod permissions;
+pub mod player;
 pub mod raft;
 pub mod theme;
 pub mod timers;

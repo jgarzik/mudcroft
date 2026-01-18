@@ -220,7 +220,7 @@ async fn test_look_shows_contents() {
     let room = wizard.expect("room").await.expect("no room");
 
     // Check for items in room - could be in "items" or "contents" fields
-    let has_items = room.get("items").map_or(false, |i| {
+    let has_items = room.get("items").is_some_and(|i| {
         if i.is_array() {
             !i.as_array().unwrap().is_empty()
         } else {
@@ -229,11 +229,11 @@ async fn test_look_shows_contents() {
     });
 
     // Check "contents" field for sword
-    let has_sword_in_contents = room.get("contents").map_or(false, |c| {
+    let has_sword_in_contents = room.get("contents").is_some_and(|c| {
         if let Some(arr) = c.as_array() {
             arr.iter().any(|item| {
                 item.as_str()
-                    .map_or(false, |s| s.to_lowercase().contains("sword"))
+                    .is_some_and(|s| s.to_lowercase().contains("sword"))
             })
         } else {
             false
@@ -263,7 +263,7 @@ async fn test_look_shows_contents() {
     let room = wizard.expect("room").await.expect("no room on look");
 
     // Check for NPCs in "living" field
-    let has_living = room.get("living").map_or(false, |l| {
+    let has_living = room.get("living").is_some_and(|l| {
         if l.is_array() {
             !l.as_array().unwrap().is_empty()
         } else {
@@ -272,7 +272,7 @@ async fn test_look_shows_contents() {
     });
 
     // Check for NPCs in "npcs" field
-    let has_npcs = room.get("npcs").map_or(false, |n| {
+    let has_npcs = room.get("npcs").is_some_and(|n| {
         if n.is_array() {
             !n.as_array().unwrap().is_empty()
         } else {
@@ -281,11 +281,11 @@ async fn test_look_shows_contents() {
     });
 
     // Check "contents" field for bat (contents contains NPC names as strings)
-    let has_bat_in_contents = room.get("contents").map_or(false, |c| {
+    let has_bat_in_contents = room.get("contents").is_some_and(|c| {
         if let Some(arr) = c.as_array() {
             arr.iter().any(|item| {
                 item.as_str()
-                    .map_or(false, |s| s.to_lowercase().contains("bat"))
+                    .is_some_and(|s| s.to_lowercase().contains("bat"))
             })
         } else {
             false

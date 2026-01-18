@@ -34,15 +34,58 @@ pub struct PlayerSession {
     pub sender: mpsc::Sender<ServerMessage>,
 }
 
+/// Grace period for reconnection (prevents inventory drop on brief disconnects)
+const RECONNECT_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Connection manager for all active WebSocket connections
-#[derive(Default)]
 pub struct ConnectionManager {
     sessions: RwLock<BTreeMap<String, PlayerSession>>,
+    /// Pending disconnect tasks that can be cancelled on reconnect
+    pending_disconnects: RwLock<BTreeMap<String, tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self {
+            sessions: RwLock::new(BTreeMap::new()),
+            pending_disconnects: RwLock::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl ConnectionManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cancel any pending disconnect for this player (called on reconnect)
+    pub async fn cancel_pending_disconnect(&self, player_id: &str) -> bool {
+        if let Some(cancel_tx) = self.pending_disconnects.write().await.remove(player_id) {
+            // Send cancel signal - ignore result since receiver may be dropped
+            let _ = cancel_tx.send(());
+            info!("Cancelled pending disconnect for player {}", player_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Schedule a delayed disconnect (grace period for reconnection)
+    pub async fn schedule_disconnect(
+        &self,
+        player_id: String,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        self.pending_disconnects
+            .write()
+            .await
+            .insert(player_id, cancel_tx);
+        cancel_rx
+    }
+
+    /// Remove pending disconnect entry after grace period expires
+    pub async fn clear_pending_disconnect(&self, player_id: &str) {
+        self.pending_disconnects.write().await.remove(player_id);
     }
 
     /// Register a new player session
@@ -227,10 +270,6 @@ async fn handle_socket(
     // Create message channel for this connection
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(32);
 
-    // Generate player ID (use account ID if authenticated, else random UUID)
-    let player_id = uuid::Uuid::new_v4().to_string();
-    let player_id_clone = player_id.clone();
-
     let (account_id, username, access_level) = match &account {
         Some(acc) => {
             let access = acc.access_level.parse().unwrap_or(AccessLevel::Player);
@@ -239,24 +278,73 @@ async fn handle_socket(
         None => (String::new(), None, AccessLevel::Player),
     };
 
-    if let Some(ref name) = username {
-        info!(
-            "WebSocket connected: {} ({}) universe={} access={:?}",
-            player_id, name, universe_id, access_level
-        );
+    // Generate player ID:
+    // - Authenticated users: use persistent path /players/<account_id>
+    // - Guests: use random UUID (ephemeral, no persistence)
+    let player_id = if !account_id.is_empty() {
+        crate::player::PlayerManager::player_path(&account_id)
+    } else {
+        uuid::Uuid::new_v4().to_string()
+    };
+    let player_id_clone = player_id.clone();
+
+    // Cancel any pending disconnect for this player (reconnection within grace period)
+    if !account_id.is_empty() {
+        let was_reconnect = state
+            .connections
+            .cancel_pending_disconnect(&player_id)
+            .await;
+        if was_reconnect {
+            info!("Player {} reconnected within grace period", player_id);
+        }
+    }
+
+    // For authenticated users, ensure persistent player object exists
+    let spawn_room_id = if !account_id.is_empty() {
+        let name = username.as_deref().unwrap_or("Unknown");
+        match state
+            .player_manager
+            .get_or_create_player(&account_id, &universe_id, name)
+            .await
+        {
+            Ok(player) => {
+                info!(
+                    "WebSocket connected: {} ({}) universe={} access={:?}",
+                    player_id, name, universe_id, access_level
+                );
+                // Get spawn location from player manager
+                state
+                    .player_manager
+                    .get_spawn_location(&player, &universe_id)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            Err(e) => {
+                warn!("Failed to create player object: {}", e);
+                None
+            }
+        }
     } else {
         info!(
             "WebSocket connected: {} (guest) universe={}",
             player_id, universe_id
         );
-    }
+        // Guests spawn at portal
+        state
+            .object_store
+            .get_portal(&universe_id)
+            .await
+            .ok()
+            .flatten()
+    };
 
     // Create session
     let session = PlayerSession {
         player_id: player_id.clone(),
         account_id: account_id.clone(),
         universe_id: universe_id.clone(),
-        room_id: None,
+        room_id: spawn_room_id.clone(),
         access_level,
         sender: tx,
     };
@@ -274,12 +362,14 @@ async fn handle_socket(
         let _ = socket.send(Message::Text(json.into())).await;
     }
 
-    // Spawn player at portal room (if set)
-    if let Ok(Some(portal_id)) = state.object_store.get_portal(&universe_id).await {
-        state
-            .connections
-            .update_room(&player_id, Some(portal_id.clone()))
-            .await;
+    // Move player to spawn room and send room description
+    if let Some(room_id) = spawn_room_id {
+        // Sync player's location to DB for authenticated users
+        if !account_id.is_empty() {
+            if let Err(e) = state.player_manager.move_player(&player_id, &room_id).await {
+                warn!("Failed to sync player location to DB: {}", e);
+            }
+        }
 
         // Send initial room description
         let acct_ref = if account_id.is_empty() {
@@ -287,13 +377,13 @@ async fn handle_socket(
         } else {
             Some(account_id.as_str())
         };
-        if let Some(room_msg) = build_room_message(&state, &portal_id, acct_ref).await {
+        if let Some(room_msg) = build_room_message(&state, &room_id, acct_ref).await {
             if let Ok(json) = serde_json::to_string(&room_msg) {
                 let _ = socket.send(Message::Text(json.into())).await;
             }
         }
     } else {
-        // No portal set - player stays nowhere
+        // No spawn location - player stays nowhere
         let msg = ServerMessage::Output {
             text: "Universe not initialized. Wizards: use 'setportal' command.".to_string(),
         };
@@ -328,9 +418,40 @@ async fn handle_socket(
         }
     }
 
-    // Clean up
+    // Unregister session immediately (stops message delivery)
     state.connections.unregister(&player_id_clone).await;
     info!("WebSocket disconnected: {}", player_id_clone);
+
+    // For authenticated users, use grace period before handling disconnect
+    // This allows reconnection without dropping inventory
+    if !account_id.is_empty() {
+        let cancel_rx = state
+            .connections
+            .schedule_disconnect(player_id_clone.clone())
+            .await;
+
+        // Clone what we need for the spawned task
+        let state_clone = state.clone();
+        let player_id_for_task = player_id_clone.clone();
+
+        tokio::spawn(async move {
+            // Wait for grace period or cancellation
+            tokio::select! {
+                _ = tokio::time::sleep(RECONNECT_GRACE_PERIOD) => {
+                    // Grace period expired - execute disconnect handling
+                    state_clone.connections.clear_pending_disconnect(&player_id_for_task).await;
+                    if let Err(e) = state_clone.player_manager.handle_disconnect(&player_id_for_task).await {
+                        warn!("Error handling player disconnect: {}", e);
+                    }
+                    info!("Disconnect handling completed for {} (grace period expired)", player_id_for_task);
+                }
+                _ = cancel_rx => {
+                    // Reconnection cancelled the disconnect - do nothing
+                    info!("Disconnect handling cancelled for {} (reconnected)", player_id_for_task);
+                }
+            }
+        });
+    }
 }
 
 /// Handle a message from the client
@@ -544,11 +665,18 @@ async fn execute_command(
                 }
             };
 
-            // Update player's room
+            // Update player's room in memory
             state
                 .connections
                 .update_room(player_id, Some(dest_room_id.clone()))
                 .await;
+
+            // Sync to database for authenticated users
+            if !account_id.is_empty() {
+                if let Err(e) = state.player_manager.move_player(player_id, &dest_room_id).await {
+                    warn!("Failed to sync player location to DB: {}", e);
+                }
+            }
 
             // Return new room description
             let acct_ref = if account_id.is_empty() {
@@ -1190,7 +1318,7 @@ fn parse_create_args(args: &str) -> Result<CreateParams, String> {
 
     // Helper to skip whitespace
     fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>) {
-        while chars.peek().map_or(false, |c| c.is_whitespace()) {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
             chars.next();
         }
     }

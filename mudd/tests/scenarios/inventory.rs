@@ -122,28 +122,28 @@ async fn test_drop_item() {
     let room = wizard.expect("room").await.expect("no room");
 
     // Check room has sword again
-    let has_sword_in_items = room.get("items").map_or(false, |items| {
+    let has_sword_in_items = room.get("items").is_some_and(|items| {
         if let Some(arr) = items.as_array() {
             arr.iter().any(|i| {
                 i.as_str()
-                    .map_or(false, |s| s.to_lowercase().contains("sword"))
+                    .is_some_and(|s| s.to_lowercase().contains("sword"))
                     || i.get("name")
                         .and_then(|n| n.as_str())
-                        .map_or(false, |s| s.to_lowercase().contains("sword"))
+                        .is_some_and(|s| s.to_lowercase().contains("sword"))
             })
         } else {
             false
         }
     });
 
-    let has_sword_in_contents = room.get("contents").map_or(false, |contents| {
+    let has_sword_in_contents = room.get("contents").is_some_and(|contents| {
         if let Some(arr) = contents.as_array() {
             arr.iter().any(|i| {
                 i.as_str()
-                    .map_or(false, |s| s.to_lowercase().contains("sword"))
+                    .is_some_and(|s| s.to_lowercase().contains("sword"))
                     || i.get("name")
                         .and_then(|n| n.as_str())
-                        .map_or(false, |s| s.to_lowercase().contains("sword"))
+                        .is_some_and(|s| s.to_lowercase().contains("sword"))
             })
         } else {
             false
@@ -269,10 +269,10 @@ async fn test_inventory_has_items() {
                 assert!(!arr.is_empty(), "Inventory should have items");
                 let has_sword = arr.iter().any(|i| {
                     i.as_str()
-                        .map_or(false, |s| s.to_lowercase().contains("sword"))
+                        .is_some_and(|s| s.to_lowercase().contains("sword"))
                         || i.get("name")
                             .and_then(|n| n.as_str())
-                            .map_or(false, |s| s.to_lowercase().contains("sword"))
+                            .is_some_and(|s| s.to_lowercase().contains("sword"))
                 });
                 assert!(has_sword, "Inventory should contain sword");
             }

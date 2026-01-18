@@ -18,6 +18,7 @@ use crate::images::ImageStore;
 use crate::lua::{ActionRegistry, MessageQueue};
 use crate::objects::{ClassRegistry, ObjectStore};
 use crate::permissions::PermissionManager;
+use crate::player::PlayerManager;
 use crate::raft::RaftWriter;
 use crate::theme::ThemeRegistry;
 use crate::timers::TimerManager;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub actions: Arc<ActionRegistry>,
     pub messages: Arc<MessageQueue>,
     pub permissions: Arc<PermissionManager>,
+    pub player_manager: Arc<PlayerManager>,
     pub timers: Arc<TimerManager>,
     pub credits: Arc<CreditManager>,
     pub venice: Arc<VeniceClient>,
@@ -57,6 +59,7 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
         db.pool().clone(),
         Some(raft_writer.clone()),
     ));
+    let player_manager = Arc::new(PlayerManager::new(object_store.clone()));
     let timers = Arc::new(TimerManager::new(
         Some(db.pool().clone()),
         Some(raft_writer.clone()),
@@ -95,6 +98,7 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
         actions,
         messages,
         permissions,
+        player_manager,
         timers,
         credits,
         venice,

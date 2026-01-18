@@ -210,18 +210,21 @@ impl ObjectStore {
         hex::encode(hasher.finalize())
     }
 
-    /// Find object by name property in a given location
+    /// Find object by name property in a given location.
+    /// Does case-insensitive partial matching: "sword" matches "Rusty Short Sword".
     pub async fn find_by_name(&self, parent_id: &str, name: &str) -> Result<Option<Object>> {
-        // SQLite JSON extraction
+        // SQLite JSON extraction with case-insensitive LIKE matching
+        // The search term is wrapped in % for partial matching
+        let search_pattern = format!("%{}%", name);
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects
-            WHERE parent_id = ? AND json_extract(properties, '$.name') = ?
+            WHERE parent_id = ? AND lower(json_extract(properties, '$.name')) LIKE lower(?)
             "#,
         )
         .bind(parent_id)
-        .bind(name)
+        .bind(&search_pattern)
         .fetch_all(&self.pool)
         .await?;
 

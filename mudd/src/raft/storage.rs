@@ -198,7 +198,17 @@ impl CombinedStorage {
         }
 
         match query.execute(&*pool).await {
-            Ok(result) => Response::ok(result.rows_affected()),
+            Ok(result) => {
+                // Checkpoint WAL to ensure read visibility across all connections
+                // This is needed because reads may use different connections than writes
+                if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                    .execute(&*pool)
+                    .await
+                {
+                    debug!("WAL checkpoint failed (non-fatal): {}", e);
+                }
+                Response::ok(result.rows_affected())
+            }
             Err(e) => {
                 error!("SQL execution failed: {}", e);
                 Response::error(e.to_string())

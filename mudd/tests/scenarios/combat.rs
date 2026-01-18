@@ -141,7 +141,7 @@ async fn test_kill_npc() {
         } else if msg_type == "combat" {
             // Check for death in combat message
             if let Some(result) = msg.get("result") {
-                if result.as_str().map_or(false, |r| r == "killed") {
+                if result.as_str() == Some("killed") {
                     bat_dead = true;
                     break;
                 }
@@ -162,14 +162,13 @@ async fn test_kill_npc() {
     let room = wizard.expect("room").await.expect("no room");
 
     // If bat is truly dead, it shouldn't be in the room anymore
-    let has_bat_in_living = room.get("living").map_or(false, |living| {
+    let has_bat_in_living = room.get("living").is_some_and(|living| {
         if let Some(arr) = living.as_array() {
             arr.iter().any(|i| {
-                i.as_str()
-                    .map_or(false, |s| s.to_lowercase().contains("bat"))
+                i.as_str().is_some_and(|s| s.to_lowercase().contains("bat"))
                     || i.get("name")
                         .and_then(|n| n.as_str())
-                        .map_or(false, |s| s.to_lowercase().contains("bat"))
+                        .is_some_and(|s| s.to_lowercase().contains("bat"))
             })
         } else {
             false
