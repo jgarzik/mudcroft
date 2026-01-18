@@ -934,6 +934,26 @@ async fn execute_command(
 
             combat_msg
         }
+        "create" => {
+            // Builder+ only
+            if access_level < AccessLevel::Builder {
+                return ServerMessage::Error {
+                    message: "Permission denied: builder+ required for create".to_string(),
+                };
+            }
+
+            // Get the arguments after "create "
+            let args = if command.len() > 7 {
+                &command[7..]
+            } else {
+                return ServerMessage::Error {
+                    message: "Usage: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]".to_string(),
+                };
+            };
+
+            // Execute create command
+            execute_create_command(state, player_id, account_id, access_level, args).await
+        }
         _ => ServerMessage::Output {
             text: format!("Unknown command: {}", verb),
         },
@@ -1048,6 +1068,235 @@ fn lua_value_to_string(value: &Value) -> String {
         Value::Error(e) => format!("[error: {}]", e),
         _ => "[unknown]".to_string(),
     }
+}
+
+/// Execute create command for builders
+/// Syntax: <type> <path> "<name>" ["<description>"] [key=value ...]
+async fn execute_create_command(
+    state: &AppState,
+    player_id: &str,
+    account_id: &str,
+    access_level: AccessLevel,
+    args: &str,
+) -> ServerMessage {
+    // Get universe from session
+    let universe_id = match state.connections.get_universe_id(player_id).await {
+        Some(id) => id,
+        None => {
+            return ServerMessage::Error {
+                message: "Session error: no universe".to_string(),
+            };
+        }
+    };
+
+    // Parse create arguments
+    let parsed = match parse_create_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            return ServerMessage::Error {
+                message: format!("Parse error: {}", e),
+            };
+        }
+    };
+
+    // Check permission to create at this path
+    let user_ctx = state
+        .permissions
+        .get_user_context(account_id, &universe_id)
+        .await;
+
+    // Override access level from session (in case it's newer than cached)
+    let user_ctx = crate::permissions::UserContext {
+        access_level,
+        ..user_ctx
+    };
+
+    let perm_result = state
+        .permissions
+        .check_create_permission(&user_ctx, &parsed.path);
+
+    if !perm_result.is_allowed() {
+        return ServerMessage::Error {
+            message: format!(
+                "Permission denied: no access to create at path {}",
+                parsed.path
+            ),
+        };
+    }
+
+    // Create the object
+    let mut obj = match crate::objects::Object::new_with_owner(
+        &parsed.path,
+        &universe_id,
+        &parsed.class,
+        account_id,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            return ServerMessage::Error {
+                message: format!("Invalid path: {}", e),
+            };
+        }
+    };
+
+    // Set name property
+    obj.set_property("name", serde_json::json!(parsed.name));
+
+    // Set description if provided
+    if let Some(desc) = parsed.description {
+        obj.set_property("description", serde_json::json!(desc));
+    }
+
+    // Set parent_id if provided
+    if let Some(parent) = parsed.parent_id {
+        obj.parent_id = Some(parent);
+    }
+
+    // Set additional properties
+    for (key, value) in parsed.properties {
+        obj.set_property(&key, value);
+    }
+
+    // Store the object
+    if let Err(e) = state.object_store.create(&obj).await {
+        return ServerMessage::Error {
+            message: format!("Failed to create object: {}", e),
+        };
+    }
+
+    ServerMessage::Output {
+        text: format!(
+            "Created {} '{}' at {}",
+            parsed.class, parsed.name, parsed.path
+        ),
+    }
+}
+
+/// Parsed create command arguments
+struct CreateParams {
+    class: String,
+    path: String,
+    name: String,
+    description: Option<String>,
+    parent_id: Option<String>,
+    properties: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Parse create command arguments
+/// Syntax: <type> <path> "<name>" ["<description>"] [key=value ...]
+fn parse_create_args(args: &str) -> Result<CreateParams, String> {
+    let mut chars = args.chars().peekable();
+    let mut tokens: Vec<String> = Vec::new();
+
+    // Helper to skip whitespace
+    fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>) {
+        while chars.peek().map_or(false, |c| c.is_whitespace()) {
+            chars.next();
+        }
+    }
+
+    // Tokenize: words and quoted strings
+    while chars.peek().is_some() {
+        skip_whitespace(&mut chars);
+        if chars.peek().is_none() {
+            break;
+        }
+
+        if chars.peek() == Some(&'"') {
+            // Quoted string
+            chars.next(); // consume opening quote
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '"' {
+                    chars.next(); // consume closing quote
+                    break;
+                }
+                if c == '\\' {
+                    chars.next();
+                    if let Some(&escaped) = chars.peek() {
+                        s.push(escaped);
+                        chars.next();
+                    }
+                } else {
+                    s.push(c);
+                    chars.next();
+                }
+            }
+            tokens.push(s);
+        } else {
+            // Unquoted word
+            let mut word = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                word.push(c);
+                chars.next();
+            }
+            tokens.push(word);
+        }
+    }
+
+    // Need at least: type, path, name
+    if tokens.len() < 3 {
+        return Err(
+            "Usage: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]"
+                .to_string(),
+        );
+    }
+
+    let class = tokens[0].clone();
+    let path = tokens[1].clone();
+    let name = tokens[2].clone();
+
+    let mut description = None;
+    let mut parent_id = None;
+    let mut properties = std::collections::HashMap::new();
+    let mut idx = 3;
+
+    // Check for optional description (next token without '=')
+    if idx < tokens.len() && !tokens[idx].contains('=') {
+        description = Some(tokens[idx].clone());
+        idx += 1;
+    }
+
+    // Parse key=value pairs
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        if let Some(eq_pos) = token.find('=') {
+            let key = &token[..eq_pos];
+            let val_str = &token[eq_pos + 1..];
+
+            // Parse value - try numeric, then boolean, then string
+            let value: serde_json::Value = if let Ok(n) = val_str.parse::<i64>() {
+                serde_json::json!(n)
+            } else if let Ok(n) = val_str.parse::<f64>() {
+                serde_json::json!(n)
+            } else if val_str == "true" {
+                serde_json::json!(true)
+            } else if val_str == "false" {
+                serde_json::json!(false)
+            } else {
+                serde_json::json!(val_str)
+            };
+
+            if key == "parent" {
+                parent_id = Some(val_str.to_string());
+            } else {
+                properties.insert(key.to_string(), value);
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(CreateParams {
+        class,
+        path,
+        name,
+        description,
+        parent_id,
+        properties,
+    })
 }
 
 /// Load universe library codes from database
