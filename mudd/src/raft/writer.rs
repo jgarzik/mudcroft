@@ -135,11 +135,8 @@ impl RaftWriter {
 
             let metrics = self.raft.metrics().borrow().clone();
 
-            if metrics.current_leader.is_some() {
-                info!(
-                    "Raft leader elected: node {}",
-                    metrics.current_leader.unwrap()
-                );
+            if let Some(leader) = metrics.current_leader {
+                info!("Raft leader elected: node {}", leader);
                 return Ok(());
             }
 
