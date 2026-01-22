@@ -1,0 +1,49 @@
+# Rust build artifacts
+mudd/target/
+mudd/**/*.db
+mudd/**/*.db-shm
+mudd/**/*.db-wal
+
+# Frontend build artifacts
+client/node_modules/
+client/dist/
+client/.vite/
+
+# Development files
+.git/
+.gitignore
+*.md
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test files
+mudd/tests/
+*.test.js
+*.spec.ts
+
+# Documentation
+docs/
+*.pdf
+
+# CI/CD (not needed in Docker context)
+.github/
+
+# Mac OS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Scripts not needed in container
+scripts/
