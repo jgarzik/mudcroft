@@ -319,7 +319,7 @@ pub struct PermissionManager {
     /// Member levels by (universe_id, account_id)
     member_levels: RwLock<HashMap<(String, String), AccessLevel>>,
     /// Universe owners by universe ID
-    universe_owners: RwLock<HashMap<String, Option<String>>>,
+    universe_owners: RwLock<HashMap<String, String>>,
     /// Path grants by (universe_id, grantee_id) -> Vec<PathGrant>
     path_grants: RwLock<HashMap<(String, String), Vec<PathGrant>>>,
     /// Database pool for fallback lookups
@@ -471,23 +471,24 @@ impl PermissionManager {
 
     async fn get_universe_owner(&self, universe_id: &str) -> Option<String> {
         if let Some(owner) = self.universe_owners.read().await.get(universe_id) {
-            return owner.clone();
+            return Some(owner.clone());
         }
         let pool = self.db_pool.as_ref()?;
+        // Cache only a found owner: a missing universe may be created later
         let owner =
             match sqlx::query_as::<_, (String,)>("SELECT owner_id FROM universes WHERE id = ?")
                 .bind(universe_id)
                 .fetch_optional(pool)
                 .await
             {
-                Ok(row) => row.map(|(o,)| o),
-                Err(_) => return None,
+                Ok(Some((owner,))) => owner,
+                Ok(None) | Err(_) => return None,
             };
         self.universe_owners
             .write()
             .await
             .insert(universe_id.to_string(), owner.clone());
-        owner
+        Some(owner)
     }
 
     /// An account's effective access level in a universe (see the struct
@@ -1048,6 +1049,17 @@ mod tests {
             AccessLevel::Admin
         );
         assert_eq!(pm.get_access_level("ua", "gwiz").await, AccessLevel::Player);
+
+        // Looking up a universe before it exists does not lock out its owner
+        assert_eq!(pm.get_access_level("uc", "gwiz").await, AccessLevel::Player);
+        sqlx::query(
+            "INSERT INTO universes (id, name, owner_id, config, created_at)
+             VALUES ('uc', 'uc', 'gwiz', '{}', '2026-01-01')",
+        )
+        .execute(pm.db_pool.as_ref().unwrap())
+        .await
+        .unwrap();
+        assert_eq!(pm.get_access_level("uc", "gwiz").await, AccessLevel::Owner);
     }
 
     #[test]

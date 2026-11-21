@@ -46,9 +46,6 @@ pub struct AppState {
     pub combat: Arc<CombatManager>,
 }
 
-/// Build the API router. With `static_dir`, also serve the built web client
-/// from it: files by path, and index.html for `/` and any other path no API
-/// route claims (client-side routes).
 impl AppState {
     /// The account service, writing through Raft
     pub fn accounts(&self) -> AccountService {
@@ -56,6 +53,9 @@ impl AppState {
     }
 }
 
+/// Build the API router. With `static_dir`, also serve the built web client
+/// from it: files by path, and index.html for `/` and any other path no API
+/// route claims (client-side routes).
 pub async fn router(
     db: Arc<Database>,
     raft_writer: Arc<RaftWriter>,
