@@ -1,283 +1,518 @@
 # Server Design Guide
 
+How `mudd` is built today. This is a current-state document: anything not yet
+built is in [docs/roadmap.md](../../docs/roadmap.md), which also lists known
+issues. Related references:
+
+- [permissions.md](permissions.md): access levels, path grants, ownership
+- [admin.md](admin.md): CLI flags, environment variables, operations
+- [API.md](API.md): HTTP and WebSocket protocol
+- [langref.md](langref.md): the `game.*` Lua API
+- [SCHEMA.md](../../SCHEMA.md): database schema
+
 ## Architecture Overview
 
 ```
 mudd/src/
-├── main.rs          # CLI entry, server startup
-├── lib.rs           # Config, Server struct
-├── init.rs          # Database initialization logic
-├── db/              # SQLite with WAL mode
-├── api/             # HTTP/WebSocket endpoints (Axum)
+├── main.rs          # mudd CLI (clap) -> Config -> Server
+├── lib.rs           # Config, Server: DB open, Raft setup, leader wait, serve
+├── bin/init.rs      # mudd_init CLI (create/upgrade a database)
+├── init.rs          # init_database: migrations, admin account, mudlib load
+├── player.rs        # PlayerManager: persistent player objects, spawn, disconnect
+├── db/              # SQLite pool (WAL, foreign keys), migrations, validation
+├── api/             # Axum router and handlers
+│   ├── mod.rs       # AppState, router, startup loading, --static-dir
 │   ├── auth.rs      # /auth/* endpoints
-│   ├── websocket.rs # /ws, ConnectionManager, PlayerSession
-│   ├── universe.rs  # /universe/* endpoints
-│   └── images.rs    # /images/* endpoints
-├── auth/            # Account service, password hashing
-├── objects/         # LPC-style object system
-│   ├── object.rs    # Object struct, properties
-│   ├── store.rs     # ObjectStore CRUD
-│   └── class.rs     # ClassDef, ClassRegistry, inheritance
-├── lua/             # Sandboxed Lua execution
-│   ├── sandbox.rs   # Instruction/memory limits
-│   ├── game_api.rs  # game.* functions exposed to Lua
-│   ├── actions.rs   # ActionRegistry for verbs
-│   ├── messaging.rs # MessageQueue for broadcasts
-│   └── metering.rs  # Resource tracking
-├── combat/          # Combat system
-│   ├── dice.rs      # Dice notation parser
-│   ├── damage.rs    # DamageType, modifiers
-│   ├── effects.rs   # StatusEffect, EffectRegistry
-│   └── state.rs     # CombatManager, PvpPolicy
-├── permissions/     # Role-based access control
-├── timers/          # call_out, heartbeat
-├── credits/         # Economy system
-├── venice/          # Venice AI client
-├── images/          # Image storage/generation
-├── theme/           # UI theme registry
-└── raft/            # Raft consensus
-    ├── storage.rs   # Log storage
-    ├── state_machine.rs
-    ├── network.rs   # RPC transport
-    └── snapshot.rs
+│   ├── universe.rs  # /universe/* endpoints, run_script
+│   ├── images.rs    # /images/{hash}
+│   ├── scripting.rs # script runner: sandboxes, hooks, timer loop, delivery
+│   └── websocket.rs # /ws, ConnectionManager, PlayerSession, commands
+├── auth/            # AccountService, tokens, password hashing
+├── universe/        # Universe ID validation
+├── objects/         # Object, ObjectStore, ClassRegistry, path validation
+├── lua/
+│   ├── sandbox.rs   # Sandbox, SandboxConfig, call budgets
+│   ├── game_api.rs  # game.* functions and parent()
+│   ├── libs.rs      # universe library loading
+│   ├── actions.rs   # ActionRegistry (custom verbs)
+│   ├── messaging.rs # MessageQueue (per execution)
+│   └── metering.rs  # instruction/memory counters
+├── combat/          # dice, damage types, status effects, CombatManager, PvpPolicy
+├── permissions/     # PermissionManager, AccessLevel, path grants
+├── timers/          # TimerManager: call_out, heartbeats
+├── credits/         # CreditManager: per-universe balances
+├── venice/          # Venice AI client (chat, images, rate limiter)
+├── images/          # ImageStore (content-addressed), room image generation
+├── theme/           # ThemeRegistry (sierra-retro, modern)
+└── raft/            # openraft: storage, state machine, network, writer
 ```
 
-## Database Schema
+`mudd/lib/*.lua` is the core mudlib (`combat.lua`, `commands.lua`,
+`utils.lua`), loaded into the database by `mudd_init --lib-dir`.
 
-### Core Tables
+## Data Model
 
-| Table | Purpose |
-|-------|---------|
-| `accounts` | User accounts with password hash, token, access_level |
-| `universes` | Game worlds with config JSON |
-| `objects` | Game objects with class, parent_id, properties JSON |
-| `code_store` | Content-addressed Lua source (hash -> source) |
-| `classes` | Custom class definitions |
-| `credits` | Player credit balances per universe |
-| `timers` | Persisted one-shot timers |
-| `universe_settings` | Key-value settings per universe (e.g., portal_room_id) |
+One SQLite database holds everything: accounts, every universe, the Raft log
+and Raft metadata. Tables are created by `Database::run_migrations`
+(`src/db/mod.rs`); see [SCHEMA.md](../../SCHEMA.md) for columns.
 
-### Permission/Combat Tables
-
-| Table | Purpose |
-|-------|---------|
-| `builder_regions` | Builder region assignments |
-| `combat_state` | HP, armor_class, attack_bonus per entity |
-| `active_effects` | Status effects with remaining ticks |
-
-### Raft Tables
-
-| Table | Purpose |
-|-------|---------|
-| `raft_log` | Replicated log entries |
-| `raft_vote` | Current term and voted_for |
-| `raft_meta` | Metadata (committed index, etc.) |
-
-### Key Relationships
+| Group | Tables |
+|-------|--------|
+| Accounts and worlds | `accounts`, `universes`, `universe_settings` (e.g. the portal room) |
+| Objects and code | `objects`, `code_store`, `core_lib_hashes` |
+| Classes | `classes`, `class_properties`, `class_handlers` |
+| Gameplay | `credits`, `timers`, `combat_state`, `active_effects` |
+| Permissions | `path_grants` (`builder_regions` is a legacy table nothing reads) |
+| Images | `image_store` |
+| Raft | `raft_log`, `raft_vote`, `raft_meta` |
 
 ```
-accounts(id) <-- universes(owner_id)
-accounts(id) <-- credits(player_id)
-accounts(id) <-- builder_regions(account_id)
-universes(id) <-- objects(universe_id)
-objects(id) <-- objects(parent_id)  -- containment hierarchy
-code_store(hash) <-- objects(code_hash)
+accounts(id) <-- universes(owner_id), credits(player_id), path_grants(grantee_id)
+universes(id) <-- objects(universe_id), credits, timers, path_grants, universe_settings
+objects(id)   <-- objects(parent_id)       -- containment
+code_store(hash) <-- objects(code_hash), universe config lib_hashes
 combat_state(entity_id) <-- active_effects(entity_id)
 ```
 
+`mudd` opens an existing database only (`Database::open`): it checks that the
+required tables exist and that at least one admin or owner account exists, and never
+runs migrations. `mudd_init` creates or upgrades a database (see
+[admin.md](admin.md)).
+
 ## Startup Sequence
 
-1. Parse CLI args (`--database`, `--bind`)
-2. Open SQLite database (validates schema + admin account)
-3. Build `AppState` with managers:
-   - `ConnectionManager` (WebSocket sessions)
-   - `ObjectStore` (database operations)
-   - `ClassRegistry` (load from DB)
-   - `ActionRegistry`, `MessageQueue`
-   - `PermissionManager` (load builder regions)
-   - `TimerManager` (load persisted timers)
-   - `CreditManager`
-   - `VeniceClient`, `ImageStore`, `ThemeRegistry`
-4. Bind TCP listener
-5. Serve Axum router with graceful shutdown
+1. Parse CLI args: `--bind`, `--database`, `--node-id`, `--raft-port`,
+   `--peers`, `--static-dir` ([admin.md](admin.md) has details).
+2. If `--static-dir` is set, fail unless it contains `index.html`.
+3. Open and validate the database.
+4. Create the `RaftWriter`: single-node (`RaftWriter::single_node`) unless
+   `--peers` is given (`RaftWriter::cluster`). Single-node initializes a
+   one-member cluster only when the database has no Raft state yet; on a
+   database it has served before it resumes the persisted vote, log and
+   membership, so restarts work. Opening the Raft store adds newer columns
+   (`raft_log.leader_node`) to older databases.
+5. Wait up to 10 seconds for a Raft leader (`wait_for_leader`). The HTTP port
+   is not bound until this succeeds.
+6. Build `AppState` (`api::router`): `ConnectionManager`, `ObjectStore`,
+   `ClassRegistry`, `ActionRegistry`, `PermissionManager`, `PlayerManager`,
+   `TimerManager`, `CreditManager`, `VeniceClient`, `ImageStore`,
+   `ThemeRegistry`, `CombatManager`.
+7. Load persisted state: timers, path grants, custom classes, combat states.
+   Failures are logged and startup continues. Access levels and credit
+   balances load lazily into in-memory caches.
+8. Spawn the timer loop (`scripting::run_timer_loop`).
+9. Bind the TCP listener and serve the Axum router with graceful shutdown.
 
-## Request Flow
+## HTTP Surface
 
-### HTTP Request
+| Route | Handler |
+|-------|---------|
+| `GET /health` | DB health check |
+| `GET /ws` | WebSocket upgrade |
+| `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/validate` | `api/auth.rs` |
+| `GET /universe/list`, `POST /universe/create`, `POST /universe/upload`, `POST /universe/{id}/run_script` | `api/universe.rs` |
+| `GET /images/{hash}` | `api/images.rs` (immutable cache headers) |
+| `GET /` | JSON server info, or the web client with `--static-dir` |
+
+With `--static-dir <dir>`, `mudd` serves the built web client from the same
+origin as the API: files by path, and `index.html` for `/` and for any path no
+API route claims (client-side routes). This removes the need for the Vite dev
+proxy or nginx. Request and response formats are in [API.md](API.md).
+
+Universe creation (admin only) seeds the universe config's `lib_hashes` with
+the core mudlib hashes from `core_lib_hashes`, plus any libraries in the
+request. `run_script` (admin or universe owner) reads a file from `scripts/`
+relative to the server's working directory and runs it with the eval limits
+below. An admin may run it as an account strictly below their own level.
+
+## WebSocket Sessions
 
 ```
-Client -> TcpListener -> Axum Router
-       -> Extract State/Path/Query/JSON
-       -> Handler function
-       -> Response (JSON/StatusCode)
+Client -> /ws?universe=<id>&token=<token>
+  ws_handler:
+    1. Validate the universe ID (3-64 chars, lowercase alphanumeric and hyphens)
+    2. Check the universe exists (404 otherwise)
+    3. Validate the token if given; an invalid or missing token means guest
+  handle_socket:
+    1. Create a bounded outgoing queue (256 messages)
+    2. Authenticated: player id /players/p-<account_id>, get or create the
+       player object, spawn at last safe location or the universe portal.
+       Guest: random UUID player id, empty account id, spawn at the portal.
+    3. Register the PlayerSession (player, account, universe, room, access
+       level fixed at connect, sender)
+    4. Send welcome, then the room description, then run on_enter on the
+       spawn room (or tell wizards to use setportal if there is no portal)
+    5. Loop: client commands in, queued server messages out
+  on disconnect:
+    unregister immediately; for accounts, run PlayerManager::handle_disconnect
+    after a 5 second grace period unless the player reconnects first
 ```
 
-### WebSocket Connection
+Message types: client sends `command` and `ping`; server sends `welcome`,
+`output`, `room` (name, description, exits, contents, optional `image_hash`),
+`error` and `echo`.
+
+### Delivery
+
+All messages to a client go through its bounded `mpsc` queue with `try_send`.
+`ConnectionManager` copies recipients out of the session map before
+delivering, so it never holds the lock while sending. A full or closed queue
+drops the message with a warning: a client that stops reading only loses its
+own messages and never stalls broadcasters, scripts or other sessions.
+
+### Commands
+
+Each command is echoed back, executed, and the reply sent. Hooks that should
+follow the reply (such as `on_enter` after the new room description) are
+deferred until the reply is queued. Every command gets a reply, even an
+empty one, except a custom verb whose handler returns `nil`
+(`ServerMessage::Silent`, never sent). `eval` and `create` take everything
+after the verb as their argument.
+
+| Command | Access | Behavior |
+|---------|--------|----------|
+| `look`, `l` | all | Room description |
+| `north`/`n`, `south`/`s`, `east`/`e`, `west`/`w`, `up`/`u`, `down`/`d` | all | Follow exit; `on_leave` on the old room, `on_enter` on the new one |
+| `say <msg>` | all | `<name> says: ...` to others in the room |
+| `get`/`take <item>`, `drop <item>`, `inventory`/`inv`/`i` | all | Call `Commands.take/drop/inventory` from the mudlib; `take` refuses `fixed` and living objects, and item names match literally (`%`, `_` escaped) |
+| `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`) |
+| `help` | all | Commands for the caller's access level |
+| `create <class> <path> "<name>" ["<desc>"] [key=value ...]` | builder+ | Create an object, path-permission checked |
+| `eval <lua>` | wizard+ | Run Lua as the caller |
+| `goto <room_id>` | wizard+ | Teleport (same universe only), with hooks; moves the player object too |
+| `setportal [room_id]` | wizard+ | Set the universe spawn room (same universe only) |
+| anything else | all | Custom verb dispatch, else `Unknown command` |
+
+Player arguments reach Lua as values through `Sandbox::execute_with_args`
+(the chunk's `...`), never spliced into source text.
+
+## Object System
+
+### Objects and Path IDs
+
+An object (`objects/object.rs`) has an `id`, `universe_id`, `class`,
+`parent_id` (its container), `properties` (a JSON map), an optional
+`code_hash` and an optional `owner_id`. Object IDs are paths such as
+`/rooms/dark-cave` (`objects/path.rs`): they start with `/`, are at most 255
+characters, and each segment starts with a letter followed by `[a-z0-9-]`.
+Paths are normalized to lowercase. Paths are also the unit of permission:
+path grants give builders a prefix such as `/d/forest`
+([permissions.md](permissions.md)).
+
+Containment is the `parent_id` chain: rooms contain players and items,
+players contain their inventory.
+
+### Classes
+
+`ClassRegistry` (`objects/class.rs`) holds class definitions in memory. Each
+class has an optional parent, default properties, handler names and an
+optional `code_hash`. Built-in classes are registered at startup and cannot be
+redefined:
 
 ```
-Client -> /ws?universe=<id>&token=<jwt>
-       -> ws_handler:
-          1. Validate universe ID format (DNS-style: 3-64 chars, alphanumeric+hyphen)
-          2. Verify universe exists in database
-          3. Validate token if provided, upgrade connection
-       -> handle_socket:
-          1. Create PlayerSession (player_id, universe_id, sender channel)
-          2. Register with ConnectionManager
-          3. Send Welcome message
-          4. Spawn at portal room (if set) or send "not initialized" message
-          5. Loop: recv ClientMessage -> execute_command -> send ServerMessage
-       -> On disconnect: unregister session
+thing (name, description)
+├── item (weight, value, fixed)
+│   ├── weapon (damage_dice, damage_bonus, damage_type)
+│   ├── armor (armor_value, slot)
+│   └── container (capacity, locked)
+├── living (hp, max_hp, attack_bonus, armor_class, in_combat)
+│   ├── player (access_level)
+│   └── npc (aggro, respawn_time)
+├── room (exits, lighting, region_id)
+└── region (environment_type, danger_level, ambient_sounds)
 ```
 
-### Command Execution
+- **Property resolution**: `resolve_properties` walks the chain from root to
+  child, children overriding parents. `game.create_object` starts a new
+  object from its class's resolved defaults, minus empty-string values and
+  any `code_hash` default; the props passed in override them. Class code is
+  used only by `parent()`, never attached to instances.
+- **Queries**: `game.is_a`, `game.get_class`, `game.get_class_chain`.
+- **Custom classes**: `game.define_class(name, {parent=..., properties=...})`
+  requires wizard+ and a non-built-in name. The registry is shared by every
+  universe, so an existing custom class may be redefined only by the account
+  that defined it (`ClassDef::defined_by`) or an admin+.
+- **`parent(class, handler, args)`**: a global Lua function that runs the
+  named handler from the parent class's attached code.
 
-```
-ClientMessage::Command{text}
-  -> parse verb + args
-  -> match verb:
-     - look, north/south/east/west, say, help: built-in handlers
-     - goto <room_id>: Wizard+ only, teleport to room
-     - setportal [room_id]: Wizard+ only, set spawn point
-     - eval: Wizard+ only, creates Sandbox with GameApi
-  -> execute, send ServerMessage
-```
+### Code and Handlers
 
-## Core Subsystems
+Lua source is stored content-addressed in `code_store` (SHA-256 hash, so
+identical code is stored once and stored code never changes).
+`game.store_code` (wizard+) returns a hash. Passing `code_hash` to
+`game.create_object` or `game.update_object` attaches stored code; unknown
+hashes are rejected, and `nil` detaches. Only the object's owner, or someone
+who outranks the owner, may change an object's `code_hash`.
 
-### Object System
+Attached code must evaluate to a table of handler functions. Each handler
+receives one argument table.
 
-**Classes** (LPC-style inheritance):
-- Base: `thing` (name, description)
-- `item` extends `thing` (weight, value, fixed)
-- `living` extends `thing` (hp, max_hp, armor_class)
-- `room` extends `thing` (exits, lighting, region_id)
-- `weapon` extends `item` (damage_dice, damage_type)
-- `player` extends `living`
-- `npc` extends `living` (aggro, respawn_time)
+| Handler | Fired by | Extra arguments |
+|---------|----------|-----------------|
+| `on_enter` | Room entered by moving, `goto`, or spawning on connect | `from`, `direction` |
+| `on_leave` | Room left by moving or `goto` | `to`, `direction` |
+| `on_damage` | Target hit by `attack` | `attacker_id`, `damage` |
+| `on_death` | Target slain by `attack` | `killer_id` |
+| custom verb method | Verb registered with `game.add_action` | `verb`, `args` |
+| timer method | `call_out` or heartbeat | `args` |
+| `on_use` etc. | `game.use_object(obj, actor, verb, target)` (`use`→`on_use`, `hit`→`on_hit`, `look`→`on_look`, `init`→`on_init`, others as named) | `verb`, `code_hash`, `target_id` |
 
-**Property Resolution**: Walk inheritance chain root->child, child overrides.
+Every hook also gets `object_id`, `actor_id` and (when known) `room_id`.
+Errors in hooks are logged. Lua `game.move_object` fires no hooks.
 
-**Storage**:
-- Objects stored in `objects` table with properties JSON
-- Code stored separately in `code_store` (content-addressed by SHA256)
-- `code_hash` on object references handler code
+### Custom Verbs
 
-### Lua Sandbox
+`game.add_action` registers a verb for a room or an object in the in-memory
+`ActionRegistry`. Because the handler runs as the object's owner,
+`add_action` and `remove_action` require Modify access to the object and
+being its owner or outranking the owner (`can_act_as`; ownerless objects need
+only Modify), and `add_action` refuses private methods (`_name` and engine
+hooks, `lua::is_private_handler`). Dispatch skips private methods too. An unknown
+command looks for candidates in this order: room actions for the player's
+room (only if their object is nearby), then object actions on inventory
+items, objects in the room, and the room itself. If the player named a target
+("pull lever"), the candidate whose object name matches wins; otherwise the
+first one does. A string result becomes the reply. Handler errors show
+players "Something went wrong." while wizards+ see the details.
 
-**Configuration** (`SandboxConfig`):
-- `max_instructions`: 1,000,000 default
-- `max_memory`: 64MB default
-- `timeout`: 500ms default
-- `max_db_queries`: 100
-- `max_venice_calls`: 5
+## Script Runner
 
-**Restricted Globals**: Removes `os`, `io`, `load`, `loadfile`, `dofile`, `require`, `package`, `debug`, `collectgarbage`.
+`api/scripting.rs` is the one path through which Lua runs for commands,
+`eval`, `run_script`, hooks, verbs and timers.
 
-**Available Libraries**: `string`, `table`, `math`, `utf8`.
+For every execution it:
 
-**Metering**: Instruction counting via hook (every 1000 instructions), memory tracking via `lua.used_memory()`.
+1. Loads the universe's libraries (`lua/libs.rs`): the universe config's
+   `lib_hashes` map (name to code hash), sorted by name. Missing libraries
+   are logged and skipped.
+2. Creates a fresh `MessageQueue` and a fresh `Sandbox`.
+3. Builds a `GameApi` and sets the user, room and object contexts **before**
+   registering the API, since each `game.*` closure captures them at
+   registration.
+4. Runs each library, then the script or handler, inside a scope that drops
+   the sandbox (the Lua state is not `Send`).
+5. Delivers the queued `game.send`, `game.broadcast` (with optional excluded
+   player) and `game.broadcast_region` messages. A region broadcast reaches
+   players whose room path is under the region's path or whose room's parent
+   is the region object.
 
-**Game API** (`game.*`):
-| Function | Description |
-|----------|-------------|
-| `create_object(path, class, parent_id, props)` | Create object with path-based ID |
-| `get_object(id)` | Fetch object |
-| `update_object(id, changes)` | Update properties |
-| `delete_object(id)` | Remove object |
-| `move_object(id, new_parent)` | Reparent |
-| `define_class(name, def)` | Register class |
-| `is_a(obj_id, class)` | Check inheritance |
-| `environment(obj_id)` | Get container |
-| `all_inventory(obj_id)` | Get contents |
-| `present(name, env_id)` | Find by name |
-| `send(target_id, msg)` | Private message |
-| `broadcast(room_id, msg)` | Room broadcast |
-| `check_permission(action, target, is_fixed, region)` | Permission check |
-| `call_out(delay, method, args)` | Schedule timer |
-| `set_heart_beat(interval_ms)` | Recurring timer |
-| `get_credits()` | Get balance |
-| `deduct_credits(amount, reason)` | Spend credits |
-| `llm_chat(messages, tier)` | Venice chat |
-| `llm_image(prompt, style, size)` | Venice image |
-| `roll_dice(dice_str)` | Parse and roll (e.g., "2d6+3") |
-| `time()` | Current time (ms) |
+### Who Code Runs As
 
-### Combat System
+- `eval`, the take/drop/inventory commands: the player's account.
+- `run_script`: the caller, or a lower-level account an admin names.
+- Hooks, verbs, timers and `game.use_object`: **the object's owner**
+  (LPC-style effective user), never the triggering player, who is only data
+  (`actor_id`). Otherwise a builder could plant code that borrows the
+  privileges of whoever walks in. Ownerless objects run with no user, so
+  permission-checked writes fail.
+- `game.use_object` runs the handler in a separate sandbox as that object's
+  owner, sharing the caller's message queue and returning plain data.
+  Nesting is capped at 8 levels, and one top-level execution may make at
+  most 32 `use_object` calls in total (a counter shared by all nested
+  sandboxes). Private handlers (`_name`) and engine hooks (`on_enter`,
+  `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`,
+  `on_destroy`) are never callable this way; such calls return `nil`. The
+  `actor_id` argument is caller-supplied, so handlers must not trust it.
+- `game.set_actor(id)` overrides the acting account for the rest of the run,
+  but only for accounts strictly below the real user's level. The override
+  lives in Rust-side app data, so Lua cannot forge it.
 
-**Damage Types**: `physical`, `fire`, `ice`, `lightning`, `poison`, `necrotic`, `radiant`, `psychic`.
+### Universe Isolation
 
-**Damage Modifiers**: `Normal`, `Immune`, `Resistant` (half), `Vulnerable` (double).
+Object ids are global, so isolation is enforced at each write:
 
-**Status Effects**:
-| Effect | Description |
-|--------|-------------|
-| Poisoned | DOT, ticks down |
-| Burning | Fire DOT |
-| Frozen | Movement penalty |
-| Stunned | Skip turn |
-| Paralyzed | Cannot act |
-| Blessed | Bonus to rolls |
-| Cursed | Penalty to rolls |
+- The runner refuses to run an object's code in a universe it does not belong
+  to, and `game.use_object` ignores objects from other universes.
+- `update_object`, `delete_object`, `move_object` (object and destination),
+  `add_action` and `remove_action` refuse objects of other universes;
+  `clone_object` refuses a foreign source. Player objects are exempt: one is
+  shared by every universe its account visits.
+- Spawning ignores a remembered room (`last_safe_location`, current room)
+  that belongs to another universe and uses the portal instead.
+- Queued `game.send` and `game.broadcast_region` messages skip sessions
+  connected to other universes.
+- `goto` and `setportal` refuse rooms outside the session's universe.
 
-**Attack Resolution**:
-1. Roll d20 + attack_bonus vs target armor_class
-2. On hit: roll damage dice, apply modifiers
-3. Update HP, check death
+Reads (`game.get_object` and the query functions) are not universe-checked;
+see [docs/roadmap.md](../../docs/roadmap.md#known-issues).
 
-**PvP Policy**: `Disabled`, `Consensual`, `Enabled`.
+### Timer Loop
 
-### Permission System
+`run_timer_loop` ticks every 100 ms. Each due `call_out` or heartbeat runs
+its method on the object's code (as the owner) with `{object_id, room_id,
+args}`. A heartbeat whose object no longer exists is removed. One-shot timers
+are persisted in `timers` and reloaded at startup; heartbeats live in memory
+only. An object may have at most 32 pending timers; heartbeat intervals are
+at least 100 ms. `game.delete_object` cancels the object's timers and
+heartbeat and clears its actions.
 
-**Access Levels** (ordered):
-| Level | Capabilities |
-|-------|--------------|
-| Player | Read, interact with non-fixed objects |
-| Builder | Create/modify in assigned regions |
-| Wizard | Full object control, bypass fixed |
-| Admin | Universe config, grant credits |
-| Owner | Grant admin access |
+## Lua Sandbox
 
-**Region Assignment**: Builders get specific regions via `assign_region()`.
+`Sandbox::new` (`lua/sandbox.rs`) creates a Lua 5.4 state with only the
+`string`, `table`, `math` and `utf8` libraries, then removes `os`, `io`,
+`load`, `loadstring`, `loadfile`, `dofile`, `require`, `package`, `debug` and
+`collectgarbage`, and replaces `print` with a no-op.
 
-**Permission Check**: `check_permission(user, action, object)` returns `Allowed` or `Denied(reason)`.
+| Limit | Object code (`SandboxConfig::default`) | `eval`, `run_script`, mudlib commands (`eval_config`) |
+|-------|------|------|
+| Instructions | 1,000,000 | 10,000,000 |
+| Memory | 64 MB | 64 MB |
+| Wall time | 500 ms | 5 s |
+| DB-backed `game.*` calls | 100 | 10,000 |
+| Venice calls | 5 | 5 |
 
-### Timer System
+- Instructions are counted by a hook every 1,000 instructions; exceeding the
+  limit aborts the script.
+- Memory is enforced by `Lua::set_memory_limit`.
+- Wall time is checked when the execution returns, so it reports a slow run
+  but does not interrupt one.
+- The call budget lives in the Lua state's app data and resets at each
+  `execute`. Every `game.*` function backed by the object store,
+  permissions, credits, timers or classes charges one DB call;
+  `llm_chat`/`llm_image` charge a Venice call. Exceeding a budget raises a
+  Lua error.
 
-**call_out** (one-shot):
-- Persisted to `timers` table
-- Fires after delay, calls method on object
-- Returns timer_id for cancellation
+### Async Bridge
 
-**heartbeat** (recurring):
-- In-memory only (not persisted)
-- Calls `heart_beat` method at interval
-- Used for NPC AI, effects tick
+Lua callbacks are synchronous, and the game API reaches async managers in two
+ways:
 
-**Tick Loop**: `TimerManager::tick()` returns fired callbacks for execution.
+- `tokio::task::block_in_place` plus `Handle::current().block_on` for most
+  object store and class registry calls.
+- `std::thread::spawn` with a fresh Tokio runtime (`block_on_perm` and
+  similar) for permission, credit, timer and Venice calls.
 
-### Raft Consensus
+### Game API
 
-**Implementation**: OpenRaft library.
+The full reference is [langref.md](langref.md). The functions that exist:
 
-**Storage**: SQLite tables (`raft_log`, `raft_vote`, `raft_meta`).
+| Area | Functions |
+|------|-----------|
+| Objects | `create_object`, `get_object`, `update_object`, `delete_object`, `move_object`, `clone_object`, `use_object`, `store_code`, `get_code` |
+| Queries | `environment`, `all_inventory`, `get_children`, `present`, `get_living_in` |
+| Classes | `define_class`, `get_class`, `get_class_chain`, `is_a` (plus global `parent`) |
+| Verbs | `add_action`, `remove_action` |
+| Messages | `send`, `broadcast`, `broadcast_region` |
+| Permissions | `set_actor`, `get_actor`, `check_permission`, `can_access_path`, `get_access_level`, `set_access_level`, `grant_path`, `revoke_path`, `get_path_grants` |
+| Timers | `call_out`, `remove_call_out`, `set_heart_beat`, `remove_heart_beat` |
+| Credits | `get_credits`, `deduct_credits`, `admin_grant_credits` |
+| AI | `llm_chat`, `llm_image` |
+| Universe | `get_universe`, `update_universe` |
+| Utility | `time`, `set_time`, `set_rng_seed`, `roll_dice` |
 
-**Replication Model**:
-- Leader accepts writes, replicates to followers
-- Committed entries applied to state machine
-- Snapshots for log compaction
+Writes are permission-checked: `create_object` checks create permission for
+the path; `update_object`, `delete_object`, `move_object` and `clone_object`
+check the acting user against the object through `PermissionManager`.
+`store_code` and `define_class` need wizard+; `set_time` and `set_rng_seed`
+need wizard+; privileged functions such as `set_access_level`,
+`admin_grant_credits` and `update_universe` enforce their own levels
+([permissions.md](permissions.md)).
+
+## Permissions
+
+Access levels (player < builder < wizard < admin < owner), path grants and
+ownership rules are described in [permissions.md](permissions.md).
+`PermissionManager` caches access levels and loads path grants at startup.
+Each WebSocket session records the account's access level at connect time.
+
+## Combat
+
+Two layers exist:
+
+- **Rust** (`src/combat/`): `CombatManager` keeps HP, armor class and attack
+  bonus per entity, persisted in `combat_state`; status effects persist in
+  `active_effects`. The `attack` command uses it: d20 + attack bonus against
+  armor class, natural 20 is a critical hit, natural 1 a fumble, then 1d6
+  physical damage (doubled on a critical). Targets must be `npc`, a class
+  derived from `npc`, or `monster`. A slain
+  target is removed from the room. There is no `game.*` binding for this
+  layer.
+- **Lua mudlib** (`mudd/lib/combat.lua`): `Combat.initiate`, `Combat.attack`,
+  `Combat.deal_damage`, `Combat.heal`, effects, working on object
+  properties. `Commands.flee` lives in `lib/commands.lua`.
+
+Rust combat types:
+
+- **Damage types**: physical, slashing, piercing, bludgeoning, fire, cold,
+  lightning, acid, poison, necrotic, radiant, psychic, force, thunder.
+- **Modifiers**: immune (0x), resistant (half, rounded down), normal,
+  vulnerable (2x).
+- **Status effects**: poisoned, stunned, blinded, burning, frozen, paralyzed,
+  slowed, hasted, strengthened, weakened, protected, exposed, invisible,
+  regenerating, silenced.
+- **PvP policy** (`PvpPolicy`): `Disabled` (default), `ArenaOnly`,
+  `Flagged`, `Open`. Not yet enforced by any command.
+- **Dice**: `combat/dice.rs` parses `NdM+K`; Lua uses `game.roll_dice`.
+
+## Credits
+
+`CreditManager` keeps per-universe balances in the `credits` table with an
+in-memory cache. Writes go through Raft; a failed read is an error, never a
+zero balance. Lua exposes `get_credits`, `deduct_credits` and
+`admin_grant_credits`. No action costs credits yet, and purchasing is out of
+scope (see [docs/blockchain.md](../../docs/blockchain.md)).
+
+## Venice AI and Room Images
+
+`VeniceClient` (`src/venice/`) talks to an OpenAI-compatible API, configured
+by `VENICE_API_KEY` and `VENICE_API_URL` ([admin.md](admin.md)). Without a
+key, AI features are off. Chat tiers are fast, balanced and quality. A
+token-bucket rate limiter allows 60 requests per minute per account.
+
+Room images (`images/gen.rs`) use two steps:
+
+1. A fast-tier chat call turns the theme's visual style plus the room's name,
+   description and region environment type into an image prompt (no people,
+   no text).
+2. An image call renders it; the PNG is stored in `image_store` by SHA-256
+   hash and the room's `image_hash` and `image_generated_at` properties are
+   set.
+
+`build_room_message` starts this in a background task when a room without
+`image_hash` is shown to an authenticated player and Venice is configured.
+The client fetches `/images/{hash}`. The theme is currently always
+`sierra-retro` (`ThemeRegistry` also has `modern`); its style is the Sierra
+adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
+3/4 elevated view).
+
+## Raft Replication
+
+`openraft` 0.9 with storage in the same SQLite database (`raft/storage.rs`):
+
+- **Log entries** are plain SQL requests (`raft/types.rs`: `Request { sql,
+  params }`). Managers write through `RaftWriter::execute`; non-deterministic
+  values (UUIDs, timestamps) are computed before proposing. On commit the
+  state machine executes the SQL with bound parameters. Reads go straight to
+  the pool.
+- **Persistence**: `raft_log` (entries, with term and `leader_node`),
+  `raft_vote` (vote and committed index), `raft_meta` (`last_applied`,
+  `last_purged`, `last_membership`). Persisting the membership lets a
+  restarted single node elect itself again.
+- **Snapshots**: after 1,000 log entries; a snapshot is the whole database
+  file after a `PRAGMA wal_checkpoint(TRUNCATE)`.
+- **Timing**: heartbeat 500 ms, election timeout 1.5-3 s.
+- **Network**: `raft/network.rs` sends RPCs as HTTP POSTs to
+  `http://<peer>/raft/<endpoint>`.
+- **Modes**: single-node by default. `--peers "1=host1:9000,2=host2:9001"`
+  selects cluster mode, where node 1 initializes the membership.
+
+Multi-node operation is not working yet: see
+[docs/roadmap.md](../../docs/roadmap.md) for the gaps and known issues
+(including writes that bypass Raft and per-node caches).
 
 ## Key Design Decisions
 
-1. **Content-addressed code**: Lua source stored by SHA256 hash, enabling deduplication and immutability.
-
-2. **Sandbox-per-execution**: Fresh Lua state for each `eval`, preventing state leakage between executions.
-
-3. **Async-in-sync bridge**: Game API uses `block_in_place` for database calls within sync Lua context.
-
-4. **Class registry in memory**: Base classes always available, custom classes loaded from DB on startup.
-
-5. **WebSocket JSON protocol**: Tagged messages (`type` field) for typed client/server communication.
-
-6. **Permissions cached**: Access levels cached in memory, backed by database for persistence.
-
-7. **Timer persistence**: One-shot timers survive restart, heartbeats do not (re-registered on object load).
+1. **Content-addressed code**: Lua source is stored by SHA-256, deduplicated
+   and immutable.
+2. **Sandbox per execution**: every run gets a fresh Lua state and message
+   queue, so nothing leaks between executions.
+3. **Object code runs as its owner**: the triggering player is data, never
+   identity.
+4. **Values, not source**: untrusted input reaches Lua as arguments
+   (`execute_with_args`), never as code.
+5. **Non-blocking delivery**: bounded per-client queues with `try_send`.
+6. **SQL-level replication**: Raft replicates the SQL a write performs, so
+   followers never run Lua.
+7. **Timers**: one-shot timers survive restart; heartbeats and registered
+   verbs are in memory and must be re-registered.
+8. **WebSocket JSON**: messages tagged by a `type` field.

@@ -95,7 +95,7 @@ impl ClassRegistry {
         registry
     }
 
-    /// Register the base classes from design.md
+    /// Register the built-in base classes (see mudd/docs/design.md, Classes)
     fn register_base_classes(&mut self) {
         // thing - root class
         let mut thing = ClassDef::new("thing", None);

@@ -94,7 +94,7 @@ impl Metering {
     }
 
     /// Calculate estimated cost in credits (millicredits)
-    /// Based on design.md pricing
+    /// Based on the draft pricing in docs/roadmap.md (Economy and Limits)
     pub fn estimated_cost_millicredits(&self) -> u64 {
         // Instructions: $0.0001 per 1M = 0.1 millicredits per 1M
         let instr_cost = self.instructions() / 10_000_000;
