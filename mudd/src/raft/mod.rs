@@ -81,8 +81,9 @@ mod tests {
             "INSERT INTO test VALUES (?)",
             vec![serde_json::json!("hello")],
         );
-        assert_eq!(req.sql, "INSERT INTO test VALUES (?)");
-        assert_eq!(req.params.len(), 1);
+        assert_eq!(req.statements.len(), 1);
+        assert_eq!(req.statements[0].sql, "INSERT INTO test VALUES (?)");
+        assert_eq!(req.statements[0].params.len(), 1);
     }
 
     #[test]

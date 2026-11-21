@@ -62,46 +62,46 @@ impl GameStateMachine {
         }
     }
 
-    /// Execute a SQL statement against the database
+    /// Execute a request's statements in one transaction (all or nothing)
     #[allow(dead_code)]
     async fn execute_sql(&self, request: &Request) -> Response {
-        debug!("Executing SQL: {}", request.sql);
-
-        // Build the query with parameters
-        let mut query = sqlx::query(&request.sql);
-
-        // Bind JSON parameters
-        for param in &request.params {
-            query = match param {
-                serde_json::Value::Null => query.bind(Option::<String>::None),
-                serde_json::Value::Bool(b) => query.bind(*b),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        query.bind(i)
-                    } else if let Some(f) = n.as_f64() {
-                        query.bind(f)
-                    } else {
-                        query.bind(n.to_string())
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => return Response::error(e.to_string()),
+        };
+        let mut rows = 0;
+        for statement in &request.statements {
+            debug!("Executing SQL: {}", statement.sql);
+            let mut query = sqlx::query(&statement.sql);
+            for param in &statement.params {
+                query = match param {
+                    serde_json::Value::Null => query.bind(Option::<String>::None),
+                    serde_json::Value::Bool(b) => query.bind(*b),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            query.bind(i)
+                        } else if let Some(f) = n.as_f64() {
+                            query.bind(f)
+                        } else {
+                            query.bind(n.to_string())
+                        }
                     }
-                }
-                serde_json::Value::String(s) => query.bind(s.clone()),
-                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                    serde_json::Value::String(s) => query.bind(s.as_str()),
                     // Serialize complex types as JSON strings
-                    query.bind(param.to_string())
+                    _ => query.bind(param.to_string()),
+                };
+            }
+            match query.execute(&mut *tx).await {
+                Ok(result) => rows += result.rows_affected(),
+                Err(e) => {
+                    error!("SQL execution failed: {}", e);
+                    return Response::error(e.to_string());
                 }
-            };
+            }
         }
-
-        match query.execute(&self.pool).await {
-            Ok(result) => {
-                let rows = result.rows_affected();
-                debug!("SQL executed successfully, {} rows affected", rows);
-                Response::ok(rows)
-            }
-            Err(e) => {
-                error!("SQL execution failed: {}", e);
-                Response::error(e.to_string())
-            }
+        match tx.commit().await {
+            Ok(()) => Response::ok(rows),
+            Err(e) => Response::error(e.to_string()),
         }
     }
 

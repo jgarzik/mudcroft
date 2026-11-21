@@ -112,19 +112,18 @@ impl RaftWriter {
 
     /// Execute a batch of SQL statements atomically via Raft consensus
     ///
-    /// All statements are committed together. If any fails, the batch is rejected.
+    /// The statements are one log entry, applied in one transaction: if any
+    /// fails, none are applied and an error is returned.
     pub async fn execute_batch(
         &self,
         statements: Vec<(String, Vec<serde_json::Value>)>,
     ) -> Result<()> {
-        for (sql, params) in statements {
-            let response = self.execute(&sql, params).await?;
-            if !response.success {
-                if let Some(err) = response.error {
-                    bail!("Batch statement failed: {}", err);
-                }
-                bail!("Batch statement failed (unknown error)");
-            }
+        let response = self.raft.client_write(Request::batch(statements)).await?;
+        if !response.data.success {
+            bail!(
+                "Batch failed: {}",
+                response.data.error.as_deref().unwrap_or("unknown error")
+            );
         }
         Ok(())
     }

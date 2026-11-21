@@ -205,63 +205,82 @@ impl CombinedStorage {
         })
     }
 
+    /// Apply a request's statements in one transaction: all or nothing
     async fn execute_sql(&self, request: &Request) -> Response {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-
-        debug!("Executing SQL: {}", request.sql);
-
         let pool = self.pool.read().await;
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => return Response::error(e.to_string()),
+        };
 
-        let mut query = sqlx::query(&request.sql);
-        for param in &request.params {
-            query = match param {
-                serde_json::Value::Null => query.bind(Option::<String>::None),
-                serde_json::Value::Bool(b) => query.bind(*b),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        query.bind(i)
-                    } else if let Some(f) = n.as_f64() {
-                        query.bind(f)
-                    } else {
-                        query.bind(n.to_string())
-                    }
+        let mut rows = 0;
+        for statement in &request.statements {
+            debug!("Executing SQL: {}", statement.sql);
+            match bind_params(sqlx::query(&statement.sql), &statement.params)
+                .execute(&mut *tx)
+                .await
+            {
+                Ok(result) => rows += result.rows_affected(),
+                Err(e) => {
+                    error!("SQL execution failed (rolling back): {}", e);
+                    // Dropping the transaction rolls it back
+                    return Response::error(e.to_string());
                 }
-                serde_json::Value::String(s) => {
-                    // Handle "blob:" prefix for binary data
-                    if let Some(b64_data) = s.strip_prefix("blob:") {
-                        match BASE64.decode(b64_data) {
-                            Ok(bytes) => query.bind(bytes),
-                            Err(e) => {
-                                error!("Failed to decode base64 blob: {}", e);
-                                query.bind(s.clone())
-                            }
-                        }
-                    } else {
-                        query.bind(s.clone())
-                    }
-                }
-                _ => query.bind(param.to_string()),
-            };
-        }
-
-        match query.execute(&*pool).await {
-            Ok(result) => {
-                // Checkpoint WAL to ensure read visibility across all connections
-                // This is needed because reads may use different connections than writes
-                if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-                    .execute(&*pool)
-                    .await
-                {
-                    debug!("WAL checkpoint failed (non-fatal): {}", e);
-                }
-                Response::ok(result.rows_affected())
-            }
-            Err(e) => {
-                error!("SQL execution failed: {}", e);
-                Response::error(e.to_string())
             }
         }
+        if let Err(e) = tx.commit().await {
+            return Response::error(e.to_string());
+        }
+
+        // Checkpoint WAL to ensure read visibility across all connections
+        // This is needed because reads may use different connections than writes
+        if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+            .execute(&*pool)
+            .await
+        {
+            debug!("WAL checkpoint failed (non-fatal): {}", e);
+        }
+        Response::ok(rows)
     }
+}
+
+/// Bind JSON parameters to a query. Strings prefixed `blob:` carry base64
+/// binary data.
+fn bind_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    params: &'q [serde_json::Value],
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    for param in params {
+        query = match param {
+            serde_json::Value::Null => query.bind(Option::<String>::None),
+            serde_json::Value::Bool(b) => query.bind(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    query.bind(i)
+                } else if let Some(f) = n.as_f64() {
+                    query.bind(f)
+                } else {
+                    query.bind(n.to_string())
+                }
+            }
+            serde_json::Value::String(s) => {
+                if let Some(b64_data) = s.strip_prefix("blob:") {
+                    match BASE64.decode(b64_data) {
+                        Ok(bytes) => query.bind(bytes),
+                        Err(e) => {
+                            error!("Failed to decode base64 blob: {}", e);
+                            query.bind(s.as_str())
+                        }
+                    }
+                } else {
+                    query.bind(s.as_str())
+                }
+            }
+            _ => query.bind(param.to_string()),
+        };
+    }
+    query
 }
 
 // Implement RaftLogReader (not sealed)
@@ -742,6 +761,40 @@ mod tests {
         let loaded = storage.read_vote().await.unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().leader_id.term, 5);
+    }
+
+    /// A batch is applied atomically: if any statement fails, none apply
+    #[tokio::test]
+    async fn test_batch_is_atomic() {
+        let pool = test_pool().await;
+        sqlx::query("CREATE TABLE batch_t (v INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let storage = CombinedStorage::new(pool.clone()).await.unwrap();
+
+        let ok = storage
+            .execute_sql(&Request::batch(vec![
+                ("INSERT INTO batch_t VALUES (1)".into(), vec![]),
+                ("INSERT INTO batch_t VALUES (2)".into(), vec![]),
+            ]))
+            .await;
+        assert!(ok.success);
+        assert_eq!(ok.rows_affected, 2);
+
+        let failed = storage
+            .execute_sql(&Request::batch(vec![
+                ("INSERT INTO batch_t VALUES (3)".into(), vec![]),
+                ("INSERT INTO batch_t VALUES (NULL)".into(), vec![]),
+            ]))
+            .await;
+        assert!(!failed.success);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM batch_t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "the failed batch left no rows behind");
     }
 
     #[tokio::test]

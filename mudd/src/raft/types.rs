@@ -34,32 +34,49 @@ impl RaftTypeConfig for TypeConfig {
     type Responder = openraft::impls::OneshotResponder<TypeConfig>;
 }
 
-/// Application request - SQL command to replicate
-///
-/// All non-deterministic values (UUIDs, timestamps) must be
-/// pre-computed by the leader before replication.
+/// One SQL statement with its bound parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Request {
+pub struct Statement {
     /// SQL statement to execute
     pub sql: String,
     /// Bound parameters as JSON values
     pub params: Vec<serde_json::Value>,
 }
 
+/// Application request: SQL statements to replicate, applied atomically in
+/// one transaction (all or nothing)
+///
+/// All non-deterministic values (UUIDs, timestamps) must be
+/// pre-computed by the leader before replication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Request {
+    /// Statements, applied in order inside one transaction
+    pub statements: Vec<Statement>,
+}
+
 impl Request {
-    /// Create a new request
+    /// A request with one statement
     pub fn new(sql: impl Into<String>, params: Vec<serde_json::Value>) -> Self {
         Self {
-            sql: sql.into(),
-            params,
+            statements: vec![Statement {
+                sql: sql.into(),
+                params,
+            }],
         }
     }
 
-    /// Create a simple request with no parameters
+    /// A request with one statement and no parameters
     pub fn simple(sql: impl Into<String>) -> Self {
+        Self::new(sql, vec![])
+    }
+
+    /// A request applying several statements atomically
+    pub fn batch(statements: Vec<(String, Vec<serde_json::Value>)>) -> Self {
         Self {
-            sql: sql.into(),
-            params: vec![],
+            statements: statements
+                .into_iter()
+                .map(|(sql, params)| Statement { sql, params })
+                .collect(),
         }
     }
 }
@@ -105,15 +122,16 @@ mod tests {
             "INSERT INTO test VALUES (?)",
             vec![serde_json::json!("hello")],
         );
-        assert_eq!(req.sql, "INSERT INTO test VALUES (?)");
-        assert_eq!(req.params.len(), 1);
+        assert_eq!(req.statements.len(), 1);
+        assert_eq!(req.statements[0].sql, "INSERT INTO test VALUES (?)");
+        assert_eq!(req.statements[0].params.len(), 1);
     }
 
     #[test]
     fn test_request_simple() {
         let req = Request::simple("DELETE FROM test");
-        assert_eq!(req.sql, "DELETE FROM test");
-        assert!(req.params.is_empty());
+        assert_eq!(req.statements[0].sql, "DELETE FROM test");
+        assert!(req.statements[0].params.is_empty());
     }
 
     #[test]
