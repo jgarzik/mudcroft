@@ -222,3 +222,51 @@ async fn test_take_argument_cannot_inject_lua() {
         assert_ne!(text, "INJECTED", "Lua injection via `{}`", cmd);
     }
 }
+
+/// game.store_code is wizard+ (PermAction::StoreCode): acting as a player
+/// must not be able to plant code
+#[tokio::test]
+async fn test_store_code_requires_wizard() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("code_wiz")).await;
+    let pl = connect(&server, player("code_player")).await;
+    let pl_id = pl.account_id().unwrap().to_string();
+
+    let out = eval(
+        &mut wiz,
+        r#"local h = game.store_code("return {}"); return type(h)"#,
+    )
+    .await;
+    assert_eq!(out, "string", "wizard may store code");
+
+    let out = eval(
+        &mut wiz,
+        &format!(
+            r#"game.set_actor("{}"); local ok, err = pcall(game.store_code, "return {{}}"); return tostring(ok)"#,
+            pl_id
+        ),
+    )
+    .await;
+    assert_eq!(out, "false", "a player identity must not store code");
+}
+
+/// Objects created via Lua are owned by the creating user
+#[tokio::test]
+async fn test_created_object_owned_by_creator() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("owner_wiz")).await;
+    let wiz_id = wiz.account_id().unwrap().to_string();
+
+    eval(
+        &mut wiz,
+        r#"return game.create_object("/items/owned-thing", "item", nil, {name = "thing"}).id"#,
+    )
+    .await;
+
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM objects WHERE id = '/items/owned-thing'")
+            .fetch_one(server.pool())
+            .await
+            .expect("object row");
+    assert_eq!(owner.as_deref(), Some(wiz_id.as_str()));
+}

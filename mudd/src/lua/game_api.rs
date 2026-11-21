@@ -234,12 +234,15 @@ impl GameApi {
     fn register_object_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let store = self.store.clone();
         let universe_id = self.universe_id.clone();
+        let current_user = self.current_user_id.clone();
+        let permissions = self.permissions.clone();
 
         // game.create_object(path, class, parent_id, props)
         // Actually creates object in database with current user as owner
         // Returns object on success, or {error = "message"} on path validation failure
         let store_clone = store.clone();
         let universe_clone = universe_id.clone();
+        let user_clone = current_user.clone();
         let create_object = lua.create_function(
             move |lua,
                   (path, class, parent_id, props): (
@@ -251,9 +254,8 @@ impl GameApi {
                 let store = store_clone.clone();
                 let universe_id = universe_clone.clone();
 
-                // Get current user for ownership
-                let actor_override: Option<String> = actor_override(lua);
-                let owner_id = actor_override;
+                // Owner is the acting user (set_actor override, else the real user)
+                let owner_id = actor_override(lua).or(user_clone.clone());
 
                 // Create object with path validation
                 let mut obj = match Object::new(&path, &universe_id, &class) {
@@ -430,10 +432,35 @@ impl GameApi {
         )?;
         game.set("clone_object", clone_object)?;
 
-        // game.store_code(source) - returns hash
+        // game.store_code(source) - returns hash (wizard+, PermAction::StoreCode)
         let store_clone = store.clone();
-        let store_code = lua.create_function(move |_, source: String| {
+        let universe_clone = universe_id.clone();
+        let user_clone = current_user.clone();
+        let permissions_clone = permissions.clone();
+        let store_code = lua.create_function(move |lua, source: String| {
             let store = store_clone.clone();
+
+            let user_id = actor_override(lua)
+                .or(user_clone.clone())
+                .ok_or_else(|| mlua::Error::runtime("store_code: no user context"))?;
+            let permissions = permissions_clone.clone();
+            let universe_id = universe_clone.clone();
+            let allowed = block_on_perm(async move {
+                let ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                let target = ObjectContext {
+                    object_id: format!("/universe/{}", universe_id),
+                    owner_id: None,
+                    is_fixed: false,
+                };
+                permissions
+                    .check_permission(&ctx, PermAction::StoreCode, &target)
+                    .is_allowed()
+            });
+            if !allowed {
+                return Err(mlua::Error::runtime(
+                    "store_code: permission denied (wizard+ required)",
+                ));
+            }
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -1395,8 +1422,7 @@ impl GameApi {
 
                     credits
                         .grant(&universe_id, &account_id, amount, "admin_grant")
-                        .await;
-                    true
+                        .await
                 });
 
                 Ok(result)
