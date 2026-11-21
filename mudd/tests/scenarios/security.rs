@@ -707,3 +707,59 @@ async fn test_define_class_protects_others_classes() {
     );
     assert_eq!(eval(&mut adm, def).await, "true", "an admin may");
 }
+
+/// Actions run the object's code as its owner, so registering one needs the
+/// owner's (or a superior's) authority, and private handlers or engine hooks
+/// are never dispatchable as verbs
+#[tokio::test]
+async fn test_add_action_respects_owner_and_private_handlers() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = connect(&server, admin("action_admin")).await;
+    let mut wiz = connect(&server, wizard("action_wizard")).await;
+
+    eval(
+        &mut adm,
+        &format!(
+            r#"local h = game.store_code([[return {{
+                 polish = function(a) return "shiny" end,
+                 _wipe = function(a) return "wiped" end,
+                 on_death = function(a) return "dead" end,
+               }}]])
+               game.create_object("/items/admin-idol", "item", "{}", {{name = "idol", code_hash = h}})
+               return true"#,
+            entrance
+        ),
+    )
+    .await;
+
+    // A wizard (who can modify the idol) must not wire verbs onto an admin's code
+    let out = eval(
+        &mut wiz,
+        r#"return tostring(game.add_action("polish", "/items/admin-idol", "polish"))"#,
+    )
+    .await;
+    assert_eq!(
+        out, "false",
+        "wizard must not add actions to an admin's object"
+    );
+
+    // Even the owner cannot expose private handlers or engine hooks
+    for method in ["_wipe", "on_death"] {
+        let out = eval(
+            &mut adm,
+            &format!(
+                r#"return tostring(game.add_action("x{m}", "/items/admin-idol", "{m}"))"#,
+                m = method
+            ),
+        )
+        .await;
+        assert_eq!(out, "false", "{} must not become a verb", method);
+    }
+    let out = eval(
+        &mut adm,
+        r#"return tostring(game.add_action("polish", "/items/admin-idol", "polish"))"#,
+    )
+    .await;
+    assert_eq!(out, "true", "owner may add a normal action");
+}

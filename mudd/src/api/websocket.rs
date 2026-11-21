@@ -1459,6 +1459,8 @@ async fn dispatch_custom_verb(
             candidates.push(action);
         }
     }
+    // Never dispatch to private handlers or engine hooks
+    candidates.retain(|a| !crate::lua::is_private_handler(&a.method));
     if candidates.is_empty() {
         return None;
     }

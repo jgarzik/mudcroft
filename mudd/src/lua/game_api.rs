@@ -131,6 +131,13 @@ const MAX_USE_DEPTH: usize = 8;
 /// across all nesting levels (each call runs a whole new sandbox)
 const MAX_USE_CALLS: usize = 32;
 
+/// Whether `handler` is private to its object's own code: `_name` helpers
+/// and engine hooks, which only the server invokes on real events. Neither
+/// game.use_object nor player verbs may call these.
+pub fn is_private_handler(handler: &str) -> bool {
+    handler.starts_with('_') || ENGINE_HOOKS.contains(&handler)
+}
+
 /// Engine hooks: run by the server on events, never via game.use_object
 const ENGINE_HOOKS: &[&str] = &[
     "on_enter",
@@ -1146,8 +1153,9 @@ impl GameApi {
             self.universe_id.clone(),
         );
 
-        /// Whether the acting user may modify `object_id` (required to add
-        /// or remove its actions)
+        /// Whether the acting user may wire verbs to `object_id`'s code. The
+        /// code runs as the object's owner, so this needs Modify access *and*
+        /// being the owner or outranking them (like attaching code).
         fn may_modify(
             lua: &Lua,
             perm_ctx: &(
@@ -1165,7 +1173,7 @@ impl GameApi {
                 let Ok(Some(obj)) = store.get(&object_id).await else {
                     return false;
                 };
-                object_permission(
+                if object_permission(
                     &permissions,
                     user.as_deref(),
                     &universe_id,
@@ -1173,7 +1181,20 @@ impl GameApi {
                     PermAction::Modify,
                 )
                 .await
-                .is_ok()
+                .is_err()
+                {
+                    return false;
+                }
+                match (&obj.owner_id, &user) {
+                    (None, _) => true,
+                    (Some(owner), Some(actor)) if owner == actor => true,
+                    (Some(owner), Some(actor)) => {
+                        let actor_level = permissions.get_access_level(actor).await;
+                        let owner_level = permissions.get_access_level(owner).await;
+                        actor_level.can_act_as(owner_level)
+                    }
+                    (Some(_), None) => false,
+                }
             })
         }
 
@@ -1186,7 +1207,7 @@ impl GameApi {
             move |lua, (verb, object_id, method): (String, String, String)| {
                 let actions = actions_clone.clone();
                 let room_id = room_id_clone.clone();
-                if !may_modify(lua, &perm_clone, &object_id) {
+                if is_private_handler(&method) || !may_modify(lua, &perm_clone, &object_id) {
                     return Ok(false);
                 }
 
@@ -2162,7 +2183,7 @@ impl GameApi {
                     };
                     // `_name` handlers are private to the object's own code, and
                     // engine hooks only run on real events
-                    if handler_name.starts_with('_') || ENGINE_HOOKS.contains(&handler_name) {
+                    if is_private_handler(handler_name) {
                         return Ok(Value::Nil);
                     }
 
