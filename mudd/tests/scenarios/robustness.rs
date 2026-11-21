@@ -369,3 +369,49 @@ async fn test_defined_class_survives_restart() {
     .await;
     assert_eq!(text, "true:true");
 }
+
+/// Account writes (register, login, logout) are replicated through Raft
+#[tokio::test]
+async fn test_account_writes_go_through_raft() {
+    let server = TestServer::start().await.expect("server");
+    async fn account_entries(server: &TestServer) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%accounts SET token%'
+                OR payload LIKE '%INSERT INTO accounts%'",
+        )
+        .fetch_one(server.pool())
+        .await
+        .unwrap()
+    }
+    let before = account_entries(&server).await;
+    let creds = serde_json::json!({"username": "raft_acct", "password": "test123"});
+    let reg: serde_json::Value = server
+        .post("/auth/register", &creds)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(reg["token"].is_string());
+    let login: serde_json::Value = server
+        .post("/auth/login", &creds)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+    let resp: serde_json::Value = server
+        .post("/auth/logout", &serde_json::json!({ "token": token }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["success"], true);
+    assert_eq!(
+        account_entries(&server).await - before,
+        3,
+        "register, login and logout each append one Raft entry"
+    );
+}

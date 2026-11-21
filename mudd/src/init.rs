@@ -59,7 +59,7 @@ pub async fn init_database(
         let db = Database::new(Some(path.to_str().unwrap())).await?;
 
         // Create admin account
-        let service = AccountService::new(db.pool().clone());
+        let service = AccountService::offline(db.pool().clone());
         let account = service.create(admin_username, admin_password).await?;
         info!(
             "Created admin account '{}' ({})",
@@ -184,7 +184,7 @@ mod tests {
 
         // Verify admin account exists with correct level
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        let service = AccountService::new(db.pool().clone());
+        let service = AccountService::offline(db.pool().clone());
         let account = service.get_by_username("admin").await.unwrap().unwrap();
         assert_eq!(account.access_level, "admin");
     }
@@ -211,7 +211,7 @@ mod tests {
 
         // Verify admin account still exists
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        let service = AccountService::new(db.pool().clone());
+        let service = AccountService::offline(db.pool().clone());
         let account = service.get_by_username("admin").await.unwrap().unwrap();
         assert_eq!(account.access_level, "admin");
     }

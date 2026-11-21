@@ -12,6 +12,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use serde::Serialize;
 use tokio::sync::RwLock;
 
+use crate::auth::accounts::AccountService;
 use crate::combat::CombatManager;
 use crate::credits::CreditManager;
 use crate::db::Database;
@@ -48,6 +49,13 @@ pub struct AppState {
 /// Build the API router. With `static_dir`, also serve the built web client
 /// from it: files by path, and index.html for `/` and any other path no API
 /// route claims (client-side routes).
+impl AppState {
+    /// The account service, writing through Raft
+    pub fn accounts(&self) -> AccountService {
+        AccountService::new(self.db.pool().clone(), self.raft_writer.clone())
+    }
+}
+
 pub async fn router(
     db: Arc<Database>,
     raft_writer: Arc<RaftWriter>,

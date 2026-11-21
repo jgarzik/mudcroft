@@ -149,7 +149,7 @@ impl TestClient {
                     }
                     Role::Admin { .. } => {
                         let account_service =
-                            mudd::auth::accounts::AccountService::new(server.pool().clone());
+                            mudd::auth::accounts::AccountService::offline(server.pool().clone());
                         account_service
                             .set_access_level(&account_id, role.access_level())
                             .await?;

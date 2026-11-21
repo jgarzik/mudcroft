@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use super::scripting::{self, ScriptContext};
 use super::AppState;
-use crate::auth::accounts::{Account, AccountService};
+use crate::auth::accounts::Account;
 use crate::combat::DamageType;
 use crate::images::generate_room_image;
 use crate::permissions::AccessLevel;
@@ -343,11 +343,7 @@ pub async fn ws_handler(
 
     // A valid token is required: there are no guests
     let account = match params.token {
-        Some(token) => AccountService::new(state.db.pool().clone())
-            .validate_token(&token)
-            .await
-            .ok()
-            .flatten(),
+        Some(token) => state.accounts().validate_token(&token).await.ok().flatten(),
         None => None,
     };
     let Some(account) = account else {

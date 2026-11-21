@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use crate::auth::accounts::{AccountService, AuthError};
+use crate::auth::accounts::AuthError;
 
 /// Build auth router
 pub fn router() -> Router<AppState> {
@@ -71,7 +71,7 @@ async fn register(
         return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
     }
 
-    let service = AccountService::new(state.db.pool().clone());
+    let service = state.accounts();
 
     match service.create_account(&req.username, &req.password).await {
         Ok((account, token)) => (
@@ -110,7 +110,7 @@ pub struct LoginRequest {
 
 /// Login with username and password
 async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
-    let service = AccountService::new(state.db.pool().clone());
+    let service = state.accounts();
 
     match service.login(&req.username, &req.password).await {
         Ok((account, token)) => (
@@ -157,7 +157,7 @@ async fn logout(
     State(state): State<AppState>,
     Json(req): Json<LogoutRequest>,
 ) -> impl IntoResponse {
-    let service = AccountService::new(state.db.pool().clone());
+    let service = state.accounts();
 
     match service.logout(&req.token).await {
         Ok(success) => (StatusCode::OK, Json(LogoutResponse { success })).into_response(),
@@ -194,7 +194,7 @@ async fn validate(
     State(state): State<AppState>,
     Query(params): Query<ValidateQuery>,
 ) -> impl IntoResponse {
-    let service = AccountService::new(state.db.pool().clone());
+    let service = state.accounts();
 
     match service.validate_token(&params.token).await {
         Ok(Some(account)) => Json(ValidateResponse {

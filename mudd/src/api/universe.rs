@@ -16,7 +16,7 @@ use zip::ZipArchive;
 
 use super::scripting::{self, ScriptContext};
 use super::AppState;
-use crate::auth::accounts::{Account, AccountService};
+use crate::auth::accounts::Account;
 use crate::permissions::AccessLevel;
 use crate::universe::validate_universe_id;
 
@@ -47,7 +47,7 @@ async fn authenticate(
         )
     })?;
 
-    let service = AccountService::new(state.db.pool().clone());
+    let service = state.accounts();
     service
         .validate_token(token)
         .await

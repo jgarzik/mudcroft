@@ -1,9 +1,17 @@
 //! Account management service
 //!
 //! Handles account creation, authentication, and token management.
+//!
+//! In the server every account write goes through Raft. Offline tools
+//! (`mudd_init`, before any Raft node exists) and unit tests write directly.
 
+use std::sync::Arc;
+
+use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePool;
 use thiserror::Error;
+
+use crate::raft::RaftWriter;
 
 use super::{generate_salt, generate_token, hash_password, verify_password};
 
@@ -30,17 +38,53 @@ pub enum AuthError {
 
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+
+    #[error("write failed: {0}")]
+    Write(String),
 }
 
 /// Account service for authentication operations
 pub struct AccountService {
     pool: SqlitePool,
+    raft_writer: Option<Arc<RaftWriter>>,
 }
 
 impl AccountService {
-    /// Create a new account service
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    /// An account service that writes through Raft (the server)
+    pub fn new(pool: SqlitePool, raft_writer: Arc<RaftWriter>) -> Self {
+        Self {
+            pool,
+            raft_writer: Some(raft_writer),
+        }
+    }
+
+    /// An account service that writes directly to SQLite: only for offline
+    /// tools that run without a Raft node (`mudd_init`) and tests
+    pub fn offline(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            raft_writer: None,
+        }
+    }
+
+    /// Run one write, through Raft when available; returns rows affected
+    async fn write(&self, sql: &str, params: Vec<Value>) -> Result<u64, AuthError> {
+        if let Some(ref raft_writer) = self.raft_writer {
+            return raft_writer
+                .execute(sql, params)
+                .await
+                .map(|r| r.rows_affected)
+                .map_err(|e| AuthError::Write(e.to_string()));
+        }
+        let mut query = sqlx::query(sql);
+        for param in params {
+            query = match param {
+                Value::Null => query.bind(Option::<String>::None),
+                Value::String(v) => query.bind(v),
+                other => query.bind(other.to_string()),
+            };
+        }
+        Ok(query.execute(&self.pool).await?.rows_affected())
     }
 
     /// Create a new account
@@ -67,19 +111,28 @@ impl AccountService {
         let token = generate_token();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Insert account
-        sqlx::query(
+        // Insert account (a concurrent registration of the same name loses
+        // on the UNIQUE constraint)
+        self.write(
             "INSERT INTO accounts (id, username, password_hash, salt, token, access_level, created_at)
              VALUES (?, ?, ?, ?, ?, 'player', ?)",
+            vec![
+                json!(id),
+                json!(username),
+                json!(password_hash),
+                json!(salt),
+                json!(token),
+                json!(now),
+            ],
         )
-        .bind(&id)
-        .bind(username)
-        .bind(&password_hash)
-        .bind(&salt)
-        .bind(&token)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| match e {
+            AuthError::Write(msg) if msg.contains("UNIQUE") => AuthError::UsernameExists,
+            AuthError::Database(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                AuthError::UsernameExists
+            }
+            other => other,
+        })?;
 
         let account = Account {
             id,
@@ -117,11 +170,11 @@ impl AccountService {
         let token = generate_token();
 
         // Update token in database
-        sqlx::query("UPDATE accounts SET token = ? WHERE id = ?")
-            .bind(&token)
-            .bind(&id)
-            .execute(&self.pool)
-            .await?;
+        self.write(
+            "UPDATE accounts SET token = ? WHERE id = ?",
+            vec![json!(token), json!(id)],
+        )
+        .await?;
 
         let account = Account {
             id,
@@ -152,12 +205,13 @@ impl AccountService {
 
     /// Logout by clearing the token
     pub async fn logout(&self, token: &str) -> Result<bool, AuthError> {
-        let result = sqlx::query("UPDATE accounts SET token = NULL WHERE token = ?")
-            .bind(token)
-            .execute(&self.pool)
+        let rows = self
+            .write(
+                "UPDATE accounts SET token = NULL WHERE token = ?",
+                vec![json!(token)],
+            )
             .await?;
-
-        Ok(result.rows_affected() > 0)
+        Ok(rows > 0)
     }
 
     /// Get account by ID
@@ -200,15 +254,16 @@ impl AccountService {
         Ok(account)
     }
 
-    /// Set account access level
+    /// Set an account's global access level
     pub async fn set_access_level(&self, account_id: &str, level: &str) -> Result<(), AuthError> {
-        let result = sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
-            .bind(level)
-            .bind(account_id)
-            .execute(&self.pool)
+        let rows = self
+            .write(
+                "UPDATE accounts SET access_level = ? WHERE id = ?",
+                vec![json!(level), json!(account_id)],
+            )
             .await?;
 
-        if result.rows_affected() == 0 {
+        if rows == 0 {
             return Err(AuthError::AccountNotFound);
         }
 
@@ -224,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn test_account_create() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         let (account, token) = service
             .create_account("testuser", "password123")
@@ -239,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn test_account_create_duplicate() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         service
             .create_account("testuser", "password123")
@@ -253,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn test_login_success() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         service
             .create_account("testuser", "password123")
@@ -269,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn test_login_wrong_password() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         service
             .create_account("testuser", "password123")
@@ -283,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_login_nonexistent_user() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         let result = service.login("nouser", "password").await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
@@ -292,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_token() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         let (_, token) = service
             .create_account("testuser", "password123")
@@ -307,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_invalid_token() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         let account = service.validate_token("invalidtoken").await.unwrap();
         assert!(account.is_none());
@@ -316,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn test_logout() {
         let pool = test_pool().await;
-        let service = AccountService::new(pool);
+        let service = AccountService::offline(pool);
 
         let (_, token) = service
             .create_account("testuser", "password123")
