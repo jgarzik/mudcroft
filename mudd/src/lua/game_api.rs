@@ -480,9 +480,11 @@ impl GameApi {
             universe_id.clone(),
             permissions.clone(),
         );
+        let cleanup = (self.timers.clone(), self.actions.clone());
         let delete_object = lua.create_function(move |lua, id: String| {
             let store = store_clone.clone();
             let (user, universe_id, permissions) = ctx_clone.clone();
+            let (timers, actions) = cleanup.clone();
             let user = actor_override(lua).or(user);
 
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
@@ -501,7 +503,16 @@ impl GameApi {
                     {
                         return Ok(Err(reason));
                     }
-                    store.delete(&id).await.map(Ok)
+                    let deleted = store.delete(&id).await?;
+                    if deleted {
+                        // Nothing may keep running for (or be dispatched to)
+                        // the deleted object, nor for a later object reusing
+                        // its path
+                        timers.remove_timers_for_object(&id).await;
+                        timers.remove_heartbeat(&id).await;
+                        actions.clear_by_object(&id).await;
+                    }
+                    Ok(Ok(deleted))
                 })
             });
 
@@ -1456,16 +1467,21 @@ impl GameApi {
                 let universe_id = universe_clone.clone();
                 let object_id = object_clone.clone();
 
-                let delay_ms = (delay_secs * 1000.0) as u64;
+                // Negative/NaN delays fire on the next tick
+                let delay_ms = (delay_secs.max(0.0) * 1000.0) as u64;
 
                 let timer_id = std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async {
-                        if let Some(obj_id) = object_id {
-                            let timer = Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
-                            timers.add_timer(timer).await
-                        } else {
-                            String::new()
+                        // "" when there is no object context or the object is
+                        // at its pending-timer limit
+                        match object_id {
+                            Some(obj_id) => {
+                                let timer =
+                                    Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
+                                timers.try_add_timer(timer).await.unwrap_or_default()
+                            }
+                            None => String::new(),
                         }
                     })
                 })

@@ -452,3 +452,63 @@ async fn test_verb_errors_are_generic_for_players() {
         reply
     );
 }
+
+/// Timers are bounded per object, and deleting an object cancels its
+/// timers, heartbeat and actions
+#[tokio::test]
+async fn test_timer_limits_and_cleanup_on_delete() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "limit_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local h = game.store_code([[return {{
+                 spam = function(a)
+                   local n = 0
+                   for i = 1, 40 do
+                     if game.call_out(60, "noop") ~= "" then n = n + 1 end
+                   end
+                   return "scheduled " .. n
+                 end,
+                 noop = function(a) end,
+                 wind = function(a) game.set_heart_beat(150); return "wound" end,
+                 heart_beat = function(a) game.broadcast(a.room_id, "Tock.") end,
+               }}]])
+               game.create_object("/items/clock", "item", "{room}", {{name = "clock", fixed = true, code_hash = h}})
+               game.add_action("spam", "/items/clock", "spam")
+               game.add_action("wind", "/items/clock", "wind")
+               return true"#,
+            room = entrance
+        ),
+    )
+    .await;
+
+    let mut alice = player(&server, "limit_alice").await;
+    alice.command("spam clock").await.unwrap();
+    alice
+        .expect_output_containing("scheduled 32")
+        .await
+        .expect("call_outs capped at 32 per object");
+
+    alice.command("wind clock").await.unwrap();
+    alice
+        .expect_output_containing("Tock.")
+        .await
+        .expect("beating");
+
+    eval(&mut wiz, r#"return game.delete_object("/items/clock")"#).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    alice.drain().await;
+    let after = alice.outputs_within(Duration::from_millis(500)).await;
+    assert!(
+        !after.iter().any(|t| t.contains("Tock.")),
+        "heartbeat cancelled on delete: {:?}",
+        after
+    );
+    alice.command("wind clock").await.unwrap();
+    alice
+        .expect_output_containing("Unknown command: wind")
+        .await
+        .expect("actions cleared on delete");
+}
