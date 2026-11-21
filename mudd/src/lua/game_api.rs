@@ -811,12 +811,45 @@ impl GameApi {
         let store = self.store.clone();
 
         // game.define_class(name, definition)
-        // Registers a new class with parent and properties
+        // Registers a new class with parent and properties. Wizard+ only
+        // (classes are shared by every universe), and built-in base classes
+        // cannot be redefined.
         let classes_clone = classes.clone();
+        let perm_ctx = (
+            self.permissions.clone(),
+            self.current_user_id.clone(),
+            self.universe_id.clone(),
+        );
         let define_class =
             lua.create_function(move |lua, (name, definition): (String, Table)| {
                 charge_db(lua)?;
                 let classes = classes_clone.clone();
+
+                if crate::objects::ClassRegistry::is_builtin(&name) {
+                    return Err(mlua::Error::runtime(format!(
+                        "define_class: {} is a built-in class",
+                        name
+                    )));
+                }
+                let (permissions, user, universe_id) = perm_ctx.clone();
+                let user = actor_override(lua).or(user);
+                let allowed = block_on_perm(async move {
+                    let Some(user) = user else { return false };
+                    let ctx = permissions.get_user_context(&user, &universe_id).await;
+                    let target = ObjectContext {
+                        object_id: format!("/universe/{}", universe_id),
+                        owner_id: None,
+                        is_fixed: false,
+                    };
+                    permissions
+                        .check_permission(&ctx, PermAction::StoreCode, &target)
+                        .is_allowed()
+                });
+                if !allowed {
+                    return Err(mlua::Error::runtime(
+                        "define_class: permission denied (wizard+ required)",
+                    ));
+                }
 
                 // Extract parent from definition
                 let parent: Option<String> = definition.get("parent").ok();

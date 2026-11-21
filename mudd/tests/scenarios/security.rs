@@ -481,3 +481,37 @@ async fn test_use_object_runs_as_owner() {
     assert_eq!(out, "false", "the code ran as the builder, not the admin");
     assert_eq!(db_access_level(&server, &bld_id).await, "builder");
 }
+
+/// Classes are shared by every universe: only wizards+ may define them, and
+/// built-in base classes cannot be redefined
+#[tokio::test]
+async fn test_define_class_restrictions() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("class_wiz")).await;
+    let pl = connect(&server, player("class_player")).await;
+    let pl_id = pl.account_id().unwrap().to_string();
+
+    let out = eval(
+        &mut wiz,
+        r#"return tostring(game.define_class("lantern", {parent = "item", properties = {lit = {type = "boolean", default = false}}}))"#,
+    )
+    .await;
+    assert_eq!(out, "true", "wizard may define a new class");
+
+    let out = eval(
+        &mut wiz,
+        r#"return tostring(pcall(game.define_class, "weapon", {parent = "item"}))"#,
+    )
+    .await;
+    assert_eq!(out, "false", "built-in classes cannot be redefined");
+
+    let out = eval(
+        &mut wiz,
+        &format!(
+            r#"game.set_actor("{}"); return tostring(pcall(game.define_class, "trap", {{parent = "item"}}))"#,
+            pl_id
+        ),
+    )
+    .await;
+    assert_eq!(out, "false", "players may not define classes");
+}

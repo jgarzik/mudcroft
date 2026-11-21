@@ -1254,16 +1254,7 @@ end
 
 function test_class_inheritance_chain()
     -- Define the inheritance chain: thing → item → weapon → sword → fire_sword
-    -- (thing and item are built-in, we define weapon, sword, fire_sword)
-
-    game.define_class("weapon", {
-        parent = "item",
-        properties = {
-            damage_dice = { type = "string", default = "1d4" },
-            damage_bonus = { type = "number", default = 0 },
-            damage_type = { type = "string", default = "physical" },
-        }
-    })
+    -- (thing, item and weapon are built-in; we define sword and fire_sword)
 
     game.define_class("sword", {
         parent = "weapon",

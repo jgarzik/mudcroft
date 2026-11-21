@@ -203,6 +203,25 @@ impl ClassRegistry {
         chain
     }
 
+    /// Names of the built-in base classes, which scripts may not redefine
+    pub const BUILTIN: &'static [&'static str] = &[
+        "thing",
+        "item",
+        "living",
+        "room",
+        "region",
+        "weapon",
+        "armor",
+        "container",
+        "player",
+        "npc",
+    ];
+
+    /// Whether `name` is a built-in base class
+    pub fn is_builtin(name: &str) -> bool {
+        Self::BUILTIN.contains(&name)
+    }
+
     /// Check if a class is a descendant of another class
     pub fn is_a(&self, child: &str, ancestor: &str) -> bool {
         let chain = self.get_chain(child);
