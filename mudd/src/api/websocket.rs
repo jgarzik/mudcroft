@@ -1140,13 +1140,25 @@ async fn execute_command(
                 .await
                 .unwrap_or_default();
 
-            let target = contents.iter().find(|obj| {
+            // Never yourself; an exact name match beats a partial one
+            let name_of = |obj: &crate::objects::Object| {
                 obj.properties
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .map(|n| n.to_lowercase().contains(&target_name))
-                    .unwrap_or(false)
-            });
+                    .map(|n| n.to_lowercase())
+            };
+            let others: Vec<_> = contents.iter().filter(|o| o.id != player_id).collect();
+            let target = others
+                .iter()
+                .find(|o| name_of(o).as_deref() == Some(target_name.as_str()))
+                .or_else(|| {
+                    others.iter().find(|o| {
+                        name_of(o)
+                            .map(|n| n.contains(&target_name))
+                            .unwrap_or(false)
+                    })
+                })
+                .copied();
 
             let target = match target {
                 Some(t) => t,
