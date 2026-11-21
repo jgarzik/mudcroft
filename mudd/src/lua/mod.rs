@@ -7,7 +7,7 @@ mod metering;
 mod sandbox;
 
 pub use actions::{Action, ActionRegistry};
-pub use game_api::GameApi;
+pub use game_api::{json_to_lua, GameApi};
 pub use messaging::{GameMessage, MessageQueue};
 pub use metering::Metering;
 pub use sandbox::{Sandbox, SandboxConfig, SandboxError};

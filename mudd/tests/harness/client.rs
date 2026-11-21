@@ -284,6 +284,44 @@ impl TestClient {
         self.recv_json_timeout(timeout).await
     }
 
+    /// Wait for an `output` message whose text contains `needle`
+    /// (skipping other messages). Returns the full text.
+    pub async fn expect_output_containing(&mut self, needle: &str) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                bail!("Timeout waiting for output containing {:?}", needle);
+            }
+            let msg = self.recv_json_timeout(remaining).await?;
+            if msg["type"] == "output" {
+                let text = msg["text"].as_str().unwrap_or_default();
+                if text.contains(needle) {
+                    return Ok(text.to_string());
+                }
+            }
+        }
+    }
+
+    /// Texts of all `output` messages received within `window`
+    pub async fn outputs_within(&mut self, window: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut texts = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return texts;
+            }
+            match self.recv_json_timeout(remaining).await {
+                Ok(msg) if msg["type"] == "output" => {
+                    texts.push(msg["text"].as_str().unwrap_or_default().to_string())
+                }
+                Ok(_) => {}
+                Err(_) => return texts,
+            }
+        }
+    }
+
     /// Drain all pending messages (non-blocking)
     pub async fn drain(&mut self) -> Vec<Value> {
         let mut messages = Vec::new();

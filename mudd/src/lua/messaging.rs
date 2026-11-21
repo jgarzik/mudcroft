@@ -1,17 +1,25 @@
 //! Messaging system for Lua scripts
 //!
-//! Collects messages during Lua execution for later delivery.
+//! Collects messages during one Lua execution; the script runner
+//! (`api::scripting`) delivers them to connected players afterwards.
+//! Each execution gets its own queue, so concurrent scripts never deliver
+//! each other's messages.
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
+
+use parking_lot::Mutex;
 
 /// A message to be delivered after Lua execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameMessage {
     /// Send to a specific player
     Send { target_id: String, message: String },
-    /// Broadcast to all players in a room
-    Broadcast { room_id: String, message: String },
+    /// Broadcast to all players in a room, optionally excluding one player
+    Broadcast {
+        room_id: String,
+        message: String,
+        exclude_id: Option<String>,
+    },
     /// Broadcast to all players in a region
     BroadcastRegion { region_id: String, message: String },
 }
@@ -19,7 +27,7 @@ pub enum GameMessage {
 /// Queue for messages generated during Lua execution
 #[derive(Debug, Default)]
 pub struct MessageQueue {
-    messages: RwLock<Vec<GameMessage>>,
+    messages: Mutex<Vec<GameMessage>>,
 }
 
 impl MessageQueue {
@@ -34,46 +42,43 @@ impl MessageQueue {
     }
 
     /// Queue a message for a specific player
-    pub async fn send(&self, target_id: &str, message: &str) {
-        let mut messages = self.messages.write().await;
-        messages.push(GameMessage::Send {
+    pub fn send(&self, target_id: &str, message: &str) {
+        self.messages.lock().push(GameMessage::Send {
             target_id: target_id.to_string(),
             message: message.to_string(),
         });
     }
 
-    /// Queue a broadcast to a room
-    pub async fn broadcast(&self, room_id: &str, message: &str) {
-        let mut messages = self.messages.write().await;
-        messages.push(GameMessage::Broadcast {
+    /// Queue a broadcast to a room, optionally excluding one player
+    pub fn broadcast(&self, room_id: &str, message: &str, exclude_id: Option<&str>) {
+        self.messages.lock().push(GameMessage::Broadcast {
             room_id: room_id.to_string(),
             message: message.to_string(),
+            exclude_id: exclude_id.map(str::to_string),
         });
     }
 
     /// Queue a broadcast to a region
-    pub async fn broadcast_region(&self, region_id: &str, message: &str) {
-        let mut messages = self.messages.write().await;
-        messages.push(GameMessage::BroadcastRegion {
+    pub fn broadcast_region(&self, region_id: &str, message: &str) {
+        self.messages.lock().push(GameMessage::BroadcastRegion {
             region_id: region_id.to_string(),
             message: message.to_string(),
         });
     }
 
     /// Drain all messages from the queue
-    pub async fn drain(&self) -> Vec<GameMessage> {
-        let mut messages = self.messages.write().await;
-        std::mem::take(&mut *messages)
+    pub fn drain(&self) -> Vec<GameMessage> {
+        std::mem::take(&mut *self.messages.lock())
     }
 
     /// Get count of pending messages
-    pub async fn len(&self) -> usize {
-        self.messages.read().await.len()
+    pub fn len(&self) -> usize {
+        self.messages.lock().len()
     }
 
     /// Check if queue is empty
-    pub async fn is_empty(&self) -> bool {
-        self.messages.read().await.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.messages.lock().is_empty()
     }
 }
 
@@ -81,34 +86,36 @@ impl MessageQueue {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_message_queue() {
+    #[test]
+    fn test_message_queue() {
         let queue = MessageQueue::new();
 
-        queue.send("player_1", "Hello!").await;
-        queue.broadcast("room_1", "Someone arrived.").await;
+        queue.send("player_1", "Hello!");
+        queue.broadcast("room_1", "Someone arrived.", Some("player_2"));
+        queue.broadcast_region("/d/forest", "Thunder rumbles.");
 
-        assert_eq!(queue.len().await, 2);
+        assert_eq!(queue.len(), 3);
 
-        let messages = queue.drain().await;
-        assert_eq!(messages.len(), 2);
+        let messages = queue.drain();
+        assert_eq!(
+            messages,
+            vec![
+                GameMessage::Send {
+                    target_id: "player_1".into(),
+                    message: "Hello!".into(),
+                },
+                GameMessage::Broadcast {
+                    room_id: "room_1".into(),
+                    message: "Someone arrived.".into(),
+                    exclude_id: Some("player_2".into()),
+                },
+                GameMessage::BroadcastRegion {
+                    region_id: "/d/forest".into(),
+                    message: "Thunder rumbles.".into(),
+                },
+            ]
+        );
 
-        match &messages[0] {
-            GameMessage::Send { target_id, message } => {
-                assert_eq!(target_id, "player_1");
-                assert_eq!(message, "Hello!");
-            }
-            _ => panic!("Expected Send message"),
-        }
-
-        match &messages[1] {
-            GameMessage::Broadcast { room_id, message } => {
-                assert_eq!(room_id, "room_1");
-                assert_eq!(message, "Someone arrived.");
-            }
-            _ => panic!("Expected Broadcast message"),
-        }
-
-        assert!(queue.is_empty().await);
+        assert!(queue.is_empty());
     }
 }

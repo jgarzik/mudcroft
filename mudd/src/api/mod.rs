@@ -2,6 +2,7 @@
 
 mod auth;
 mod images;
+pub mod scripting;
 mod universe;
 mod websocket;
 
@@ -15,7 +16,7 @@ use crate::combat::CombatManager;
 use crate::credits::CreditManager;
 use crate::db::Database;
 use crate::images::ImageStore;
-use crate::lua::{ActionRegistry, MessageQueue};
+use crate::lua::ActionRegistry;
 use crate::objects::{ClassRegistry, ObjectStore};
 use crate::permissions::PermissionManager;
 use crate::player::PlayerManager;
@@ -34,7 +35,6 @@ pub struct AppState {
     pub object_store: Arc<ObjectStore>,
     pub classes: Arc<RwLock<ClassRegistry>>,
     pub actions: Arc<ActionRegistry>,
-    pub messages: Arc<MessageQueue>,
     pub permissions: Arc<PermissionManager>,
     pub player_manager: Arc<PlayerManager>,
     pub timers: Arc<TimerManager>,
@@ -54,7 +54,6 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
     ));
     let mut class_registry = ClassRegistry::with_db(db.pool().clone(), raft_writer.clone());
     let actions = Arc::new(ActionRegistry::new());
-    let messages = Arc::new(MessageQueue::new());
     let permissions = Arc::new(PermissionManager::with_db(
         db.pool().clone(),
         Some(raft_writer.clone()),
@@ -96,7 +95,6 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
         object_store,
         classes,
         actions,
-        messages,
         permissions,
         player_manager,
         timers,

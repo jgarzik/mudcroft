@@ -9,16 +9,15 @@ use axum::{
     },
     response::IntoResponse,
 };
-use mlua::Value;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
+use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
 use crate::combat::DamageType;
 use crate::images::generate_room_image;
-use crate::lua::{GameApi, Sandbox, SandboxConfig};
 use crate::permissions::AccessLevel;
 use crate::theme::DEFAULT_THEME_ID;
 use crate::universe::validate_universe_id;
@@ -127,6 +126,34 @@ impl ConnectionManager {
                 warn!("Failed to broadcast to player {}", session.player_id);
             }
         }
+    }
+
+    /// Broadcast to all players in a room except `exclude_id` (if given)
+    pub async fn broadcast_room_except(
+        &self,
+        room_id: &str,
+        exclude_id: Option<&str>,
+        msg: ServerMessage,
+    ) {
+        let sessions = self.sessions.read().await;
+        for session in sessions.values() {
+            if session.room_id.as_deref() == Some(room_id)
+                && Some(session.player_id.as_str()) != exclude_id
+                && session.sender.send(msg.clone()).await.is_err()
+            {
+                warn!("Failed to broadcast to player {}", session.player_id);
+            }
+        }
+    }
+
+    /// (player_id, room_id) for every connected player that is in a room
+    pub async fn player_rooms(&self) -> Vec<(String, String)> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .filter_map(|s| s.room_id.clone().map(|r| (s.player_id.clone(), r)))
+            .collect()
     }
 
     /// Update player's room
@@ -484,6 +511,19 @@ async fn handle_client_message(
         ClientMessage::Ping => {
             // Just keep the connection alive, no response needed
         }
+    }
+}
+
+/// Name shown to other players: the player object's `name`, else "Someone"
+async fn display_name(state: &AppState, player_id: &str) -> String {
+    match state.object_store.get(player_id).await {
+        Ok(Some(obj)) => obj
+            .properties
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Someone")
+            .to_string(),
+        _ => "Someone".to_string(),
     }
 }
 
@@ -1060,16 +1100,21 @@ async fn execute_command(
                 ));
             }
 
-            // Broadcast combat message to room
-            let combat_msg = ServerMessage::Output {
-                text: messages.join("\n"),
-            };
+            // Onlookers get a third-person summary; the attacker gets the
+            // detailed result as this command's reply
+            let attacker_name = display_name(state, player_id).await;
+            let mut seen = format!("{} attacks {}.", attacker_name, target_display_name);
+            if state.combat.get_state(&target_id).await.is_none() {
+                seen.push_str(&format!(" {} is slain!", target_display_name));
+            }
             state
                 .connections
-                .broadcast_room(&room_id, combat_msg.clone())
+                .broadcast_room_except(&room_id, Some(player_id), ServerMessage::Output { text: seen })
                 .await;
 
-            combat_msg
+            ServerMessage::Output {
+                text: messages.join("\n"),
+            }
         }
         "create" => {
             // Builder+ only
@@ -1107,7 +1152,8 @@ async fn execute_lua(
     execute_lua_with_args(state, player_id, account_id, code, Vec::new()).await
 }
 
-/// Execute a Lua chunk with `args` available as its varargs (`...`)
+/// Execute a Lua chunk with `args` available as its varargs (`...`),
+/// as the player's account, in the player's universe
 async fn execute_lua_with_args(
     state: &AppState,
     player_id: &str,
@@ -1115,110 +1161,20 @@ async fn execute_lua_with_args(
     code: &str,
     args: Vec<String>,
 ) -> ServerMessage {
-    // Get universe from session
-    let universe_id = match state.connections.get_universe_id(player_id).await {
-        Some(id) => id,
-        None => {
-            return ServerMessage::Error {
-                message: "Session error: no universe".to_string(),
-            };
-        }
-    };
-
-    // Pre-load universe libraries (before creating sandbox)
-    let lib_codes = match load_universe_lib_codes(state, &universe_id).await {
-        Ok(codes) => codes,
-        Err(e) => {
-            return ServerMessage::Error {
-                message: format!("Failed to load universe libs: {}", e),
-            };
-        }
-    };
-
-    // Create game API with all managers
-    let mut game_api = GameApi::new(
-        state.object_store.clone(),
-        state.classes.clone(),
-        state.actions.clone(),
-        state.messages.clone(),
-        state.permissions.clone(),
-        state.timers.clone(),
-        state.credits.clone(),
-        state.venice.clone(),
-        state.image_store.clone(),
-        &universe_id,
-    );
-    game_api.set_user_context(Some(account_id.to_string()));
-
-    // Create sandbox with generous limits for wizards
-    let config = SandboxConfig {
-        max_instructions: 10_000_000, // 10M instructions
-        timeout: std::time::Duration::from_secs(5),
-        ..Default::default()
-    };
-
-    let mut sandbox = match Sandbox::new(config) {
-        Ok(s) => s,
-        Err(e) => {
-            return ServerMessage::Error {
-                message: format!("Failed to create sandbox: {}", e),
-            };
-        }
-    };
-
-    // Register game API
-    if let Err(e) = game_api.register(sandbox.lua()) {
+    let Some(universe_id) = state.connections.get_universe_id(player_id).await else {
         return ServerMessage::Error {
-            message: format!("Failed to register game API: {}", e),
+            message: "Session error: no universe".to_string(),
         };
-    }
-
-    // Execute pre-loaded universe libraries
-    for (lib_name, lib_code) in &lib_codes {
-        let result: Result<(), _> = sandbox.execute(lib_code);
-        if let Err(e) = result {
-            return ServerMessage::Error {
-                message: format!("Failed to execute library {}: {}", lib_name, e),
-            };
-        }
-    }
-
-    // Execute the code
-    let result: Result<Value, _> = if args.is_empty() {
-        sandbox.execute(code)
-    } else {
-        sandbox.execute_with_args(code, mlua::Variadic::from_iter(args))
     };
-
-    match result {
-        Ok(value) => {
-            let text = lua_value_to_string(&value);
-            ServerMessage::Output { text }
-        }
-        Err(e) => ServerMessage::Error {
-            message: format!("Lua error: {}", e),
-        },
-    }
-}
-
-/// Convert Lua value to displayable string
-fn lua_value_to_string(value: &Value) -> String {
-    match value {
-        Value::Nil => "nil".to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s
-            .to_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "<invalid utf8>".to_string()),
-        Value::Table(_) => "[table]".to_string(),
-        Value::Function(_) => "[function]".to_string(),
-        Value::Thread(_) => "[thread]".to_string(),
-        Value::UserData(_) => "[userdata]".to_string(),
-        Value::LightUserData(_) => "[lightuserdata]".to_string(),
-        Value::Error(e) => format!("[error: {}]", e),
-        _ => "[unknown]".to_string(),
+    let ctx = ScriptContext {
+        universe_id,
+        user_id: Some(account_id.to_string()),
+        room_id: None,
+        object_id: None,
+    };
+    match scripting::run_lua(state, &ctx, code, args, scripting::eval_config()).await {
+        Ok(text) => ServerMessage::Output { text },
+        Err(message) => ServerMessage::Error { message },
     }
 }
 
@@ -1449,64 +1405,4 @@ fn parse_create_args(args: &str) -> Result<CreateParams, String> {
         parent_id,
         properties,
     })
-}
-
-/// Load universe library codes from database
-/// Returns Vec of (lib_name, code) pairs, sorted by name for determinism
-async fn load_universe_lib_codes(
-    state: &AppState,
-    universe_id: &str,
-) -> Result<Vec<(String, String)>, String> {
-    // Get universe config
-    let universe = match state.object_store.get_universe(universe_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return Ok(Vec::new()), // No universe = no libs to load
-        Err(e) => return Err(format!("Failed to get universe: {}", e)),
-    };
-
-    // Get lib_hashes from config
-    let lib_hashes = match universe.config.get("lib_hashes") {
-        Some(hashes) => hashes,
-        None => return Ok(Vec::new()), // No libs defined
-    };
-
-    // Parse lib_hashes as object
-    let hashes_obj = match lib_hashes.as_object() {
-        Some(obj) => obj,
-        None => return Ok(Vec::new()), // Invalid format, skip
-    };
-
-    // Load each library in order (sorted for determinism)
-    let mut lib_names: Vec<_> = hashes_obj.keys().collect();
-    lib_names.sort();
-
-    let mut lib_codes = Vec::new();
-
-    for lib_name in lib_names {
-        let hash = match hashes_obj.get(lib_name).and_then(|v| v.as_str()) {
-            Some(h) => h,
-            None => continue,
-        };
-
-        // Get code from code_store
-        let code = match state.object_store.get_code(hash).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                tracing::warn!(
-                    "Library {} with hash {} not found in code_store",
-                    lib_name,
-                    hash
-                );
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load library {}: {}", lib_name, e);
-                continue;
-            }
-        };
-
-        lib_codes.push((lib_name.clone(), code));
-    }
-
-    Ok(lib_codes)
 }

@@ -990,61 +990,35 @@ impl GameApi {
     }
 
     fn register_message_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
-        let messages = self.messages.clone();
+        // Messages are queued here and delivered by the script runner after
+        // the execution finishes (see api::scripting::deliver).
 
         // game.send(target_id, message)
         // Send a private message to a player
-        let messages_clone = messages.clone();
+        let messages = self.messages.clone();
         let send = lua.create_function(move |_, (target_id, message): (String, String)| {
-            let messages = messages_clone.clone();
-
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    messages.send(&target_id, &message).await;
-                });
-            })
-            .join()
-            .ok();
-
+            messages.send(&target_id, &message);
             Ok(true)
         })?;
         game.set("send", send)?;
 
-        // game.broadcast(room_id, message)
-        // Broadcast a message to all players in a room
-        let messages_clone = messages.clone();
-        let broadcast = lua.create_function(move |_, (room_id, message): (String, String)| {
-            let messages = messages_clone.clone();
-
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    messages.broadcast(&room_id, &message).await;
-                });
-            })
-            .join()
-            .ok();
-
-            Ok(true)
-        })?;
+        // game.broadcast(room_id, message, exclude_id?)
+        // Broadcast to all players in a room, optionally skipping one player
+        let messages = self.messages.clone();
+        let broadcast = lua.create_function(
+            move |_, (room_id, message, exclude_id): (String, String, Option<String>)| {
+                messages.broadcast(&room_id, &message, exclude_id.as_deref());
+                Ok(true)
+            },
+        )?;
         game.set("broadcast", broadcast)?;
 
         // game.broadcast_region(region_id, message)
-        // Broadcast a message to all players in a region
+        // Broadcast to all players in rooms under a region
+        let messages = self.messages.clone();
         let broadcast_region =
             lua.create_function(move |_, (region_id, message): (String, String)| {
-                let messages = messages.clone();
-
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        messages.broadcast_region(&region_id, &message).await;
-                    });
-                })
-                .join()
-                .ok();
-
+                messages.broadcast_region(&region_id, &message);
                 Ok(true)
             })?;
         game.set("broadcast_region", broadcast_region)?;
@@ -2118,7 +2092,7 @@ fn object_to_lua(lua: &Lua, obj: &Object) -> LuaResult<Table> {
 }
 
 /// Convert JSON to Lua value
-fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<Value> {
+pub fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<Value> {
     match value {
         serde_json::Value::Null => Ok(Value::Nil),
         serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),

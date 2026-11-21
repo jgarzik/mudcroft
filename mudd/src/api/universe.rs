@@ -14,9 +14,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
+use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
-use crate::lua::{GameApi, Sandbox, SandboxConfig};
+use crate::lua::SandboxConfig;
 use crate::permissions::AccessLevel;
 use crate::universe::validate_universe_id;
 
@@ -493,48 +494,21 @@ async fn run_script(
         }
     };
 
-    // Create sandbox and game API
-    let mut sandbox = match Sandbox::new(SandboxConfig::default()) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to create sandbox: {}", e),
-                }),
-            )
-                .into_response();
-        }
+    // Run the script (universe libs loaded, script messages delivered)
+    let ctx = ScriptContext {
+        universe_id: universe_id.clone(),
+        user_id: Some(run_as),
+        room_id: None,
+        object_id: None,
     };
-
-    let mut game_api = GameApi::new(
-        state.object_store.clone(),
-        state.classes.clone(),
-        state.actions.clone(),
-        state.messages.clone(),
-        state.permissions.clone(),
-        state.timers.clone(),
-        state.credits.clone(),
-        state.venice.clone(),
-        state.image_store.clone(),
-        &universe_id,
-    );
-
-    game_api.set_user_context(Some(run_as));
-
-    // Register game API
-    if let Err(e) = game_api.register(sandbox.lua()) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to register game API: {}", e),
-            }),
-        )
-            .into_response();
-    }
-
-    // Execute script
-    let result: Result<String, _> = sandbox.execute(&script_content);
+    let result = scripting::run_lua(
+        &state,
+        &ctx,
+        &script_content,
+        Vec::new(),
+        SandboxConfig::default(),
+    )
+    .await;
 
     match result {
         Ok(output) => (StatusCode::OK, Json(RunScriptResponse { result: output })).into_response(),
