@@ -415,3 +415,24 @@ async fn test_account_writes_go_through_raft() {
         "register, login and logout each append one Raft entry"
     );
 }
+
+/// A second connection for the same player replaces the first, which is
+/// told so (and the client then stops reconnecting) instead of silently
+/// closed
+#[tokio::test]
+async fn test_replaced_connection_is_told() {
+    let server = TestServer::start().await.expect("server");
+    let role = Role::Player {
+        username: "two_tabs".into(),
+    };
+    let mut first = server.connect_as(role.clone()).await.expect("first");
+    first.drain().await;
+    let mut second = server.connect_as(role).await.expect("second");
+    let msg = first.expect("replaced").await.expect("replaced notice");
+    assert!(msg["message"].as_str().unwrap().contains("another"));
+
+    // The second connection keeps working
+    second.drain().await;
+    second.command("look").await.unwrap();
+    assert!(second.expect("room").await.is_ok());
+}

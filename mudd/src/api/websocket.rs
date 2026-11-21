@@ -123,11 +123,16 @@ impl ConnectionManager {
     }
 
     /// Register a player session. A previous connection for the same
-    /// (universe, player) is replaced: its sender is dropped, which ends that
-    /// connection's loop.
+    /// (universe, player) is replaced: it is sent `Replaced`, then its sender
+    /// is dropped, which ends that connection's loop after delivering it.
     pub async fn register(&self, session: PlayerSession) {
         let k = key(&session.universe_id, &session.player_id);
-        self.sessions.write().await.insert(k, session);
+        if let Some(old) = self.sessions.write().await.insert(k, session) {
+            let _ = old.sender.try_send(ServerMessage::Replaced {
+                message: "You connected from another window; this one is now disconnected."
+                    .to_string(),
+            });
+        }
     }
 
     /// Remove a player session, but only if it is still `conn_id`'s.
@@ -279,6 +284,10 @@ pub enum ServerMessage {
     /// Command echo (for confirmation)
     #[serde(rename = "echo")]
     Echo { command: String },
+    /// This connection was replaced by a newer one for the same player and
+    /// is about to close; clients must not reconnect automatically
+    #[serde(rename = "replaced")]
+    Replaced { message: String },
     /// No reply: the command already said everything it had to (e.g. a verb
     /// handler that only used game.send). Never sent to clients.
     #[serde(skip)]

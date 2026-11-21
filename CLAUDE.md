@@ -96,7 +96,7 @@ One SQLite file with tables: accounts, universes, universe_settings, objects, co
 
 - Connect: `/ws?universe=<id>&token=...` (token required; 401 without a valid one, no guests)
 - Universe ID required (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens)
-- Client sends `{type:"command", text}` or `{type:"ping"}`; server sends `welcome`, `room`, `output`, `error`, `echo` (every command is echoed first)
+- Client sends `{type:"command", text}` or `{type:"ping"}`; server sends `welcome`, `room`, `output`, `error`, `echo` (every command is echoed first), `replaced` (a newer connection for the same player took over; clients must not auto-reconnect)
 - Commands: look, north/south/east/west/up/down (and n/s/e/w/u/d), say, get/take, drop, inventory/i, attack/kill, help; builder+: create; wizard+: eval, goto, setportal; other verbs dispatch to `game.add_action` handlers
 
 ## Test Infrastructure

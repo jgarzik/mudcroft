@@ -238,8 +238,9 @@ their `last_safe_location`. If that is not set, they spawn in the room they
 were last in, if it is a safe zone (the portal, a room with `is_portal = true`,
 or their workroom). Otherwise they spawn at the universe portal.
 
-When a player disconnects, the server waits 5 seconds for a
-reconnect. If the player does not return and is outside a safe zone, their
+One player has one connection per universe: a new connection replaces the
+old one, which receives `replaced`. When a player disconnects, the server
+waits 5 seconds for a reconnect. If the player does not return and is outside a safe zone, their
 inventory is dropped in the room.
 
 ### Client to server
@@ -303,6 +304,15 @@ and messages sent by Lua (`game.send`, `game.broadcast`).
 
 ```json
 {"type": "echo", "command": "look"}
+```
+
+**replaced**: a newer connection for the same player and universe (another
+tab or device) has taken over, and the server closes this one right after.
+Clients must not reconnect automatically on it, or the two connections would
+keep evicting each other.
+
+```json
+{"type": "replaced", "message": "You connected from another window; this one is now disconnected."}
 ```
 
 If no spawn room exists, the server sends this right after `welcome`:

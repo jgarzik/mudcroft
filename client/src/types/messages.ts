@@ -5,6 +5,7 @@ export type ServerMessage =
   | { type: 'room'; name: string; description: string; exits: string[]; contents: string[]; image_hash?: string }
   | { type: 'error'; message: string }
   | { type: 'echo'; command: string }
+  | { type: 'replaced'; message: string }
 
 // Client → Server messages
 export type ClientMessage =

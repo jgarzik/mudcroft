@@ -12,6 +12,9 @@ export function useWebSocket() {
   const pingIntervalRef = useRef<number | null>(null)
   const reconnectTimeoutRef = useRef<number | null>(null)
   const reconnectDelayRef = useRef(RECONNECT_BASE_DELAY)
+  // Set when the server says a newer connection (another tab or device)
+  // replaced this one: reconnecting would just evict that one in turn
+  const replacedRef = useRef(false)
 
   const {
     token,
@@ -71,6 +74,11 @@ export function useWebSocket() {
         case 'echo':
           addMessage(`> ${msg.command}`, 'command')
           break
+
+        case 'replaced':
+          replacedRef.current = true
+          addMessage(msg.message, 'system')
+          break
       }
     } catch (err) {
       console.error('Failed to parse WebSocket message:', err)
@@ -81,6 +89,7 @@ export function useWebSocket() {
     if (!token || !universe || !isAuthenticated) return
 
     cleanup()
+    replacedRef.current = false
     setConnectionStatus('connecting')
 
     const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}&universe=${encodeURIComponent(universe)}`)
@@ -110,8 +119,9 @@ export function useWebSocket() {
       setConnectionStatus('disconnected')
       addMessage('Disconnected from server', 'system')
 
-      // Schedule reconnect with exponential backoff
-      if (isAuthenticated && token && universe) {
+      // Schedule reconnect with exponential backoff, unless another
+      // connection replaced this one
+      if (!replacedRef.current && isAuthenticated && token && universe) {
         reconnectTimeoutRef.current = window.setTimeout(() => {
           reconnectDelayRef.current = Math.min(
             reconnectDelayRef.current * 2,

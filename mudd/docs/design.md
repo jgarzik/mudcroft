@@ -149,7 +149,8 @@ Client -> /ws?universe=<id>&token=<token>
 
 Message types: client sends `command` and `ping`; server sends `welcome`,
 `output`, `room` (name, description, exits, contents, optional `image_hash`),
-`error` and `echo`.
+`error`, `echo` and `replaced` (a newer connection for the same player took
+over; the client does not auto-reconnect).
 
 ### Delivery
 
