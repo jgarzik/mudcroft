@@ -55,8 +55,10 @@ async fn object_permission(
     let Some(user_id) = user_id else {
         return Err("no user context".to_string());
     };
-    // Object ids are global: never touch another universe's objects
-    if obj.universe_id != universe_id {
+    // Object ids are global: never touch another universe's objects. Player
+    // objects are the exception: one is shared by every universe its account
+    // visits (it holds the inventory and HP wherever the player is).
+    if obj.universe_id != universe_id && obj.class != "player" {
         return Err(format!("{} belongs to another universe", obj.id));
     }
     let ctx = permissions.get_user_context(user_id, universe_id).await;
@@ -657,7 +659,8 @@ impl GameApi {
                             }
                             if let Some(ref dest) = new_parent_id {
                                 match store.get(dest).await? {
-                                    Some(d) if d.universe_id == universe_id => {}
+                                    Some(d)
+                                        if d.universe_id == universe_id || d.class == "player" => {}
                                     Some(_) => {
                                         return Ok(Err(format!(
                                             "{} belongs to another universe",

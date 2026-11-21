@@ -763,3 +763,86 @@ async fn test_add_action_respects_owner_and_private_handlers() {
     .await;
     assert_eq!(out, "true", "owner may add a normal action");
 }
+
+/// Player objects are shared across universes (created in the first one the
+/// player joins). The universe confinement of Lua writes must not stop a
+/// player from picking things up in a second universe.
+#[tokio::test]
+async fn test_take_works_in_second_universe() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let server = TestServer::start().await.expect("server");
+
+    // Universe "other-world" with a portal room holding a gem
+    // Same config (core library) as the main universe
+    sqlx::query(
+        "INSERT INTO universes (id, name, owner_id, config)
+         SELECT 'other-world', 'Other', owner_id, config FROM universes WHERE id = ?",
+    )
+    .bind(server.universe_id())
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let store = server.world().store();
+    let mut hall = mudd::objects::Object::new("/d/other/hall", "other-world", "room").unwrap();
+    hall.set_property("name", serde_json::json!("Hall"));
+    store.create(&hall).await.unwrap();
+    let mut gem = mudd::objects::Object::new("/d/other/gem", "other-world", "item").unwrap();
+    gem.set_property("name", serde_json::json!("gem"));
+    gem.parent_id = Some("/d/other/hall".to_string());
+    store.create(&gem).await.unwrap();
+    store
+        .set_portal("other-world", "/d/other/hall")
+        .await
+        .unwrap();
+
+    let reg: serde_json::Value = server
+        .post(
+            "/auth/register",
+            &serde_json::json!({"username": "traveler", "password": "test123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = reg["token"].as_str().unwrap().to_string();
+
+    // First visit the main universe (this creates the player object there)
+    let url = |u: &str| format!("ws://{}/ws?universe={}&token={}", server.addr, u, token);
+    let (mut first, _) = tokio_tungstenite::connect_async(url(server.universe_id()))
+        .await
+        .unwrap();
+    first.next().await; // welcome
+    first.close(None).await.ok();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Then play in the other universe
+    let (mut ws, _) = tokio_tungstenite::connect_async(url("other-world"))
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while ws.next().await.is_some() {}
+    })
+    .await;
+    ws.send(Message::Text(
+        serde_json::json!({"type": "command", "text": "take gem"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            let v: serde_json::Value =
+                serde_json::from_str(msg.to_text().unwrap_or("{}")).unwrap_or_default();
+            if v["type"] == "output" || v["type"] == "error" {
+                return v;
+            }
+        }
+        serde_json::Value::Null
+    })
+    .await
+    .expect("reply");
+    assert_eq!(reply["text"], "You take gem.", "{}", reply);
+}
