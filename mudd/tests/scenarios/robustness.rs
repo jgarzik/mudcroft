@@ -95,3 +95,84 @@ async fn test_item_names_match_literally() {
         assert_eq!(text, "You don't see that here", "pattern {:?}", pattern);
     }
 }
+
+/// Registration rejects unusable usernames and passwords
+#[tokio::test]
+async fn test_register_validates_credentials() {
+    let server = TestServer::start_with_world(false).await.expect("server");
+    for (user, pass) in [
+        ("", ""),
+        ("ab", "secret1"),
+        ("has space", "secret1"),
+        ("fine_user", "12345"),
+    ] {
+        let resp = server
+            .post(
+                "/auth/register",
+                &serde_json::json!({"username": user, "password": pass}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "({:?}, {:?}) must be rejected",
+            user,
+            pass
+        );
+    }
+    let resp = server
+        .post(
+            "/auth/register",
+            &serde_json::json!({"username": "fine_user", "password": "123456"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+}
+
+/// run_script accepts a universe id in any case, like /ws and create
+#[tokio::test]
+async fn test_run_script_universe_id_case_insensitive() {
+    let server = TestServer::start().await.expect("server");
+    let login: serde_json::Value = server
+        .post(
+            "/auth/login",
+            &serde_json::json!({"username": "test_admin", "password": "testpass123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+    let upper = server.universe_id().to_uppercase();
+    let resp = server
+        .post_auth(
+            &format!("/universe/{}/run_script", upper),
+            &serde_json::json!({"script": "no-such-script.lua"}),
+            token,
+        )
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Script not found"),
+        "universe should be found: {}",
+        body
+    );
+}
+
+/// A database whose only administrator is an owner still starts
+#[tokio::test]
+async fn test_server_starts_with_owner_but_no_admin() {
+    let mut server = TestServer::start_with_world(false).await.expect("server");
+    sqlx::query("UPDATE accounts SET access_level = 'owner' WHERE access_level = 'admin'")
+        .execute(server.pool())
+        .await
+        .unwrap();
+    server
+        .restart()
+        .await
+        .expect("restart with an owner account");
+}

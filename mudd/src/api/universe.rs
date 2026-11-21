@@ -404,6 +404,19 @@ async fn run_script(
     Path(universe_id): Path<String>,
     Json(request): Json<RunScriptRequest>,
 ) -> impl IntoResponse {
+    // Normalize like create and /ws (ids are case-insensitive)
+    let universe_id = match validate_universe_id(&universe_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid universe ID: {}", e),
+                }),
+            )
+                .into_response()
+        }
+    };
     // Require authentication
     let account = match authenticate(&headers, &state).await {
         Ok(acc) => acc,

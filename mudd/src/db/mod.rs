@@ -137,11 +137,12 @@ impl Database {
             }
         }
 
-        // Check that at least one admin account exists
-        let admin_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM accounts WHERE access_level = 'admin'")
-                .fetch_one(&self.pool)
-                .await?;
+        // Check that at least one administrator (admin or owner) exists
+        let admin_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM accounts WHERE access_level IN ('admin', 'owner')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
 
         if admin_count.0 == 0 {
             bail!("Database has no admin account. Run mudd_init to create a valid database.");
