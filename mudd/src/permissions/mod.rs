@@ -8,9 +8,11 @@
 //! - Owner: Universe owner, can grant admin access
 //!
 //! Permission check order (first match wins):
+//! 0. AdminConfig/GrantCredits need Admin+; StoreCode needs Wizard+
 //! 1. Wizard+ bypass: access_level >= Wizard → Allowed
 //! 2. Owner check: object.owner_id == user.account_id → Allowed
-//! 3. Path grant: Any grant where object.id.starts_with(grant.path_prefix) → Allowed
+//! 3. Path grant: any grant that covers object.id on a `/` boundary
+//!    (PathGrant::covers_path) → Allowed
 //! 4. Player actions: Read/Execute/Move-non-fixed → Allowed
 //! 5. Default: Denied
 
@@ -669,9 +671,12 @@ impl PermissionManager {
     /// Check if an action is permitted
     ///
     /// Permission check order (first match wins):
+    /// 0. AdminConfig/GrantCredits need Admin+; StoreCode needs Wizard+
+    ///    (decided here, before any bypass)
     /// 1. Wizard+ bypass: access_level >= Wizard → Allowed
     /// 2. Owner check: object.owner_id == user.account_id → Allowed
-    /// 3. Path grant: Any grant where object.id.starts_with(grant.path_prefix) → Allowed
+    /// 3. Path grant: any grant that covers object.id on a `/` boundary
+    ///    (PathGrant::covers_path) → Allowed
     /// 4. Player actions: Read/Execute/Move-non-fixed → Allowed
     /// 5. Default: Denied
     pub fn check_permission(
