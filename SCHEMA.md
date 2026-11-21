@@ -1,7 +1,9 @@
 # Mudcroft Database Schema
 
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
-on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place.
+on). `mudd_init` creates it. Re-running `mudd_init` refreshes the core mudlib
+and creates any missing tables, but does not migrate existing tables: a
+database made with an older schema must be recreated.
 The schema is defined in `mudd/src/db/mod.rs` (`run_migrations`). This file
 mirrors it.
 

@@ -320,7 +320,8 @@ impl GameApi {
                         let parent = registry.get_class(&universe_id, &parent_class_name);
                         match parent {
                             Some(class_def) => {
-                                // The class's attached code (legacy: a code_hash property)
+                                // The class's code: ClassDef.code_hash, or a code_hash
+                                // property default (how define_class attaches it)
                                 let hash = class_def.code_hash.clone().or_else(|| {
                                     class_def
                                         .properties

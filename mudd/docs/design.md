@@ -76,8 +76,9 @@ combat_state(entity_id) <-- active_effects(entity_id)
 
 `mudd` opens an existing database only (`Database::open`): it checks that the
 required tables exist and that at least one admin or owner account exists, and never
-runs migrations. `mudd_init` creates or upgrades a database (see
-[admin.md](admin.md)).
+runs migrations. `mudd_init` creates a database, and re-running it refreshes
+the core mudlib (see [admin.md](admin.md)). Existing tables are never
+migrated.
 
 ## Startup Sequence
 
@@ -89,8 +90,7 @@ runs migrations. `mudd_init` creates or upgrades a database (see
    `--peers` is given (`RaftWriter::cluster`). Single-node initializes a
    one-member cluster only when the database has no Raft state yet; on a
    database it has served before it resumes the persisted vote, log and
-   membership, so restarts work. Opening the Raft store adds newer columns
-   (`raft_log.leader_node`) to older databases.
+   membership, so restarts work.
 5. Wait up to 10 seconds for a Raft leader (`wait_for_leader`). The HTTP port
    is not bound until this succeeds.
 6. Build `AppState` (`api::router`): `ConnectionManager`, `ObjectStore`,
