@@ -113,9 +113,7 @@ async fn test_disconnect_in_portal_preserves_inventory() {
 
     let take_text = msg["text"].as_str().unwrap_or("").to_lowercase();
     if msg["type"].as_str() == Some("error") || take_text.contains("player not found") {
-        eprintln!("Note: take command failed: {}", take_text);
-        wizard.close().await.ok();
-        return;
+        panic!("take command failed: {}", take_text);
     }
 
     // Verify sword in inventory
@@ -124,9 +122,7 @@ async fn test_disconnect_in_portal_preserves_inventory() {
     let inv_text = inv_msg["text"].as_str().unwrap_or("").to_lowercase();
 
     if !inv_text.contains("sword") && !inv_text.contains("rusty") {
-        eprintln!("Note: Sword not in inventory after take: {}", inv_text);
-        wizard.close().await.ok();
-        return;
+        panic!("Sword not in inventory after take: {}", inv_text);
     }
 
     // Disconnect
@@ -182,9 +178,7 @@ async fn test_disconnect_outside_safezone_drops_inventory() {
 
     let take_text = msg["text"].as_str().unwrap_or("").to_lowercase();
     if msg["type"].as_str() == Some("error") || take_text.contains("player not found") {
-        eprintln!("Note: take command failed: {}", take_text);
-        wizard.close().await.ok();
-        return;
+        panic!("take command failed: {}", take_text);
     }
 
     // Move to narrow passage (not a portal, not a workroom)
@@ -267,9 +261,7 @@ async fn test_reconnect_grace_period() {
 
     let take_text = msg["text"].as_str().unwrap_or("").to_lowercase();
     if msg["type"].as_str() == Some("error") || take_text.contains("player not found") {
-        eprintln!("Note: take command failed: {}", take_text);
-        wizard.close().await.ok();
-        return;
+        panic!("take command failed: {}", take_text);
     }
 
     // Move to unsafe zone
@@ -349,9 +341,7 @@ async fn test_workroom_is_safe_zone() {
 
     let take_text = msg["text"].as_str().unwrap_or("").to_lowercase();
     if msg["type"].as_str() == Some("error") || take_text.contains("player not found") {
-        eprintln!("Note: take command failed: {}", take_text);
-        wizard.close().await.ok();
-        return;
+        panic!("take command failed: {}", take_text);
     }
 
     // Go to workroom

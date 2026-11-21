@@ -40,11 +40,7 @@ async fn test_get_item() {
 
         if msg["type"].as_str().unwrap() == "error" {
             // Commands may not be implemented yet - that's discoverable
-            eprintln!(
-                "Note: take/get commands may not be implemented. Error: {:?}",
-                msg
-            );
-            return;
+            panic!("take/get failed. Error: {:?}", msg);
         }
     }
 
@@ -97,8 +93,7 @@ async fn test_drop_item() {
             .await
             .expect("no response");
         if msg["type"].as_str().unwrap() == "error" {
-            eprintln!("Note: take/get commands may not be implemented");
-            return;
+            panic!("take/get commands may not be implemented");
         }
     }
 
@@ -110,11 +105,7 @@ async fn test_drop_item() {
         .expect("no response");
 
     if msg["type"].as_str().unwrap() == "error" {
-        eprintln!(
-            "Note: drop command may not be implemented. Error: {:?}",
-            msg
-        );
-        return;
+        panic!("drop command failed. Error: {:?}", msg);
     }
 
     // Look to verify sword is back in room
@@ -180,11 +171,7 @@ async fn test_inventory_empty() {
     let msg_type = msg["type"].as_str().unwrap();
 
     if msg_type == "error" {
-        eprintln!(
-            "Note: inventory command may not be implemented. Error: {:?}",
-            msg
-        );
-        return;
+        panic!("inventory command failed. Error: {:?}", msg);
     }
 
     if msg_type == "output" {
@@ -235,8 +222,7 @@ async fn test_inventory_has_items() {
             .await
             .expect("no response");
         if msg["type"].as_str().unwrap() == "error" {
-            eprintln!("Note: take/get commands may not be implemented");
-            return;
+            panic!("take/get commands may not be implemented");
         }
     }
 
@@ -251,8 +237,7 @@ async fn test_inventory_has_items() {
     let msg_type = msg["type"].as_str().unwrap();
 
     if msg_type == "error" {
-        eprintln!("Note: inventory command may not be implemented");
-        return;
+        panic!("inventory command may not be implemented");
     }
 
     if msg_type == "output" {
