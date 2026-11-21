@@ -234,14 +234,17 @@ impl GameApi {
                         let parent = registry.get_class(&parent_class_name);
                         match parent {
                             Some(class_def) => {
-                                // Classes may store their code hash in handlers list
-                                // For now, we look for a code_hash in properties
-                                if let Some(serde_json::Value::String(hash)) =
-                                    class_def.properties.get("code_hash")
-                                {
-                                    store.get_code(hash).await.ok().flatten()
-                                } else {
-                                    None
+                                // The class's attached code (legacy: a code_hash property)
+                                let hash = class_def.code_hash.clone().or_else(|| {
+                                    class_def
+                                        .properties
+                                        .get("code_hash")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string)
+                                });
+                                match hash {
+                                    Some(hash) => store.get_code(&hash).await.ok().flatten(),
+                                    None => None,
                                 }
                             }
                             None => None,
@@ -330,6 +333,17 @@ impl GameApi {
                     }
                 }
 
+                // A `code_hash` prop attaches stored code rather than being a property
+                match obj.properties.remove("code_hash") {
+                    Some(serde_json::Value::String(hash)) => obj.code_hash = Some(hash),
+                    Some(serde_json::Value::Null) | None => {}
+                    Some(_) => {
+                        let error_table = lua.create_table()?;
+                        error_table.set("error", "code_hash must be a string")?;
+                        return Ok(Value::Table(error_table));
+                    }
+                }
+
                 // Check permission, then save to database
                 let obj_clone = obj.clone();
                 let permissions = permissions_clone.clone();
@@ -344,7 +358,12 @@ impl GameApi {
                             )
                             .await
                             {
-                                return Ok(Err(reason));
+                                return Ok(Err(format!("permission denied: {}", reason)));
+                            }
+                            if let Some(ref hash) = obj_clone.code_hash {
+                                if store.get_code(hash).await?.is_none() {
+                                    return Ok(Err(format!("unknown code_hash {}", hash)));
+                                }
                             }
                             store.create(&obj_clone).await.map(Ok)
                         })
@@ -354,7 +373,7 @@ impl GameApi {
                     Ok(Ok(())) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
                     Ok(Err(reason)) => {
                         let error_table = lua.create_table()?;
-                        error_table.set("error", format!("permission denied: {}", reason))?;
+                        error_table.set("error", reason)?;
                         Ok(Value::Table(error_table))
                     }
                     Err(e) => Err(mlua::Error::external(e)),
@@ -419,9 +438,23 @@ impl GameApi {
                             {
                                 return Ok(Err(reason));
                             }
-                            // Apply changes
+                            // Apply changes; `code_hash` attaches (or, if nil,
+                            // detaches) stored code instead of setting a property
                             for (k, v) in changes_vec {
-                                obj.properties.insert(k, v);
+                                if k == "code_hash" {
+                                    match v {
+                                        serde_json::Value::String(hash) => {
+                                            if store.get_code(&hash).await?.is_none() {
+                                                anyhow::bail!("unknown code_hash {}", hash);
+                                            }
+                                            obj.code_hash = Some(hash);
+                                        }
+                                        serde_json::Value::Null => obj.code_hash = None,
+                                        _ => anyhow::bail!("code_hash must be a string"),
+                                    }
+                                } else {
+                                    obj.properties.insert(k, v);
+                                }
                             }
                             store.update(&obj).await?;
                             Ok(Ok(true))
@@ -2070,6 +2103,7 @@ fn object_to_lua(lua: &Lua, obj: &Object) -> LuaResult<Table> {
     table.set("class", obj.class.as_str())?;
     table.set("parent_id", obj.parent_id.clone())?;
     table.set("owner_id", obj.owner_id.clone())?;
+    table.set("code_hash", obj.code_hash.clone())?;
 
     // Flatten common properties to root level
     if let Some(name) = obj.properties.get("name") {

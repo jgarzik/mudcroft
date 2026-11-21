@@ -61,7 +61,7 @@ pub async fn run_lua(
         };
         value
             .map(|v| lua_value_to_string(&v))
-            .map_err(|e| format!("Lua error: {}", e))
+            .map_err(|e| e.to_string())
     };
 
     deliver(state, &queue).await;

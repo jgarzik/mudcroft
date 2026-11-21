@@ -9,6 +9,7 @@
 //! - Multiuser: Builder permissions, path grants, multi-user interactions
 //! - Player lifecycle: Persistent objects, safe zones, disconnect, reconnect
 //! - Security: Access-level enforcement in privileged Lua functions
+//! - Scripting: Object code, hooks, custom verbs, timers
 
 pub mod chat;
 pub mod combat;
@@ -17,4 +18,5 @@ pub mod messaging;
 pub mod movement;
 pub mod multiuser;
 pub mod player_lifecycle;
+pub mod scripting;
 pub mod security;
