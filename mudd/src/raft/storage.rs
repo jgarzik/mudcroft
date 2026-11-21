@@ -91,6 +91,16 @@ impl CombinedStorage {
                 .execute(&*pool)
                 .await
                 .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
+            // Existing entries came from the only leader such a database has
+            // had (they could not survive a restart before this column): the
+            // node in the persisted vote
+            sqlx::query(
+                "UPDATE raft_log SET leader_node =
+                 COALESCE((SELECT node_id FROM raft_vote WHERE id = 1), 0)",
+            )
+            .execute(&*pool)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
         }
         Ok(())
     }
@@ -675,6 +685,38 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
 mod tests {
     use super::*;
     use crate::db::test_utils::test_pool;
+
+    /// Upgrading a database whose raft_log predates the leader_node column
+    /// must label existing entries with the persisted leader, not node 0
+    #[tokio::test]
+    async fn test_leader_node_migration_uses_persisted_leader() {
+        let pool = test_pool().await;
+        sqlx::query("DROP TABLE raft_log")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE raft_log (log_index INTEGER PRIMARY KEY, term INTEGER NOT NULL,
+             entry_type TEXT NOT NULL, payload TEXT,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO raft_log (log_index, term, entry_type) VALUES (1, 1, 'blank')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO raft_vote (id, term, node_id, committed) VALUES (1, 1, 7, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut storage = CombinedStorage::new(pool).await.unwrap();
+        let state = storage.get_log_state().await.unwrap();
+        let last = state.last_log_id.expect("last log id");
+        assert_eq!(last.leader_id.node_id, 7);
+    }
 
     #[tokio::test]
     async fn test_storage_creation() {
