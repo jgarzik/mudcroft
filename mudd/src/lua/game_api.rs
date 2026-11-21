@@ -878,17 +878,21 @@ impl GameApi {
                 }
                 let (permissions, user, universe_id) = perm_ctx.clone();
                 let user = actor_override(lua).or(user);
-                let allowed = block_on_perm(async move {
-                    let Some(user) = user else { return false };
+                let caller = user.clone();
+                let (allowed, is_admin) = block_on_perm(async move {
+                    let Some(user) = user else {
+                        return (false, false);
+                    };
                     let ctx = permissions.get_user_context(&user, &universe_id).await;
                     let target = ObjectContext {
                         object_id: format!("/universe/{}", universe_id),
                         owner_id: None,
                         is_fixed: false,
                     };
-                    permissions
+                    let allowed = permissions
                         .check_permission(&ctx, PermAction::StoreCode, &target)
-                        .is_allowed()
+                        .is_allowed();
+                    (allowed, ctx.access_level.can_admin())
                 });
                 if !allowed {
                     return Err(mlua::Error::runtime(
@@ -915,12 +919,29 @@ impl GameApi {
                     }
                 }
 
-                tokio::task::block_in_place(|| {
+                // Classes are shared by every universe: an existing custom class
+                // may be replaced only by whoever defined it, or by an admin
+                let replaced: Result<(), String> = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let mut registry = classes.write().await;
-                        registry.define_class(&name, parent.as_deref(), props_map);
+                        if let Some(existing) = registry.get_class(&name) {
+                            if existing.defined_by != caller && !is_admin {
+                                return Err(format!(
+                                    "define_class: {} is already defined by another account",
+                                    name
+                                ));
+                            }
+                        }
+                        registry.define_class(
+                            &name,
+                            parent.as_deref(),
+                            props_map,
+                            caller.as_deref(),
+                        );
+                        Ok(())
                     })
                 });
+                replaced.map_err(mlua::Error::runtime)?;
 
                 Ok(true)
             })?;

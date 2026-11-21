@@ -688,3 +688,22 @@ async fn test_class_defaults_do_not_attach_code() {
     .await;
     assert_eq!(out, "nil:iron:nil");
 }
+
+/// A custom class may be redefined only by whoever defined it (or an admin)
+#[tokio::test]
+async fn test_define_class_protects_others_classes() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz_a = connect(&server, wizard("class_owner_a")).await;
+    let mut wiz_b = connect(&server, wizard("class_owner_b")).await;
+    let mut adm = connect(&server, admin("class_admin")).await;
+
+    let def = r#"return tostring(pcall(game.define_class, "torch", {parent = "item"}))"#;
+    assert_eq!(eval(&mut wiz_a, def).await, "true", "first definition");
+    assert_eq!(eval(&mut wiz_a, def).await, "true", "definer may redefine");
+    assert_eq!(
+        eval(&mut wiz_b, def).await,
+        "false",
+        "another wizard may not"
+    );
+    assert_eq!(eval(&mut adm, def).await, "true", "an admin may");
+}

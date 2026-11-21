@@ -23,6 +23,9 @@ pub struct ClassDef {
     pub handlers: Vec<String>,
     /// Code hash for this class's Lua implementation
     pub code_hash: Option<String>,
+    /// Account that defined the class via game.define_class (None for
+    /// built-in or loaded classes); only it (or an admin) may redefine it
+    pub defined_by: Option<String>,
 }
 
 impl ClassDef {
@@ -34,6 +37,7 @@ impl ClassDef {
             properties: Properties::new(),
             handlers: Vec::new(),
             code_hash: None,
+            defined_by: None,
         }
     }
 
@@ -280,8 +284,10 @@ impl ClassRegistry {
         name: &str,
         parent: Option<&str>,
         props_map: std::collections::HashMap<String, (String, serde_json::Value)>,
+        defined_by: Option<&str>,
     ) {
         let mut class = ClassDef::new(name, parent);
+        class.defined_by = defined_by.map(str::to_string);
         for (prop_name, (_type_name, default_val)) in props_map.iter() {
             class.set_property(prop_name, default_val.clone());
         }
