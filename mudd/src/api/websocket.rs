@@ -734,6 +734,24 @@ async fn execute_command(
         }
         "say" => {
             let message = parts[1..].join(" ");
+            if message.is_empty() {
+                return ServerMessage::Error {
+                    message: "Say what?".to_string(),
+                };
+            }
+            if let Some(room_id) = state.connections.get_room_id(player_id).await {
+                let speaker = display_name(state, player_id).await;
+                state
+                    .connections
+                    .broadcast_room_except(
+                        &room_id,
+                        Some(player_id),
+                        ServerMessage::Output {
+                            text: format!("{} says: {}", speaker, message),
+                        },
+                    )
+                    .await;
+            }
             ServerMessage::Output {
                 text: format!("You say: {}", message),
             }

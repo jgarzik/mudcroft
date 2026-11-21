@@ -1,106 +1,102 @@
 //! Chat scenario tests
 //!
-//! Tests the say command for in-room communication
+//! The say command: confirmation to the speaker, delivery to everyone else
+//! in the same room, nothing to other rooms.
 
-use crate::harness::{Role, TestServer};
+use crate::harness::{Role, TestClient, TestServer};
 use std::time::Duration;
 
-/// Test: Say command echoes back to player
-#[tokio::test]
-async fn test_say_command() {
-    let server = TestServer::start().await.expect("Failed to start server");
+const QUIET: Duration = Duration::from_millis(400);
 
-    let mut wizard = server
-        .connect_as(Role::Wizard {
-            username: "saywizard".to_string(),
+async fn connect(server: &TestServer, name: &str) -> TestClient {
+    let mut c = server
+        .connect_as(Role::Player {
+            username: name.to_string(),
         })
         .await
-        .expect("Failed to connect as wizard");
-
-    // Say something
-    wizard.command("say hello").await.expect("say failed");
-
-    let msg = wizard
-        .expect_any_timeout(Duration::from_secs(5))
-        .await
-        .expect("no response");
-
-    let msg_type = msg["type"].as_str().unwrap();
-
-    if msg_type == "error" {
-        eprintln!("Note: say command may not be implemented. Error: {:?}", msg);
-        return;
-    }
-
-    // Should get output confirming what we said
-    if msg_type == "output" {
-        let text = msg["text"].as_str().unwrap_or("");
-        // Should contain "You say" or similar, and our message
-        assert!(
-            text.to_lowercase().contains("say") || text.to_lowercase().contains("hello"),
-            "Say output should echo our message: {}",
-            text
-        );
-    } else if msg_type == "chat" || msg_type == "say" {
-        // Might be a special chat message type
-        let message = msg
-            .get("message")
-            .or_else(|| msg.get("text"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
-        assert!(
-            message.to_lowercase().contains("hello"),
-            "Chat message should contain our text: {}",
-            message
-        );
-    }
+        .expect("connect");
+    c.drain().await;
+    c
 }
 
-/// Test: Say with no message gives error or usage hint
+/// Speaker gets "You say: ...", others in the room get "<name> says: ..."
+#[tokio::test]
+async fn test_say_heard_by_others_in_room() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let mut alice = connect(&server, "alice_says").await;
+    let mut bob = connect(&server, "bob_listens").await;
+
+    alice.command("say hello there").await.expect("say failed");
+
+    let reply = alice
+        .expect_output_containing("You say: hello there")
+        .await
+        .expect("speaker confirmation");
+    assert_eq!(reply, "You say: hello there");
+
+    let heard = bob
+        .expect_output_containing("alice_says says: hello there")
+        .await
+        .expect("listener hears it");
+    assert_eq!(heard, "alice_says says: hello there");
+
+    // The speaker does not also get the third-person version
+    let rest = alice.outputs_within(QUIET).await;
+    assert!(
+        !rest.iter().any(|t| t.contains("alice_says says")),
+        "speaker got the onlooker message: {:?}",
+        rest
+    );
+}
+
+/// Players in other rooms do not hear it
+#[tokio::test]
+async fn test_say_not_heard_in_other_rooms() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let mut alice = connect(&server, "alice_far").await;
+    let mut carol = connect(&server, "carol_away").await;
+
+    // Move carol out of the entrance
+    let exits = server
+        .world()
+        .store()
+        .get(&server.world().entrance_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .properties["exits"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .cloned()
+        .expect("entrance has an exit");
+    carol.command(&exits).await.unwrap();
+    carol.expect("room").await.expect("carol moved");
+    carol.drain().await;
+
+    alice.command("say secret").await.unwrap();
+    alice
+        .expect_output_containing("You say: secret")
+        .await
+        .unwrap();
+
+    let carol_out = carol.outputs_within(QUIET).await;
+    assert!(
+        !carol_out.iter().any(|t| t.contains("secret")),
+        "player in another room heard it: {:?}",
+        carol_out
+    );
+}
+
+/// Saying nothing asks what to say
 #[tokio::test]
 async fn test_say_empty() {
     let server = TestServer::start().await.expect("Failed to start server");
+    let mut alice = connect(&server, "alice_quiet").await;
 
-    let mut wizard = server
-        .connect_as(Role::Wizard {
-            username: "emptysay".to_string(),
-        })
-        .await
-        .expect("Failed to connect as wizard");
-
-    // Say nothing
-    wizard.command("say").await.expect("say failed");
-
-    let msg = wizard
-        .expect_any_timeout(Duration::from_secs(5))
-        .await
-        .expect("no response");
-
-    let msg_type = msg["type"].as_str().unwrap();
-
-    // Should get error or usage hint
-    if msg_type == "error" {
-        let text = msg["message"].as_str().unwrap_or("").to_lowercase();
-        assert!(
-            text.contains("what")
-                || text.contains("usage")
-                || text.contains("say what")
-                || text.contains("message")
-                || text.contains("argument"),
-            "Error should ask what to say: {}",
-            text
-        );
-    } else if msg_type == "output" {
-        let text = msg["text"].as_str().unwrap_or("").to_lowercase();
-        // Could be error message in output type
-        assert!(
-            text.contains("what")
-                || text.contains("usage")
-                || text.contains("say what")
-                || text.contains("nothing")
-                || text.is_empty(),
-            "Output should indicate missing message: {}",
-            text
-        );
-    }
+    alice.command("say").await.expect("say failed");
+    let _ = alice.expect("echo").await;
+    let msg = alice.expect("error").await.expect("error reply");
+    assert_eq!(msg["message"], "Say what?");
 }
