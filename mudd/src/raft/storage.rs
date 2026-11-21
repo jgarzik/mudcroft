@@ -46,6 +46,7 @@ impl CombinedStorage {
             membership: RwLock::new(StoredMembership::default()),
             current_snapshot: RwLock::new(None),
         };
+        storage.ensure_schema().await?;
         storage.load_state().await?;
         Ok(storage)
     }
@@ -64,6 +65,7 @@ impl CombinedStorage {
             membership: RwLock::new(StoredMembership::default()),
             current_snapshot: RwLock::new(None),
         };
+        storage.ensure_schema().await?;
         storage.load_state().await?;
         Ok(storage)
     }
@@ -71,6 +73,26 @@ impl CombinedStorage {
     /// Get a reference to the pool (read lock)
     pub async fn pool(&self) -> tokio::sync::RwLockReadGuard<'_, SqlitePool> {
         self.pool.read().await
+    }
+
+    /// Add columns newer than the database (raft_log.leader_node records
+    /// which node led each entry's term; without it log ids cannot be
+    /// reconstructed exactly after a restart)
+    async fn ensure_schema(&self) -> Result<(), StorageError<NodeId>> {
+        let pool = self.pool.read().await;
+        let has_leader_node: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('raft_log') WHERE name = 'leader_node'",
+        )
+        .fetch_optional(&*pool)
+        .await
+        .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
+        if has_leader_node.is_none() {
+            sqlx::query("ALTER TABLE raft_log ADD COLUMN leader_node INTEGER NOT NULL DEFAULT 0")
+                .execute(&*pool)
+                .await
+                .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
+        }
+        Ok(())
     }
 
     async fn load_state(&self) -> Result<(), StorageError<NodeId>> {
@@ -114,19 +136,34 @@ impl CombinedStorage {
             }
         }
 
+        // Cluster membership as of the last applied membership entry. Without
+        // it a restarted node has no voters and can never elect a leader.
+        if let Some((value,)) = sqlx::query_as::<_, (String,)>(
+            "SELECT value FROM raft_meta WHERE key = 'last_membership'",
+        )
+        .fetch_optional(&*pool)
+        .await
+        .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
+        {
+            if let Ok(membership) = serde_json::from_str(&value) {
+                *self.membership.write().await = membership;
+            }
+        }
+
         Ok(())
     }
 
     fn row_to_entry(
         log_index: i64,
         term: i64,
+        leader_node: i64,
         entry_type: &str,
         payload: Option<&str>,
     ) -> Result<Entry<TypeConfig>, StorageError<NodeId>> {
         let log_id = LogId {
             leader_id: openraft::LeaderId {
                 term: term as u64,
-                node_id: 0,
+                node_id: leader_node as u64,
             },
             index: log_index as u64,
         };
@@ -238,8 +275,8 @@ impl RaftLogReader<TypeConfig> for CombinedStorage {
 
         let pool = self.pool.read().await;
 
-        let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(
-            "SELECT log_index, term, entry_type, payload FROM raft_log
+        let rows: Vec<(i64, i64, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT log_index, term, leader_node, entry_type, payload FROM raft_log
              WHERE log_index >= ? AND log_index < ? ORDER BY log_index",
         )
         .bind(start)
@@ -249,8 +286,8 @@ impl RaftLogReader<TypeConfig> for CombinedStorage {
         .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
 
         rows.into_iter()
-            .map(|(idx, term, etype, payload)| {
-                Self::row_to_entry(idx, term, &etype, payload.as_deref())
+            .map(|(idx, term, leader, etype, payload)| {
+                Self::row_to_entry(idx, term, leader, &etype, payload.as_deref())
             })
             .collect()
     }
@@ -320,19 +357,23 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
         let last_purged = *self.last_purged.read().await;
         let pool = self.pool.read().await;
 
-        let last_log: Option<(i64, i64)> =
-            sqlx::query_as("SELECT log_index, term FROM raft_log ORDER BY log_index DESC LIMIT 1")
-                .fetch_optional(&*pool)
-                .await
-                .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
+        let last_log: Option<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT log_index, term, leader_node FROM raft_log ORDER BY log_index DESC LIMIT 1",
+        )
+        .fetch_optional(&*pool)
+        .await
+        .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
 
-        let last_log_id = last_log.map(|(index, term)| LogId {
-            leader_id: openraft::LeaderId {
-                term: term as u64,
-                node_id: 0,
-            },
-            index: index as u64,
-        });
+        // An empty log after purging still has a last log id: the purged one
+        let last_log_id = last_log
+            .map(|(index, term, leader)| LogId {
+                leader_id: openraft::LeaderId {
+                    term: term as u64,
+                    node_id: leader as u64,
+                },
+                index: index as u64,
+            })
+            .or(last_purged);
 
         Ok(LogState {
             last_purged_log_id: last_purged,
@@ -403,10 +444,11 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             };
 
             sqlx::query(
-                "INSERT OR REPLACE INTO raft_log (log_index, term, entry_type, payload) VALUES (?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO raft_log (log_index, term, leader_node, entry_type, payload) VALUES (?, ?, ?, ?, ?)",
             )
             .bind(entry.log_id.index as i64)
             .bind(entry.log_id.leader_id.term as i64)
+            .bind(entry.log_id.leader_id.node_id as i64)
             .bind(entry_type)
             .bind(payload)
             .execute(&mut *tx)
@@ -485,6 +527,23 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
                     results.push(Response::ok(0));
                 }
             }
+        }
+
+        // Persist the membership if this batch changed it
+        if entries
+            .iter()
+            .any(|e| matches!(e.payload, EntryPayload::Membership(_)))
+        {
+            let pool = self.pool.read().await;
+            let json = serde_json::to_string(&*self.membership.read().await)
+                .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
+            sqlx::query(
+                "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_membership', ?)",
+            )
+            .bind(&json)
+            .execute(&*pool)
+            .await
+            .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
         }
 
         // Persist last_applied
@@ -570,7 +629,29 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             }
         }
 
-        // Apply snapshot state
+        // Apply snapshot state, and persist it so a restart resumes from it
+        {
+            let pool = self.pool.read().await;
+            for (key, value) in [
+                (
+                    "last_applied",
+                    serde_json::to_string(&snapshot_data.last_applied_log),
+                ),
+                (
+                    "last_membership",
+                    serde_json::to_string(&snapshot_data.last_membership),
+                ),
+            ] {
+                let json = value
+                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?;
+                sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES (?, ?)")
+                    .bind(key)
+                    .bind(&json)
+                    .execute(&*pool)
+                    .await
+                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?;
+            }
+        }
         *self.last_applied.write().await = snapshot_data.last_applied_log;
         *self.membership.write().await = snapshot_data.last_membership;
         *self.current_snapshot.write().await = Some((meta.clone(), data));

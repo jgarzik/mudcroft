@@ -1360,3 +1360,44 @@ async fn test_help_lists_commands_for_role() {
         assert_eq!(text.contains("eval <lua>"), has_eval, "{}", text);
     }
 }
+
+/// mudd must start again on a database it has already served, with its
+/// data intact (single-node Raft must not re-initialize)
+#[tokio::test]
+async fn test_server_restarts_on_existing_database() {
+    let mut server = TestServer::start().await.expect("Failed to start server");
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "restart_wiz".to_string(),
+        })
+        .await
+        .expect("connect");
+    wizard.drain().await;
+    wizard
+        .command(r#"eval return game.create_object("/items/keepsake", "item", nil, {name = "keepsake"}).id"#)
+        .await
+        .unwrap();
+    wizard
+        .expect_output_containing("/items/keepsake")
+        .await
+        .expect("object created");
+    wizard.close().await.ok();
+
+    server.restart().await.expect("server restarts");
+
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "restart_wiz".to_string(),
+        })
+        .await
+        .expect("reconnect after restart");
+    wizard.drain().await;
+    wizard
+        .command(r#"eval return game.get_object("/items/keepsake").name"#)
+        .await
+        .unwrap();
+    wizard
+        .expect_output_containing("keepsake")
+        .await
+        .expect("data survives restart");
+}

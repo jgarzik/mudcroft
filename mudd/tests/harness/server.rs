@@ -30,6 +30,9 @@ pub struct TestServer {
     world: Option<TestWorld>,
     /// Path to the server log file (inside the temp dir)
     pub log_path: PathBuf,
+    /// mudd binary and extra arguments, for restart()
+    mudd_path: PathBuf,
+    extra_args: Vec<String>,
     /// Temp directory for database and other files (cleaned up on drop)
     _temp_dir: TempDir,
     /// Path to the database file
@@ -93,60 +96,10 @@ impl TestServer {
             );
         }
 
-        // Spawn the server process. Guard it immediately so any early return
-        // below (startup timeout, DB error) still kills it.
+        let extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
         let log_path = temp_dir.path().join("mudd.log");
-        let log_out = File::create(&log_path)?;
-        let child = ChildGuard::new(
-            die_with_parent(&mut Command::new(&mudd_path))
-                .arg("--bind")
-                .arg(addr.to_string())
-                .arg("--database")
-                .arg(db_path.to_string_lossy().as_ref())
-                .args(extra_args)
-                .env("RUST_LOG", "info")
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(log_out.try_clone()?))
-                .stderr(Stdio::from(log_out))
-                .spawn()
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", mudd_path, e)
-                })?,
-        );
-
-        // Wait for server to be ready
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
-
-        // Poll until the server answers. mudd binds only after Raft leader
-        // election (up to 10s), which is slow when many test servers start
-        // at once, so allow generous time but stop early if it exits.
-        let mut child = child;
-        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
-        loop {
-            if client
-                .get(format!("http://{}/health", addr))
-                .send()
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            if let Some(status) = child.try_wait()? {
-                anyhow::bail!(
-                    "Server exited during startup ({}). Log tail:\n{}",
-                    status,
-                    log_tail(&log_path, 40)
-                );
-            }
-            if std::time::Instant::now() > deadline {
-                anyhow::bail!(
-                    "Server failed to start within {:?}. Log tail:\n{}",
-                    STARTUP_TIMEOUT,
-                    log_tail(&log_path, 40)
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let child = spawn_mudd(&client, &mudd_path, addr, &db_path, &extra_args, &log_path).await?;
 
         // Open a separate database connection for test setup
         // Configure with foreign keys enabled to match server behavior
@@ -168,6 +121,8 @@ impl TestServer {
             child,
             world: None,
             log_path,
+            mudd_path,
+            extra_args,
             _temp_dir: temp_dir,
             db_path,
             db_pool,
@@ -180,6 +135,22 @@ impl TestServer {
         }
 
         Ok(test_server)
+    }
+
+    /// Stop the server process and start it again on the same database,
+    /// port and arguments (simulates a server restart)
+    pub async fn restart(&mut self) -> Result<()> {
+        self.child.kill();
+        self.child = spawn_mudd(
+            &self.client,
+            &self.mudd_path,
+            self.addr,
+            &self.db_path,
+            &self.extra_args,
+            &self.log_path,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Get the base URL for the server
@@ -440,6 +411,69 @@ impl Drop for TestServer {
                 log_tail(&self.log_path, 60)
             );
         }
+    }
+}
+
+/// Spawn mudd and wait until it answers /health. The child is guarded
+/// immediately, so any early return (startup timeout, exit) kills it.
+/// Output is appended to `log_path`.
+async fn spawn_mudd(
+    client: &Client,
+    mudd_path: &Path,
+    addr: SocketAddr,
+    db_path: &Path,
+    extra_args: &[String],
+    log_path: &Path,
+) -> Result<ChildGuard> {
+    let log_out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let mut child = ChildGuard::new(
+        die_with_parent(&mut Command::new(mudd_path))
+            .arg("--bind")
+            .arg(addr.to_string())
+            .arg("--database")
+            .arg(db_path.to_string_lossy().as_ref())
+            .args(extra_args)
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_out.try_clone()?))
+            .stderr(Stdio::from(log_out))
+            .spawn()
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", mudd_path, e)
+            })?,
+    );
+
+    // Poll until the server answers. mudd binds only after Raft leader
+    // election (up to 10s), which is slow when many test servers start at
+    // once, so allow generous time but stop early if it exits.
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if client
+            .get(format!("http://{}/health", addr))
+            .send()
+            .await
+            .is_ok()
+        {
+            return Ok(child);
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "Server exited during startup ({}). Log tail:\n{}",
+                status,
+                log_tail(log_path, 40)
+            );
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "Server failed to start within {:?}. Log tail:\n{}",
+                STARTUP_TIMEOUT,
+                log_tail(log_path, 40)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
