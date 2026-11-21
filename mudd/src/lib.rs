@@ -44,6 +44,8 @@ pub struct Config {
     pub raft_port: u16,
     /// Cluster peers (format: "1=host1:9000,2=host2:9001"). None = single-node.
     pub peers: Option<String>,
+    /// Directory of the built web client to serve (None = API only)
+    pub static_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -54,6 +56,7 @@ impl Default for Config {
             node_id: 1,
             raft_port: 9000,
             peers: None,
+            static_dir: None,
         }
     }
 }
@@ -71,6 +74,15 @@ impl Server {
     /// Create a new server instance
     /// Requires a pre-initialized database (created by mudd_init)
     pub async fn new(config: Config) -> Result<Self> {
+        if let Some(ref dir) = config.static_dir {
+            if !dir.join("index.html").is_file() {
+                anyhow::bail!(
+                    "--static-dir {} has no index.html (build the client first)",
+                    dir.display()
+                );
+            }
+        }
+
         let db = Database::open(&config.db_path).await?;
         let db = Arc::new(db);
 
@@ -119,7 +131,12 @@ impl Server {
 
     /// Build the router
     async fn router(&self) -> Router {
-        api::router(self.db.clone(), self.raft_writer.clone()).await
+        api::router(
+            self.db.clone(),
+            self.raft_writer.clone(),
+            self.config.static_dir.clone(),
+        )
+        .await
     }
 
     /// Run the server until shutdown

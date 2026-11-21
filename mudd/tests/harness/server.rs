@@ -46,6 +46,11 @@ impl TestServer {
 
     /// Start a test server, optionally creating a test world
     pub async fn start_with_world(create_world: bool) -> Result<Self> {
+        Self::start_with_args(create_world, &[]).await
+    }
+
+    /// Start a test server passing extra command-line arguments to mudd
+    pub async fn start_with_args(create_world: bool, extra_args: &[&str]) -> Result<Self> {
         // Create temp directory for this test instance
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("test.db");
@@ -98,6 +103,7 @@ impl TestServer {
                 .arg(addr.to_string())
                 .arg("--database")
                 .arg(db_path.to_string_lossy().as_ref())
+                .args(extra_args)
                 .env("RUST_LOG", "info")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log_out.try_clone()?))
