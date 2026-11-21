@@ -36,6 +36,47 @@ impl Default for SandboxConfig {
     }
 }
 
+/// Per-execution budget for database queries and Venice calls.
+///
+/// Kept in the Lua state's app data so `game.*` functions can charge it
+/// (see [`charge_db`] / [`charge_venice`]); reset at the start of every
+/// execution.
+#[derive(Debug, Default)]
+pub(crate) struct CallBudget {
+    db_queries: u64,
+    venice_calls: u64,
+    max_db_queries: u64,
+    max_venice_calls: u64,
+}
+
+/// Count one database-backed `game.*` call against the execution's budget
+pub(crate) fn charge_db(lua: &Lua) -> LuaResult<()> {
+    if let Some(mut budget) = lua.app_data_mut::<CallBudget>() {
+        budget.db_queries += 1;
+        if budget.db_queries > budget.max_db_queries {
+            return Err(mlua::Error::runtime(
+                SandboxError::DbQueryLimitExceeded(budget.db_queries, budget.max_db_queries)
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Count one Venice API call against the execution's budget
+pub(crate) fn charge_venice(lua: &Lua) -> LuaResult<()> {
+    if let Some(mut budget) = lua.app_data_mut::<CallBudget>() {
+        budget.venice_calls += 1;
+        if budget.venice_calls > budget.max_venice_calls {
+            return Err(mlua::Error::runtime(
+                SandboxError::VeniceCallLimitExceeded(budget.venice_calls, budget.max_venice_calls)
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Errors that can occur during sandbox execution
 #[derive(Debug, Error)]
 pub enum SandboxError {
@@ -100,6 +141,12 @@ impl Sandbox {
                 }
             },
         );
+
+        lua.set_app_data(CallBudget {
+            max_db_queries: config.max_db_queries,
+            max_venice_calls: config.max_venice_calls,
+            ..Default::default()
+        });
 
         // Remove dangerous globals
         Self::remove_dangerous_globals(&lua)?;
@@ -195,6 +242,10 @@ impl Sandbox {
         self.instruction_count.store(0, Ordering::Relaxed);
         self.exceeded.store(false, Ordering::Relaxed);
         self.metering.reset();
+        if let Some(mut budget) = self.lua.app_data_mut::<CallBudget>() {
+            budget.db_queries = 0;
+            budget.venice_calls = 0;
+        }
         self.start_time = Some(Instant::now());
 
         // Compile and execute

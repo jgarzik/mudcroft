@@ -512,3 +512,52 @@ async fn test_timer_limits_and_cleanup_on_delete() {
         .await
         .expect("actions cleared on delete");
 }
+
+/// Object code is limited to 100 database-backed calls per execution;
+/// wizard eval gets a much larger budget
+#[tokio::test]
+async fn test_db_query_limit_for_object_code() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "budget_wiz").await;
+
+    // Wizard eval: 150 lookups are fine
+    let out = eval(
+        &mut wiz,
+        &format!(
+            r#"for i = 1, 150 do game.get_object("{room}") end; return "ok""#,
+            room = entrance
+        ),
+    )
+    .await;
+    assert_eq!(out, "ok");
+
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local h = game.store_code([[return {{
+                 search = function(a)
+                   for i = 1, 150 do game.get_object(a.room_id) end
+                   return "searched"
+                 end,
+               }}]])
+               game.create_object("/items/haystack", "item", "{room}", {{name = "haystack", code_hash = h}})
+               return game.add_action("search", "/items/haystack", "search")"#,
+            room = entrance
+        ),
+    )
+    .await;
+
+    wiz.drain().await;
+    wiz.command("search haystack").await.unwrap();
+    let _ = wiz.expect("echo").await;
+    let reply = wiz.expect("error").await.expect("limit error");
+    assert!(
+        reply["message"]
+            .as_str()
+            .unwrap()
+            .contains("database query limit exceeded"),
+        "got: {}",
+        reply
+    );
+}

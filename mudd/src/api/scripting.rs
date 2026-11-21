@@ -30,11 +30,14 @@ pub struct ScriptContext {
     pub object_id: Option<String>,
 }
 
-/// Sandbox limits for interactive wizard `eval` and admin scripts
+/// Sandbox limits for interactive wizard `eval` and admin scripts, which
+/// legitimately build whole areas in one run. Object code (hooks, verbs,
+/// timers) uses the stricter `SandboxConfig::default()`.
 pub fn eval_config() -> SandboxConfig {
     SandboxConfig {
         max_instructions: 10_000_000,
         timeout: std::time::Duration::from_secs(5),
+        max_db_queries: 10_000,
         ..Default::default()
     }
 }

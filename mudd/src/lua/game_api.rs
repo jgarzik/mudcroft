@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 
 use super::actions::{Action, ActionRegistry};
 use super::messaging::MessageQueue;
+use super::sandbox::{charge_db, charge_venice};
 use crate::credits::CreditManager;
 use crate::objects::{ClassRegistry, Object, ObjectStore};
 use crate::permissions::{AccessLevel, Action as PermAction, ObjectContext, PermissionManager};
@@ -210,6 +211,7 @@ impl GameApi {
         let store = self.store.clone();
         let parent_fn = lua.create_function(
             move |lua, (class_name, handler_name, args): (String, String, Table)| {
+                charge_db(lua)?;
                 let classes = classes.clone();
                 let store = store.clone();
 
@@ -305,6 +307,7 @@ impl GameApi {
                 Option<String>,
                 Option<Table>,
             )| {
+                charge_db(lua)?;
                 let store = store_clone.clone();
                 let universe_id = universe_clone.clone();
 
@@ -386,6 +389,7 @@ impl GameApi {
         // Actually fetches from database
         let store_clone = store.clone();
         let get_object = lua.create_function(move |lua, id: String| {
+            charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
@@ -409,6 +413,7 @@ impl GameApi {
             permissions.clone(),
         );
         let update_object = lua.create_function(move |lua, (id, changes): (String, Table)| {
+            charge_db(lua)?;
             let store = store_clone.clone();
             let (user, universe_id, permissions) = ctx_clone.clone();
             let user = actor_override(lua).or(user);
@@ -499,6 +504,7 @@ impl GameApi {
         );
         let cleanup = (self.timers.clone(), self.actions.clone());
         let delete_object = lua.create_function(move |lua, id: String| {
+            charge_db(lua)?;
             let store = store_clone.clone();
             let (user, universe_id, permissions) = ctx_clone.clone();
             let (timers, actions) = cleanup.clone();
@@ -551,6 +557,7 @@ impl GameApi {
         );
         let move_object =
             lua.create_function(move |lua, (id, new_parent_id): (String, Option<String>)| {
+                charge_db(lua)?;
                 let store = store_clone.clone();
                 let (user, universe_id, permissions) = ctx_clone.clone();
                 let user = actor_override(lua).or(user);
@@ -598,6 +605,7 @@ impl GameApi {
         );
         let clone_object = lua.create_function(
             move |lua, (id, new_path, new_parent_id): (String, String, Option<String>)| {
+                charge_db(lua)?;
                 let store = store_clone.clone();
                 let (user, universe_id, permissions) = ctx_clone.clone();
                 let user = actor_override(lua).or(user);
@@ -663,6 +671,7 @@ impl GameApi {
         let user_clone = current_user.clone();
         let permissions_clone = permissions.clone();
         let store_code = lua.create_function(move |lua, source: String| {
+            charge_db(lua)?;
             let store = store_clone.clone();
 
             let user_id = actor_override(lua)
@@ -702,6 +711,7 @@ impl GameApi {
         // game.get_code(hash) - returns source
         let store_clone = store.clone();
         let get_code = lua.create_function(move |lua, hash: String| {
+            charge_db(lua)?;
             let store = store_clone.clone();
 
             let result: anyhow::Result<Option<String>> = tokio::task::block_in_place(|| {
@@ -720,6 +730,7 @@ impl GameApi {
         let store_clone = store;
         let get_children =
             lua.create_function(move |lua, (parent_id, filter): (String, Option<Table>)| {
+                charge_db(lua)?;
                 let store = store_clone.clone();
 
                 let result = tokio::task::block_in_place(|| {
@@ -763,43 +774,46 @@ impl GameApi {
         // game.define_class(name, definition)
         // Registers a new class with parent and properties
         let classes_clone = classes.clone();
-        let define_class = lua.create_function(move |_, (name, definition): (String, Table)| {
-            let classes = classes_clone.clone();
+        let define_class =
+            lua.create_function(move |lua, (name, definition): (String, Table)| {
+                charge_db(lua)?;
+                let classes = classes_clone.clone();
 
-            // Extract parent from definition
-            let parent: Option<String> = definition.get("parent").ok();
+                // Extract parent from definition
+                let parent: Option<String> = definition.get("parent").ok();
 
-            // Extract properties
-            let properties: Option<Table> = definition.get("properties").ok();
-            let mut props_map = std::collections::HashMap::new();
-            if let Some(props) = properties {
-                for (prop_name, prop_def) in props.pairs::<String, Table>().flatten() {
-                    let prop_type: String = prop_def
-                        .get("type")
-                        .unwrap_or_else(|_| "string".to_string());
-                    let default_val = prop_def.get::<Value>("default").ok();
-                    let json_default = default_val
-                        .map(|v| lua_to_json(v).unwrap_or(serde_json::Value::Null))
-                        .unwrap_or(serde_json::Value::Null);
-                    props_map.insert(prop_name, (prop_type, json_default));
+                // Extract properties
+                let properties: Option<Table> = definition.get("properties").ok();
+                let mut props_map = std::collections::HashMap::new();
+                if let Some(props) = properties {
+                    for (prop_name, prop_def) in props.pairs::<String, Table>().flatten() {
+                        let prop_type: String = prop_def
+                            .get("type")
+                            .unwrap_or_else(|_| "string".to_string());
+                        let default_val = prop_def.get::<Value>("default").ok();
+                        let json_default = default_val
+                            .map(|v| lua_to_json(v).unwrap_or(serde_json::Value::Null))
+                            .unwrap_or(serde_json::Value::Null);
+                        props_map.insert(prop_name, (prop_type, json_default));
+                    }
                 }
-            }
 
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut registry = classes.write().await;
-                    registry.define_class(&name, parent.as_deref(), props_map);
-                })
-            });
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let mut registry = classes.write().await;
+                        registry.define_class(&name, parent.as_deref(), props_map);
+                    })
+                });
 
-            Ok(true)
-        })?;
+                Ok(true)
+            })?;
         game.set("define_class", define_class)?;
 
         // game.get_class(name)
         // Returns class definition as table
         let classes_clone = classes.clone();
         let get_class = lua.create_function(move |lua, name: String| {
+            charge_db(lua)?;
             let classes = classes_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
@@ -839,7 +853,8 @@ impl GameApi {
         // Checks if object is of class or inherits from it
         let store_clone = store.clone();
         let classes_clone = classes.clone();
-        let is_a = lua.create_function(move |_, (obj_id, class_name): (String, String)| {
+        let is_a = lua.create_function(move |lua, (obj_id, class_name): (String, String)| {
+            charge_db(lua)?;
             let store = store_clone.clone();
             let classes = classes_clone.clone();
 
@@ -866,6 +881,7 @@ impl GameApi {
         // game.get_class_chain(class_name)
         // Returns inheritance chain as array
         let get_class_chain = lua.create_function(move |lua, name: String| {
+            charge_db(lua)?;
             let classes = classes.clone();
 
             let chain = tokio::task::block_in_place(|| {
@@ -893,6 +909,7 @@ impl GameApi {
         // Returns the parent object (container/room)
         let store_clone = store.clone();
         let environment = lua.create_function(move |lua, obj_id: String| {
+            charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
@@ -912,6 +929,7 @@ impl GameApi {
         // Returns all contents of an object
         let store_clone = store.clone();
         let all_inventory = lua.create_function(move |lua, obj_id: String| {
+            charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
@@ -936,6 +954,7 @@ impl GameApi {
         // Find object by name in a location
         let store_clone = store.clone();
         let present = lua.create_function(move |lua, (name, env_id): (String, String)| {
+            charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
@@ -954,6 +973,7 @@ impl GameApi {
         // game.get_living_in(env_id)
         // Returns living entities (players, npcs) in a location
         let get_living_in = lua.create_function(move |lua, env_id: String| {
+            charge_db(lua)?;
             let store = store.clone();
 
             let result = tokio::task::block_in_place(|| {
@@ -1144,6 +1164,7 @@ impl GameApi {
         let permissions_clone = permissions.clone();
         let current_user_clone = current_user.clone();
         let set_actor = lua.create_function(move |lua, actor_id: Option<String>| {
+            charge_db(lua)?;
             let Some(id) = actor_id else {
                 lua.set_app_data(ActorOverride(None));
                 return Ok(true);
@@ -1187,6 +1208,7 @@ impl GameApi {
                 Option<bool>,
                 Option<String>,
             )| {
+                charge_db(lua)?;
                 let permissions = permissions_clone.clone();
                 let current_user = current_user_clone.clone();
                 let universe_id = universe_clone.clone();
@@ -1280,7 +1302,8 @@ impl GameApi {
         // game.get_access_level(account_id)
         // Returns the access level of a user as a string
         let permissions_clone = permissions.clone();
-        let get_access_level = lua.create_function(move |_, account_id: String| {
+        let get_access_level = lua.create_function(move |lua, account_id: String| {
+            charge_db(lua)?;
             let permissions = permissions_clone.clone();
 
             let level = std::thread::spawn(move || {
@@ -1308,6 +1331,7 @@ impl GameApi {
         let current_user_clone = current_user.clone();
         let set_access_level =
             lua.create_function(move |lua, (account_id, level_str): (String, String)| {
+                charge_db(lua)?;
                 let permissions = permissions_clone.clone();
 
                 let level = match level_str.as_str() {
@@ -1344,6 +1368,7 @@ impl GameApi {
         let universe_clone = universe_id.clone();
         let grant_path = lua.create_function(
             move |lua, (grantee_id, path_prefix, can_delegate): (String, String, Option<bool>)| {
+                charge_db(lua)?;
                 let permissions = permissions_clone.clone();
                 let current_user = current_user_clone.clone();
                 let universe_id = universe_clone.clone();
@@ -1401,6 +1426,7 @@ impl GameApi {
         let current_user_clone = current_user.clone();
         let universe_clone = universe_id.clone();
         let revoke_path = lua.create_function(move |lua, grant_id: String| {
+            charge_db(lua)?;
             let permissions = permissions_clone.clone();
             let current_user = current_user_clone.clone();
             let universe_id = universe_clone.clone();
@@ -1439,6 +1465,7 @@ impl GameApi {
         let permissions_clone = permissions;
         let universe_clone = universe_id;
         let get_path_grants = lua.create_function(move |lua, account_id: String| {
+            charge_db(lua)?;
             let permissions = permissions_clone.clone();
             let universe_id = universe_clone.clone();
 
@@ -1479,7 +1506,8 @@ impl GameApi {
         let universe_clone = universe_id.clone();
         let object_clone = current_object.clone();
         let call_out = lua.create_function(
-            move |_, (delay_secs, method, args): (f64, String, Option<String>)| {
+            move |lua, (delay_secs, method, args): (f64, String, Option<String>)| {
+                charge_db(lua)?;
                 let timers = timers_clone.clone();
                 let universe_id = universe_clone.clone();
                 let object_id = object_clone.clone();
@@ -1513,7 +1541,8 @@ impl GameApi {
         // game.remove_call_out(timer_id)
         // Cancel a scheduled timer
         let timers_clone = timers.clone();
-        let remove_call_out = lua.create_function(move |_, timer_id: String| {
+        let remove_call_out = lua.create_function(move |lua, timer_id: String| {
+            charge_db(lua)?;
             let timers = timers_clone.clone();
 
             let removed = std::thread::spawn(move || {
@@ -1532,7 +1561,8 @@ impl GameApi {
         let timers_clone = timers.clone();
         let universe_clone = universe_id.clone();
         let object_clone = current_object.clone();
-        let set_heart_beat = lua.create_function(move |_, interval_ms: u64| {
+        let set_heart_beat = lua.create_function(move |lua, interval_ms: u64| {
+            charge_db(lua)?;
             let timers = timers_clone.clone();
             let universe_id = universe_clone.clone();
             let object_id = object_clone.clone();
@@ -1556,7 +1586,8 @@ impl GameApi {
         // game.remove_heart_beat()
         // Remove the heartbeat for the current object
         let object_clone = current_object;
-        let remove_heart_beat = lua.create_function(move |_, ()| {
+        let remove_heart_beat = lua.create_function(move |lua, ()| {
+            charge_db(lua)?;
             let timers = timers.clone();
             let object_id = object_clone.clone();
 
@@ -1591,7 +1622,8 @@ impl GameApi {
         let credits_clone = credits.clone();
         let universe_clone = universe_id.clone();
         let user_clone = current_user.clone();
-        let get_credits = lua.create_function(move |_, ()| {
+        let get_credits = lua.create_function(move |lua, ()| {
+            charge_db(lua)?;
             let credits = credits_clone.clone();
             let universe_id = universe_clone.clone();
             let user_id = user_clone.clone();
@@ -1619,7 +1651,8 @@ impl GameApi {
         let credits_clone = credits.clone();
         let universe_clone = universe_id.clone();
         let user_clone = current_user.clone();
-        let deduct_credits = lua.create_function(move |_, (amount, reason): (i64, String)| {
+        let deduct_credits = lua.create_function(move |lua, (amount, reason): (i64, String)| {
+            charge_db(lua)?;
             let credits = credits_clone.clone();
             let universe_id = universe_clone.clone();
             let user_id = user_clone.clone();
@@ -1648,6 +1681,7 @@ impl GameApi {
         let user_clone = current_user;
         let admin_grant_credits =
             lua.create_function(move |lua, (account_id, amount): (String, i64)| {
+                charge_db(lua)?;
                 let credits = credits_clone.clone();
                 let universe_id = universe_clone.clone();
                 let permissions = permissions.clone();
@@ -1695,6 +1729,7 @@ impl GameApi {
         let user_clone = current_user.clone();
         let llm_chat = lua.create_function(
             move |lua, (messages_table, tier_str): (Table, Option<String>)| {
+                charge_venice(lua)?;
                 let venice = venice_clone.clone();
                 let user_id = user_clone.clone();
 
@@ -1745,6 +1780,7 @@ impl GameApi {
         let user_clone = current_user;
         let llm_image = lua.create_function(
             move |lua, (prompt, style_str, size_str): (String, Option<String>, Option<String>)| {
+                charge_venice(lua)?;
                 let venice = venice.clone();
                 let image_store = image_store.clone();
                 let user_id = user_clone.clone();
@@ -1825,6 +1861,7 @@ impl GameApi {
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
         let set_time = lua.create_function(move |lua, time_ms: u64| {
+            charge_db(lua)?;
             let permissions = permissions_clone.clone();
             let user_id = user_clone.clone();
             let time_override = time_override_clone.clone();
@@ -1863,6 +1900,7 @@ impl GameApi {
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
         let set_rng_seed = lua.create_function(move |lua, seed: u64| {
+            charge_db(lua)?;
             let permissions = permissions_clone.clone();
             let user_id = user_clone.clone();
             let rng = rng_clone.clone();
@@ -1923,6 +1961,7 @@ impl GameApi {
                     String,
                     Option<String>,
                 )| {
+                    charge_db(lua)?;
                     let store = store_clone.clone();
 
                     // Get the object
@@ -2001,6 +2040,7 @@ impl GameApi {
         let store_clone = store.clone();
         let universe_clone = universe_id.clone();
         let get_universe = lua.create_function(move |lua, ()| {
+            charge_db(lua)?;
             let store = store_clone.clone();
             let universe_id = universe_clone.clone();
 
@@ -2033,6 +2073,7 @@ impl GameApi {
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
         let update_universe = lua.create_function(move |lua, config: Table| {
+            charge_db(lua)?;
             let store = store_clone.clone();
             let universe_id = universe_clone.clone();
             let permissions = permissions_clone.clone();

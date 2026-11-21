@@ -17,7 +17,6 @@ use zip::ZipArchive;
 use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
-use crate::lua::SandboxConfig;
 use crate::permissions::AccessLevel;
 use crate::universe::validate_universe_id;
 
@@ -506,7 +505,7 @@ async fn run_script(
         &ctx,
         &script_content,
         Vec::new(),
-        SandboxConfig::default(),
+        scripting::eval_config(),
     )
     .await;
 
