@@ -73,11 +73,10 @@ them:
 eval local t = {} for _, r in ipairs(game.get_children("/d/town", {class = "room"})) do t[#t+1] = r.id end return table.concat(t, ", ")
 ```
 
-Where logged-in players appear:
+Where players appear:
 
 - **New players** appear in the portal room.
 - **Returning players** reappear in the last *safe* room they stood in. A safe room is the portal room at that time, a room with `is_portal = true`, or the player's `workroom_id`. If that room no longer exists, they go to the portal.
-- **Guests** always appear in the portal room.
 
 The portal is set **only** by `setportal`. Universe config keys such as
 `spawn_room` are not read by the server.

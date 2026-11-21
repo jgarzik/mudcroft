@@ -476,6 +476,22 @@ async fn test_player_movement() {
 
 // WebSocket Tests
 
+/// There are no guests: /ws without a valid token is refused before upgrade
+#[tokio::test]
+async fn test_websocket_requires_token() {
+    use tokio_tungstenite::tungstenite::Error;
+    let mudd = MuddTest::start().await.expect("Failed to start server");
+    for url in [
+        mudd.ws_url(),
+        format!("{}&token=not-a-real-token", mudd.ws_url()),
+    ] {
+        match tokio_tungstenite::connect_async(&url).await {
+            Err(Error::Http(resp)) => assert_eq!(resp.status(), 401, "{}", url),
+            other => panic!("expected 401 for {}, got {:?}", url, other.map(|_| ())),
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_websocket_connect() {
     let mudd = MuddTest::start().await.expect("Failed to start server");
@@ -726,8 +742,8 @@ async fn test_harness_connect_as_player() {
 
     // Verify we got a player ID from the welcome message
     assert!(player.player_id().is_some(), "Should have player ID");
-    assert!(player.account_id().is_some(), "Should have account ID");
-    assert!(player.auth_token().is_some(), "Should have auth token");
+    assert!(!player.account_id().is_empty(), "Should have account ID");
+    assert!(!player.auth_token().is_empty(), "Should have auth token");
 }
 
 #[tokio::test]
@@ -744,12 +760,12 @@ async fn test_harness_connect_as_wizard() {
 
     // Verify wizard account
     assert!(
-        wizard.account_id().is_some(),
+        !wizard.account_id().is_empty(),
         "Wizard should have account ID"
     );
 
     // Verify the account is a wizard member of the test universe
-    let account_id = wizard.account_id().unwrap();
+    let account_id = wizard.account_id();
     let level: (String,) = sqlx::query_as(
         "SELECT level FROM universe_members WHERE universe_id = ? AND account_id = ?",
     )

@@ -1,7 +1,7 @@
 //! TestClient - Role-based authenticated WebSocket client for testing
 //!
-//! Supports Guest, Player, Builder, Wizard, and Admin roles with
-//! automatic account creation and authentication.
+//! Supports Player, Builder, Wizard, and Admin roles with automatic
+//! account creation and authentication (there are no guests).
 
 #![allow(dead_code)]
 
@@ -17,8 +17,6 @@ use super::server::TestServer;
 /// Role for test client authentication
 #[derive(Debug, Clone)]
 pub enum Role {
-    /// Unauthenticated guest connection
-    Guest,
     /// Regular player (creates account with password "test123")
     Player { username: String },
     /// Builder with assigned regions (creates account with password "test123")
@@ -33,21 +31,19 @@ pub enum Role {
 }
 
 impl Role {
-    /// Get the username for this role, if any
-    pub fn username(&self) -> Option<&str> {
+    /// Get the username for this role
+    pub fn username(&self) -> &str {
         match self {
-            Role::Guest => None,
-            Role::Player { username } => Some(username),
-            Role::Builder { username, .. } => Some(username),
-            Role::Wizard { username } => Some(username),
-            Role::Admin { username } => Some(username),
+            Role::Player { username }
+            | Role::Builder { username, .. }
+            | Role::Wizard { username }
+            | Role::Admin { username } => username,
         }
     }
 
     /// Get the access level string for this role
     pub fn access_level(&self) -> &'static str {
         match self {
-            Role::Guest => "guest",
             Role::Player { .. } => "player",
             Role::Builder { .. } => "builder",
             Role::Wizard { .. } => "wizard",
@@ -75,8 +71,8 @@ pub struct TestClient {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     >,
-    account_id: Option<String>,
-    auth_token: Option<String>,
+    account_id: String,
+    auth_token: String,
     player_id: Option<String>,
     /// Messages already read from the socket but not yet returned
     pending: std::collections::VecDeque<Value>,
@@ -92,10 +88,9 @@ impl TestClient {
     /// wizard role is made a member of that universe at that level
     pub async fn connect_in(server: &TestServer, role: Role, universe_id: &str) -> Result<Self> {
         // Register account if needed
-        let (account_id, auth_token) = match &role {
-            Role::Guest => (None, None),
-            _ => {
-                let username = role.username().unwrap();
+        let (account_id, auth_token) = {
+            {
+                let username = role.username();
                 let password = Role::password();
 
                 // Try to register (may already exist)
@@ -170,18 +165,14 @@ impl TestClient {
                     }
                 }
 
-                (Some(account_id), Some(token))
+                (account_id, token)
             }
         };
 
-        // Connect WebSocket with or without token
-        let ws_url = match &auth_token {
-            Some(token) => format!(
-                "ws://{}/ws?token={}&universe={}",
-                server.addr, token, universe_id
-            ),
-            None => format!("ws://{}/ws?universe={}", server.addr, universe_id),
-        };
+        let ws_url = format!(
+            "ws://{}/ws?token={}&universe={}",
+            server.addr, auth_token, universe_id
+        );
 
         let (ws_stream, _) = connect_async(&ws_url).await?;
         let (write, read) = ws_stream.split();
@@ -217,14 +208,14 @@ impl TestClient {
         &self.role
     }
 
-    /// Get the account ID if authenticated
-    pub fn account_id(&self) -> Option<&str> {
-        self.account_id.as_deref()
+    /// Get the account ID
+    pub fn account_id(&self) -> &str {
+        &self.account_id
     }
 
-    /// Get the auth token if authenticated
-    pub fn auth_token(&self) -> Option<&str> {
-        self.auth_token.as_deref()
+    /// Get the auth token
+    pub fn auth_token(&self) -> &str {
+        &self.auth_token
     }
 
     /// Get the player ID from the welcome message

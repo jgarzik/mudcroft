@@ -67,8 +67,6 @@ an account ID. To find the account, read the player object's `owner_id`:
 local account_id = game.get_object(args.actor_id).owner_id
 ```
 
-Guests have a random UUID as their player ID and no player object.
-
 ### Contexts
 
 Each execution may have a **room context** and an **object context**:
@@ -528,8 +526,6 @@ which one you get is unspecified.
 **Returns** objects in `env_id` whose class is `living` or descends from it:
 players, NPCs and their subclasses (including classes made with
 `define_class`).
-
-Connected guests have no player object, so they never appear.
 
 ---
 

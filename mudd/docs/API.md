@@ -221,29 +221,26 @@ ws://127.0.0.1:8080/ws?universe=<universe_id>&token=<token>
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `universe` | yes | Universe id (lowercased before lookup) |
-| `token` | no | Session token. If it is missing **or invalid**, the connection is accepted as a guest. No error is returned. |
+| `token` | yes | Session token from `/auth/login` or `/auth/register`. There are no guests. |
 
 Upgrade failures are plain-text HTTP responses:
 
 | Status | Body |
 |--------|------|
 | 400 | `Universe ID required in query param: ?universe=<id>` or `Invalid universe ID: ...` |
+| 401 | `A valid token is required: ?token=<token>` (missing, invalid or logged-out token) |
 | 404 | `Universe not found: <id>` |
 | 500 | `Failed to verify universe` |
 
-**Logged-in players** have a persistent player object,
+Every player has a persistent player object in the universe,
 `/players/p-<account_id>`, which holds their inventory. A player spawns at
 their `last_safe_location`. If that is not set, they spawn in the room they
 were last in, if it is a safe zone (the portal, a room with `is_portal = true`,
 or their workroom). Otherwise they spawn at the universe portal.
 
-When a logged-in player disconnects, the server waits 5 seconds for a
+When a player disconnects, the server waits 5 seconds for a
 reconnect. If the player does not return and is outside a safe zone, their
 inventory is dropped in the room.
-
-**Guests** get a random player id and no player object. They spawn at the
-portal and can look, move and `say` (shown as "Someone"). Commands that need a
-player object, such as `get` and `inventory`, fail.
 
 ### Client to server
 

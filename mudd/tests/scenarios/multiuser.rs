@@ -35,10 +35,7 @@ async fn test_multiuser_builder_creates_room() {
         .expect("Failed to connect as player");
 
     // Get account IDs
-    let builder_account_id = builder
-        .account_id()
-        .expect("builder has account")
-        .to_string();
+    let builder_account_id = builder.account_id().to_string();
 
     // Drain initial room messages for all
     wizard.drain().await;
@@ -373,10 +370,7 @@ async fn test_builder_path_restriction() {
         .await
         .expect("Failed to connect as builder");
 
-    let builder_account_id = builder
-        .account_id()
-        .expect("builder has account")
-        .to_string();
+    let builder_account_id = builder.account_id().to_string();
 
     wizard.drain().await;
     builder.drain().await;

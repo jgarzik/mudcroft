@@ -132,12 +132,11 @@ Client -> /ws?universe=<id>&token=<token>
   ws_handler:
     1. Validate the universe ID (3-64 chars, lowercase alphanumeric and hyphens)
     2. Check the universe exists (404 otherwise)
-    3. Validate the token if given; an invalid or missing token means guest
+    3. Validate the token (401 if missing or invalid; there are no guests)
   handle_socket:
     1. Create a bounded outgoing queue (256 messages)
-    2. Authenticated: player id /players/p-<account_id>, get or create the
-       player object, spawn at last safe location or the universe portal.
-       Guest: random UUID player id, empty account id, spawn at the portal.
+    2. Player id /players/p-<account_id>: get or create the player object
+       in this universe, spawn at last safe location or the universe portal
     3. Register the PlayerSession (player, account, universe, room, access
        level fixed at connect, sender)
     4. Send welcome, then the room description, then run on_enter on the

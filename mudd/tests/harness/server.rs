@@ -262,11 +262,6 @@ impl TestServer {
         )
     }
 
-    /// Connect a guest (unauthenticated) client
-    pub async fn connect_guest(&self) -> Result<TestClient> {
-        TestClient::connect(self, Role::Guest).await
-    }
-
     /// Connect as a specific role (creates account if needed)
     pub async fn connect_as(&self, role: Role) -> Result<TestClient> {
         TestClient::connect(self, role).await
@@ -308,10 +303,24 @@ impl TestServer {
         Ok(clients)
     }
 
-    /// Connect to the WebSocket endpoint (backward compatibility)
-    /// Returns a raw WsClient without automatic welcome message handling
+    /// Register a fresh player account and connect to the WebSocket
+    /// endpoint with its token. Returns a raw WsClient without automatic
+    /// welcome message handling.
     pub async fn connect_ws(&self) -> Result<RawWsClient> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&self.ws_url()).await?;
+        let username = format!("raw-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let resp: serde_json::Value = self
+            .post(
+                "/auth/register",
+                &serde_json::json!({"username": username, "password": "test123"}),
+            )
+            .await?
+            .json()
+            .await?;
+        let token = resp["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("register failed: {}", resp))?;
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async(&self.ws_url_with_token(token)).await?;
         let (write, read) = futures_util::StreamExt::split(ws_stream);
         Ok(RawWsClient { write, read })
     }

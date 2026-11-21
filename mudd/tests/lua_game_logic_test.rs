@@ -104,9 +104,9 @@ async fn test_lua_game_logic() {
 
     let prelude = format!(
         "local ACCOUNTS = {{ wizard = {}, player = {}, builder = {}, player_body = {} }}\n",
-        lua_str(wizard.account_id().expect("wizard account")),
-        lua_str(player.account_id().expect("player account")),
-        lua_str(builder.account_id().expect("builder account")),
+        lua_str(wizard.account_id()),
+        lua_str(player.account_id()),
+        lua_str(builder.account_id()),
         lua_str(player.player_id().expect("player body")),
     );
 

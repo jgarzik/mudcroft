@@ -341,12 +341,21 @@ pub async fn ws_handler(
         }
     }
 
-    // Validate token if provided
-    let account = if let Some(token) = params.token {
-        let service = AccountService::new(state.db.pool().clone());
-        service.validate_token(&token).await.ok().flatten()
-    } else {
-        None
+    // A valid token is required: there are no guests
+    let account = match params.token {
+        Some(token) => AccountService::new(state.db.pool().clone())
+            .validate_token(&token)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let Some(account) = account else {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "A valid token is required: ?token=<token>",
+        )
+            .into_response();
     };
 
     ws.on_upgrade(move |socket| handle_socket(socket, state, account, universe_id))
@@ -356,47 +365,34 @@ pub async fn ws_handler(
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
-    account: Option<Account>,
+    account: Account,
     universe_id: String,
 ) {
     // Create message channel for this connection
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(CLIENT_QUEUE_SIZE);
 
-    let (account_id, username, access_level) = match &account {
-        Some(acc) => {
-            let access = state
-                .permissions
-                .get_access_level(&universe_id, &acc.id)
-                .await;
-            (acc.id.clone(), Some(acc.username.clone()), access)
-        }
-        None => (String::new(), None, AccessLevel::Player),
-    };
+    let access_level = state
+        .permissions
+        .get_access_level(&universe_id, &account.id)
+        .await;
+    let account_id = account.id.clone();
 
-    // Generate player ID:
-    // - Authenticated users: use persistent path /players/<account_id>
-    // - Guests: use random UUID (ephemeral, no persistence)
-    let player_id = if !account_id.is_empty() {
-        crate::player::PlayerManager::player_path(&account_id)
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
+    // The account's persistent player object in this universe
+    let player_id = crate::player::PlayerManager::player_path(&account_id);
     let player_id_clone = player_id.clone();
 
     // Cancel any pending disconnect for this player (reconnection within grace period)
-    if !account_id.is_empty() {
-        let was_reconnect = state
-            .connections
-            .cancel_pending_disconnect(&universe_id, &player_id)
-            .await;
-        if was_reconnect {
-            info!("Player {} reconnected within grace period", player_id);
-        }
+    let was_reconnect = state
+        .connections
+        .cancel_pending_disconnect(&universe_id, &player_id)
+        .await;
+    if was_reconnect {
+        info!("Player {} reconnected within grace period", player_id);
     }
 
-    // For authenticated users, ensure persistent player object exists
-    let spawn_room_id = if !account_id.is_empty() {
-        let name = username.as_deref().unwrap_or("Unknown");
+    // Ensure the player object exists and find where it spawns
+    let spawn_room_id = {
+        let name = account.username.as_str();
         match state
             .player_manager
             .get_or_create_player(&account_id, &universe_id, name)
@@ -420,18 +416,6 @@ async fn handle_socket(
                 None
             }
         }
-    } else {
-        info!(
-            "WebSocket connected: {} (guest) universe={}",
-            player_id, universe_id
-        );
-        // Guests spawn at portal
-        state
-            .object_store
-            .get_portal(&universe_id)
-            .await
-            .ok()
-            .flatten()
     };
 
     // Create session (replacing any older connection for this player)
@@ -461,24 +445,19 @@ async fn handle_socket(
 
     // Move player to spawn room and send room description
     if let Some(room_id) = spawn_room_id {
-        // Sync player's location to DB for authenticated users
-        if !account_id.is_empty() {
-            if let Err(e) = state
-                .player_manager
-                .move_player(&universe_id, &player_id, &room_id)
-                .await
-            {
-                warn!("Failed to sync player location to DB: {}", e);
-            }
+        // Sync player's location to DB
+        if let Err(e) = state
+            .player_manager
+            .move_player(&universe_id, &player_id, &room_id)
+            .await
+        {
+            warn!("Failed to sync player location to DB: {}", e);
         }
 
         // Send initial room description
-        let acct_ref = if account_id.is_empty() {
-            None
-        } else {
-            Some(account_id.as_str())
-        };
-        if let Some(room_msg) = build_room_message(&state, &universe_id, &room_id, acct_ref).await {
+        if let Some(room_msg) =
+            build_room_message(&state, &universe_id, &room_id, Some(&account_id)).await
+        {
             if let Ok(json) = serde_json::to_string(&room_msg) {
                 let _ = socket.send(Message::Text(json.into())).await;
             }
@@ -548,9 +527,9 @@ async fn handle_socket(
         .await;
     info!("WebSocket disconnected: {}", player_id_clone);
 
-    // For authenticated users, use grace period before handling disconnect
-    // This allows reconnection without dropping inventory
-    if !account_id.is_empty() && !replaced {
+    // Grace period before handling disconnect, so a reconnect does not drop
+    // inventory
+    if !replaced {
         let cancel_rx = state
             .connections
             .schedule_disconnect(&universe_id, &player_id_clone)
@@ -846,13 +825,8 @@ async fn execute_command(
         "look" | "l" => {
             // Get player's current room
             if let Some(room_id) = state.connections.get_room_id(universe_id, player_id).await {
-                let acct_ref = if account_id.is_empty() {
-                    None
-                } else {
-                    Some(account_id)
-                };
                 if let Some(room_msg) =
-                    build_room_message(state, universe_id, &room_id, acct_ref).await
+                    build_room_message(state, universe_id, &room_id, Some(account_id)).await
                 {
                     return room_msg;
                 }
@@ -918,15 +892,13 @@ async fn execute_command(
                 .update_room(universe_id, player_id, Some(dest_room_id.clone()))
                 .await;
 
-            // Sync to database for authenticated users
-            if !account_id.is_empty() {
-                if let Err(e) = state
-                    .player_manager
-                    .move_player(universe_id, player_id, &dest_room_id)
-                    .await
-                {
-                    warn!("Failed to sync player location to DB: {}", e);
-                }
+            // Sync to database
+            if let Err(e) = state
+                .player_manager
+                .move_player(universe_id, player_id, &dest_room_id)
+                .await
+            {
+                warn!("Failed to sync player location to DB: {}", e);
             }
 
             // Entering hook runs after the new room description is sent
@@ -939,13 +911,8 @@ async fn execute_command(
             ));
 
             // Return new room description
-            let acct_ref = if account_id.is_empty() {
-                None
-            } else {
-                Some(account_id)
-            };
             if let Some(room_msg) =
-                build_room_message(state, universe_id, &dest_room_id, acct_ref).await
+                build_room_message(state, universe_id, &dest_room_id, Some(account_id)).await
             {
                 return room_msg;
             }
@@ -1084,20 +1051,18 @@ async fn execute_command(
                         .await;
                     }
 
-                    // Update player's room, in the session and (for accounts)
-                    // the player object, which get/drop and respawn use
+                    // Update player's room, in the session and the player
+                    // object, which get/drop and respawn use
                     state
                         .connections
                         .update_room(universe_id, player_id, Some(room_id.clone()))
                         .await;
-                    if !account_id.is_empty() {
-                        if let Err(e) = state
-                            .player_manager
-                            .move_player(universe_id, player_id, &room_id)
-                            .await
-                        {
-                            warn!("Failed to sync player location to DB: {}", e);
-                        }
+                    if let Err(e) = state
+                        .player_manager
+                        .move_player(universe_id, player_id, &room_id)
+                        .await
+                    {
+                        warn!("Failed to sync player location to DB: {}", e);
                     }
                     deferred.push(Hook::new(
                         &room_id,
@@ -1108,13 +1073,8 @@ async fn execute_command(
                     ));
 
                     // Return room description
-                    let acct_ref = if account_id.is_empty() {
-                        None
-                    } else {
-                        Some(account_id)
-                    };
                     if let Some(room_msg) =
-                        build_room_message(state, universe_id, &room_id, acct_ref).await
+                        build_room_message(state, universe_id, &room_id, Some(account_id)).await
                     {
                         return room_msg;
                     }

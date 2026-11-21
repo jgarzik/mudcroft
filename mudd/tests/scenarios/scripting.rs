@@ -329,7 +329,7 @@ async fn test_object_code_runs_as_owner_not_triggerer() {
     let server = TestServer::start().await.expect("server");
     let entrance = server.world().entrance_id.clone();
     let pl = player(&server, "trap_target").await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
     let mut wiz = wizard(&server, "trap_wiz").await;
     eval(
         &mut wiz,
@@ -380,7 +380,7 @@ async fn test_add_action_requires_access_and_nearby_object() {
     let entrance = server.world().entrance_id.clone();
     let pool_room = server.world().pool_id.clone();
     let pl = player(&server, "action_player").await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
     drop(pl);
     let mut wiz = wizard(&server, "action_wiz").await;
 

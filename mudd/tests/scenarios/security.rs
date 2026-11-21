@@ -67,7 +67,7 @@ fn player(name: &str) -> Role {
 async fn test_wizard_cannot_set_access_level() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("sec_wiz")).await;
-    let wiz_id = wiz.account_id().unwrap().to_string();
+    let wiz_id = wiz.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -85,8 +85,8 @@ async fn test_admin_set_access_level_rules() {
     let mut adm = connect(&server, admin("sec_admin")).await;
     let peer = connect(&server, admin("sec_admin_peer")).await;
     let pl = connect(&server, player("sec_player")).await;
-    let peer_id = peer.account_id().unwrap().to_string();
-    let pl_id = pl.account_id().unwrap().to_string();
+    let peer_id = peer.account_id().to_string();
+    let pl_id = pl.account_id().to_string();
 
     // Allowed: promote a player to builder
     let out = eval(
@@ -122,7 +122,7 @@ async fn test_grant_credits_requires_admin() {
     let mut wiz = connect(&server, wizard("cred_wiz")).await;
     let mut adm = connect(&server, admin("cred_admin")).await;
     let pl = connect(&server, player("cred_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -158,8 +158,8 @@ async fn test_set_actor_cannot_impersonate_superior() {
     let mut wiz = connect(&server, wizard("actor_wiz")).await;
     let adm = connect(&server, admin("actor_admin")).await;
     let pl = connect(&server, player("actor_player")).await;
-    let adm_id = adm.account_id().unwrap().to_string();
-    let pl_id = pl.account_id().unwrap().to_string();
+    let adm_id = adm.account_id().to_string();
+    let pl_id = pl.account_id().to_string();
 
     // Impersonating a superior is refused and leaves the actor unchanged
     let out = eval(
@@ -238,7 +238,7 @@ async fn test_store_code_requires_wizard() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("code_wiz")).await;
     let pl = connect(&server, player("code_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -263,7 +263,7 @@ async fn test_store_code_requires_wizard() {
 async fn test_created_object_owned_by_creator() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("owner_wiz")).await;
-    let wiz_id = wiz.account_id().unwrap().to_string();
+    let wiz_id = wiz.account_id().to_string();
 
     eval(
         &mut wiz,
@@ -287,7 +287,7 @@ async fn test_lua_object_writes_are_permission_checked() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("perm_wiz")).await;
     let pl = connect(&server, player("perm_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     // Wizard sets up objects (wizards bypass path checks)
     eval(
@@ -461,7 +461,7 @@ async fn test_use_object_runs_as_owner() {
         })
         .await
         .unwrap();
-    let bld_id = bld.account_id().unwrap().to_string();
+    let bld_id = bld.account_id().to_string();
 
     // The builder owns a trinket whose code tries to promote the builder
     let out = eval(
@@ -497,7 +497,7 @@ async fn test_define_class_restrictions() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("class_wiz")).await;
     let pl = connect(&server, player("class_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -1029,7 +1029,7 @@ async fn test_broadcast_and_create_parent_stay_in_universe() {
 async fn test_access_levels_are_per_universe() {
     let server = TestServer::start().await.expect("server");
     let realm_owner = connect(&server, player("realm_owner")).await;
-    let owner_id = realm_owner.account_id().unwrap().to_string();
+    let owner_id = realm_owner.account_id().to_string();
     server
         .create_universe("owned-realm", &owner_id)
         .await
@@ -1037,7 +1037,7 @@ async fn test_access_levels_are_per_universe() {
 
     // The test universe's wizard is a player in owned-realm
     let wiz = connect(&server, wizard("home_wiz")).await;
-    let wiz_id = wiz.account_id().unwrap().to_string();
+    let wiz_id = wiz.account_id().to_string();
     let mut wiz_away = server
         .connect_in(player("home_wiz"), "owned-realm")
         .await

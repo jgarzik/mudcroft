@@ -71,9 +71,6 @@ affected feature.
   constant-time compare.
 - A session's access level is fixed at connect (`mudd/src/api/websocket.rs`);
   promotions and demotions apply after the player reconnects.
-- Guests connect with an empty account id and a random UUID player id
-  (`mudd/src/api/websocket.rs`); take/drop/inventory run their Lua with that
-  empty account.
 
 ### Docker
 
