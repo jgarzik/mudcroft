@@ -348,3 +348,38 @@ async fn test_lua_object_writes_are_permission_checked() {
     .expect("box still exists");
     assert_eq!(name, "box");
 }
+
+/// goto/setportal must not reach rooms in another universe
+#[tokio::test]
+async fn test_goto_and_setportal_stay_in_universe() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("xuni_wiz")).await;
+    let owner = server.world().wizard_account_id.clone();
+
+    // A second universe with one room
+    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('other-world', 'Other', ?)")
+        .bind(&owner)
+        .execute(server.pool())
+        .await
+        .expect("create universe");
+    let mut room = mudd::objects::Object::new("/rooms/elsewhere", "other-world", "room").unwrap();
+    room.set_property("name", serde_json::json!("Elsewhere"));
+    server
+        .world()
+        .store()
+        .create(&room)
+        .await
+        .expect("create room");
+
+    for cmd in ["goto /rooms/elsewhere", "setportal /rooms/elsewhere"] {
+        wiz.drain().await;
+        wiz.command(cmd).await.unwrap();
+        let _ = wiz.expect("echo").await;
+        let reply = wiz.expect_any().await.unwrap();
+        assert_eq!(
+            reply["type"], "error",
+            "`{}` must be refused: {}",
+            cmd, reply
+        );
+    }
+}

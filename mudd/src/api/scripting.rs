@@ -83,7 +83,7 @@ pub async fn invoke_handler(
     let Some(object_id) = ctx.object_id.as_deref() else {
         return Err("invoke_handler: no object context".to_string());
     };
-    let Some(code) = object_code(state, object_id).await? else {
+    let Some(code) = object_code(state, object_id, &ctx.universe_id).await? else {
         return Ok(None);
     };
     let libs = load_universe_lib_codes(state, &ctx.universe_id).await?;
@@ -98,13 +98,24 @@ pub async fn invoke_handler(
     result
 }
 
-/// Source of an object's attached code, if any
-async fn object_code(state: &AppState, object_id: &str) -> Result<Option<String>, String> {
+/// Source of an object's attached code, if any. Objects from another
+/// universe never run in this one.
+async fn object_code(
+    state: &AppState,
+    object_id: &str,
+    universe_id: &str,
+) -> Result<Option<String>, String> {
     let obj = match state.object_store.get(object_id).await {
         Ok(Some(obj)) => obj,
         Ok(None) => return Ok(None),
         Err(e) => return Err(format!("Failed to load {}: {}", object_id, e)),
     };
+    if obj.universe_id != universe_id {
+        return Err(format!(
+            "{} belongs to universe {}, not {}",
+            object_id, obj.universe_id, universe_id
+        ));
+    }
     let Some(hash) = obj.code_hash else {
         return Ok(None);
     };

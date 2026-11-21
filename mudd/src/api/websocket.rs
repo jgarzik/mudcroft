@@ -961,8 +961,15 @@ async fn execute_command(
                 };
             };
 
-            // Verify room exists
+            let session_universe = state.connections.get_universe_id(player_id).await;
+
+            // Verify room exists (in this universe)
             match state.object_store.get(&room_id).await {
+                Ok(Some(room)) if Some(&room.universe_id) != session_universe.as_ref() => {
+                    ServerMessage::Error {
+                        message: format!("Room not found: {}", room_id),
+                    }
+                }
                 Ok(Some(room)) if room.class == "room" => {
                     let from = state.connections.get_room_id(player_id).await;
                     if let Some(ref from_id) = from {
@@ -1051,8 +1058,11 @@ async fn execute_command(
                 }
             };
 
-            // Verify room exists
+            // Verify room exists (in this universe)
             match state.object_store.get(&room_id).await {
+                Ok(Some(room)) if room.universe_id != universe_id => ServerMessage::Error {
+                    message: format!("Room not found: {}", room_id),
+                },
                 Ok(Some(room)) if room.class == "room" => {
                     // Set portal
                     if let Err(e) = state.object_store.set_portal(&universe_id, &room_id).await {
