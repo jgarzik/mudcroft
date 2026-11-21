@@ -877,19 +877,20 @@ impl GameApi {
                 lua.set_app_data(ActorOverride(None));
                 return Ok(true);
             };
-            // With no real user (trusted server-side context) anything goes
-            if let Some(real) = current_user_clone.clone() {
-                if id != real {
-                    let permissions = permissions_clone.clone();
-                    let target = id.clone();
-                    let allowed = block_on_perm(async move {
-                        let real_level = permissions.get_access_level(&real).await;
-                        let target_level = permissions.get_access_level(&target).await;
-                        real_level.can_act_as(target_level)
-                    });
-                    if !allowed {
-                        return Ok(false);
-                    }
+            // Without a real user there is no level to check against: refuse
+            let Some(real) = current_user_clone.clone() else {
+                return Ok(false);
+            };
+            if id != real {
+                let permissions = permissions_clone.clone();
+                let target = id.clone();
+                let allowed = block_on_perm(async move {
+                    let real_level = permissions.get_access_level(&real).await;
+                    let target_level = permissions.get_access_level(&target).await;
+                    real_level.can_act_as(target_level)
+                });
+                if !allowed {
+                    return Ok(false);
                 }
             }
             lua.set_app_data(ActorOverride(Some(id)));

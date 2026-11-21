@@ -446,6 +446,26 @@ async fn run_script(
             .into_response();
     }
 
+    // Run as the authenticated caller. An admin+ may run as another account,
+    // but only one strictly below their own level (no impersonating peers or
+    // superiors).
+    let run_as = match request.account_id {
+        Some(other) if other != account.id => {
+            let target_level = state.permissions.get_access_level(&other).await;
+            if !(level.can_admin() && target_level < level) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse {
+                        error: "Cannot run a script as that account".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            other
+        }
+        _ => account.id.clone(),
+    };
+
     // Security: only allow scripts from the scripts/ directory, no path traversal
     let script_name = &request.script;
     if script_name.contains("..") || script_name.starts_with('/') {
@@ -500,10 +520,7 @@ async fn run_script(
         &universe_id,
     );
 
-    // Set user context if provided
-    if let Some(account_id) = request.account_id {
-        game_api.set_user_context(Some(account_id));
-    }
+    game_api.set_user_context(Some(run_as));
 
     // Register game API
     if let Err(e) = game_api.register(sandbox.lua()) {
