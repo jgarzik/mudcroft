@@ -111,26 +111,35 @@ impl TestServer {
         // Wait for server to be ready
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
-        // Poll until server is ready (max 5 seconds to handle resource contention)
-        let mut ready = false;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Poll until the server answers. mudd binds only after Raft leader
+        // election (up to 10s), which is slow when many test servers start
+        // at once, so allow generous time but stop early if it exits.
+        let mut child = child;
+        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
             if client
                 .get(format!("http://{}/health", addr))
                 .send()
                 .await
                 .is_ok()
             {
-                ready = true;
                 break;
             }
-        }
-
-        if !ready {
-            anyhow::bail!(
-                "Server failed to start within 5 seconds. Log tail:\n{}",
-                log_tail(&log_path, 40)
-            );
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!(
+                    "Server exited during startup ({}). Log tail:\n{}",
+                    status,
+                    log_tail(&log_path, 40)
+                );
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "Server failed to start within {:?}. Log tail:\n{}",
+                    STARTUP_TIMEOUT,
+                    log_tail(&log_path, 40)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         // Open a separate database connection for test setup
@@ -428,6 +437,9 @@ impl Drop for TestServer {
     }
 }
 
+/// How long to wait for a test server to answer /health
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Owns a child process and kills it when dropped, so no exit path
 /// (early return, `?`, panic) can leak a running server.
 struct ChildGuard(Option<Child>);
@@ -441,6 +453,14 @@ impl ChildGuard {
     fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
         let mut child = self.0.take().expect("child already taken");
         child.wait()
+    }
+
+    /// Exit status if the process has already exited
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self.0.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        }
     }
 
     /// Kill and reap the process (idempotent)
