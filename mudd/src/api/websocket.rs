@@ -430,6 +430,21 @@ async fn handle_socket(
                 let _ = socket.send(Message::Text(json.into())).await;
             }
         }
+
+        // Arriving in the world counts as entering the spawn room
+        run_hook(
+            &state,
+            &player_id,
+            &account_id,
+            Hook::new(
+                &room_id,
+                Some(&room_id),
+                "on_enter",
+                &player_id,
+                serde_json::json!({ "from": null }),
+            ),
+        )
+        .await;
     } else {
         // No spawn location - player stays nowhere
         let msg = ServerMessage::Output {
@@ -525,9 +540,23 @@ async fn handle_client_message(
                 )
                 .await;
 
-            // Parse and execute the command
-            let response = execute_command(state, player_id, account_id, access_level, &text).await;
+            // Parse and execute the command; hooks it triggers that should
+            // follow the reply (e.g. on_enter after the room description)
+            // run once the reply is queued
+            let mut deferred = Vec::new();
+            let response = execute_command(
+                state,
+                player_id,
+                account_id,
+                access_level,
+                &text,
+                &mut deferred,
+            )
+            .await;
             state.connections.send_to_player(player_id, response).await;
+            for hook in deferred {
+                run_hook(state, player_id, account_id, hook).await;
+            }
         }
         ClientMessage::Ping => {
             // Just keep the connection alive, no response needed
@@ -655,6 +684,58 @@ async fn build_room_message(
     })
 }
 
+/// An object hook to run on behalf of a player
+struct Hook {
+    /// Object whose attached code handles the hook
+    object_id: String,
+    /// Room the hook happens in (room context for the script)
+    room_id: Option<String>,
+    /// Handler name, e.g. "on_enter"
+    method: &'static str,
+    /// Handler argument table (object_id and actor_id are always set)
+    args: serde_json::Value,
+}
+
+impl Hook {
+    fn new(
+        object_id: &str,
+        room_id: Option<&str>,
+        method: &'static str,
+        actor_id: &str,
+        mut args: serde_json::Value,
+    ) -> Self {
+        if let Some(map) = args.as_object_mut() {
+            map.insert("object_id".into(), object_id.into());
+            map.insert("actor_id".into(), actor_id.into());
+            if let Some(room) = room_id {
+                map.insert("room_id".into(), room.into());
+            }
+        }
+        Self {
+            object_id: object_id.to_string(),
+            room_id: room_id.map(str::to_string),
+            method,
+            args,
+        }
+    }
+}
+
+/// Run an object hook as the player (errors are logged, not shown)
+async fn run_hook(state: &AppState, player_id: &str, account_id: &str, hook: Hook) {
+    let Some(universe_id) = state.connections.get_universe_id(player_id).await else {
+        return;
+    };
+    let ctx = ScriptContext {
+        universe_id,
+        user_id: Some(account_id.to_string()),
+        room_id: hook.room_id,
+        object_id: Some(hook.object_id.clone()),
+    };
+    if let Err(e) = scripting::invoke_handler(state, &ctx, hook.method, hook.args).await {
+        warn!("{} hook on {} failed: {}", hook.method, hook.object_id, e);
+    }
+}
+
 /// Parse and execute a player command
 async fn execute_command(
     state: &AppState,
@@ -662,6 +743,7 @@ async fn execute_command(
     account_id: &str,
     access_level: AccessLevel,
     command: &str,
+    deferred: &mut Vec<Hook>,
 ) -> ServerMessage {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
@@ -726,6 +808,21 @@ async fn execute_command(
                 }
             };
 
+            // Leaving hook runs before the move
+            run_hook(
+                state,
+                player_id,
+                account_id,
+                Hook::new(
+                    &current_room_id,
+                    Some(&current_room_id),
+                    "on_leave",
+                    player_id,
+                    serde_json::json!({ "to": dest_room_id, "direction": direction }),
+                ),
+            )
+            .await;
+
             // Update player's room in memory
             state
                 .connections
@@ -738,6 +835,15 @@ async fn execute_command(
                     warn!("Failed to sync player location to DB: {}", e);
                 }
             }
+
+            // Entering hook runs after the new room description is sent
+            deferred.push(Hook::new(
+                &dest_room_id,
+                Some(&dest_room_id),
+                "on_enter",
+                player_id,
+                serde_json::json!({ "from": current_room_id, "direction": direction }),
+            ));
 
             // Return new room description
             let acct_ref = if account_id.is_empty() {
@@ -854,11 +960,35 @@ async fn execute_command(
             // Verify room exists
             match state.object_store.get(&room_id).await {
                 Ok(Some(room)) if room.class == "room" => {
+                    let from = state.connections.get_room_id(player_id).await;
+                    if let Some(ref from_id) = from {
+                        run_hook(
+                            state,
+                            player_id,
+                            account_id,
+                            Hook::new(
+                                from_id,
+                                Some(from_id),
+                                "on_leave",
+                                player_id,
+                                serde_json::json!({ "to": room_id }),
+                            ),
+                        )
+                        .await;
+                    }
+
                     // Update player's room
                     state
                         .connections
                         .update_room(player_id, Some(room_id.clone()))
                         .await;
+                    deferred.push(Hook::new(
+                        &room_id,
+                        Some(&room_id),
+                        "on_enter",
+                        player_id,
+                        serde_json::json!({ "from": from }),
+                    ));
 
                     // Return room description
                     let acct_ref = if account_id.is_empty() {
@@ -1093,6 +1223,13 @@ async fn execute_command(
 
             if attack_result.hit {
                 let damage = attack_result.damage.as_ref().map(|d| d.final_damage).unwrap_or(0);
+                deferred.push(Hook::new(
+                    &target_id,
+                    Some(&room_id),
+                    "on_damage",
+                    player_id,
+                    serde_json::json!({ "attacker_id": player_id, "damage": damage }),
+                ));
                 if attack_result.critical {
                     messages.push(format!(
                         "CRITICAL HIT! You strike {} for {} damage!",
@@ -1108,6 +1245,13 @@ async fn execute_command(
                 // Check if target is dead
                 if state.combat.is_dead(&target_id).await {
                     messages.push(format!("{} is slain!", target_display_name));
+                    deferred.push(Hook::new(
+                        &target_id,
+                        Some(&room_id),
+                        "on_death",
+                        player_id,
+                        serde_json::json!({ "killer_id": player_id }),
+                    ));
 
                     // End combat and remove target from room
                     state.combat.end_combat(player_id).await;
