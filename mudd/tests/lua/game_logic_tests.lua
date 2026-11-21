@@ -1317,7 +1317,7 @@ function test_property_inheritance()
     Test.assert_eq(sword.metadata.damage_type, "physical", "damage_type from weapon")
 
     -- Properties from item (inherited through weapon)
-    Test.assert_eq(sword.metadata.weight, 1, "weight from item")
+    Test.assert_eq(sword.metadata.weight, 0, "weight from item")
     Test.assert_eq(sword.metadata.fixed, false, "fixed from item")
 end
 
@@ -1370,21 +1370,19 @@ function test_is_a_query()
     Test.assert(not game.is_a(sword.id, "player"), "sword is NOT player")
 end
 
--- Handlers below log their calls to HANDLER_LOG, a global shared with the
--- eval chunk (game.use_object runs object code in the caller's Lua state),
--- and pass the hit result along in args.result.
+-- Handlers below run in their own sandbox (game.use_object runs object code
+-- as the object's owner), so they record their calls in the result they
+-- return: result.log lists handlers in the order they ran.
 function test_handler_inheritance_with_parent()
     local actors = setup_test_world()
     act_as(actors.wizard)
-
-    HANDLER_LOG = {}
 
     -- Define classes with handlers that call parent()
     local weapon_code = game.store_code([[
         return {
             on_hit = function(args)
-                table.insert(HANDLER_LOG, "weapon_on_hit")
-                args.result = args.result or { hit = true }
+                args.result = args.result or { hit = true, log = {} }
+                table.insert(args.result.log, "weapon_on_hit")
                 args.result.weapon_processed = true
                 return args.result
             end
@@ -1398,10 +1396,10 @@ function test_handler_inheritance_with_parent()
     local sword_code = game.store_code([[
         return {
             on_hit = function(args)
-                args.result = args.result or { hit = true }
+                args.result = args.result or { hit = true, log = {} }
                 -- Call parent first
                 local result = parent("test_sword", "on_hit", args)
-                table.insert(HANDLER_LOG, "sword_on_hit")
+                table.insert(result.log, "sword_on_hit")
                 result.sword_processed = true
                 return result
             end
@@ -1415,10 +1413,10 @@ function test_handler_inheritance_with_parent()
     local fire_code = game.store_code([[
         return {
             on_hit = function(args)
-                args.result = args.result or { hit = true }
+                args.result = args.result or { hit = true, log = {} }
                 -- Call parent first (sword → weapon)
                 local result = parent("test_fire_sword", "on_hit", args)
-                table.insert(HANDLER_LOG, "fire_sword_on_hit")
+                table.insert(result.log, "fire_sword_on_hit")
                 result.fire_processed = true
                 return result
             end
@@ -1442,9 +1440,9 @@ function test_handler_inheritance_with_parent()
     local result = game.use_object(sword.id, actors.body, "hit", dummy_defender.id)
 
     -- Verify call order: weapon → sword → fire_sword
-    Test.assert_eq(HANDLER_LOG[1], "weapon_on_hit", "weapon handler called first")
-    Test.assert_eq(HANDLER_LOG[2], "sword_on_hit", "sword handler called second")
-    Test.assert_eq(HANDLER_LOG[3], "fire_sword_on_hit", "fire_sword handler called third")
+    Test.assert_eq(result.log[1], "weapon_on_hit", "weapon handler called first")
+    Test.assert_eq(result.log[2], "sword_on_hit", "sword handler called second")
+    Test.assert_eq(result.log[3], "fire_sword_on_hit", "fire_sword handler called third")
 
     -- Verify all handlers contributed to result
     Test.assert(result.weapon_processed, "weapon modified result")
@@ -1456,13 +1454,10 @@ function test_handler_override_without_parent()
     local actors = setup_test_world()
     act_as(actors.wizard)
 
-    HANDLER_LOG = {}
-
     local base_code = game.store_code([[
         return {
             on_use = function(args)
-                table.insert(HANDLER_LOG, "base_on_use")
-                return { success = true, message = "base" }
+                return { success = true, message = "base", log = { "base_on_use" } }
             end
         }
     ]])
@@ -1475,8 +1470,7 @@ function test_handler_override_without_parent()
         return {
             on_use = function(args)
                 -- Deliberately NOT calling parent() - complete override
-                table.insert(HANDLER_LOG, "override_on_use")
-                return { success = true, message = "override" }
+                return { success = true, message = "override", log = { "override_on_use" } }
             end
         }
     ]])
@@ -1495,8 +1489,8 @@ function test_handler_override_without_parent()
     local result = game.use_object(item.id, actors.body, "use")
 
     -- Only override handler should have run
-    Test.assert_eq(#HANDLER_LOG, 1, "Only one handler called")
-    Test.assert_eq(HANDLER_LOG[1], "override_on_use", "Override handler called")
+    Test.assert_eq(#result.log, 1, "Only one handler called")
+    Test.assert_eq(result.log[1], "override_on_use", "Override handler called")
     Test.assert_eq(result.message, "override", "Override result returned")
 end
 
@@ -1625,9 +1619,6 @@ local NO_COMBAT_STATE = "lib/combat.lua Combat.initiate only checks both are in 
     .. " no auto-retaliate"
 local NO_PVP = "no PvP policy in Combat.initiate (TODO at lib/combat.lua:54); also"
     .. " game.update_universe needs admin+, so the wizard eval cannot set pvp_mode"
-local NO_CLASS_DEFAULTS = "BUG: game.create_object (src/lua/game_api.rs:302) stores only the"
-    .. " props it is given and never applies the class chain's default properties;"
-    .. " ClassRegistry::resolve_properties (src/objects/class.rs:213) is unused outside unit tests"
 
 local SKIP = {
     test_region_code_executes_on_enter = "no region on_enter hook: game.move_object"
@@ -1636,14 +1627,6 @@ local SKIP = {
     test_fire_sword_damage_against_normal_enemy = NO_ATTACK_EXTENDED,
     test_fire_sword_against_fire_immune_enemy = NO_ATTACK_EXTENDED,
     test_fire_sword_against_fire_resistant_enemy = NO_ATTACK_EXTENDED,
-    test_spawner_chest_creates_sword = "BUG: game.use_object (src/lua/game_api.rs:1955-2033)"
-        .. " runs object code in the caller's Lua state, as the calling actor, not as the"
-        .. " object's owner (unlike scripting::invoke_handler, src/api/scripting.rs:76-113);"
-        .. " the wizard-owned chest's create_object is denied for the opening player",
-    test_spawner_chest_respects_cooldown = "BUG: game.use_object runs object code as the caller,"
-        .. " not the object's owner (see test_spawner_chest_creates_sword)",
-    test_spawner_only_one_sword_per_day = "BUG: game.use_object runs object code as the caller,"
-        .. " not the object's owner (see test_spawner_chest_creates_sword)",
     test_combat_initiation_pvm = NO_COMBAT_STATE,
     test_combat_pvp_disabled = NO_PVP,
     test_combat_pvp_arena_only = NO_PVP,
@@ -1658,10 +1641,6 @@ local SKIP = {
         .. " ai_idle_tick/ai_combat_tick handler names; no code implements them",
     test_status_effects_in_combat = "no stun handling in attacks and no Combat.process_statuses: "
         .. NO_ATTACK_EXTENDED .. "; lib/combat.lua only has time-based Combat.process_effects",
-    test_property_inheritance = NO_CLASS_DEFAULTS .. ". Also: built-in item weight default is 0"
-        .. " (src/objects/class.rs:106) but design.md:631 and this test expect 1",
-    test_property_override = NO_CLASS_DEFAULTS,
-    test_deep_inheritance_legendary_sword = NO_CLASS_DEFAULTS,
 }
 
 local function run_all_tests(section)

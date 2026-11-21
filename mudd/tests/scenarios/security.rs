@@ -438,3 +438,46 @@ async fn test_attaching_code_requires_owner_or_superior() {
     .await;
     assert_eq!(out, "true", "a superior may attach code");
 }
+
+/// game.use_object runs the object's code as its owner: an admin using a
+/// builder's object does not lend the builder admin rights (an admin could
+/// promote the builder to wizard; the builder itself cannot)
+#[tokio::test]
+async fn test_use_object_runs_as_owner() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, admin("use_admin")).await;
+    let bld = server
+        .connect_as(Role::Builder {
+            username: "use_builder".to_string(),
+            regions: vec![],
+        })
+        .await
+        .unwrap();
+    let bld_id = bld.account_id().unwrap().to_string();
+
+    // The builder owns a trinket whose code tries to promote the builder
+    let out = eval(
+        &mut wiz,
+        &format!(
+            r#"game.grant_path("{b}", "/d/workshop", false)
+               local h = game.store_code([[return {{
+                 on_use = function(a) return game.set_access_level("{b}", "wizard") end,
+               }}]])
+               game.set_actor("{b}")
+               local t = game.create_object("/d/workshop/trinket", "item", nil, {{name = "trinket", code_hash = h}})
+               game.set_actor(nil)
+               return t.owner_id"#,
+            b = bld_id
+        ),
+    )
+    .await;
+    assert_eq!(out, bld_id, "builder owns the trinket");
+
+    let out = eval(
+        &mut wiz,
+        r#"return tostring(game.use_object("/d/workshop/trinket", "someone", "use"))"#,
+    )
+    .await;
+    assert_eq!(out, "false", "the code ran as the builder, not the admin");
+    assert_eq!(db_access_level(&server, &bld_id).await, "builder");
+}

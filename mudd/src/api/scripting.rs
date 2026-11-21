@@ -312,41 +312,7 @@ pub async fn load_universe_lib_codes(
     state: &AppState,
     universe_id: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    let universe = match state.object_store.get_universe(universe_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return Ok(Vec::new()), // No universe = no libs to load
-        Err(e) => return Err(format!("Failed to get universe: {}", e)),
-    };
-
-    let Some(hashes_obj) = universe
-        .config
-        .get("lib_hashes")
-        .and_then(|h| h.as_object())
-    else {
-        return Ok(Vec::new()); // No (or invalid) libs defined
-    };
-
-    // Load each library in order (sorted for determinism)
-    let mut lib_names: Vec<_> = hashes_obj.keys().collect();
-    lib_names.sort();
-
-    let mut lib_codes = Vec::new();
-    for lib_name in lib_names {
-        let Some(hash) = hashes_obj.get(lib_name).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        match state.object_store.get_code(hash).await {
-            Ok(Some(code)) => lib_codes.push((lib_name.clone(), code)),
-            Ok(None) => tracing::warn!(
-                "Library {} with hash {} not found in code_store",
-                lib_name,
-                hash
-            ),
-            Err(e) => tracing::warn!("Failed to load library {}: {}", lib_name, e),
-        }
-    }
-
-    Ok(lib_codes)
+    crate::lua::universe_lib_codes(&state.object_store, universe_id).await
 }
 
 /// Convert Lua value to displayable string

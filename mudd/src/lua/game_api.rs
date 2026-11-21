@@ -113,7 +113,12 @@ pub struct GameApi {
     time_override: Arc<AtomicU64>,
     /// RNG for dice rolls - seeded for reproducibility in tests
     rng: Arc<Mutex<StdRng>>,
+    /// How many game.use_object calls deep this API's script is nested
+    use_depth: usize,
 }
+
+/// Deepest allowed game.use_object nesting (object code using objects...)
+const MAX_USE_DEPTH: usize = 8;
 
 impl GameApi {
     /// Create a new game API for a universe
@@ -146,6 +151,30 @@ impl GameApi {
             current_object_id: None,
             time_override: Arc::new(AtomicU64::new(0)),
             rng: Arc::new(Mutex::new(StdRng::from_rng(&mut rand::rng()))),
+            use_depth: 0,
+        }
+    }
+
+    /// A game API for running another object's code from inside a script:
+    /// same managers and message queue, one level deeper, no contexts set.
+    fn nested(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            classes: self.classes.clone(),
+            actions: self.actions.clone(),
+            messages: self.messages.clone(),
+            permissions: self.permissions.clone(),
+            timers: self.timers.clone(),
+            credits: self.credits.clone(),
+            venice: self.venice.clone(),
+            image_store: self.image_store.clone(),
+            universe_id: self.universe_id.clone(),
+            current_room_id: None,
+            current_user_id: None,
+            current_object_id: None,
+            time_override: self.time_override.clone(),
+            rng: self.rng.clone(),
+            use_depth: self.use_depth + 1,
         }
     }
 
@@ -299,6 +328,7 @@ impl GameApi {
         let universe_clone = universe_id.clone();
         let user_clone = current_user.clone();
         let permissions_clone = permissions.clone();
+        let classes_clone = self.classes.clone();
         let create_object = lua.create_function(
             move |lua,
                   (path, class, parent_id, props): (
@@ -326,6 +356,15 @@ impl GameApi {
                 };
                 obj.parent_id = parent_id;
                 obj.owner_id = owner_id; // Set creator as owner
+
+                // Start from the class's defaults (inherited along its chain);
+                // the props given here override them
+                let classes = classes_clone.clone();
+                let class_name = class.clone();
+                obj.properties = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(async { classes.read().await.resolve_properties(&class_name) })
+                });
 
                 // Copy properties from Lua table if provided
                 if let Some(props_table) = props {
@@ -1949,9 +1988,12 @@ impl GameApi {
         game.set("roll_dice", roll_dice)?;
 
         // game.use_object(obj_id, actor_id, verb, target_id)
-        // Invoke an object's handler method
-        // Returns the result from the handler, or nil if not found
-        let store_clone = store.clone();
+        // Invoke an object's handler. Like every object hook, the handler runs
+        // in its own sandbox as the object's owner (never as the caller), with
+        // {object_id, actor_id, verb, code_hash, target_id}. Returns the
+        // handler's result (tables, strings, numbers, booleans), or nil if the
+        // object has no code or no such handler.
+        let nested_api = self.nested();
         let use_object =
             lua.create_function(
                 move |lua,
@@ -1962,74 +2004,73 @@ impl GameApi {
                     Option<String>,
                 )| {
                     charge_db(lua)?;
-                    let store = store_clone.clone();
+                    if nested_api.use_depth > MAX_USE_DEPTH {
+                        return Err(mlua::Error::runtime(format!(
+                            "use_object: nested deeper than {} levels",
+                            MAX_USE_DEPTH
+                        )));
+                    }
+                    let store = nested_api.store.clone();
+                    let universe_id = nested_api.universe_id.clone();
 
-                    // Get the object
-                    let result: anyhow::Result<Option<(String, String)>> =
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                let obj = store.get(&obj_id).await?;
-                                match obj {
-                                    Some(o) => {
-                                        if let Some(hash) = o.code_hash {
-                                            let code = store.get_code(&hash).await?;
-                                            Ok(code.map(|c| (hash, c)))
-                                        } else {
-                                            Ok(None)
-                                        }
-                                    }
-                                    None => Ok(None),
-                                }
-                            })
-                        });
-
-                    let (code_hash, code) = match result {
-                        Ok(Some((h, c))) => (h, c),
-                        Ok(None) => return Ok(Value::Nil),
-                        Err(e) => return Err(mlua::Error::external(e)),
+                    // Load the object, its code and the universe libraries
+                    type Loaded = Option<(Object, String, String, Vec<(String, String)>)>;
+                    let loaded: Result<Loaded, String> = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let obj = match store.get(&obj_id).await {
+                                Ok(Some(o)) => o,
+                                Ok(None) => return Ok(None),
+                                Err(e) => return Err(e.to_string()),
+                            };
+                            if obj.universe_id != universe_id {
+                                return Ok(None);
+                            }
+                            let Some(hash) = obj.code_hash.clone() else {
+                                return Ok(None);
+                            };
+                            let Some(code) =
+                                store.get_code(&hash).await.map_err(|e| e.to_string())?
+                            else {
+                                return Ok(None);
+                            };
+                            let libs =
+                                super::libs::universe_lib_codes(&store, &universe_id).await?;
+                            Ok(Some((obj, hash, code, libs)))
+                        })
+                    });
+                    let Some((obj, code_hash, code, libs)) =
+                        loaded.map_err(mlua::Error::runtime)?
+                    else {
+                        return Ok(Value::Nil);
                     };
 
-                    // Create a minimal sub-environment to execute the object code
-                    // First, evaluate the code to get the object's function table
-                    let chunk = lua.load(&code);
-                    let handlers: LuaResult<Table> = chunk.eval();
+                    // Map verb to handler name
+                    let handler_name = match verb.as_str() {
+                        "use" => "on_use",
+                        "hit" => "on_hit",
+                        "look" => "on_look",
+                        "init" => "on_init",
+                        other => other, // Use verb directly if no mapping
+                    };
 
-                    match handlers {
-                        Ok(handler_table) => {
-                            // Map verb to handler name
-                            let handler_name = match verb.as_str() {
-                                "use" => "on_use",
-                                "hit" => "on_hit",
-                                "look" => "on_look",
-                                "init" => "on_init",
-                                _ => verb.as_str(), // Use verb directly if no mapping
-                            };
+                    let mut args = serde_json::json!({
+                        "object_id": obj_id,
+                        "actor_id": actor_id,
+                        "verb": verb,
+                        "code_hash": code_hash,
+                    });
+                    if let Some(tid) = target_id {
+                        args["target_id"] = serde_json::Value::String(tid);
+                    }
 
-                            // Try to get the handler function
-                            if let Ok(handler) = handler_table.get::<Function>(handler_name) {
-                                // Call the handler with context
-                                let args_table = lua.create_table()?;
-                                args_table.set("object_id", obj_id.as_str())?;
-                                args_table.set("actor_id", actor_id.as_str())?;
-                                args_table.set("verb", verb.as_str())?;
-                                args_table.set("code_hash", code_hash.as_str())?;
-                                if let Some(ref tid) = target_id {
-                                    args_table.set("target_id", tid.as_str())?;
-                                }
-
-                                match handler.call::<Value>(args_table) {
-                                    Ok(result) => Ok(result),
-                                    Err(e) => Err(e),
-                                }
-                            } else {
-                                // No handler for this verb
-                                Ok(Value::Nil)
-                            }
-                        }
-                        Err(_) => {
-                            // Code didn't return a table, try calling it as a function
-                            Ok(Value::Nil)
-                        }
+                    // Fresh sandbox, contexts set before registration
+                    let mut api = nested_api.nested_for(&obj);
+                    api.use_depth = nested_api.use_depth;
+                    let result = run_handler_sandboxed(&api, &libs, &code, handler_name, &args)
+                        .map_err(mlua::Error::runtime)?;
+                    match result {
+                        Some(json) => json_to_lua(lua, &json),
+                        None => Ok(Value::Nil),
                     }
                 },
             )?;
@@ -2112,6 +2153,51 @@ impl GameApi {
 
         Ok(())
     }
+}
+
+impl GameApi {
+    /// Nested API for running `obj`'s code as its owner, in its room
+    fn nested_for(&self, obj: &Object) -> Self {
+        let mut api = self.nested();
+        api.current_user_id = obj.owner_id.clone();
+        api.current_room_id = obj.parent_id.clone();
+        api.current_object_id = Some(obj.id.clone());
+        api
+    }
+}
+
+/// Run `handler` from object `code` in a fresh sandbox with `api`
+/// registered and the universe libraries loaded. The result crosses back
+/// as JSON, so only plain data (no functions) survives.
+fn run_handler_sandboxed(
+    api: &GameApi,
+    libs: &[(String, String)],
+    code: &str,
+    handler: &str,
+    args: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut sandbox = super::Sandbox::new(super::SandboxConfig::default())
+        .map_err(|e| format!("use_object: {}", e))?;
+    api.register(sandbox.lua())
+        .map_err(|e| format!("use_object: {}", e))?;
+    for (name, lib) in libs {
+        sandbox
+            .execute::<()>(lib)
+            .map_err(|e| format!("use_object: library {}: {}", name, e))?;
+    }
+    let handlers: Table = sandbox
+        .execute(code)
+        .map_err(|e| format!("use_object: object code: {}", e))?;
+    let Ok(func) = handlers.get::<Function>(handler) else {
+        return Ok(None);
+    };
+    let lua_args = json_to_lua(sandbox.lua(), args).map_err(|e| e.to_string())?;
+    let value: Value = sandbox
+        .call(func, lua_args)
+        .map_err(|e| format!("use_object: {}: {}", handler, e))?;
+    lua_to_json(value)
+        .map(Some)
+        .map_err(|e| format!("use_object: {} result: {}", handler, e))
 }
 
 /// Parse dice notation (e.g., "2d6+3") and roll
