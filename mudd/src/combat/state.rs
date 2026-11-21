@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 
 use super::damage::{DamageProfile, DamageResult, DamageType};
 use super::dice::{is_critical, is_fumble, roll_d20};
+use crate::raft::RaftWriter;
 
 /// PvP policy for a universe
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -211,7 +212,6 @@ fn ek(universe_id: &str, entity_id: &str) -> EntityKey {
 }
 
 /// Combat manager for all universes
-#[derive(Debug)]
 pub struct CombatManager {
     /// Combat states by (universe, entity)
     states: RwLock<BTreeMap<EntityKey, CombatState>>,
@@ -219,6 +219,17 @@ pub struct CombatManager {
     pvp_policy: RwLock<PvpPolicy>,
     /// Database pool for persistence
     db_pool: Option<SqlitePool>,
+    /// Raft writer: in the server every write goes through it
+    raft_writer: Option<Arc<RaftWriter>>,
+}
+
+impl std::fmt::Debug for CombatManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CombatManager")
+            .field("db_pool", &self.db_pool.is_some())
+            .field("raft_writer", &self.raft_writer.is_some())
+            .finish()
+    }
 }
 
 impl Default for CombatManager {
@@ -227,6 +238,7 @@ impl Default for CombatManager {
             states: RwLock::new(BTreeMap::new()),
             pvp_policy: RwLock::new(PvpPolicy::default()),
             db_pool: None,
+            raft_writer: None,
         }
     }
 }
@@ -237,13 +249,33 @@ impl CombatManager {
         Self::default()
     }
 
-    /// Create a new combat manager with database pool
-    pub fn with_db(pool: SqlitePool) -> Self {
+    /// Create a combat manager that persists state: through Raft when a
+    /// writer is given (the server), otherwise directly (tests)
+    pub fn with_db(pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self {
             states: RwLock::new(BTreeMap::new()),
             pvp_policy: RwLock::new(PvpPolicy::default()),
             db_pool: Some(pool),
+            raft_writer,
         }
+    }
+
+    /// Run one write, through Raft when available
+    async fn write(&self, sql: &str, params: Vec<serde_json::Value>) -> anyhow::Result<()> {
+        if let Some(ref raft_writer) = self.raft_writer {
+            raft_writer.execute(sql, params).await?;
+        } else if let Some(ref pool) = self.db_pool {
+            let mut query = sqlx::query(sql);
+            for param in params {
+                query = match param {
+                    serde_json::Value::String(v) => query.bind(v),
+                    serde_json::Value::Number(n) => query.bind(n.as_i64()),
+                    other => query.bind(other.to_string()),
+                };
+            }
+            query.execute(pool).await?;
+        }
+        Ok(())
     }
 
     /// Create a shared instance
@@ -252,8 +284,8 @@ impl CombatManager {
     }
 
     /// Create a shared instance with database pool
-    pub fn shared_with_db(pool: SqlitePool) -> Arc<Self> {
-        Arc::new(Self::with_db(pool))
+    pub fn shared_with_db(pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Arc<Self> {
+        Arc::new(Self::with_db(pool, raft_writer))
     }
 
     /// Set the PvP policy
@@ -270,13 +302,8 @@ impl CombatManager {
     pub async fn init_entity(&self, universe_id: &str, entity_id: &str, max_hp: i32) {
         let state = CombatState::new_with_universe(max_hp, universe_id);
 
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) = self
-                .persist_state(universe_id, entity_id, &state, pool)
-                .await
-            {
-                warn!("Failed to persist combat state for {}: {}", entity_id, e);
-            }
+        if let Err(e) = self.persist_state(universe_id, entity_id, &state).await {
+            warn!("Failed to persist combat state for {}: {}", entity_id, e);
         }
 
         self.states
@@ -291,38 +318,29 @@ impl CombatManager {
         universe_id: &str,
         entity_id: &str,
         state: &CombatState,
-        pool: &SqlitePool,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO combat_state
-            (universe_id, entity_id, hp, max_hp, armor_class, attack_bonus)
-            VALUES (?, ?, ?, ?, ?, ?)
-            "#,
+        self.write(
+            "INSERT OR REPLACE INTO combat_state
+             (universe_id, entity_id, hp, max_hp, armor_class, attack_bonus)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            vec![
+                serde_json::json!(universe_id),
+                serde_json::json!(entity_id),
+                serde_json::json!(state.hp),
+                serde_json::json!(state.max_hp),
+                serde_json::json!(state.armor_class),
+                serde_json::json!(state.attack_bonus),
+            ],
         )
-        .bind(universe_id)
-        .bind(entity_id)
-        .bind(state.hp)
-        .bind(state.max_hp)
-        .bind(state.armor_class)
-        .bind(state.attack_bonus)
-        .execute(pool)
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Save current state to database (for HP changes)
     async fn save_entity_state(&self, universe_id: &str, entity_id: &str) {
-        let Some(ref pool) = self.db_pool else {
-            return;
-        };
         let Some(state) = self.get_state(universe_id, entity_id).await else {
             return;
         };
-        if let Err(e) = self
-            .persist_state(universe_id, entity_id, &state, pool)
-            .await
-        {
+        if let Err(e) = self.persist_state(universe_id, entity_id, &state).await {
             warn!("Failed to save combat state for {}: {}", entity_id, e);
         }
     }
@@ -537,16 +555,14 @@ impl CombatManager {
     pub async fn remove_entity(&self, universe_id: &str, entity_id: &str) {
         self.end_combat(universe_id, entity_id).await;
 
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) =
-                sqlx::query("DELETE FROM combat_state WHERE universe_id = ? AND entity_id = ?")
-                    .bind(universe_id)
-                    .bind(entity_id)
-                    .execute(pool)
-                    .await
-            {
-                warn!("Failed to remove combat state for {}: {}", entity_id, e);
-            }
+        if let Err(e) = self
+            .write(
+                "DELETE FROM combat_state WHERE universe_id = ? AND entity_id = ?",
+                vec![serde_json::json!(universe_id), serde_json::json!(entity_id)],
+            )
+            .await
+        {
+            warn!("Failed to remove combat state for {}: {}", entity_id, e);
         }
 
         self.states

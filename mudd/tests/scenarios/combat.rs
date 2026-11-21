@@ -209,3 +209,28 @@ async fn test_npc_subclasses_are_attackable() {
     let text = attack(&mut wiz, "attack wolf").await;
     assert!(text.contains("Wolf"), "{}", text);
 }
+
+/// Combat state writes are replicated through Raft
+#[tokio::test]
+async fn test_combat_state_goes_through_raft() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let mut alice = player_in_passage(&server, "raft_fighter").await;
+    attack(&mut alice, "attack bat").await;
+
+    let entries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%combat_state%'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert!(
+        entries >= 2,
+        "attacker and bat state replicated, got {}",
+        entries
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM combat_state WHERE universe_id = ?")
+        .bind(server.universe_id())
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 2);
+}

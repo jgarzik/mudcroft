@@ -481,11 +481,14 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
 
 `openraft` 0.9 with storage in the same SQLite database (`raft/storage.rs`):
 
-- **Log entries** are plain SQL requests (`raft/types.rs`: `Request { sql,
-  params }`). Managers write through `RaftWriter::execute`; non-deterministic
-  values (UUIDs, timestamps) are computed before proposing. On commit the
-  state machine executes the SQL with bound parameters. Reads go straight to
-  the pool.
+- **Log entries** are SQL requests (`raft/types.rs`: `Request { statements }`,
+  each statement SQL plus bound parameters), applied in one transaction: all
+  or nothing. Managers write through `RaftWriter::execute` (one statement) or
+  `execute_batch` (several, atomically); non-deterministic values (UUIDs,
+  timestamps) are computed before proposing. Reads go straight to the pool.
+- **Every server write goes through Raft**, including accounts and combat
+  state. Only `mudd_init` (and `AccountService::offline`) writes directly,
+  because it runs before any Raft node exists.
 - **Persistence**: `raft_log` (entries, with term and `leader_node`),
   `raft_vote` (vote and committed index), `raft_meta` (`last_applied`,
   `last_purged`, `last_membership`). Persisting the membership lets a
@@ -500,7 +503,7 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
 
 Multi-node operation is not working yet: see
 [docs/roadmap.md](../../docs/roadmap.md) for the gaps and known issues
-(including writes that bypass Raft and per-node caches).
+(including per-node caches).
 
 ## Key Design Decisions
 

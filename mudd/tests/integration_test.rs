@@ -1149,7 +1149,7 @@ async fn test_combat_state_persistence() {
         .await
         .expect("Failed to create combat_state table");
 
-        let combat = CombatManager::with_db(pool);
+        let combat = CombatManager::with_db(pool, None);
         combat.init_entity("universe1", "player1", 100).await;
 
         // Verify initial state
@@ -1185,7 +1185,7 @@ async fn test_combat_state_persistence() {
             .await
             .expect("Failed to connect");
 
-        let combat = CombatManager::with_db(pool);
+        let combat = CombatManager::with_db(pool, None);
         combat
             .load_from_db()
             .await

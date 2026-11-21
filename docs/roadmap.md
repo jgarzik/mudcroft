@@ -26,9 +26,9 @@ affected feature.
   the persisted call_outs (`mudd/src/api/mod.rs`, `run_timer_loop` in
   `mudd/src/api/scripting.rs`), so in a cluster each call_out and heartbeat
   would run on every node.
-- **Writes that bypass Raft.** Account registration, login and logout tokens
-  (`mudd/src/auth/accounts.rs`) and combat state and effects
-  (`mudd/src/combat/state.rs`, `effects.rs`) write straight to SQLite.
+- **Status effect persistence bypasses Raft.** `EffectRegistry`
+  (`mudd/src/combat/effects.rs`) writes straight to SQLite; it is not wired
+  into the server yet.
 - **Per-node caches are never invalidated.** Access levels
   (`PermissionManager`, `mudd/src/permissions/mod.rs`) and credit balances
   (`CreditManager`, `mudd/src/credits/mod.rs`) are cached per node and not

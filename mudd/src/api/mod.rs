@@ -84,7 +84,10 @@ pub async fn router(
     let venice = Arc::new(VeniceClient::new());
     let image_store = Arc::new(ImageStore::new(db.pool().clone(), raft_writer.clone()));
     let themes = Arc::new(ThemeRegistry::new());
-    let combat = Arc::new(CombatManager::with_db(db.pool().clone()));
+    let combat = Arc::new(CombatManager::with_db(
+        db.pool().clone(),
+        Some(raft_writer.clone()),
+    ));
 
     // Load persisted data on startup
     if let Err(e) = timers.load_from_db().await {
