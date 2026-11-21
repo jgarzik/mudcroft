@@ -160,7 +160,6 @@ impl ClassRegistry {
 
         // player - inherits from living
         let mut player = ClassDef::new("player", Some("living"));
-        player.set_property("wallet_address", serde_json::json!(null));
         player.set_property("access_level", serde_json::json!("player"));
         self.register(player);
 

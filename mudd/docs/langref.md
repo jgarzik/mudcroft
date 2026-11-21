@@ -1032,7 +1032,6 @@ Player characters.
 **Properties:**
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `wallet_address` | string | `null` | Crypto wallet |
 | `access_level` | string | `"player"` | Permission level |
 
 ---
