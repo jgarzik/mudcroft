@@ -184,3 +184,63 @@ async fn test_npc_damage_and_death_hooks() {
         outputs
     );
 }
+
+/// Verbs registered with game.add_action dispatch to object handlers, for
+/// objects in the room and in the player's inventory
+#[tokio::test]
+async fn test_custom_verbs_dispatch_to_object_handlers() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "verb_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local lever = game.store_code([[return {{
+                 pull = function(a) game.send(a.actor_id, "Clunk! (" .. a.args .. ")"); return "You pull the lever." end,
+               }}]])
+               local horn = game.store_code([[return {{
+                 blow = function(a) game.broadcast(a.room_id, "A horn blares!", a.actor_id); return "You blow the horn." end,
+               }}]])
+               game.create_object("/items/lever", "item", "{room}", {{name = "lever", fixed = true, code_hash = lever}})
+               game.create_object("/items/horn", "item", "{room}", {{name = "horn", code_hash = horn}})
+               game.add_action("pull", "/items/lever", "pull")
+               game.add_action("blow", "/items/horn", "blow")
+               return true"#,
+            room = entrance
+        ),
+    )
+    .await;
+
+    let mut alice = player(&server, "verb_alice").await;
+    let mut bob = player(&server, "verb_bob").await;
+
+    // Object in the room
+    alice.command("pull lever").await.unwrap();
+    alice
+        .expect_output_containing("Clunk! (lever)")
+        .await
+        .expect("handler message");
+    alice
+        .expect_output_containing("You pull the lever.")
+        .await
+        .expect("handler result is the reply");
+
+    // Object in inventory
+    alice.command("take horn").await.unwrap();
+    alice.expect_output_containing("You take").await.unwrap();
+    alice.command("blow horn").await.unwrap();
+    alice
+        .expect_output_containing("You blow the horn.")
+        .await
+        .expect("inventory verb works");
+    bob.expect_output_containing("A horn blares!")
+        .await
+        .expect("onlooker hears the horn");
+
+    // Unregistered verbs are still unknown
+    alice.command("frobnicate").await.unwrap();
+    alice
+        .expect_output_containing("Unknown command: frobnicate")
+        .await
+        .unwrap();
+}

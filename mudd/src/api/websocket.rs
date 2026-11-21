@@ -553,7 +553,11 @@ async fn handle_client_message(
                 &mut deferred,
             )
             .await;
-            state.connections.send_to_player(player_id, response).await;
+            // An empty output means the command already said everything
+            // (e.g. a verb handler that only used game.send)
+            if !matches!(&response, ServerMessage::Output { text } if text.is_empty()) {
+                state.connections.send_to_player(player_id, response).await;
+            }
             for hook in deferred {
                 run_hook(state, player_id, account_id, hook).await;
             }
@@ -1319,10 +1323,101 @@ async fn execute_command(
             // Execute create command
             execute_create_command(state, player_id, account_id, access_level, args).await
         }
-        _ => ServerMessage::Output {
-            text: format!("Unknown command: {}", verb),
-        },
+        _ => {
+            let args = parts[1..].join(" ");
+            match dispatch_custom_verb(state, player_id, account_id, &verb, &args).await {
+                Some(reply) => reply,
+                None => ServerMessage::Output {
+                    text: format!("Unknown command: {}", verb),
+                },
+            }
+        }
     }
+}
+
+/// Run a verb registered with game.add_action, if one is in scope.
+///
+/// Candidates, in order: actions registered for the player's room, then
+/// object actions on inventory items, on objects in the room, and on the
+/// room itself. When the player names a target ("pull lever"), a candidate
+/// whose object name contains it wins; otherwise the first candidate does.
+/// The handler gets {verb, args, actor_id, object_id, room_id}; a string
+/// result becomes the reply.
+async fn dispatch_custom_verb(
+    state: &AppState,
+    player_id: &str,
+    account_id: &str,
+    verb: &str,
+    args: &str,
+) -> Option<ServerMessage> {
+    let room_id = state.connections.get_room_id(player_id).await;
+
+    let mut candidates = Vec::new();
+    if let Some(ref room) = room_id {
+        candidates.extend(state.actions.get_room_actions(room, verb).await);
+    }
+    let mut nearby: Vec<String> = Vec::new();
+    if let Ok(items) = state.object_store.get_contents(player_id).await {
+        nearby.extend(items.into_iter().map(|o| o.id));
+    }
+    if let Some(ref room) = room_id {
+        if let Ok(objs) = state.object_store.get_contents(room).await {
+            nearby.extend(objs.into_iter().map(|o| o.id));
+        }
+        nearby.push(room.clone());
+    }
+    for object_id in &nearby {
+        if let Some(action) = state.actions.get_object_action(object_id, verb).await {
+            candidates.push(action);
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Prefer the candidate the player named
+    let wanted = args.to_lowercase();
+    let mut chosen = candidates[0].clone();
+    if !wanted.is_empty() {
+        for action in &candidates {
+            if let Ok(Some(obj)) = state.object_store.get(&action.object_id).await {
+                let name = obj
+                    .properties
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !name.is_empty() && (wanted.contains(&name) || name.contains(&wanted)) {
+                    chosen = action.clone();
+                    break;
+                }
+            }
+        }
+    }
+
+    let universe_id = state.connections.get_universe_id(player_id).await?;
+    let ctx = ScriptContext {
+        universe_id,
+        user_id: Some(account_id.to_string()),
+        room_id: room_id.clone(),
+        object_id: Some(chosen.object_id.clone()),
+    };
+    let handler_args = serde_json::json!({
+        "verb": verb,
+        "args": args,
+        "actor_id": player_id,
+        "object_id": chosen.object_id,
+        "room_id": room_id,
+    });
+    Some(
+        match scripting::invoke_handler(state, &ctx, &chosen.method, handler_args).await {
+            Ok(Some(text)) if text != "nil" => ServerMessage::Output { text },
+            Ok(_) => ServerMessage::Output {
+                text: String::new(),
+            },
+            Err(message) => ServerMessage::Error { message },
+        },
+    )
 }
 
 /// Execute Lua code in sandbox with game API
