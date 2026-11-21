@@ -104,7 +104,7 @@ async fn test_object_crud() {
 
     // Read
     let loaded = store
-        .get(&obj.id)
+        .get(&universe_id, &obj.id)
         .await
         .expect("Failed to get object")
         .expect("Object not found");
@@ -117,14 +117,20 @@ async fn test_object_crud() {
     updated.set_property("damage_dice", serde_json::json!("3d6"));
     store.update(&updated).await.expect("Failed to update");
 
-    let reloaded = store.get(&obj.id).await.unwrap().unwrap();
+    let reloaded = store.get(&universe_id, &obj.id).await.unwrap().unwrap();
     assert_eq!(reloaded.get_string("damage_dice"), Some("3d6"));
 
     // Delete
-    let deleted = store.delete(&obj.id).await.expect("Failed to delete");
+    let deleted = store
+        .delete(&universe_id, &obj.id)
+        .await
+        .expect("Failed to delete");
     assert!(deleted);
 
-    let gone = store.get(&obj.id).await.expect("Failed to check deletion");
+    let gone = store
+        .get(&universe_id, &obj.id)
+        .await
+        .expect("Failed to check deletion");
     assert!(gone.is_none());
 }
 
@@ -162,18 +168,18 @@ async fn test_object_hierarchy() {
 
     // Get room contents
     let contents = store
-        .get_contents(&room.id)
+        .get_contents(&universe_id, &room.id)
         .await
         .expect("Failed to get contents");
     assert_eq!(contents.len(), 2);
 
     // Move sword out of room
     store
-        .move_object(&sword.id, None)
+        .move_object(&universe_id, &sword.id, None)
         .await
         .expect("Failed to move");
 
-    let contents_after = store.get_contents(&room.id).await.unwrap();
+    let contents_after = store.get_contents(&universe_id, &room.id).await.unwrap();
     assert_eq!(contents_after.len(), 1);
 }
 
@@ -258,14 +264,17 @@ async fn test_find_by_name() {
 
     // Find by name
     let found = store
-        .find_by_name(&room.id, "Magic Sword")
+        .find_by_name(&universe_id, &room.id, "Magic Sword")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(found.id, sword.id);
 
     // Not found
-    let not_found = store.find_by_name(&room.id, "Missing Item").await.unwrap();
+    let not_found = store
+        .find_by_name(&universe_id, &room.id, "Missing Item")
+        .await
+        .unwrap();
     assert!(not_found.is_none());
 }
 
@@ -291,23 +300,44 @@ async fn test_room_exits() {
     store.create(&room2).await.unwrap();
 
     // Set exits
-    store.set_exit(&room1.id, "north", &room2.id).await.unwrap();
-    store.set_exit(&room2.id, "south", &room1.id).await.unwrap();
+    store
+        .set_exit(&universe_id, &room1.id, "north", &room2.id)
+        .await
+        .unwrap();
+    store
+        .set_exit(&universe_id, &room2.id, "south", &room1.id)
+        .await
+        .unwrap();
 
     // Verify exits
-    let north_dest = store.get_exit(&room1.id, "north").await.unwrap();
+    let north_dest = store
+        .get_exit(&universe_id, &room1.id, "north")
+        .await
+        .unwrap();
     assert_eq!(north_dest, Some(room2.id.clone()));
 
-    let south_dest = store.get_exit(&room2.id, "south").await.unwrap();
+    let south_dest = store
+        .get_exit(&universe_id, &room2.id, "south")
+        .await
+        .unwrap();
     assert_eq!(south_dest, Some(room1.id.clone()));
 
     // No exit in that direction
-    let no_exit = store.get_exit(&room1.id, "west").await.unwrap();
+    let no_exit = store
+        .get_exit(&universe_id, &room1.id, "west")
+        .await
+        .unwrap();
     assert!(no_exit.is_none());
 
     // Remove exit
-    store.remove_exit(&room1.id, "north").await.unwrap();
-    let removed = store.get_exit(&room1.id, "north").await.unwrap();
+    store
+        .remove_exit(&universe_id, &room1.id, "north")
+        .await
+        .unwrap();
+    let removed = store
+        .get_exit(&universe_id, &room1.id, "north")
+        .await
+        .unwrap();
     assert!(removed.is_none());
 }
 
@@ -333,12 +363,15 @@ async fn test_environment_query() {
     store.create(&player).await.unwrap();
 
     // Get environment
-    let env = store.get_environment(&player.id).await.unwrap();
+    let env = store
+        .get_environment(&universe_id, &player.id)
+        .await
+        .unwrap();
     assert!(env.is_some());
     assert_eq!(env.unwrap().id, room.id);
 
     // Room has no environment (top level)
-    let room_env = store.get_environment(&room.id).await.unwrap();
+    let room_env = store.get_environment(&universe_id, &room.id).await.unwrap();
     assert!(room_env.is_none());
 }
 
@@ -376,7 +409,7 @@ async fn test_get_living_in() {
     store.create(&sword).await.unwrap();
 
     // Get living entities
-    let living = store.get_living_in(&room.id).await.unwrap();
+    let living = store.get_living_in(&universe_id, &room.id).await.unwrap();
     assert_eq!(living.len(), 2);
 
     let names: Vec<_> = living.iter().filter_map(|o| o.get_string("name")).collect();
@@ -403,7 +436,10 @@ async fn test_player_movement() {
     room2.set_property("name", serde_json::json!("End"));
     store.create(&room2).await.unwrap();
 
-    store.set_exit(&room1.id, "east", &room2.id).await.unwrap();
+    store
+        .set_exit(&universe_id, &room1.id, "east", &room2.id)
+        .await
+        .unwrap();
 
     // Create player in room1
     let mut player = Object::new("/players/adventurer", &universe_id, "player").unwrap();
@@ -412,21 +448,28 @@ async fn test_player_movement() {
     store.create(&player).await.unwrap();
 
     // Verify player is in room1
-    let contents1 = store.get_living_in(&room1.id).await.unwrap();
+    let contents1 = store.get_living_in(&universe_id, &room1.id).await.unwrap();
     assert_eq!(contents1.len(), 1);
 
     // Get exit destination
-    let dest = store.get_exit(&room1.id, "east").await.unwrap().unwrap();
+    let dest = store
+        .get_exit(&universe_id, &room1.id, "east")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(dest, room2.id);
 
     // Move player to room2
-    store.move_object(&player.id, Some(&dest)).await.unwrap();
+    store
+        .move_object(&universe_id, &player.id, Some(&dest))
+        .await
+        .unwrap();
 
     // Verify player moved
-    let contents1_after = store.get_living_in(&room1.id).await.unwrap();
+    let contents1_after = store.get_living_in(&universe_id, &room1.id).await.unwrap();
     assert_eq!(contents1_after.len(), 0);
 
-    let contents2 = store.get_living_in(&room2.id).await.unwrap();
+    let contents2 = store.get_living_in(&universe_id, &room2.id).await.unwrap();
     assert_eq!(contents2.len(), 1);
     assert_eq!(contents2[0].get_string("name"), Some("Adventurer"));
 }

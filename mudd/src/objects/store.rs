@@ -72,14 +72,15 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// Get an object by ID
-    pub async fn get(&self, id: &str) -> Result<Option<Object>> {
+    /// Get an object by ID within a universe
+    pub async fn get(&self, universe_id: &str, id: &str) -> Result<Option<Object>> {
         let row: Option<ObjectRow> = sqlx::query_as(
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
-            FROM objects WHERE id = ?
+            FROM objects WHERE universe_id = ? AND id = ?
             "#,
         )
+        .bind(universe_id)
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -97,13 +98,14 @@ impl ObjectStore {
         let updated_at = chrono::Utc::now().to_rfc3339();
 
         self.execute_write(
-            "UPDATE objects SET class = ?, parent_id = ?, properties = ?, code_hash = ?, updated_at = ? WHERE id = ?",
+            "UPDATE objects SET class = ?, parent_id = ?, properties = ?, code_hash = ?, updated_at = ? WHERE universe_id = ? AND id = ?",
             vec![
                 serde_json::json!(&obj.class),
                 serde_json::json!(&obj.parent_id),
                 serde_json::json!(&properties),
                 serde_json::json!(&obj.code_hash),
                 serde_json::json!(&updated_at),
+                serde_json::json!(&obj.universe_id),
                 serde_json::json!(&obj.id),
             ],
         )
@@ -113,11 +115,11 @@ impl ObjectStore {
     }
 
     /// Delete an object
-    pub async fn delete(&self, id: &str) -> Result<bool> {
+    pub async fn delete(&self, universe_id: &str, id: &str) -> Result<bool> {
         let rows = self
             .execute_write(
-                "DELETE FROM objects WHERE id = ?",
-                vec![serde_json::json!(id)],
+                "DELETE FROM objects WHERE universe_id = ? AND id = ?",
+                vec![serde_json::json!(universe_id), serde_json::json!(id)],
             )
             .await?;
 
@@ -125,13 +127,14 @@ impl ObjectStore {
     }
 
     /// Get all objects with a given parent (contents of a room/container)
-    pub async fn get_contents(&self, parent_id: &str) -> Result<Vec<Object>> {
+    pub async fn get_contents(&self, universe_id: &str, parent_id: &str) -> Result<Vec<Object>> {
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
-            FROM objects WHERE parent_id = ?
+            FROM objects WHERE universe_id = ? AND parent_id = ?
             "#,
         )
+        .bind(universe_id)
         .bind(parent_id)
         .fetch_all(&self.pool)
         .await?;
@@ -140,15 +143,21 @@ impl ObjectStore {
     }
 
     /// Move an object to a new parent
-    pub async fn move_object(&self, id: &str, new_parent_id: Option<&str>) -> Result<()> {
+    pub async fn move_object(
+        &self,
+        universe_id: &str,
+        id: &str,
+        new_parent_id: Option<&str>,
+    ) -> Result<()> {
         // Pre-compute timestamp for deterministic replication
         let updated_at = chrono::Utc::now().to_rfc3339();
 
         self.execute_write(
-            "UPDATE objects SET parent_id = ?, updated_at = ? WHERE id = ?",
+            "UPDATE objects SET parent_id = ?, updated_at = ? WHERE universe_id = ? AND id = ?",
             vec![
                 serde_json::json!(new_parent_id),
                 serde_json::json!(&updated_at),
+                serde_json::json!(universe_id),
                 serde_json::json!(id),
             ],
         )
@@ -212,7 +221,12 @@ impl ObjectStore {
 
     /// Find object by name property in a given location.
     /// Does case-insensitive partial matching: "sword" matches "Rusty Short Sword".
-    pub async fn find_by_name(&self, parent_id: &str, name: &str) -> Result<Option<Object>> {
+    pub async fn find_by_name(
+        &self,
+        universe_id: &str,
+        parent_id: &str,
+        name: &str,
+    ) -> Result<Option<Object>> {
         // SQLite JSON extraction with case-insensitive LIKE matching.
         // The search term is matched literally (its own % and _ escaped) and
         // wrapped in % for partial matching.
@@ -225,9 +239,11 @@ impl ObjectStore {
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects
-            WHERE parent_id = ? AND lower(json_extract(properties, '$.name')) LIKE lower(?) ESCAPE '\'
+            WHERE universe_id = ? AND parent_id = ?
+              AND lower(json_extract(properties, '$.name')) LIKE lower(?) ESCAPE '\'
             "#,
         )
+        .bind(universe_id)
         .bind(parent_id)
         .bind(&search_pattern)
         .fetch_all(&self.pool)
@@ -240,11 +256,11 @@ impl ObjectStore {
     }
 
     /// Get the environment (parent) of an object
-    pub async fn get_environment(&self, obj_id: &str) -> Result<Option<Object>> {
-        let obj = self.get(obj_id).await?;
+    pub async fn get_environment(&self, universe_id: &str, obj_id: &str) -> Result<Option<Object>> {
+        let obj = self.get(universe_id, obj_id).await?;
         match obj {
             Some(o) => match &o.parent_id {
-                Some(parent_id) => self.get(parent_id).await,
+                Some(parent_id) => self.get(universe_id, parent_id).await,
                 None => Ok(None),
             },
             None => Ok(None),
@@ -252,14 +268,15 @@ impl ObjectStore {
     }
 
     /// Get all living entities (players, npcs) in a location
-    pub async fn get_living_in(&self, parent_id: &str) -> Result<Vec<Object>> {
+    pub async fn get_living_in(&self, universe_id: &str, parent_id: &str) -> Result<Vec<Object>> {
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects
-            WHERE parent_id = ? AND (class = 'player' OR class = 'npc' OR class = 'living')
+            WHERE universe_id = ? AND parent_id = ? AND (class = 'player' OR class = 'npc' OR class = 'living')
             "#,
         )
+        .bind(universe_id)
         .bind(parent_id)
         .fetch_all(&self.pool)
         .await?;
@@ -268,8 +285,13 @@ impl ObjectStore {
     }
 
     /// Get room exit destination
-    pub async fn get_exit(&self, room_id: &str, direction: &str) -> Result<Option<String>> {
-        let room = self.get(room_id).await?;
+    pub async fn get_exit(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        direction: &str,
+    ) -> Result<Option<String>> {
+        let room = self.get(universe_id, room_id).await?;
         match room {
             Some(r) => {
                 if let Some(exits) = r.properties.get("exits") {
@@ -286,8 +308,14 @@ impl ObjectStore {
     }
 
     /// Set a room exit
-    pub async fn set_exit(&self, room_id: &str, direction: &str, dest_room_id: &str) -> Result<()> {
-        let room = self.get(room_id).await?;
+    pub async fn set_exit(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        direction: &str,
+        dest_room_id: &str,
+    ) -> Result<()> {
+        let room = self.get(universe_id, room_id).await?;
         if let Some(mut r) = room {
             let exits = r
                 .properties
@@ -304,8 +332,13 @@ impl ObjectStore {
     }
 
     /// Remove a room exit
-    pub async fn remove_exit(&self, room_id: &str, direction: &str) -> Result<()> {
-        let room = self.get(room_id).await?;
+    pub async fn remove_exit(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        direction: &str,
+    ) -> Result<()> {
+        let room = self.get(universe_id, room_id).await?;
         if let Some(mut r) = room {
             if let Some(exits) = r.properties.get_mut("exits") {
                 if let Some(exits_obj) = exits.as_object_mut() {

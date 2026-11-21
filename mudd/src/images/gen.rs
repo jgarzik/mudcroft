@@ -17,6 +17,7 @@ pub async fn generate_room_image(
     venice: &VeniceClient,
     image_store: &ImageStore,
     object_store: &ObjectStore,
+    universe_id: &str,
     room_id: &str,
     theme: &Theme,
     account_id: &str,
@@ -28,7 +29,7 @@ pub async fn generate_room_image(
 
     // Get room data
     let room = object_store
-        .get(room_id)
+        .get(universe_id, room_id)
         .await
         .map_err(|e| format!("Failed to get room: {}", e))?
         .ok_or_else(|| format!("Room not found: {}", room_id))?;
@@ -48,7 +49,7 @@ pub async fn generate_room_image(
     // Get region for environment type (if available)
     let environment_type =
         if let Some(region_id) = room.properties.get("region_id").and_then(|v| v.as_str()) {
-            if let Ok(Some(region)) = object_store.get(region_id).await {
+            if let Ok(Some(region)) = object_store.get(universe_id, region_id).await {
                 region
                     .properties
                     .get("environment_type")

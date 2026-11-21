@@ -43,19 +43,8 @@ where
     .expect("permission lookup thread panicked")
 }
 
-/// Whether `obj` is an account's own player object (`/players/p-<account>`,
-/// owned by that account). Only these are shared across universes; scripts
-/// cannot create them (see `is_reserved_object`).
-fn is_account_player_object(obj: &Object) -> bool {
-    obj.class == "player"
-        && obj
-            .owner_id
-            .as_deref()
-            .is_some_and(|owner| obj.id == crate::player::PlayerManager::player_path(owner))
-}
-
-/// Check that `parent_id` (if any) may contain objects of `universe_id`: it
-/// must exist and belong to that universe, or be an account's player object
+/// Check that `parent_id` (if any) exists in `universe_id` (object ids are
+/// scoped per universe, so a parent is always in the same universe)
 async fn check_parent(
     store: &ObjectStore,
     universe_id: &str,
@@ -64,9 +53,8 @@ async fn check_parent(
     let Some(parent_id) = parent_id else {
         return Ok(Ok(()));
     };
-    Ok(match store.get(parent_id).await? {
-        Some(p) if p.universe_id == universe_id || is_account_player_object(&p) => Ok(()),
-        Some(_) => Err(format!("{} belongs to another universe", parent_id)),
+    Ok(match store.get(universe_id, parent_id).await? {
+        Some(_) => Ok(()),
         None => Err(format!("parent not found: {}", parent_id)),
     })
 }
@@ -89,10 +77,8 @@ async fn object_permission(
     let Some(user_id) = user_id else {
         return Err("no user context".to_string());
     };
-    // Object ids are global: never touch another universe's objects. Player
-    // objects are the exception: one is shared by every universe its account
-    // visits (it holds the inventory and HP wherever the player is).
-    if obj.universe_id != universe_id && !is_account_player_object(obj) {
+    // Objects are looked up per universe, so this only guards misuse
+    if obj.universe_id != universe_id {
         return Err(format!("{} belongs to another universe", obj.id));
     }
     let ctx = permissions.get_user_context(user_id, universe_id).await;
@@ -512,12 +498,13 @@ impl GameApi {
         // game.get_object(id)
         // Actually fetches from database
         let store_clone = store.clone();
+        let uni = universe_id.clone();
         let get_object = lua.create_function(move |lua, id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async { store.get(&id).await })
+                tokio::runtime::Handle::current().block_on(async { store.get(&uni, &id).await })
             });
 
             match result {
@@ -553,7 +540,7 @@ impl GameApi {
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     // First get the existing object
-                    let obj_result = store.get(&id).await?;
+                    let obj_result = store.get(&universe_id, &id).await?;
                     match obj_result {
                         Some(mut obj) => {
                             if let Err(reason) = object_permission(
@@ -636,7 +623,7 @@ impl GameApi {
 
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let Some(obj) = store.get(&id).await? else {
+                    let Some(obj) = store.get(&universe_id, &id).await? else {
                         return Ok(Ok(false));
                     };
                     if let Err(reason) = object_permission(
@@ -650,7 +637,7 @@ impl GameApi {
                     {
                         return Ok(Err(reason));
                     }
-                    let deleted = store.delete(&id).await?;
+                    let deleted = store.delete(&universe_id, &id).await?;
                     if deleted {
                         // Nothing may keep running for (or be dispatched to)
                         // the deleted object, nor for a later object reusing
@@ -689,7 +676,7 @@ impl GameApi {
                 let result: anyhow::Result<Result<(), String>> =
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let Some(obj) = store.get(&id).await? else {
+                            let Some(obj) = store.get(&universe_id, &id).await? else {
                                 anyhow::bail!("Object not found: {}", id);
                             };
                             if let Err(reason) = object_permission(
@@ -703,22 +690,13 @@ impl GameApi {
                             {
                                 return Ok(Err(reason));
                             }
-                            if let Some(ref dest) = new_parent_id {
-                                match store.get(dest).await? {
-                                    Some(d)
-                                        if d.universe_id == universe_id
-                                            || is_account_player_object(&d) => {}
-                                    Some(_) => {
-                                        return Ok(Err(format!(
-                                            "{} belongs to another universe",
-                                            dest
-                                        )))
-                                    }
-                                    None => anyhow::bail!("Destination not found: {}", dest),
-                                }
+                            if let Err(reason) =
+                                check_parent(&store, &universe_id, new_parent_id.as_deref()).await?
+                            {
+                                anyhow::bail!("Destination {}", reason);
                             }
                             store
-                                .move_object(&id, new_parent_id.as_deref())
+                                .move_object(&universe_id, &id, new_parent_id.as_deref())
                                 .await
                                 .map(Ok)
                         })
@@ -761,7 +739,7 @@ impl GameApi {
                 let result: anyhow::Result<Result<Option<Object>, String>> =
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let obj_result = store.get(&id).await?;
+                            let obj_result = store.get(&universe_id, &id).await?;
                             match obj_result {
                                 Some(original)
                                     if is_reserved_object(&validated_path, &original.class) =>
@@ -887,7 +865,7 @@ impl GameApi {
 
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(async { store.get_contents(&parent_id).await })
+                        .block_on(async { store.get_contents(&universe_id, &parent_id).await })
                 });
 
                 match result {
@@ -1059,6 +1037,7 @@ impl GameApi {
         // Checks if object is of class or inherits from it
         let store_clone = store.clone();
         let classes_clone = classes.clone();
+        let universe_id = self.universe_id.clone();
         let is_a = lua.create_function(move |lua, (obj_id, class_name): (String, String)| {
             charge_db(lua)?;
             let store = store_clone.clone();
@@ -1066,7 +1045,7 @@ impl GameApi {
 
             let result: anyhow::Result<bool> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let obj = store.get(&obj_id).await?;
+                    let obj = store.get(&universe_id, &obj_id).await?;
                     match obj {
                         Some(o) => {
                             let registry = classes.read().await;
@@ -1110,17 +1089,19 @@ impl GameApi {
 
     fn register_query_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let store = self.store.clone();
+        let universe = self.universe_id.clone();
 
         // game.environment(obj_id)
         // Returns the parent object (container/room)
         let store_clone = store.clone();
+        let universe_id = universe.clone();
         let environment = lua.create_function(move |lua, obj_id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(async { store.get_environment(&obj_id).await })
+                    .block_on(async { store.get_environment(&universe_id, &obj_id).await })
             });
 
             match result {
@@ -1134,13 +1115,14 @@ impl GameApi {
         // game.all_inventory(obj_id)
         // Returns all contents of an object
         let store_clone = store.clone();
+        let universe_id = universe.clone();
         let all_inventory = lua.create_function(move |lua, obj_id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(async { store.get_contents(&obj_id).await })
+                    .block_on(async { store.get_contents(&universe_id, &obj_id).await })
             });
 
             match result {
@@ -1159,13 +1141,14 @@ impl GameApi {
         // game.present(name, env_id)
         // Find object by name in a location
         let store_clone = store.clone();
+        let universe_id = universe.clone();
         let present = lua.create_function(move |lua, (name, env_id): (String, String)| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(async { store.find_by_name(&env_id, &name).await })
+                    .block_on(async { store.find_by_name(&universe_id, &env_id, &name).await })
             });
 
             match result {
@@ -1180,6 +1163,7 @@ impl GameApi {
         // Returns living entities in a location: anything whose class is
         // living or descends from it (players, npcs and their subclasses)
         let classes = self.classes.clone();
+        let universe_id = universe.clone();
         let get_living_in = lua.create_function(move |lua, env_id: String| {
             charge_db(lua)?;
             let store = store.clone();
@@ -1187,7 +1171,7 @@ impl GameApi {
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let contents = store.get_contents(&env_id).await?;
+                    let contents = store.get_contents(&universe_id, &env_id).await?;
                     let registry = classes.read().await;
                     Ok::<_, anyhow::Error>(
                         contents
@@ -1242,7 +1226,7 @@ impl GameApi {
             let user = actor_override(lua).or(user);
             let object_id = object_id.to_string();
             block_on_perm(async move {
-                let Ok(Some(obj)) = store.get(&object_id).await else {
+                let Ok(Some(obj)) = store.get(&universe_id, &object_id).await else {
                     return false;
                 };
                 if object_permission(
@@ -2218,7 +2202,7 @@ impl GameApi {
                     type Loaded = Option<(Object, String, String, Vec<(String, String)>)>;
                     let loaded: Result<Loaded, String> = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let obj = match store.get(&obj_id).await {
+                            let obj = match store.get(&universe_id, &obj_id).await {
                                 Ok(Some(o)) => o,
                                 Ok(None) => return Ok(None),
                                 Err(e) => return Err(e.to_string()),

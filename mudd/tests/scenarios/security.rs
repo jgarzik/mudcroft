@@ -534,35 +534,62 @@ async fn other_universe(server: &TestServer) {
         .expect("create gem");
 }
 
-/// Scripts cannot modify, move, delete or clone objects of another universe
+/// Object ids are per universe: another universe's objects are invisible to
+/// scripts, so they can be neither read nor changed
 #[tokio::test]
-async fn test_lua_writes_stay_in_universe() {
+async fn test_lua_cannot_see_other_universes() {
     let server = TestServer::start().await.expect("server");
     other_universe(&server).await;
     let mut wiz = connect(&server, wizard("xuni_writer")).await;
 
-    for code in [
-        r#"return tostring(pcall(game.update_object, "/d/other/gem", {name = "mine"}))"#,
-        r#"return tostring(pcall(game.move_object, "/d/other/gem", nil))"#,
-        r#"return tostring(pcall(game.delete_object, "/d/other/gem"))"#,
-    ] {
-        assert_eq!(eval(&mut wiz, code).await, "false", "{}", code);
-    }
     let out = eval(
         &mut wiz,
-        r#"local c = game.clone_object("/d/other/gem", "/d/here/gem", nil)
-           return c == nil and "none" or (c.error and "error" or c.universe_id)"#,
+        r#"local seen = game.get_object("/d/other/gem")
+           local updated = game.update_object("/d/other/gem", {name = "mine"})
+           local deleted = game.delete_object("/d/other/gem")
+           local moved = pcall(game.move_object, "/d/other/gem", nil)
+           local cloned = game.clone_object("/d/other/gem", "/d/here/gem", nil)
+           return table.concat({tostring(seen), tostring(updated), tostring(deleted),
+                                tostring(moved), tostring(cloned)}, ",")"#,
     )
     .await;
-    assert_ne!(
-        out, "other-world",
-        "clone must not land in the other universe"
-    );
-    assert_ne!(
-        out,
-        server.universe_id(),
-        "nor copy another universe's object"
-    );
+    assert_eq!(out, "nil,false,false,false,nil");
+
+    let name: String = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.name') FROM objects
+         WHERE universe_id = 'other-world' AND id = '/d/other/gem'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .expect("gem untouched");
+    assert_eq!(name, "gem");
+}
+
+/// The same path can exist in two universes, independently
+#[tokio::test]
+async fn test_same_path_in_two_universes() {
+    let server = TestServer::start().await.expect("server");
+    other_universe(&server).await;
+    let mut wiz = connect(&server, wizard("twin_paths")).await;
+
+    let out = eval(
+        &mut wiz,
+        r#"local g = game.create_object("/d/other/gem", "item", nil, {name = "local gem"})
+           game.update_object("/d/other/gem", {shiny = true})
+           return g.universe_id .. ":" .. game.get_object("/d/other/gem").name"#,
+    )
+    .await;
+    assert_eq!(out, format!("{}:local gem", server.universe_id()));
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT universe_id, json_extract(properties, '$.name') FROM objects
+         WHERE id = '/d/other/gem' ORDER BY universe_id",
+    )
+    .fetch_all(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "one object per universe: {:?}", rows);
+    assert!(rows.contains(&("other-world".to_string(), "gem".to_string())));
 }
 
 /// Script messages only reach players in the script's universe
@@ -764,11 +791,10 @@ async fn test_add_action_respects_owner_and_private_handlers() {
     assert_eq!(out, "true", "owner may add a normal action");
 }
 
-/// Player objects are shared across universes (created in the first one the
-/// player joins). The universe confinement of Lua writes must not stop a
-/// player from picking things up in a second universe.
+/// Each universe has its own player object for an account, so play (and the
+/// inventory) in a second universe is independent of the first
 #[tokio::test]
-async fn test_take_works_in_second_universe() {
+async fn test_inventory_is_per_universe() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let server = TestServer::start().await.expect("server");
@@ -846,8 +872,7 @@ async fn test_take_works_in_second_universe() {
     .expect("reply");
     assert_eq!(reply["text"], "You take gem.", "{}", reply);
 
-    // Back in the first universe the gem stays in the pack: dropping it
-    // there would move another universe's object into this one
+    // Back in the first universe the pack does not hold the gem
     ws.close(None).await.ok();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let (mut back, _) = tokio_tungstenite::connect_async(url(server.universe_id()))
@@ -876,48 +901,33 @@ async fn test_take_works_in_second_universe() {
     })
     .await
     .expect("reply");
+    assert_eq!(reply["text"], "You don't have that", "{}", reply);
+
+    // Two player objects, one per universe; the gem is in the other one's pack
+    let owners: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT universe_id, (SELECT parent_id FROM objects g
+                               WHERE g.universe_id = p.universe_id AND g.id = '/d/other/gem')
+         FROM objects p WHERE p.id = ? ORDER BY universe_id",
+    )
+    .bind(mudd::player::PlayerManager::player_path(
+        reg["account_id"].as_str().unwrap(),
+    ))
+    .fetch_all(server.pool())
+    .await
+    .unwrap();
     assert_eq!(
-        reply["type"], "output",
-        "a clean refusal, not an error: {}",
-        reply
-    );
-    assert!(
-        reply["text"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("another world"),
-        "{}",
-        reply
+        owners.len(),
+        2,
+        "a player object per universe: {:?}",
+        owners
     );
 }
 
-/// Only an account's real player object is shared across universes: an
-/// ordinary object of class "player" gets no exemption, and scripts cannot
-/// create player-class objects at all
+/// Scripts cannot create player objects: the server makes them on connect
 #[tokio::test]
-async fn test_player_exemption_requires_real_player_object() {
+async fn test_scripts_cannot_create_player_objects() {
     let server = TestServer::start().await.expect("server");
-    let owner = server.world().wizard_account_id.clone();
-    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('other-world', 'Other', ?)")
-        .bind(&owner)
-        .execute(server.pool())
-        .await
-        .unwrap();
-    let mut fake = mudd::objects::Object::new("/d/other/fake", "other-world", "player").unwrap();
-    fake.set_property("name", serde_json::json!("decoy"));
-    server.world().store().create(&fake).await.unwrap();
-
     let mut wiz = connect(&server, wizard("fake_player_wiz")).await;
-    let out = eval(
-        &mut wiz,
-        r#"return tostring(pcall(game.update_object, "/d/other/fake", {name = "mine"}))"#,
-    )
-    .await;
-    assert_eq!(
-        out, "false",
-        "a non-account player-class object is not exempt"
-    );
-
     for code in [
         r#"local r = game.create_object("/d/here/fake", "player", nil, {}); return r.error and "refused" or "created""#,
         r#"local r = game.create_object("/players/p-nobody", "item", nil, {}); return r.error and "refused" or "created""#,

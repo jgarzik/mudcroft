@@ -125,7 +125,11 @@ pub async fn run_timer_loop(state: AppState) {
     loop {
         interval.tick().await;
         for fired in state.timers.tick().await {
-            let room_id = match state.object_store.get(&fired.object_id).await {
+            let room_id = match state
+                .object_store
+                .get(&fired.universe_id, &fired.object_id)
+                .await
+            {
                 Ok(Some(obj)) => obj.parent_id,
                 Ok(None) => {
                     // Object is gone: stop its heartbeat too
@@ -163,24 +167,18 @@ pub async fn run_timer_loop(state: AppState) {
     }
 }
 
-/// An object's attached code and its owner, if it has code. Objects from
-/// another universe never run in this one.
+/// An object's attached code and its owner, if it has code (objects are
+/// looked up within the universe, so foreign objects never run here)
 async fn object_code(
     state: &AppState,
     object_id: &str,
     universe_id: &str,
 ) -> Result<Option<(String, Option<String>)>, String> {
-    let obj = match state.object_store.get(object_id).await {
+    let obj = match state.object_store.get(universe_id, object_id).await {
         Ok(Some(obj)) => obj,
         Ok(None) => return Ok(None),
         Err(e) => return Err(format!("Failed to load {}: {}", object_id, e)),
     };
-    if obj.universe_id != universe_id {
-        return Err(format!(
-            "{} belongs to universe {}, not {}",
-            object_id, obj.universe_id, universe_id
-        ));
-    }
     let Some(hash) = obj.code_hash else {
         return Ok(None);
     };
@@ -278,7 +276,7 @@ pub async fn deliver(state: &AppState, queue: &MessageQueue, universe_id: &str) 
             } => {
                 // Only rooms of the script's own universe
                 let in_universe = matches!(
-                    state.object_store.get(&room_id).await,
+                    state.object_store.get(universe_id, &room_id).await,
                     Ok(Some(room)) if room.universe_id == universe_id
                 );
                 if in_universe {
@@ -315,7 +313,7 @@ async fn broadcast_region(state: &AppState, universe_id: &str, region_id: &str, 
         }
         let in_region = room_id.starts_with(&prefix)
             || matches!(
-                state.object_store.get(&room_id).await,
+                state.object_store.get(universe_id, &room_id).await,
                 Ok(Some(room)) if room.parent_id.as_deref() == Some(region_id)
             );
         if in_region {

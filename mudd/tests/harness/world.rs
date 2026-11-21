@@ -189,15 +189,27 @@ impl TestWorld {
 
         // Link rooms with exits (matching cave_adventure.lua)
         // entrance -> north -> passage
-        store.set_exit(&entrance_id, "north", &passage_id).await?;
+        store
+            .set_exit(&universe_id, &entrance_id, "north", &passage_id)
+            .await?;
         // passage -> south -> entrance, north -> chamber, east -> pool
-        store.set_exit(&passage_id, "south", &entrance_id).await?;
-        store.set_exit(&passage_id, "north", &chamber_id).await?;
-        store.set_exit(&passage_id, "east", &pool_id).await?;
+        store
+            .set_exit(&universe_id, &passage_id, "south", &entrance_id)
+            .await?;
+        store
+            .set_exit(&universe_id, &passage_id, "north", &chamber_id)
+            .await?;
+        store
+            .set_exit(&universe_id, &passage_id, "east", &pool_id)
+            .await?;
         // chamber -> south -> passage
-        store.set_exit(&chamber_id, "south", &passage_id).await?;
+        store
+            .set_exit(&universe_id, &chamber_id, "south", &passage_id)
+            .await?;
         // pool -> west -> passage
-        store.set_exit(&pool_id, "west", &passage_id).await?;
+        store
+            .set_exit(&universe_id, &pool_id, "west", &passage_id)
+            .await?;
 
         // Create Giant Bat NPC in passage (15 HP)
         let mut bat = Object::new("/npcs/giant-bat", &universe_id, "npc")?;
@@ -322,8 +334,12 @@ impl TestWorld {
 
     /// Link two rooms with exits
     pub async fn link_rooms(&self, room1: &str, dir1: &str, room2: &str, dir2: &str) -> Result<()> {
-        self.store.set_exit(room1, dir1, room2).await?;
-        self.store.set_exit(room2, dir2, room1).await?;
+        self.store
+            .set_exit(&self.universe_id, room1, dir1, room2)
+            .await?;
+        self.store
+            .set_exit(&self.universe_id, room2, dir2, room1)
+            .await?;
         Ok(())
     }
 

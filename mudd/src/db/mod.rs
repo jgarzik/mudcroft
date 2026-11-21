@@ -187,19 +187,22 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Per-universe schema (for now, single shared DB)
-        // Objects table
+        // Objects: ids are paths scoped per universe, so the same path can
+        // exist in every universe. A parent is always in the same universe.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS objects (
-                id TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL REFERENCES universes(id),
+                id TEXT NOT NULL,
                 class TEXT NOT NULL,
-                parent_id TEXT REFERENCES objects(id),
+                parent_id TEXT,
                 properties TEXT NOT NULL DEFAULT '{}',
                 code_hash TEXT,
+                owner_id TEXT REFERENCES accounts(id),
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (universe_id, id),
+                FOREIGN KEY (universe_id, parent_id) REFERENCES objects(universe_id, id)
             )
             "#,
         )
@@ -320,46 +323,17 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Add owner_id column to objects if not exists (migration)
-        // SQLite doesn't have IF NOT EXISTS for ALTER TABLE, so we check manually
-        let has_owner_id: Option<(String,)> =
-            sqlx::query_as("SELECT name FROM pragma_table_info('objects') WHERE name = 'owner_id'")
-                .fetch_optional(&self.pool)
-                .await?;
-
-        if has_owner_id.is_none() {
-            sqlx::query("ALTER TABLE objects ADD COLUMN owner_id TEXT REFERENCES accounts(id)")
-                .execute(&self.pool)
-                .await?;
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_owner ON objects(owner_id)")
-                .execute(&self.pool)
-                .await?;
-        }
-
-        // Legacy: Builder regions table (for backward compatibility during migration)
-        // TODO: Remove after migration is complete
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS builder_regions (
-                account_id TEXT NOT NULL,
-                region_id TEXT NOT NULL,
-                PRIMARY KEY (account_id, region_id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
         // Combat state table (HP persistence)
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS combat_state (
-                entity_id TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
                 hp INTEGER NOT NULL,
                 max_hp INTEGER NOT NULL,
                 armor_class INTEGER NOT NULL DEFAULT 10,
-                attack_bonus INTEGER NOT NULL DEFAULT 0
+                attack_bonus INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (universe_id, entity_id)
             )
             "#,
         )
@@ -371,13 +345,13 @@ impl Database {
             r#"
             CREATE TABLE IF NOT EXISTS active_effects (
                 id TEXT PRIMARY KEY,
+                universe_id TEXT,
                 entity_id TEXT NOT NULL,
                 effect_type TEXT NOT NULL,
                 remaining_ticks INTEGER NOT NULL,
                 magnitude INTEGER NOT NULL DEFAULT 0,
                 damage_type TEXT,
-                source_id TEXT,
-                FOREIGN KEY (entity_id) REFERENCES combat_state(entity_id) ON DELETE CASCADE
+                source_id TEXT
             )
             "#,
         )
@@ -480,7 +454,12 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_universe ON objects(universe_id)")
             .execute(&self.pool)
             .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_parent ON objects(parent_id)")
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_objects_parent ON objects(universe_id, parent_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_owner ON objects(owner_id)")
             .execute(&self.pool)
             .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timers_fire_at ON timers(fire_at)")

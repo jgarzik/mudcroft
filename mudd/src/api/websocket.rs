@@ -418,7 +418,11 @@ async fn handle_socket(
     if let Some(room_id) = spawn_room_id {
         // Sync player's location to DB for authenticated users
         if !account_id.is_empty() {
-            if let Err(e) = state.player_manager.move_player(&player_id, &room_id).await {
+            if let Err(e) = state
+                .player_manager
+                .move_player(&universe_id, &player_id, &room_id)
+                .await
+            {
                 warn!("Failed to sync player location to DB: {}", e);
             }
         }
@@ -429,7 +433,7 @@ async fn handle_socket(
         } else {
             Some(account_id.as_str())
         };
-        if let Some(room_msg) = build_room_message(&state, &room_id, acct_ref).await {
+        if let Some(room_msg) = build_room_message(&state, &universe_id, &room_id, acct_ref).await {
             if let Ok(json) = serde_json::to_string(&room_msg) {
                 let _ = socket.send(Message::Text(json.into())).await;
             }
@@ -438,7 +442,7 @@ async fn handle_socket(
         // Arriving in the world counts as entering the spawn room
         run_hook(
             &state,
-            &player_id,
+            &universe_id,
             Hook::new(
                 &room_id,
                 Some(&room_id),
@@ -474,7 +478,7 @@ async fn handle_socket(
                 match result {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                            handle_client_message(&state, &player_id, &account_id, access_level, client_msg).await;
+                            handle_client_message(&state, &universe_id, &player_id, &account_id, access_level, client_msg).await;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -499,6 +503,7 @@ async fn handle_socket(
         // Clone what we need for the spawned task
         let state_clone = state.clone();
         let player_id_for_task = player_id_clone.clone();
+        let universe_for_task = universe_id.clone();
 
         tokio::spawn(async move {
             // Wait for grace period or cancellation
@@ -506,7 +511,7 @@ async fn handle_socket(
                 _ = tokio::time::sleep(RECONNECT_GRACE_PERIOD) => {
                     // Grace period expired - execute disconnect handling
                     state_clone.connections.clear_pending_disconnect(&player_id_for_task).await;
-                    if let Err(e) = state_clone.player_manager.handle_disconnect(&player_id_for_task).await {
+                    if let Err(e) = state_clone.player_manager.handle_disconnect(&universe_for_task, &player_id_for_task).await {
                         warn!("Error handling player disconnect: {}", e);
                     }
                     info!("Disconnect handling completed for {} (grace period expired)", player_id_for_task);
@@ -523,6 +528,7 @@ async fn handle_socket(
 /// Handle a message from the client
 async fn handle_client_message(
     state: &AppState,
+    universe_id: &str,
     player_id: &str,
     account_id: &str,
     access_level: AccessLevel,
@@ -549,6 +555,7 @@ async fn handle_client_message(
             let mut deferred = Vec::new();
             let response = execute_command(
                 state,
+                universe_id,
                 player_id,
                 account_id,
                 access_level,
@@ -560,7 +567,7 @@ async fn handle_client_message(
                 state.connections.send_to_player(player_id, response).await;
             }
             for hook in deferred {
-                run_hook(state, player_id, hook).await;
+                run_hook(state, universe_id, hook).await;
             }
         }
         ClientMessage::Ping => {
@@ -580,8 +587,8 @@ fn args_after_verb(command: &str) -> &str {
 }
 
 /// Name shown to other players: the player object's `name`, else "Someone"
-async fn display_name(state: &AppState, player_id: &str) -> String {
-    match state.object_store.get(player_id).await {
+async fn display_name(state: &AppState, universe_id: &str, player_id: &str) -> String {
+    match state.object_store.get(universe_id, player_id).await {
         Ok(Some(obj)) => obj
             .properties
             .get("name")
@@ -596,16 +603,17 @@ async fn display_name(state: &AppState, player_id: &str) -> String {
 /// Also triggers background image generation if room has no image and Venice is configured
 async fn build_room_message(
     state: &AppState,
+    universe_id: &str,
     room_id: &str,
     account_id: Option<&str>,
 ) -> Option<ServerMessage> {
     // Get room object
-    let room = state.object_store.get(room_id).await.ok()??;
+    let room = state.object_store.get(universe_id, room_id).await.ok()??;
 
     // Get room contents
     let contents = state
         .object_store
-        .get_contents(room_id)
+        .get_contents(universe_id, room_id)
         .await
         .unwrap_or_default();
 
@@ -658,6 +666,7 @@ async fn build_room_message(
             let object_store = state.object_store.clone();
             let themes = state.themes.clone();
             let room_id_owned = room_id.to_string();
+            let universe_owned = universe_id.to_string();
             let account_id_owned = acct_id.to_string();
 
             // Spawn background task for image generation
@@ -667,6 +676,7 @@ async fn build_room_message(
                     &venice,
                     &image_store,
                     &object_store,
+                    &universe_owned,
                     &room_id_owned,
                     &theme,
                     &account_id_owned,
@@ -737,13 +747,10 @@ impl Hook {
 
 /// Run an object hook triggered by a player. The hook runs as the
 /// object's owner (see scripting::invoke_handler); errors are logged.
-async fn run_hook(state: &AppState, player_id: &str, hook: Hook) {
-    let Some(universe_id) = state.connections.get_universe_id(player_id).await else {
-        return;
-    };
+async fn run_hook(state: &AppState, universe_id: &str, hook: Hook) {
     if let Err(e) = scripting::invoke_handler(
         state,
-        &universe_id,
+        universe_id,
         &hook.object_id,
         hook.room_id,
         hook.method,
@@ -758,6 +765,7 @@ async fn run_hook(state: &AppState, player_id: &str, hook: Hook) {
 /// Parse and execute a player command
 async fn execute_command(
     state: &AppState,
+    universe_id: &str,
     player_id: &str,
     account_id: &str,
     access_level: AccessLevel,
@@ -783,7 +791,9 @@ async fn execute_command(
                 } else {
                     Some(account_id)
                 };
-                if let Some(room_msg) = build_room_message(state, &room_id, acct_ref).await {
+                if let Some(room_msg) =
+                    build_room_message(state, universe_id, &room_id, acct_ref).await
+                {
                     return room_msg;
                 }
             }
@@ -816,7 +826,7 @@ async fn execute_command(
             // Check if exit exists
             let dest_room_id = match state
                 .object_store
-                .get_exit(&current_room_id, direction)
+                .get_exit(universe_id, &current_room_id, direction)
                 .await
             {
                 Ok(Some(dest)) => dest,
@@ -830,7 +840,7 @@ async fn execute_command(
             // Leaving hook runs before the move
             run_hook(
                 state,
-                player_id,
+                universe_id,
                 Hook::new(
                     &current_room_id,
                     Some(&current_room_id),
@@ -851,7 +861,7 @@ async fn execute_command(
             if !account_id.is_empty() {
                 if let Err(e) = state
                     .player_manager
-                    .move_player(player_id, &dest_room_id)
+                    .move_player(universe_id, player_id, &dest_room_id)
                     .await
                 {
                     warn!("Failed to sync player location to DB: {}", e);
@@ -873,7 +883,9 @@ async fn execute_command(
             } else {
                 Some(account_id)
             };
-            if let Some(room_msg) = build_room_message(state, &dest_room_id, acct_ref).await {
+            if let Some(room_msg) =
+                build_room_message(state, universe_id, &dest_room_id, acct_ref).await
+            {
                 return room_msg;
             }
 
@@ -889,7 +901,7 @@ async fn execute_command(
                 };
             }
             if let Some(room_id) = state.connections.get_room_id(player_id).await {
-                let speaker = display_name(state, player_id).await;
+                let speaker = display_name(state, universe_id, player_id).await;
                 state
                     .connections
                     .broadcast_room_except(
@@ -991,21 +1003,14 @@ async fn execute_command(
                 };
             };
 
-            let session_universe = state.connections.get_universe_id(player_id).await;
-
             // Verify room exists (in this universe)
-            match state.object_store.get(&room_id).await {
-                Ok(Some(room)) if Some(&room.universe_id) != session_universe.as_ref() => {
-                    ServerMessage::Error {
-                        message: format!("Room not found: {}", room_id),
-                    }
-                }
+            match state.object_store.get(universe_id, &room_id).await {
                 Ok(Some(room)) if room.class == "room" => {
                     let from = state.connections.get_room_id(player_id).await;
                     if let Some(ref from_id) = from {
                         run_hook(
                             state,
-                            player_id,
+                            universe_id,
                             Hook::new(
                                 from_id,
                                 Some(from_id),
@@ -1024,7 +1029,10 @@ async fn execute_command(
                         .update_room(player_id, Some(room_id.clone()))
                         .await;
                     if !account_id.is_empty() {
-                        if let Err(e) = state.player_manager.move_player(player_id, &room_id).await
+                        if let Err(e) = state
+                            .player_manager
+                            .move_player(universe_id, player_id, &room_id)
+                            .await
                         {
                             warn!("Failed to sync player location to DB: {}", e);
                         }
@@ -1043,7 +1051,9 @@ async fn execute_command(
                     } else {
                         Some(account_id)
                     };
-                    if let Some(room_msg) = build_room_message(state, &room_id, acct_ref).await {
+                    if let Some(room_msg) =
+                        build_room_message(state, universe_id, &room_id, acct_ref).await
+                    {
                         return room_msg;
                     }
                     ServerMessage::Output {
@@ -1069,16 +1079,6 @@ async fn execute_command(
                 };
             }
 
-            // Get universe from session
-            let universe_id = match state.connections.get_universe_id(player_id).await {
-                Some(id) => id,
-                None => {
-                    return ServerMessage::Error {
-                        message: "Session error: no universe".to_string(),
-                    };
-                }
-            };
-
             // Get room_id from args or current room
             let room_id = if parts.len() > 1 {
                 parts[1].to_string()
@@ -1096,13 +1096,10 @@ async fn execute_command(
             };
 
             // Verify room exists (in this universe)
-            match state.object_store.get(&room_id).await {
-                Ok(Some(room)) if room.universe_id != universe_id => ServerMessage::Error {
-                    message: format!("Room not found: {}", room_id),
-                },
+            match state.object_store.get(universe_id, &room_id).await {
                 Ok(Some(room)) if room.class == "room" => {
                     // Set portal
-                    if let Err(e) = state.object_store.set_portal(&universe_id, &room_id).await {
+                    if let Err(e) = state.object_store.set_portal(universe_id, &room_id).await {
                         return ServerMessage::Error {
                             message: format!("Failed to set portal: {}", e),
                         };
@@ -1170,7 +1167,7 @@ async fn execute_command(
             // Find target in room
             let contents = state
                 .object_store
-                .get_contents(&room_id)
+                .get_contents(universe_id, &room_id)
                 .await
                 .unwrap_or_default();
 
@@ -1338,7 +1335,9 @@ async fn execute_command(
                     state.combat.remove_entity(&target_id).await;
 
                     // Remove NPC from room (set parent_id to None)
-                    if let Ok(Some(mut dead_target)) = state.object_store.get(&target_id).await {
+                    if let Ok(Some(mut dead_target)) =
+                        state.object_store.get(universe_id, &target_id).await
+                    {
                         dead_target.parent_id = None;
                         let _ = state.object_store.update(&dead_target).await;
                     }
@@ -1365,7 +1364,7 @@ async fn execute_command(
 
             // Onlookers get a third-person summary; the attacker gets the
             // detailed result as this command's reply
-            let attacker_name = display_name(state, player_id).await;
+            let attacker_name = display_name(state, universe_id, player_id).await;
             let mut seen = format!("{} attacks {}.", attacker_name, target_display_name);
             if state.combat.get_state(&target_id).await.is_none() {
                 seen.push_str(&format!(" {} is slain!", target_display_name));
@@ -1405,7 +1404,9 @@ async fn execute_command(
         }
         _ => {
             let args = parts[1..].join(" ");
-            match dispatch_custom_verb(state, player_id, access_level, &verb, &args).await {
+            match dispatch_custom_verb(state, universe_id, player_id, access_level, &verb, &args)
+                .await
+            {
                 Some(reply) => reply,
                 None => ServerMessage::Output {
                     text: format!("Unknown command: {}", verb),
@@ -1425,6 +1426,7 @@ async fn execute_command(
 /// object_id, room_id}; a string result becomes the reply.
 async fn dispatch_custom_verb(
     state: &AppState,
+    universe_id: &str,
     player_id: &str,
     access_level: AccessLevel,
     verb: &str,
@@ -1433,19 +1435,15 @@ async fn dispatch_custom_verb(
     let room_id = state.connections.get_room_id(player_id).await;
 
     let mut nearby: Vec<String> = Vec::new();
-    // Only objects of this universe (an inventory may hold items carried in
-    // from elsewhere; their code cannot run here)
-    let universe = state.connections.get_universe_id(player_id).await?;
-    if let Ok(items) = state.object_store.get_contents(player_id).await {
-        nearby.extend(
-            items
-                .into_iter()
-                .filter(|o| o.universe_id == universe)
-                .map(|o| o.id),
-        );
+    if let Ok(items) = state
+        .object_store
+        .get_contents(universe_id, player_id)
+        .await
+    {
+        nearby.extend(items.into_iter().map(|o| o.id));
     }
     if let Some(ref room) = room_id {
-        if let Ok(objs) = state.object_store.get_contents(room).await {
+        if let Ok(objs) = state.object_store.get_contents(universe_id, room).await {
             nearby.extend(objs.into_iter().map(|o| o.id));
         }
         nearby.push(room.clone());
@@ -1478,7 +1476,7 @@ async fn dispatch_custom_verb(
     let mut chosen = candidates[0].clone();
     if !wanted.is_empty() {
         for action in &candidates {
-            if let Ok(Some(obj)) = state.object_store.get(&action.object_id).await {
+            if let Ok(Some(obj)) = state.object_store.get(universe_id, &action.object_id).await {
                 let name = obj
                     .properties
                     .get("name")
@@ -1493,7 +1491,6 @@ async fn dispatch_custom_verb(
         }
     }
 
-    let universe_id = state.connections.get_universe_id(player_id).await?;
     let handler_args = serde_json::json!({
         "verb": verb,
         "args": args,
@@ -1503,7 +1500,7 @@ async fn dispatch_custom_verb(
     });
     let result = scripting::invoke_handler(
         state,
-        &universe_id,
+        universe_id,
         &chosen.object_id,
         room_id,
         &chosen.method,

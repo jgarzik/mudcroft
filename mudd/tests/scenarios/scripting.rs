@@ -87,7 +87,13 @@ pub async fn player(server: &TestServer, name: &str) -> TestClient {
 
 /// Direction of the exit from `from` that leads to `to`
 async fn direction(server: &TestServer, from: &str, to: &str) -> String {
-    let room = server.world().store().get(from).await.unwrap().unwrap();
+    let room = server
+        .world()
+        .store()
+        .get(server.universe_id(), from)
+        .await
+        .unwrap()
+        .unwrap();
     room.properties["exits"]
         .as_object()
         .unwrap()
