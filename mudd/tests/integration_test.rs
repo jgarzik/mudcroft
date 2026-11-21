@@ -1322,3 +1322,41 @@ async fn test_eval_create_object() {
         obj_id
     );
 }
+
+/// help lists the commands available at the caller's access level
+#[tokio::test]
+async fn test_help_lists_commands_for_role() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    for (role, has_create, has_eval) in [
+        (
+            harness::Role::Player {
+                username: "help_player".to_string(),
+            },
+            false,
+            false,
+        ),
+        (
+            harness::Role::Builder {
+                username: "help_builder".to_string(),
+                regions: vec![],
+            },
+            true,
+            false,
+        ),
+        (
+            harness::Role::Wizard {
+                username: "help_wizard".to_string(),
+            },
+            true,
+            true,
+        ),
+    ] {
+        let mut c = server.connect_as(role).await.expect("connect");
+        c.drain().await;
+        c.command("help").await.unwrap();
+        let text = c.expect_output_containing("Commands:").await.unwrap();
+        assert!(text.contains("attack/kill"), "{}", text);
+        assert_eq!(text.contains("create <type>"), has_create, "{}", text);
+        assert_eq!(text.contains("eval <lua>"), has_eval, "{}", text);
+    }
+}

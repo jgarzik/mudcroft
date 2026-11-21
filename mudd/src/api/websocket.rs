@@ -837,7 +837,11 @@ async fn execute_command(
 
             // Sync to database for authenticated users
             if !account_id.is_empty() {
-                if let Err(e) = state.player_manager.move_player(player_id, &dest_room_id).await {
+                if let Err(e) = state
+                    .player_manager
+                    .move_player(player_id, &dest_room_id)
+                    .await
+                {
                     warn!("Failed to sync player location to DB: {}", e);
                 }
             }
@@ -889,10 +893,22 @@ async fn execute_command(
                 text: format!("You say: {}", message),
             }
         }
-        "help" => ServerMessage::Output {
-            text: "Commands: look, north/south/east/west, say <message>, get/take <item>, drop <item>, inventory/i, attack <target>, eval <lua>, goto <room_id>, setportal [room_id], help"
-                .to_string(),
-        },
+        "help" => {
+            let mut text = String::from(
+                "Commands: look, north/south/east/west/up/down, say <message>, \
+                 get/take <item>, drop <item>, inventory/i, attack/kill <target>, help. \
+                 Objects may offer their own verbs (e.g. 'pull lever').",
+            );
+            if access_level >= AccessLevel::Builder {
+                text.push_str(
+                    "\nBuilder: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]",
+                );
+            }
+            if access_level >= AccessLevel::Wizard {
+                text.push_str("\nWizard: eval <lua>, goto <room_id>, setportal [room_id]");
+            }
+            ServerMessage::Output { text }
+        }
         "get" | "take" => {
             // Get item name from args
             let item_name = if parts.len() > 1 {
@@ -1052,8 +1068,9 @@ async fn execute_command(
                     Some(id) => id,
                     None => {
                         return ServerMessage::Error {
-                            message: "You are nowhere. Use 'setportal <room_id>' to specify a room."
-                                .to_string(),
+                            message:
+                                "You are nowhere. Use 'setportal <room_id>' to specify a room."
+                                    .to_string(),
                         };
                     }
                 }
@@ -1203,7 +1220,11 @@ async fn execute_command(
                     .combat
                     .init_entity_with_universe(
                         &target_id,
-                        state.connections.get_universe_id(player_id).await.as_deref(),
+                        state
+                            .connections
+                            .get_universe_id(player_id)
+                            .await
+                            .as_deref(),
                         target_max_hp,
                     )
                     .await;
@@ -1218,7 +1239,11 @@ async fn execute_command(
                     .combat
                     .init_entity_with_universe(
                         player_id,
-                        state.connections.get_universe_id(player_id).await.as_deref(),
+                        state
+                            .connections
+                            .get_universe_id(player_id)
+                            .await
+                            .as_deref(),
                         100, // Default player HP
                     )
                     .await;
@@ -1249,7 +1274,11 @@ async fn execute_command(
             let mut messages = Vec::new();
 
             if attack_result.hit {
-                let damage = attack_result.damage.as_ref().map(|d| d.final_damage).unwrap_or(0);
+                let damage = attack_result
+                    .damage
+                    .as_ref()
+                    .map(|d| d.final_damage)
+                    .unwrap_or(0);
                 deferred.push(Hook::new(
                     &target_id,
                     Some(&room_id),
@@ -1319,7 +1348,11 @@ async fn execute_command(
             }
             state
                 .connections
-                .broadcast_room_except(&room_id, Some(player_id), ServerMessage::Output { text: seen })
+                .broadcast_room_except(
+                    &room_id,
+                    Some(player_id),
+                    ServerMessage::Output { text: seen },
+                )
                 .await;
 
             ServerMessage::Output {
@@ -1339,7 +1372,9 @@ async fn execute_command(
                 &command[7..]
             } else {
                 return ServerMessage::Error {
-                    message: "Usage: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]".to_string(),
+                    message:
+                        "Usage: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]"
+                            .to_string(),
                 };
             };
 
