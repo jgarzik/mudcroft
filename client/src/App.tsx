@@ -24,8 +24,9 @@ function GameScreen() {
       >
         <span className="text-highlight">Mudcroft</span>
         <div className="flex items-center gap-4">
-          <span className="text-sm text-muted">{username}</span>
+          <span className="text-sm text-muted" data-testid="current-user">{username}</span>
           <button
+            data-testid="logout"
             onClick={logout}
             style={{
               padding: '0.25rem 0.75rem',

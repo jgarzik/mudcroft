@@ -52,6 +52,7 @@ export function RoomPanel() {
       <div style={{ padding: '0.75rem', flex: 1, overflow: 'auto' }}>
         {/* Room Name */}
         <h2
+          data-testid="room-name"
           className="text-lg text-highlight"
           style={{ marginBottom: '0.5rem' }}
         >
@@ -59,7 +60,7 @@ export function RoomPanel() {
         </h2>
 
         {/* Description */}
-        <p style={{ marginBottom: '1rem', lineHeight: 1.6 }}>
+        <p data-testid="room-description" style={{ marginBottom: '1rem', lineHeight: 1.6 }}>
           {currentRoom.description}
         </p>
 
@@ -67,7 +68,7 @@ export function RoomPanel() {
         {currentRoom.exits.length > 0 && (
           <div style={{ marginBottom: '0.75rem' }}>
             <span className="text-sm text-muted">Exits: </span>
-            <span className="text-primary">
+            <span className="text-primary" data-testid="room-exits">
               {currentRoom.exits.join(', ')}
             </span>
           </div>
@@ -77,7 +78,7 @@ export function RoomPanel() {
         {currentRoom.contents.length > 0 && (
           <div>
             <span className="text-sm text-muted">You see: </span>
-            <span>{currentRoom.contents.join(', ')}</span>
+            <span data-testid="room-contents">{currentRoom.contents.join(', ')}</span>
           </div>
         )}
       </div>

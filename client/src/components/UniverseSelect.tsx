@@ -123,7 +123,7 @@ export function UniverseSelect() {
               className="flex flex-col items-center justify-center"
               style={{ padding: '2rem', gap: '1rem' }}
             >
-              <span className="text-muted">No worlds available</span>
+              <span className="text-muted" data-testid="no-universes">No worlds available</span>
               <span className="text-sm text-muted">
                 Contact an admin to create one
               </span>
@@ -131,10 +131,13 @@ export function UniverseSelect() {
           )}
 
           {!loading && !error && universes.length > 0 && (
-            <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+            <ul data-testid="universe-list" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
               {universes.map((universe, index) => (
                 <li
                   key={universe.id}
+                  data-testid="universe-item"
+                  data-universe-id={universe.id}
+                  aria-selected={selectedId === universe.id}
                   onClick={() => handleSelect(universe.id)}
                   onDoubleClick={() => {
                     setSelectedId(universe.id)
@@ -205,6 +208,7 @@ export function UniverseSelect() {
           </button>
           <button
             type="button"
+            data-testid="enter-world"
             onClick={handleEnter}
             disabled={!selectedId || entering}
             style={{

@@ -49,6 +49,8 @@ export function AuthScreen() {
         <div className="auth-tabs flex gap-2" style={{ marginBottom: '1rem' }}>
           <button
             type="button"
+            data-testid="auth-tab-login"
+            aria-pressed={mode === 'login'}
             onClick={() => setMode('login')}
             style={{
               flex: 1,
@@ -59,6 +61,8 @@ export function AuthScreen() {
           </button>
           <button
             type="button"
+            data-testid="auth-tab-register"
+            aria-pressed={mode === 'register'}
             onClick={() => setMode('register')}
             style={{
               flex: 1,
@@ -72,6 +76,8 @@ export function AuthScreen() {
         <form onSubmit={handleSubmit} className="flex flex-col gap-2">
           <input
             type="text"
+            data-testid="auth-username"
+            aria-label="Username"
             placeholder="Username"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
@@ -81,6 +87,8 @@ export function AuthScreen() {
           />
           <input
             type="password"
+            data-testid="auth-password"
+            aria-label="Password"
             placeholder="Password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
@@ -90,12 +98,12 @@ export function AuthScreen() {
           />
 
           {error && (
-            <div className="text-error text-sm" style={{ padding: '0.5rem' }}>
+            <div className="text-error text-sm" role="alert" data-testid="auth-error" style={{ padding: '0.5rem' }}>
               {error}
             </div>
           )}
 
-          <button type="submit" disabled={loading} style={{ marginTop: '0.5rem' }}>
+          <button type="submit" data-testid="auth-submit" disabled={loading} style={{ marginTop: '0.5rem' }}>
             {loading ? '...' : mode === 'login' ? 'Enter' : 'Create Account'}
           </button>
         </form>
