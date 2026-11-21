@@ -3,6 +3,10 @@
 //! The state machine receives committed log entries from Raft and
 //! applies them to the SQLite database.
 
+// openraft's StorageError is large but is the error type its storage traits
+// require, so boxing it here would only add conversions at every call site.
+#![allow(clippy::result_large_err)]
+
 use std::io;
 
 use openraft::{BasicNode, LogId, StorageError, StorageIOError, StoredMembership};

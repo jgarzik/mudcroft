@@ -2,6 +2,10 @@
 //!
 //! Handles creation and restoration of database snapshots.
 
+// openraft's StorageError is large but is the error type its storage traits
+// require, so boxing it here would only add conversions at every call site.
+#![allow(clippy::result_large_err)]
+
 use std::io;
 use std::io::Cursor;
 use std::path::Path;
@@ -167,7 +171,7 @@ impl SnapshotStore {
         }
 
         // Sort by modification time, newest first
-        snapshots.sort_by(|a, b| b.1.cmp(&a.1));
+        snapshots.sort_by_key(|s| std::cmp::Reverse(s.1));
 
         // Delete old snapshots beyond the keep count
         for (path, _) in snapshots.into_iter().skip(keep) {
