@@ -713,12 +713,15 @@ async fn execute_command(
             };
 
             // Execute Commands.take() via Lua
-            let code = format!(
-                r#"local r = Commands.take("{}", "{}"); return r.message"#,
-                player_id.replace('"', r#"\""#),
-                item_name.replace('"', r#"\""#)
-            );
-            execute_lua(state, player_id, account_id, &code).await
+            // Arguments are passed as values, never spliced into the source
+            execute_lua_with_args(
+                state,
+                player_id,
+                account_id,
+                "local pid, item = ...; return Commands.take(pid, item).message",
+                vec![player_id.to_string(), item_name],
+            )
+            .await
         }
         "drop" => {
             // Get item name from args
@@ -731,20 +734,26 @@ async fn execute_command(
             };
 
             // Execute Commands.drop() via Lua
-            let code = format!(
-                r#"local r = Commands.drop("{}", "{}"); return r.message"#,
-                player_id.replace('"', r#"\""#),
-                item_name.replace('"', r#"\""#)
-            );
-            execute_lua(state, player_id, account_id, &code).await
+            // Arguments are passed as values, never spliced into the source
+            execute_lua_with_args(
+                state,
+                player_id,
+                account_id,
+                "local pid, item = ...; return Commands.drop(pid, item).message",
+                vec![player_id.to_string(), item_name],
+            )
+            .await
         }
         "inventory" | "inv" | "i" => {
             // Execute Commands.inventory() via Lua
-            let code = format!(
-                r#"local r = Commands.inventory("{}"); return r.message"#,
-                player_id.replace('"', r#"\""#)
-            );
-            execute_lua(state, player_id, account_id, &code).await
+            execute_lua_with_args(
+                state,
+                player_id,
+                account_id,
+                "local pid = ...; return Commands.inventory(pid).message",
+                vec![player_id.to_string()],
+            )
+            .await
         }
         "goto" => {
             // Wizard+ only
@@ -1095,6 +1104,17 @@ async fn execute_lua(
     account_id: &str,
     code: &str,
 ) -> ServerMessage {
+    execute_lua_with_args(state, player_id, account_id, code, Vec::new()).await
+}
+
+/// Execute a Lua chunk with `args` available as its varargs (`...`)
+async fn execute_lua_with_args(
+    state: &AppState,
+    player_id: &str,
+    account_id: &str,
+    code: &str,
+    args: Vec<String>,
+) -> ServerMessage {
     // Get universe from session
     let universe_id = match state.connections.get_universe_id(player_id).await {
         Some(id) => id,
@@ -1164,7 +1184,11 @@ async fn execute_lua(
     }
 
     // Execute the code
-    let result: Result<Value, _> = sandbox.execute(code);
+    let result: Result<Value, _> = if args.is_empty() {
+        sandbox.execute(code)
+    } else {
+        sandbox.execute_with_args(code, mlua::Variadic::from_iter(args))
+    };
 
     match result {
         Ok(value) => {

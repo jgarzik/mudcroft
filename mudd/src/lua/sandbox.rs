@@ -172,6 +172,25 @@ impl Sandbox {
     where
         R: mlua::FromLuaMulti,
     {
+        // `eval` also accepts bare expressions (e.g. `1 + 2`)
+        self.run_metered(|lua| lua.load(code).eval())
+    }
+
+    /// Execute a Lua chunk, passing `args` as the chunk's varargs (`...`).
+    ///
+    /// Use this instead of formatting untrusted values into Lua source:
+    /// the values arrive as Lua strings/numbers and can never change the
+    /// code that runs.
+    pub fn execute_with_args<A, R>(&mut self, code: &str, args: A) -> Result<R, SandboxError>
+    where
+        A: mlua::IntoLuaMulti,
+        R: mlua::FromLuaMulti,
+    {
+        self.run_metered(|lua| lua.load(code).into_function()?.call(args))
+    }
+
+    /// Run `f` with instruction/time metering reset and enforced
+    fn run_metered<R>(&mut self, f: impl FnOnce(&Lua) -> LuaResult<R>) -> Result<R, SandboxError> {
         // Reset counters for this execution
         self.instruction_count.store(0, Ordering::Relaxed);
         self.exceeded.store(false, Ordering::Relaxed);
@@ -179,8 +198,7 @@ impl Sandbox {
         self.start_time = Some(Instant::now());
 
         // Compile and execute
-        let chunk = self.lua.load(code);
-        let result: LuaResult<R> = chunk.eval();
+        let result = f(&self.lua);
 
         // Update metering
         let instr = self.instruction_count.load(Ordering::Relaxed);

@@ -199,3 +199,26 @@ async fn test_set_actor_cannot_impersonate_superior() {
     .await;
     assert_eq!(out, format!("true:{}", pl_id));
 }
+
+/// Player command arguments must never be spliced into Lua source.
+/// `take x\"); return 'INJECTED' --` used to break out of the string literal.
+#[tokio::test]
+async fn test_take_argument_cannot_inject_lua() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = connect(&server, player("inject_player")).await;
+    pl.drain().await;
+
+    for cmd in [
+        r#"take x\"); return 'INJECTED' --"#,
+        r#"drop x\"); return 'INJECTED' --"#,
+    ] {
+        pl.command(cmd).await.expect("send");
+        let _ = pl.expect("echo").await;
+        let reply = pl.expect_any().await.expect("reply");
+        let text = reply["text"]
+            .as_str()
+            .or(reply["message"].as_str())
+            .unwrap_or_default();
+        assert_ne!(text, "INJECTED", "Lua injection via `{}`", cmd);
+    }
+}
