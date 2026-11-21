@@ -237,15 +237,18 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Classes table (for class definitions)
+        // Classes defined per universe (built-in classes live in code; a
+        // parent may be built-in, so it has no foreign key)
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS classes (
-                name TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL REFERENCES universes(id),
-                parent TEXT REFERENCES classes(name),
+                name TEXT NOT NULL,
+                parent TEXT,
                 code_hash TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                defined_by TEXT REFERENCES accounts(id),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (universe_id, name)
             )
             "#,
         )
@@ -256,11 +259,13 @@ impl Database {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS class_properties (
-                class_name TEXT NOT NULL REFERENCES classes(name) ON DELETE CASCADE,
-                universe_id TEXT NOT NULL REFERENCES universes(id),
+                universe_id TEXT NOT NULL,
+                class_name TEXT NOT NULL,
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
-                PRIMARY KEY (class_name, key)
+                PRIMARY KEY (universe_id, class_name, key),
+                FOREIGN KEY (universe_id, class_name)
+                    REFERENCES classes(universe_id, name) ON DELETE CASCADE
             )
             "#,
         )
@@ -271,10 +276,12 @@ impl Database {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS class_handlers (
-                class_name TEXT NOT NULL REFERENCES classes(name) ON DELETE CASCADE,
-                universe_id TEXT NOT NULL REFERENCES universes(id),
+                universe_id TEXT NOT NULL,
+                class_name TEXT NOT NULL,
                 handler TEXT NOT NULL,
-                PRIMARY KEY (class_name, handler)
+                PRIMARY KEY (universe_id, class_name, handler),
+                FOREIGN KEY (universe_id, class_name)
+                    REFERENCES classes(universe_id, name) ON DELETE CASCADE
             )
             "#,
         )
@@ -468,16 +475,6 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_raft_log_term ON raft_log(term)")
             .execute(&self.pool)
             .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_class_props_universe ON class_properties(universe_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_class_handlers_universe ON class_handlers(universe_id)",
-        )
-        .execute(&self.pool)
-        .await?;
 
         info!("Database migrations complete");
         Ok(())

@@ -333,3 +333,39 @@ async fn test_one_account_in_two_universes() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(look(&mut b).await, "Second Hall");
 }
+
+/// Classes defined with game.define_class are persisted and survive a restart
+#[tokio::test]
+async fn test_defined_class_survives_restart() {
+    let mut server = TestServer::start().await.expect("server");
+    let mut wiz = connect(
+        &server,
+        Role::Wizard {
+            username: "class_keeper".into(),
+        },
+    )
+    .await;
+    let text = reply_text(
+        &mut wiz,
+        r#"eval return tostring(game.define_class("lantern", {parent = "item", properties = {lit = {type = "boolean", default = true}}}))"#,
+    )
+    .await;
+    assert_eq!(text, "true");
+    wiz.close().await.ok();
+
+    server.restart().await.expect("restart");
+
+    let mut wiz = connect(
+        &server,
+        Role::Wizard {
+            username: "class_keeper".into(),
+        },
+    )
+    .await;
+    let text = reply_text(
+        &mut wiz,
+        r#"eval local o = game.create_object("/items/lamp", "lantern", nil, {}); return tostring(o.metadata.lit) .. ":" .. tostring(game.is_a("/items/lamp", "item"))"#,
+    )
+    .await;
+    assert_eq!(text, "true:true");
+}

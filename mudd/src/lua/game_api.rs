@@ -291,17 +291,19 @@ impl GameApi {
         // This is a global function, not on the game table
         let classes = self.classes.clone();
         let store = self.store.clone();
+        let parent_universe = self.universe_id.clone();
         let parent_fn = lua.create_function(
             move |lua, (class_name, handler_name, args): (String, String, Table)| {
                 charge_db(lua)?;
                 let classes = classes.clone();
                 let store = store.clone();
+                let universe_id = parent_universe.clone();
 
                 // Get the parent class name
                 let parent_class = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let registry = classes.read().await;
-                        let class = registry.get_class(&class_name);
+                        let class = registry.get_class(&universe_id, &class_name);
                         class.and_then(|c| c.parent.clone())
                     })
                 });
@@ -315,7 +317,7 @@ impl GameApi {
                 let parent_code = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let registry = classes.read().await;
-                        let parent = registry.get_class(&parent_class_name);
+                        let parent = registry.get_class(&universe_id, &parent_class_name);
                         match parent {
                             Some(class_def) => {
                                 // The class's attached code (legacy: a code_hash property)
@@ -415,8 +417,12 @@ impl GameApi {
                 let classes = classes_clone.clone();
                 let class_name = class.clone();
                 obj.properties = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { classes.read().await.resolve_properties(&class_name) })
+                    tokio::runtime::Handle::current().block_on(async {
+                        classes
+                            .read()
+                            .await
+                            .resolve_properties(&universe_id, &class_name)
+                    })
                 });
                 // A class's code (its code_hash default, used by parent()) is
                 // never attached to instances implicitly: attaching code is an
@@ -902,9 +908,8 @@ impl GameApi {
         let store = self.store.clone();
 
         // game.define_class(name, definition)
-        // Registers a new class with parent and properties. Wizard+ only
-        // (classes are shared by every universe), and built-in base classes
-        // cannot be redefined.
+        // Registers a class in the script's universe, with parent and
+        // properties. Wizard+ only; built-in base classes cannot be redefined.
         let classes_clone = classes.clone();
         let perm_ctx = (
             self.permissions.clone(),
@@ -923,6 +928,7 @@ impl GameApi {
                     )));
                 }
                 let (permissions, user, universe_id) = perm_ctx.clone();
+                let class_universe = universe_id.clone();
                 let user = actor_override(lua).or(user);
                 let caller = user.clone();
                 let (allowed, is_admin) = block_on_perm(async move {
@@ -965,12 +971,12 @@ impl GameApi {
                     }
                 }
 
-                // Classes are shared by every universe: an existing custom class
-                // may be replaced only by whoever defined it, or by an admin
+                // An existing class may be replaced only by whoever defined
+                // it, or by an admin
                 let replaced: Result<(), String> = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let mut registry = classes.write().await;
-                        if let Some(existing) = registry.get_class(&name) {
+                        if let Some(existing) = registry.get_class(&class_universe, &name) {
                             if existing.defined_by != caller && !is_admin {
                                 return Err(format!(
                                     "define_class: {} is already defined by another account",
@@ -978,13 +984,16 @@ impl GameApi {
                                 ));
                             }
                         }
-                        registry.define_class(
-                            &name,
-                            parent.as_deref(),
-                            props_map,
-                            caller.as_deref(),
-                        );
-                        Ok(())
+                        registry
+                            .define_class(
+                                &class_universe,
+                                &name,
+                                parent.as_deref(),
+                                props_map,
+                                caller.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| format!("define_class: {}", e))
                     })
                 });
                 replaced.map_err(mlua::Error::runtime)?;
@@ -996,6 +1005,7 @@ impl GameApi {
         // game.get_class(name)
         // Returns class definition as table
         let classes_clone = classes.clone();
+        let class_universe = self.universe_id.clone();
         let get_class = lua.create_function(move |lua, name: String| {
             charge_db(lua)?;
             let classes = classes_clone.clone();
@@ -1003,7 +1013,7 @@ impl GameApi {
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     let registry = classes.read().await;
-                    registry.get_class(&name).cloned()
+                    registry.get_class(&class_universe, &name).cloned()
                 })
             });
 
@@ -1049,7 +1059,7 @@ impl GameApi {
                     match obj {
                         Some(o) => {
                             let registry = classes.read().await;
-                            Ok(registry.is_a(&o.class, &class_name))
+                            Ok(registry.is_a(&universe_id, &o.class, &class_name))
                         }
                         None => Ok(false),
                     }
@@ -1065,6 +1075,7 @@ impl GameApi {
 
         // game.get_class_chain(class_name)
         // Returns inheritance chain as array
+        let class_universe = self.universe_id.clone();
         let get_class_chain = lua.create_function(move |lua, name: String| {
             charge_db(lua)?;
             let classes = classes.clone();
@@ -1072,7 +1083,7 @@ impl GameApi {
             let chain = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     let registry = classes.read().await;
-                    registry.get_inheritance_chain(&name)
+                    registry.get_inheritance_chain(&class_universe, &name)
                 })
             });
 
@@ -1176,7 +1187,7 @@ impl GameApi {
                     Ok::<_, anyhow::Error>(
                         contents
                             .into_iter()
-                            .filter(|o| registry.is_a(&o.class, "living"))
+                            .filter(|o| registry.is_a(&universe_id, &o.class, "living"))
                             .collect::<Vec<_>>(),
                     )
                 })

@@ -216,18 +216,18 @@ async fn test_class_registry() {
     let registry = ClassRegistry::new();
 
     // Verify inheritance chain
-    assert!(registry.is_a("weapon", "item"));
-    assert!(registry.is_a("weapon", "thing"));
-    assert!(registry.is_a("player", "living"));
+    assert!(registry.is_a("u", "weapon", "item"));
+    assert!(registry.is_a("u", "weapon", "thing"));
+    assert!(registry.is_a("u", "player", "living"));
 
     // Verify property resolution
-    let props = registry.resolve_properties("weapon");
+    let props = registry.resolve_properties("u", "weapon");
     assert!(props.contains_key("damage_dice")); // from weapon
     assert!(props.contains_key("weight")); // from item
     assert!(props.contains_key("name")); // from thing
 
     // Verify handlers resolution
-    let handlers = registry.resolve_handlers("npc");
+    let handlers = registry.resolve_handlers("u", "npc");
     assert!(handlers.contains(&"heart_beat".to_string())); // from living
     assert!(handlers.contains(&"ai_idle_tick".to_string())); // from npc
     assert!(handlers.contains(&"on_init".to_string())); // from thing

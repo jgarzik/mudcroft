@@ -1269,8 +1269,12 @@ async fn execute_command(
 
             // Check if target is attackable (NPC or PvP-flagged player)
             // Any npc, including subclasses defined with define_class
-            let is_npc =
-                target.class == "monster" || state.classes.read().await.is_a(&target.class, "npc");
+            let is_npc = target.class == "monster"
+                || state
+                    .classes
+                    .read()
+                    .await
+                    .is_a(universe_id, &target.class, "npc");
             if !is_npc {
                 return ServerMessage::Error {
                     message: format!("You can't attack {}.", target_display_name),
