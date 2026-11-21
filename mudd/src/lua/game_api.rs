@@ -43,6 +43,23 @@ where
     .expect("permission lookup thread panicked")
 }
 
+/// Whether `obj` is an account's own player object (`/players/p-<account>`,
+/// owned by that account). Only these are shared across universes; scripts
+/// cannot create them (see `is_reserved_object`).
+fn is_account_player_object(obj: &Object) -> bool {
+    obj.class == "player"
+        && obj
+            .owner_id
+            .as_deref()
+            .is_some_and(|owner| obj.id == crate::player::PlayerManager::player_path(owner))
+}
+
+/// Objects only the server may create: player-class objects and anything
+/// under /players/ (player objects are made on connect)
+fn is_reserved_object(path: &str, class: &str) -> bool {
+    class == "player" || path == "/players" || path.starts_with("/players/")
+}
+
 /// Check `action` on an existing object for the acting user.
 /// Returns the denial reason on failure; no user context is always denied.
 async fn object_permission(
@@ -58,7 +75,7 @@ async fn object_permission(
     // Object ids are global: never touch another universe's objects. Player
     // objects are the exception: one is shared by every universe its account
     // visits (it holds the inventory and HP wherever the player is).
-    if obj.universe_id != universe_id && obj.class != "player" {
+    if obj.universe_id != universe_id && !is_account_player_object(obj) {
         return Err(format!("{} belongs to another universe", obj.id));
     }
     let ctx = permissions.get_user_context(user_id, universe_id).await;
@@ -425,6 +442,12 @@ impl GameApi {
                     }
                 }
 
+                if is_reserved_object(&obj.id, &obj.class) {
+                    let error_table = lua.create_table()?;
+                    error_table.set("error", "player objects are created by the server")?;
+                    return Ok(Value::Table(error_table));
+                }
+
                 // Check permission, then save to database
                 let obj_clone = obj.clone();
                 let permissions = permissions_clone.clone();
@@ -660,7 +683,8 @@ impl GameApi {
                             if let Some(ref dest) = new_parent_id {
                                 match store.get(dest).await? {
                                     Some(d)
-                                        if d.universe_id == universe_id || d.class == "player" => {}
+                                        if d.universe_id == universe_id
+                                            || is_account_player_object(&d) => {}
                                     Some(_) => {
                                         return Ok(Err(format!(
                                             "{} belongs to another universe",
@@ -716,6 +740,11 @@ impl GameApi {
                         tokio::runtime::Handle::current().block_on(async {
                             let obj_result = store.get(&id).await?;
                             match obj_result {
+                                Some(original)
+                                    if is_reserved_object(&validated_path, &original.class) =>
+                                {
+                                    Ok(Err("player objects are created by the server".to_string()))
+                                }
                                 Some(original) if original.universe_id != universe_id => {
                                     Ok(Err(format!("{} belongs to another universe", original.id)))
                                 }

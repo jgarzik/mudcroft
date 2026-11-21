@@ -846,3 +846,38 @@ async fn test_take_works_in_second_universe() {
     .expect("reply");
     assert_eq!(reply["text"], "You take gem.", "{}", reply);
 }
+
+/// Only an account's real player object is shared across universes: an
+/// ordinary object of class "player" gets no exemption, and scripts cannot
+/// create player-class objects at all
+#[tokio::test]
+async fn test_player_exemption_requires_real_player_object() {
+    let server = TestServer::start().await.expect("server");
+    let owner = server.world().wizard_account_id.clone();
+    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('other-world', 'Other', ?)")
+        .bind(&owner)
+        .execute(server.pool())
+        .await
+        .unwrap();
+    let mut fake = mudd::objects::Object::new("/d/other/fake", "other-world", "player").unwrap();
+    fake.set_property("name", serde_json::json!("decoy"));
+    server.world().store().create(&fake).await.unwrap();
+
+    let mut wiz = connect(&server, wizard("fake_player_wiz")).await;
+    let out = eval(
+        &mut wiz,
+        r#"return tostring(pcall(game.update_object, "/d/other/fake", {name = "mine"}))"#,
+    )
+    .await;
+    assert_eq!(
+        out, "false",
+        "a non-account player-class object is not exempt"
+    );
+
+    for code in [
+        r#"local r = game.create_object("/d/here/fake", "player", nil, {}); return r.error and "refused" or "created""#,
+        r#"local r = game.create_object("/players/p-nobody", "item", nil, {}); return r.error and "refused" or "created""#,
+    ] {
+        assert_eq!(eval(&mut wiz, code).await, "refused", "{}", code);
+    }
+}

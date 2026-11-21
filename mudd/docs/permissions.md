@@ -73,8 +73,10 @@ Before this algorithm runs, Lua object writes (`update_object`,
 `delete_object`, `move_object`, `add_action`, `remove_action`) refuse an
 object that belongs to another universe, whatever the acting account's
 level; `move_object` also refuses a destination in another universe, and
-`clone_object` a source in another universe. Player objects are exempt (one
-is shared by every universe its account visits). Object ids are global, so
+`clone_object` a source in another universe. An account's own player object
+(`/players/p-<account>`, owned by that account) is exempt, since one is
+shared by every universe its account visits; scripts cannot create
+player-class objects or anything under `/players/`. Object ids are global, so
 this is what keeps scripts inside their universe. Reads (`game.get_object` and the
 query functions) are not universe-checked.
 

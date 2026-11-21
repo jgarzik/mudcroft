@@ -325,8 +325,10 @@ Object ids are global, so isolation is enforced at each write:
   to, and `game.use_object` ignores objects from other universes.
 - `update_object`, `delete_object`, `move_object` (object and destination),
   `add_action` and `remove_action` refuse objects of other universes;
-  `clone_object` refuses a foreign source. Player objects are exempt: one is
-  shared by every universe its account visits.
+  `clone_object` refuses a foreign source. An account's own player object
+  (`/players/p-<account>`, owned by that account) is exempt: one is shared by
+  every universe its account visits. Scripts cannot create player-class
+  objects or anything under `/players/`.
 - Spawning ignores a remembered room (`last_safe_location`, current room)
   that belongs to another universe and uses the portal instead.
 - Queued `game.send` and `game.broadcast_region` messages skip sessions

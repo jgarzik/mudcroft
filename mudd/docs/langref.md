@@ -208,9 +208,11 @@ Object IDs are unique across the **whole server**, not per universe.
 Writes stay in the script's universe: `update_object`, `delete_object` and
 `move_object` refuse objects (and move destinations) that belong to another
 universe, and `clone_object` refuses a source from another universe.
-Player objects are the exception: one is shared by every universe its
-account visits (it carries inventory and HP), so scripts may update it and
-move items into it from any universe. Reads such as `get_object` are not
+An account's player object (`/players/p-<account>`, owned by that account)
+is the exception: one is shared by every universe its account visits (it
+carries inventory and HP), so scripts may update it and move items into it
+from any universe. Scripts cannot create player objects: `create_object`
+and `clone_object` refuse class `player` and paths under `/players/`. Reads such as `get_object` are not
 universe-checked.
 
 Path grants work on prefixes, so group an area under one prefix such as
