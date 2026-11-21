@@ -1,56 +1,45 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# Stop Test Server Script
+# Stop the test server started by scripts/start-testsrv.sh.
 #
-# Stops any running test server and client processes.
+# Signals only the mudd PID recorded by start-testsrv.sh (never "whatever is
+# on port 8080") and removes its temp dir. The start script then exits and
+# cleans up after itself as well.
 #
 # Usage:
-#   ./scripts/stop-testsrv.sh
-#
+#   scripts/stop-testsrv.sh
 
-# Configuration
-TESTDIR="${TESTDIR:-/tmp/mudcroft-e2e-test}"
-SERVER_PORT="8080"
+set -euo pipefail
 
-# Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# shellcheck source-path=SCRIPTDIR source=testsrv-common.sh
+source "${SCRIPT_DIR}/testsrv-common.sh"
 
-# Kill processes listening on server port
-if command -v lsof >/dev/null 2>&1; then
-    PIDS=$(lsof -ti :${SERVER_PORT} 2>/dev/null || true)
-    if [ -n "$PIDS" ]; then
-        echo "[STOP] Killing processes on port ${SERVER_PORT}..."
-        echo "$PIDS" | xargs kill 2>/dev/null || true
-        sleep 0.5
+if [ ! -f "$TESTSRV_STATE" ]; then
+    echo "[STOP] No test server recorded"
+    exit 0
+fi
+
+PID="$(testsrv_pid)"
+DIR="$(testsrv_dir)"
+
+if testsrv_running; then
+    echo "[STOP] Stopping mudd (PID ${PID})..."
+    kill "$PID"
+    for _ in $(seq 1 50); do
+        kill -0 "$PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+        kill -9 "$PID" 2>/dev/null || true
     fi
+else
+    echo "[STOP] Recorded server (PID ${PID:-?}) is not running"
 fi
 
-# Kill any mudd processes running from test directory
-MUDD_PIDS=$(pgrep -f "mudd.*${TESTDIR}" 2>/dev/null || true)
-if [ -n "$MUDD_PIDS" ]; then
-    echo "[STOP] Killing test server processes..."
-    echo "$MUDD_PIDS" | xargs kill 2>/dev/null || true
-fi
-
-# Kill client dev server (npm run dev from client directory)
-CLIENT_PIDS=$(pgrep -f "vite.*${PROJECT_ROOT}/client" 2>/dev/null || true)
-if [ -n "$CLIENT_PIDS" ]; then
-    echo "[STOP] Killing client dev server..."
-    echo "$CLIENT_PIDS" | xargs kill 2>/dev/null || true
-fi
-
-# Also try killing by the npm process
-NPM_PIDS=$(pgrep -f "npm.*dev.*client" 2>/dev/null || true)
-if [ -n "$NPM_PIDS" ]; then
-    echo "[STOP] Killing npm processes..."
-    echo "$NPM_PIDS" | xargs kill 2>/dev/null || true
-fi
-
-# Clean up test directory
-if [ -d "$TESTDIR" ]; then
-    rm -rf "$TESTDIR"
-    echo "[STOP] Test directory removed"
-fi
-
+# Only remove what start-testsrv.sh created
+case "$DIR" in
+    "${TMPDIR:-/tmp}"/mudcroft-testsrv.*) rm -rf "$DIR" ;;
+esac
+rm -f "$TESTSRV_STATE"
 echo "[STOP] Done"

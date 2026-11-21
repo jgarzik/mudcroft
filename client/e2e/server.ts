@@ -98,13 +98,18 @@ async function wsCommand(url: string, token: string, command: string): Promise<s
       ws.close()
       reject(new Error(`no reply to ${command}`))
     }, 10_000)
+    // The reply is the first output/error after our command is echoed back
+    // (the server may send other output first, e.g. a greeting)
     let sent = false
+    let echoed = false
     ws.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data))
       if (msg.type === 'welcome' && !sent) {
         sent = true
         ws.send(JSON.stringify({ type: 'command', text: command }))
-      } else if (sent && (msg.type === 'output' || msg.type === 'error')) {
+      } else if (msg.type === 'echo') {
+        echoed = true
+      } else if (echoed && (msg.type === 'output' || msg.type === 'error')) {
         clearTimeout(timer)
         ws.close()
         if (msg.type === 'error') reject(new Error(`${command}: ${msg.message}`))
