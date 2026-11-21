@@ -442,6 +442,23 @@ impl GameApi {
                             // detaches) stored code instead of setting a property
                             for (k, v) in changes_vec {
                                 if k == "code_hash" {
+                                    // The code will run as the object's owner,
+                                    // so only the owner or a superior may set it
+                                    if let Some(ref owner) = obj.owner_id {
+                                        let actor = user.as_deref().unwrap_or_default();
+                                        if actor != owner {
+                                            let actor_level =
+                                                permissions.get_access_level(actor).await;
+                                            let owner_level =
+                                                permissions.get_access_level(owner).await;
+                                            if !actor_level.can_act_as(owner_level) {
+                                                return Ok(Err(
+                                                    "only the owner or a superior may attach code"
+                                                        .to_string(),
+                                                ));
+                                            }
+                                        }
+                                    }
                                     match v {
                                         serde_json::Value::String(hash) => {
                                             if store.get_code(&hash).await?.is_none() {

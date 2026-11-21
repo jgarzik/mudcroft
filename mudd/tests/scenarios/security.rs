@@ -383,3 +383,58 @@ async fn test_goto_and_setportal_stay_in_universe() {
         );
     }
 }
+
+/// Object code runs as the object's owner, so attaching code requires being
+/// the owner or outranking them
+#[tokio::test]
+async fn test_attaching_code_requires_owner_or_superior() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("attach_wiz")).await;
+    let mut adm = connect(&server, admin("attach_admin")).await;
+
+    eval(
+        &mut adm,
+        r#"game.create_object("/items/admin-orb", "item", nil, {name = "orb"}); return true"#,
+    )
+    .await;
+    eval(
+        &mut wiz,
+        r#"game.create_object("/items/wiz-orb", "item", nil, {name = "orb"}); return true"#,
+    )
+    .await;
+
+    // Wizard cannot attach code to an admin's object (it would run as admin)
+    let out = eval(
+        &mut wiz,
+        r#"local h = game.store_code("return {}")
+           local ok = pcall(game.update_object, "/items/admin-orb", {code_hash = h})
+           return tostring(ok)"#,
+    )
+    .await;
+    assert_eq!(
+        out, "false",
+        "wizard must not attach code to an admin's object"
+    );
+
+    // Plain property edits are still fine for wizards
+    let out = eval(
+        &mut wiz,
+        r#"return game.update_object("/items/admin-orb", {shiny = true})"#,
+    )
+    .await;
+    assert_eq!(out, "true");
+
+    // Owners and superiors may attach code
+    let out = eval(
+        &mut wiz,
+        r#"local h = game.store_code("return {}"); return game.update_object("/items/wiz-orb", {code_hash = h})"#,
+    )
+    .await;
+    assert_eq!(out, "true", "owner may attach code");
+    let out = eval(
+        &mut adm,
+        r#"local h = game.store_code("return {}"); return game.update_object("/items/wiz-orb", {code_hash = h})"#,
+    )
+    .await;
+    assert_eq!(out, "true", "a superior may attach code");
+}
