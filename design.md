@@ -5,7 +5,6 @@
 ## 1. Executive Summary
 
 Modern MUD game integrating:
-- **Blockchain payments** via Hemi Payment Hub (see separate spec)
 - **AI visuals** via Venice AI (OpenAI-compatible, DIEM tokens)
 - **Programmable logic** via sandboxed Lua
 - **Multi-universe** architecture on shared infrastructure
@@ -13,14 +12,14 @@ Modern MUD game integrating:
 ### Core Principles
 
 1. **Code is Content**: Game mechanics are Lua scripts players can modify
-2. **Pull Payments**: Users deposit collateral, vendors pull funds (inverts push model)
+2. **Credits**: In-game credits are the unit of account for resource-consuming actions
 3. **Economic Sustainability**: All resource-consuming actions cost credits
-4. **Wallet = Identity**: Ethereum wallet is permanent cross-universe identity
-5. **Universe Economic Isolation**: Credits are universe-scoped, crypto→credits is one-way
+4. **Account = Identity**: An account is the cross-universe identity
+5. **Universe Economic Isolation**: Credits are universe-scoped
 
 ### Identity Model
 
-- Global layer: Account (wallet), friends, platform subscription
+- Global layer: Account, friends
 - Per-universe: Separate player object, credits, stats, inventory
 - Cross-universe: Whisper/mail via shared messaging
 
@@ -29,11 +28,10 @@ Modern MUD game integrating:
 | Component | Technology | Purpose |
 |-----------|------------|---------|
 | Game Server | Rust (tokio, axum, openraft) | WebSocket, Lua execution, Raft consensus |
-| Client | TypeScript, React, Vite, Viem | Browser UI, wallet |
+| Client | TypeScript, React, Vite | Browser UI |
 | Database | SQLite (Raft-replicated) | Per-universe storage |
-| Payments | Hemi Payment Hub (see separate spec) | Pull-payment infrastructure |
 | LLM/Image | Venice AI | Text/image generation |
-| Auth | JWT + wallet signatures | Sessions |
+| Auth | Session tokens | Sessions |
 
 ### Monorepo Structure
 
@@ -44,12 +42,11 @@ hemimud/
 ├── docker-compose.yml          # Local dev cluster
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml              # cargo test, npm test, forge test
+│       ├── ci.yml              # cargo test, npm test
 │       └── deploy.yml
 │
 ├── docs/
-│   ├── hemimud-design-spec.md
-│   └── hemi-payment-hub-spec.md
+│   └── hemimud-design-spec.md
 │
 ├── server/                     # Rust game server
 │   ├── Cargo.toml
@@ -92,11 +89,7 @@ hemimud/
 │   │   │   └── protocol.rs     # Message types
 │   │   ├── auth/
 │   │   │   ├── mod.rs
-│   │   │   ├── wallet.rs       # Signature verification
 │   │   │   └── jwt.rs
-│   │   ├── payments/
-│   │   │   ├── mod.rs
-│   │   │   └── hub_client.rs   # Payment Hub integration
 │   │   ├── venice/
 │   │   │   ├── mod.rs
 │   │   │   ├── client.rs       # OpenAI-compatible API
@@ -113,13 +106,11 @@ hemimud/
 │       │   └── cluster.rs
 │       ├── mocks/
 │       │   ├── mod.rs
-│       │   ├── venice.rs
-│       │   └── payment_hub.rs
+│       │   └── venice.rs
 │       ├── fixtures/
 │       │   ├── mod.rs
 │       │   ├── world.rs
-│       │   ├── combat.rs
-│       │   └── wallets.rs
+│       │   └── combat.rs
 │       ├── common.rs
 │       ├── test_sandbox.rs
 │       ├── test_objects.rs
@@ -141,44 +132,27 @@ hemimud/
 │   │   │   ├── RoomCanvas.tsx
 │   │   │   ├── CommandInput.tsx
 │   │   │   ├── ChatLog.tsx
-│   │   │   ├── StatusBar.tsx
-│   │   │   └── WalletConnect.tsx
+│   │   │   └── StatusBar.tsx
 │   │   ├── hooks/
 │   │   │   ├── useWebSocket.ts
-│   │   │   ├── useGame.ts
-│   │   │   └── usePaymentHub.ts
+│   │   │   └── useGame.ts
 │   │   ├── stores/
 │   │   │   ├── gameStore.ts    # Zustand
 │   │   │   └── authStore.ts
 │   │   ├── lib/
 │   │   │   ├── protocol.ts     # Message types (shared with server)
-│   │   │   ├── commands.ts
-│   │   │   └── wallet.ts
+│   │   │   └── commands.ts
 │   │   └── styles/
 │   └── tests/
 │       └── e2e/
 │           ├── playwright.config.ts
 │           ├── auth.spec.ts
-│           ├── gameplay.spec.ts
-│           └── payments.spec.ts
-│
-├── contracts/                  # Solidity (Payment Hub)
-│   ├── foundry.toml
-│   ├── src/
-│   │   ├── PaymentHub.sol
-│   │   ├── PaymentHubLogic.sol
-│   │   └── PriceOracle.sol
-│   ├── script/
-│   │   └── Deploy.s.sol
-│   └── test/
-│       ├── PaymentHub.t.sol
-│       └── PriceOracle.t.sol
+│           └── gameplay.spec.ts
 │
 └── scripts/
     ├── dev-cluster.sh          # Spin up 3-node local cluster
     ├── migrate.sh              # DB migrations
-    ├── seed-world.sh           # Create test universe with rooms
-    └── deploy-contracts.sh     # Deploy to testnet/mainnet
+    └── seed-world.sh           # Create test universe with rooms
 ```
 
 ### Build Commands
@@ -192,12 +166,10 @@ all: build
 build:
 	cd server && cargo build --release
 	cd client && npm run build
-	cd contracts && forge build
 
 test:
 	cd server && cargo test
 	cd client && npm test
-	cd contracts && forge test
 
 dev:
 	docker-compose up -d
@@ -207,33 +179,11 @@ dev:
 lint:
 	cd server && cargo clippy
 	cd client && npm run lint
-	cd contracts && forge fmt --check
 ```
 
-## 3. Payments
+## 3. Credits
 
-HemiMUD uses **Hemi Payment Hub** for blockchain payments. See separate spec: `hemi-payment-hub-spec.md`
-
-**Integration points:**
-- Platform vendor wallet: Receives universe creation fees, hosting fees
-- Universe vendor wallet: Each universe owner registers as vendor, receives credit purchases
-- Credit purchase: Client calls `hub.pull(user, token, usdAmount)` via universe's vendor wallet
-
-### Credit System (HemiMUD-Specific)
-
-Credits are universe-scoped, in-game currency. One-way conversion: crypto → credits (no withdrawal).
-
-**Why one-way:**
-- Avoids money transmitter regulations
-- Simplifies accounting
-- Prevents arbitrage between universes
-- Credits are consumable game resources, not stored value
-
-**Purchase flow:**
-1. User clicks "Buy 1000 credits for $10"
-2. Client calls Payment Hub `pull(user, USDC, 10_000000)`
-3. On success: server credits user's universe account via Raft log entry
-4. On failure: UI shows "top up collateral" message
+Credits are universe-scoped, in-game currency. How credits are purchased is out of scope here; the parked blockchain payment design is in `docs/blockchain.md`.
 
 ## 4. Game Server Architecture
 
@@ -259,10 +209,9 @@ Flow:
 
 ```rust
 pub enum GameLogEntry {
-    CreateUniverse { universe_id, name, owner_account_id, vendor_wallet, initial_config },
+    CreateUniverse { universe_id, name, owner_account_id, initial_config },
     DeleteUniverse { universe_id },
     Mutations { universe_id, sql_statements: Vec<String> },
-    DepositCredits { universe_id, account_id, wallet_address, amount, tx_hash, block_number },
     StoreCode { universe_id, hash, code, author_account_id },
 }
 ```
@@ -282,8 +231,6 @@ Three trigger types on leader:
 ```toml
 node_id = 1
 peers = ["10.0.1.1:9000", "10.0.1.2:9000", "10.0.1.3:9000"]
-owner_wallet = "0x..."  # Server owner receives platform fees
-hemi_rpc_url = "https://rpc.hemi.network"
 venice_api_key = "venice-..."
 venice_api_url = "https://api.venice.ai/api/v1"
 ```
@@ -316,7 +263,6 @@ venice_api_url = "https://api.venice.ai/api/v1"
 ```sql
 CREATE TABLE accounts (
     id TEXT PRIMARY KEY,
-    wallet_address TEXT UNIQUE NOT NULL,
     username TEXT UNIQUE,
     created_at INTEGER NOT NULL,
     last_login INTEGER,
@@ -329,7 +275,6 @@ CREATE TABLE universes (
     name TEXT NOT NULL,
     slug TEXT UNIQUE NOT NULL,
     owner_account_id TEXT REFERENCES accounts(id),
-    vendor_wallet TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     is_official BOOLEAN DEFAULT FALSE,
     status TEXT DEFAULT 'active'
@@ -482,7 +427,7 @@ thing (root)
 │   ├── handlers: heart_beat, on_damage, on_death
 │   │
 │   ├── player
-│   │   ├── access_level, assigned_regions, wallet_address
+│   │   ├── access_level, assigned_regions
 │   │   ├── actions = {}  -- contextual verbs added by init()
 │   │   └── handlers: on_disconnect
 │   │
@@ -895,7 +840,7 @@ When Venice unavailable: text-only, procedural gradients, or sprite-only.
 
 ### Stack
 
-React 18+, TypeScript, Vite, Zustand (state), Viem + wagmi (blockchain), HTML5 Canvas (room rendering)
+React 18+, TypeScript, Vite, Zustand (state), HTML5 Canvas (room rendering)
 
 ### WebSocket Protocol
 
@@ -932,15 +877,6 @@ interface RoomState {
 
 ## 10. Pricing & Economics
 
-### Credit Packages (Universe-Configurable)
-
-```json
-[
-  { "usd": 5, "credits": 500 },
-  { "usd": 20, "credits": 2200, "bonus_pct": 10 },
-  { "usd": 100, "credits": 12000, "bonus_pct": 20 }
-]
-```
 
 ### Default Costs
 
@@ -968,7 +904,7 @@ Players pay **credits** (in-game) to universe. Server operator pays **DIEM token
 | player | Move, interact, own inventory, run allowed commands |
 | builder | Create/edit rooms and objects in `assigned_regions` only |
 | wizard | Execute arbitrary code, create regions, moderate players |
-| admin | Universe config, billing, user management |
+| admin | Universe config, user management |
 | owner | Full control, can delete universe |
 
 ```lua
@@ -1906,7 +1842,7 @@ Return aggregated view: `{ aggregated: true, player_count, notable_entities[], c
 
 Located at `server/src/lua/stdlib/tests/game_logic_tests.lua`. Run via `cargo test --test test_lua_game_logic`.
 
-These tests validate that player-facing game mechanics work as expected before adding infrastructure complexity (Raft, auth, payments).
+These tests validate that player-facing game mechanics work as expected before adding infrastructure complexity (Raft, auth).
 
 **User Story 1: Wizard Creates Region**
 - `test_region_creation_basic` - Region with metadata (environment, danger_level)
@@ -1967,12 +1903,10 @@ These tests validate that player-facing game mechanics work as expected before a
 ### REST Endpoints
 
 ```
-POST /api/auth/challenge     -> { challenge, expires }
-POST /api/auth/verify        -> { token, account }
+POST /api/auth/login         -> { token, account }
 GET  /api/universes          -> universe[]
 POST /api/universes          -> universe (create)
 GET  /api/universes/:id      -> universe details
-POST /api/credits/purchase   -> { success, new_balance }
 ```
 
 ### WebSocket
@@ -1986,7 +1920,7 @@ POST /api/credits/purchase   -> { success, new_balance }
 ```bash
 # From repo root
 make dev          # Starts server + client in dev mode
-make test         # Runs all tests (server, client, contracts)
+make test         # Runs all tests (server, client)
 ./scripts/dev-cluster.sh  # Spin up 3-node local Raft cluster
 ```
 
@@ -2030,7 +1964,7 @@ Phase 3-4 (Days 6-10):  Object System + Rooms/Movement
 Phase 5-6 (Days 11-16): WebSocket + Combat ← GAME PLAYABLE HERE
 Phase 7   (Days 17-19): Persistence
 Phase 8   (Days 20-24): Raft Replication ← PRODUCTION-READY HERE
-Phase 9+  (Days 25+):   Auth, Payments, Venice, Client
+Phase 9+  (Days 25+):   Auth, Venice, Client
 ```
 
 **Key insight**: Phases 1-6 produce a fully playable single-node game server. All game logic validation happens BEFORE adding Raft complexity. This means:
@@ -2515,100 +2449,28 @@ async fn test_snapshot_recovery() {
 
 ### Phase 9: Authentication (Days 25-27)
 
-**Goal**: Wallet-based auth with JWT sessions.
+**Goal**: Account-based auth with session tokens.
 
 **Tasks**:
-- Implement challenge-response: server sends nonce, client signs with wallet
-- Implement signature verification (ethers-rs or alloy)
-- Implement JWT token generation and validation
-- Implement account creation on first login
+- Implement account registration and login (username/password)
+- Issue session tokens and validate them on WebSocket connect
 - Replace test tokens with real auth flow
 
-**Integration Tests**:
-```rust
-#[tokio::test]
-async fn test_wallet_auth_flow() {
-    let server = start_test_server().await;
-    let wallet = LocalWallet::random();
-    
-    // Get challenge
-    let challenge = server.get_challenge(wallet.address()).await;
-    
-    // Sign challenge
-    let signature = wallet.sign_message(&challenge.message).await.unwrap();
-    
-    // Verify and get token
-    let auth = server.verify_signature(wallet.address(), &signature).await.unwrap();
-    assert!(!auth.token.is_empty());
-    
-    // Use token for WebSocket
-    let mut ws = connect_async(&server.ws_url()).await.unwrap().0;
-    ws.send(Message::Text(format!(r#"{{"type":"auth","token":"{}"}}"#, auth.token))).await.unwrap();
-    let response = ws.next().await.unwrap().unwrap();
-    assert!(response.to_text().unwrap().contains("auth_ok"));
-}
-
-#[tokio::test]
-async fn test_invalid_signature_rejected() {
-    let server = start_test_server().await;
-    let wallet = LocalWallet::random();
-    let other_wallet = LocalWallet::random();
-    
-    let challenge = server.get_challenge(wallet.address()).await;
-    let bad_signature = other_wallet.sign_message(&challenge.message).await.unwrap();
-    
-    let result = server.verify_signature(wallet.address(), &bad_signature).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_account_created_on_first_login() {
-    let server = start_test_server().await;
-    let wallet = LocalWallet::random();
-    
-    assert!(server.get_account(wallet.address()).await.is_none());
-    
-    // Complete auth flow
-    server.full_auth_flow(&wallet).await.unwrap();
-    
-    assert!(server.get_account(wallet.address()).await.is_some());
-}
-```
-
-**Validation Gate**: Players authenticate with real wallet signatures.
+(Wallet-based authentication is parked in `docs/blockchain.md`.)
 
 ---
 
-### Phase 10: Payment Integration (Days 28-30)
+### Phase 10: Credit Consumption (Days 28-30)
 
-**Goal**: Credits can be purchased via Payment Hub.
+**Goal**: Game actions can consume universe credits.
 
 **Tasks**:
-- Integrate with Hemi Payment Hub contract (read-only for balance check)
-- Implement credit purchase endpoint
-- Server calls `hub.pull()` on behalf of universe vendor
-- On success: add credits via Raft log entry
 - Implement credit deduction for game actions
 
-**Integration Tests** (requires testnet or mock):
-```rust
-#[tokio::test]
-async fn test_credit_purchase_flow() {
-    let server = start_test_server_with_mock_hub().await;
-    let wallet = test_wallet_with_balance();
-    
-    // Set budget for our vendor
-    server.mock_hub.set_budget(wallet.address(), server.vendor_wallet(), 100_000000);
-    
-    // Purchase credits
-    let result = server.purchase_credits(&wallet, 10_000000).await; // $10
-    assert!(result.is_ok());
-    
-    // Verify credits added
-    let credits = server.get_credits(wallet.address(), "universe1").await;
-    assert_eq!(credits, 1000); // $10 = 1000 credits at default rate
-}
+(Credit purchase via blockchain payments is parked in `docs/blockchain.md`.)
 
+**Integration Tests**:
+```rust
 #[tokio::test]
 async fn test_credit_deduction_on_action() {
     let server = start_test_server().await;
@@ -2631,7 +2493,7 @@ async fn test_insufficient_credits_blocks_action() {
 }
 ```
 
-**Validation Gate**: Full credit purchase and consumption flow works.
+**Validation Gate**: Credit consumption flow works.
 
 ---
 
@@ -2721,19 +2583,17 @@ async fn test_bot_rate_limiting() {
 
 **Tasks**:
 - Vite + React + TypeScript setup
-- Wallet connection (wagmi + viem)
 - WebSocket connection manager
 - Room display with canvas rendering
 - Command input and history
 - Chat/event log display
 - Credit balance display
-- Payment Hub deposit/budget UI
 
 **Integration Tests** (Playwright/Cypress):
 ```typescript
 test('player can connect and move', async ({ page }) => {
   await page.goto('/');
-  await connectWallet(page, testWallet);
+  await login(page, testUser);
   await page.waitForSelector('[data-testid="room-name"]');
   
   expect(await page.textContent('[data-testid="room-name"]')).toBe('Starting Room');
@@ -2742,20 +2602,6 @@ test('player can connect and move', async ({ page }) => {
   await page.press('[data-testid="command-input"]', 'Enter');
   
   await page.waitForSelector('[data-testid="room-name"]:has-text("North Room")');
-});
-
-test('player can purchase credits', async ({ page }) => {
-  await page.goto('/');
-  await connectWallet(page, testWalletWithBalance);
-  
-  await page.click('[data-testid="buy-credits"]');
-  await page.click('[data-testid="package-1000"]');
-  await page.click('[data-testid="confirm-purchase"]');
-  
-  // Approve transaction in wallet mock
-  await approveTransaction(page);
-  
-  await page.waitForSelector('[data-testid="credit-balance"]:has-text("1000")');
 });
 ```
 
@@ -2774,20 +2620,17 @@ server/tests/
 │   └── cluster.rs     # spawn_cluster()
 ├── mocks/
 │   ├── mod.rs
-│   ├── venice.rs      # MockVenice HTTP server
-│   └── payment_hub.rs # In-memory contract simulation
+│   └── venice.rs      # MockVenice HTTP server
 ├── fixtures/
 │   ├── mod.rs
 │   ├── world.rs       # setup_test_world() - rooms, exits, players
-│   ├── combat.rs      # setup_combat_test() - combat-ready entities
-│   └── wallets.rs     # Pre-funded test wallets
+│   └── combat.rs      # setup_combat_test() - combat-ready entities
 └── common.rs          # setup_test_env(), connect_and_auth()
 ```
 
 **E2E Tests** (in `client/tests/e2e/`):
-- `auth.spec.ts` - Wallet connection, login flow
+- `auth.spec.ts` - Login flow
 - `gameplay.spec.ts` - Movement, combat, chat
-- `payments.spec.ts` - Credit purchase flow
 
 **CI Pipeline** (`.github/workflows/ci.yml`):
 ```yaml
@@ -2803,12 +2646,6 @@ jobs:
     steps:
       - run: cd client && npm ci && npm test
       - run: cd client && npm run lint
-  
-  contracts:
-    runs-on: ubuntu-latest
-    steps:
-      - run: cd contracts && forge test
-      - run: cd contracts && forge fmt --check
   
   e2e:
     needs: [server, client]
