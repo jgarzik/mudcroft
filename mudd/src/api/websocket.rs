@@ -435,7 +435,6 @@ async fn handle_socket(
         run_hook(
             &state,
             &player_id,
-            &account_id,
             Hook::new(
                 &room_id,
                 Some(&room_id),
@@ -559,7 +558,7 @@ async fn handle_client_message(
                 state.connections.send_to_player(player_id, response).await;
             }
             for hook in deferred {
-                run_hook(state, player_id, account_id, hook).await;
+                run_hook(state, player_id, hook).await;
             }
         }
         ClientMessage::Ping => {
@@ -724,18 +723,22 @@ impl Hook {
     }
 }
 
-/// Run an object hook as the player (errors are logged, not shown)
-async fn run_hook(state: &AppState, player_id: &str, account_id: &str, hook: Hook) {
+/// Run an object hook triggered by a player. The hook runs as the
+/// object's owner (see scripting::invoke_handler); errors are logged.
+async fn run_hook(state: &AppState, player_id: &str, hook: Hook) {
     let Some(universe_id) = state.connections.get_universe_id(player_id).await else {
         return;
     };
-    let ctx = ScriptContext {
-        universe_id,
-        user_id: Some(account_id.to_string()),
-        room_id: hook.room_id,
-        object_id: Some(hook.object_id.clone()),
-    };
-    if let Err(e) = scripting::invoke_handler(state, &ctx, hook.method, hook.args).await {
+    if let Err(e) = scripting::invoke_handler(
+        state,
+        &universe_id,
+        &hook.object_id,
+        hook.room_id,
+        hook.method,
+        hook.args,
+    )
+    .await
+    {
         warn!("{} hook on {} failed: {}", hook.method, hook.object_id, e);
     }
 }
@@ -816,7 +819,6 @@ async fn execute_command(
             run_hook(
                 state,
                 player_id,
-                account_id,
                 Hook::new(
                     &current_room_id,
                     Some(&current_room_id),
@@ -976,7 +978,6 @@ async fn execute_command(
                         run_hook(
                             state,
                             player_id,
-                            account_id,
                             Hook::new(
                                 from_id,
                                 Some(from_id),
@@ -1335,7 +1336,7 @@ async fn execute_command(
         }
         _ => {
             let args = parts[1..].join(" ");
-            match dispatch_custom_verb(state, player_id, account_id, &verb, &args).await {
+            match dispatch_custom_verb(state, player_id, access_level, &verb, &args).await {
                 Some(reply) => reply,
                 None => ServerMessage::Output {
                     text: format!("Unknown command: {}", verb),
@@ -1351,21 +1352,17 @@ async fn execute_command(
 /// object actions on inventory items, on objects in the room, and on the
 /// room itself. When the player names a target ("pull lever"), a candidate
 /// whose object name contains it wins; otherwise the first candidate does.
-/// The handler gets {verb, args, actor_id, object_id, room_id}; a string
-/// result becomes the reply.
+/// The handler runs as the object's owner and gets {verb, args, actor_id,
+/// object_id, room_id}; a string result becomes the reply.
 async fn dispatch_custom_verb(
     state: &AppState,
     player_id: &str,
-    account_id: &str,
+    access_level: AccessLevel,
     verb: &str,
     args: &str,
 ) -> Option<ServerMessage> {
     let room_id = state.connections.get_room_id(player_id).await;
 
-    let mut candidates = Vec::new();
-    if let Some(ref room) = room_id {
-        candidates.extend(state.actions.get_room_actions(room, verb).await);
-    }
     let mut nearby: Vec<String> = Vec::new();
     if let Ok(items) = state.object_store.get_contents(player_id).await {
         nearby.extend(items.into_iter().map(|o| o.id));
@@ -1375,6 +1372,18 @@ async fn dispatch_custom_verb(
             nearby.extend(objs.into_iter().map(|o| o.id));
         }
         nearby.push(room.clone());
+    }
+    // Room actions only count when their object is actually nearby
+    let mut candidates = Vec::new();
+    if let Some(ref room) = room_id {
+        candidates.extend(
+            state
+                .actions
+                .get_room_actions(room, verb)
+                .await
+                .into_iter()
+                .filter(|a| nearby.contains(&a.object_id)),
+        );
     }
     for object_id in &nearby {
         if let Some(action) = state.actions.get_object_action(object_id, verb).await {
@@ -1406,12 +1415,6 @@ async fn dispatch_custom_verb(
     }
 
     let universe_id = state.connections.get_universe_id(player_id).await?;
-    let ctx = ScriptContext {
-        universe_id,
-        user_id: Some(account_id.to_string()),
-        room_id: room_id.clone(),
-        object_id: Some(chosen.object_id.clone()),
-    };
     let handler_args = serde_json::json!({
         "verb": verb,
         "args": args,
@@ -1419,15 +1422,35 @@ async fn dispatch_custom_verb(
         "object_id": chosen.object_id,
         "room_id": room_id,
     });
-    Some(
-        match scripting::invoke_handler(state, &ctx, &chosen.method, handler_args).await {
-            Ok(Some(text)) if text != "nil" => ServerMessage::Output { text },
-            Ok(_) => ServerMessage::Output {
-                text: String::new(),
-            },
-            Err(message) => ServerMessage::Error { message },
-        },
+    let result = scripting::invoke_handler(
+        state,
+        &universe_id,
+        &chosen.object_id,
+        room_id,
+        &chosen.method,
+        handler_args,
     )
+    .await;
+    Some(match result {
+        Ok(Some(text)) if text != "nil" => ServerMessage::Output { text },
+        Ok(_) => ServerMessage::Output {
+            text: String::new(),
+        },
+        Err(message) => {
+            warn!(
+                "{} handler on {} failed: {}",
+                verb, chosen.object_id, message
+            );
+            // Script internals are for builders' eyes only
+            if access_level >= AccessLevel::Wizard {
+                ServerMessage::Error { message }
+            } else {
+                ServerMessage::Error {
+                    message: "Something went wrong.".to_string(),
+                }
+            }
+        }
+    })
 }
 
 /// Execute Lua code in sandbox with game API

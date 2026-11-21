@@ -952,15 +952,57 @@ impl GameApi {
     fn register_action_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let actions = self.actions.clone();
         let room_id = self.current_room_id.clone();
+        // (store, permissions, real user, universe) for the Modify check
+        let perm_ctx = (
+            self.store.clone(),
+            self.permissions.clone(),
+            self.current_user_id.clone(),
+            self.universe_id.clone(),
+        );
+
+        /// Whether the acting user may modify `object_id` (required to add
+        /// or remove its actions)
+        fn may_modify(
+            lua: &Lua,
+            perm_ctx: &(
+                Arc<ObjectStore>,
+                Arc<PermissionManager>,
+                Option<String>,
+                String,
+            ),
+            object_id: &str,
+        ) -> bool {
+            let (store, permissions, user, universe_id) = perm_ctx.clone();
+            let user = actor_override(lua).or(user);
+            let object_id = object_id.to_string();
+            block_on_perm(async move {
+                let Ok(Some(obj)) = store.get(&object_id).await else {
+                    return false;
+                };
+                object_permission(
+                    &permissions,
+                    user.as_deref(),
+                    &universe_id,
+                    &obj,
+                    PermAction::Modify,
+                )
+                .await
+                .is_ok()
+            })
+        }
 
         // game.add_action(verb, object_id, method)
         // Adds a contextual action for the current room
         let actions_clone = actions.clone();
         let room_id_clone = room_id.clone();
+        let perm_clone = perm_ctx.clone();
         let add_action = lua.create_function(
-            move |_, (verb, object_id, method): (String, String, String)| {
+            move |lua, (verb, object_id, method): (String, String, String)| {
                 let actions = actions_clone.clone();
                 let room_id = room_id_clone.clone();
+                if !may_modify(lua, &perm_clone, &object_id) {
+                    return Ok(false);
+                }
 
                 // Use blocking task since we're in sync Lua context
                 // In production, this would be handled differently
@@ -998,9 +1040,12 @@ impl GameApi {
         let actions_clone = actions.clone();
         let room_id_clone = room_id;
         let remove_action =
-            lua.create_function(move |_, (verb, object_id): (String, String)| {
+            lua.create_function(move |lua, (verb, object_id): (String, String)| {
                 let actions = actions_clone.clone();
                 let room_id = room_id_clone.clone();
+                if !may_modify(lua, &perm_ctx, &object_id) {
+                    return Ok(false);
+                }
 
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();

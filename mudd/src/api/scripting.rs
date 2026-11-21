@@ -70,27 +70,38 @@ pub async fn run_lua(
 
 /// Call handler `method` on an object's attached code (`code_hash`).
 ///
+/// The code runs **as the object's owner** (LPC-style effective user), never
+/// as whoever triggered it: the triggering player is only data in `args`.
+/// Otherwise code planted by a lower-privileged author would borrow the
+/// privileges of anyone who walks into it. Objects without an owner run
+/// with no user, so permission-checked writes fail.
+///
 /// The object's code must evaluate to a table of handler functions; the
-/// handler receives `args` converted to a Lua table. `ctx.object_id` must be
-/// the object. Returns `Ok(None)` when the object has no code or no such
-/// handler, otherwise the handler's result rendered as text.
+/// handler receives `args` converted to a Lua table. Returns `Ok(None)`
+/// when the object has no code or no such handler, otherwise the handler's
+/// result rendered as text.
 pub async fn invoke_handler(
     state: &AppState,
-    ctx: &ScriptContext,
+    universe_id: &str,
+    object_id: &str,
+    room_id: Option<String>,
     method: &str,
     args: serde_json::Value,
 ) -> Result<Option<String>, String> {
-    let Some(object_id) = ctx.object_id.as_deref() else {
-        return Err("invoke_handler: no object context".to_string());
-    };
-    let Some(code) = object_code(state, object_id, &ctx.universe_id).await? else {
+    let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
         return Ok(None);
     };
-    let libs = load_universe_lib_codes(state, &ctx.universe_id).await?;
+    let ctx = ScriptContext {
+        universe_id: universe_id.to_string(),
+        user_id: owner_id,
+        room_id,
+        object_id: Some(object_id.to_string()),
+    };
+    let libs = load_universe_lib_codes(state, universe_id).await?;
     let queue = MessageQueue::shared();
 
     let result = {
-        let mut sandbox = prepare(state, ctx, &queue, &libs, SandboxConfig::default())?;
+        let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
         call_handler(&mut sandbox, &code, method, &args)
     };
 
@@ -103,8 +114,8 @@ const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Fire due call_out timers and heartbeats forever.
 ///
-/// Each callback runs the named handler on the object's code, as the
-/// object's owner, with {object_id, room_id, args}.
+/// Each callback runs the named handler on the object's code (as the
+/// object's owner, see [`invoke_handler`]) with {object_id, room_id, args}.
 pub async fn run_timer_loop(state: AppState) {
     let mut interval = tokio::time::interval(TIMER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -123,18 +134,21 @@ pub async fn run_timer_loop(state: AppState) {
                     continue;
                 }
             };
-            let ctx = ScriptContext {
-                universe_id: fired.universe_id.clone(),
-                user_id: None,
-                room_id: room_id.clone(),
-                object_id: Some(fired.object_id.clone()),
-            };
             let args = serde_json::json!({
                 "object_id": fired.object_id,
                 "room_id": room_id,
                 "args": fired.args,
             });
-            if let Err(e) = invoke_handler(&state, &ctx, &fired.method, args).await {
+            if let Err(e) = invoke_handler(
+                &state,
+                &fired.universe_id,
+                &fired.object_id,
+                room_id,
+                &fired.method,
+                args,
+            )
+            .await
+            {
                 tracing::warn!(
                     "Timer {} on {} failed: {}",
                     fired.method,
@@ -146,13 +160,13 @@ pub async fn run_timer_loop(state: AppState) {
     }
 }
 
-/// Source of an object's attached code, if any. Objects from another
-/// universe never run in this one.
+/// An object's attached code and its owner, if it has code. Objects from
+/// another universe never run in this one.
 async fn object_code(
     state: &AppState,
     object_id: &str,
     universe_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, Option<String>)>, String> {
     let obj = match state.object_store.get(object_id).await {
         Ok(Some(obj)) => obj,
         Ok(None) => return Ok(None),
@@ -167,11 +181,12 @@ async fn object_code(
     let Some(hash) = obj.code_hash else {
         return Ok(None);
     };
-    state
+    let code = state
         .object_store
         .get_code(&hash)
         .await
-        .map_err(|e| format!("Failed to load code {}: {}", hash, e))
+        .map_err(|e| format!("Failed to load code {}: {}", hash, e))?;
+    Ok(code.map(|c| (c, obj.owner_id)))
 }
 
 /// Evaluate object code to its handler table and call `method`
