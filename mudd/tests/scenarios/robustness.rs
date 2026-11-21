@@ -250,3 +250,86 @@ async fn test_run_script_requires_auth_first() {
         .unwrap();
     assert_eq!(resp.status(), 401);
 }
+
+/// One account may play two universes at once: the sessions are independent
+#[tokio::test]
+async fn test_one_account_in_two_universes() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let server = TestServer::start().await.expect("server");
+    sqlx::query(
+        "INSERT INTO universes (id, name, owner_id, config)
+         SELECT 'second-world', 'Second', owner_id, config FROM universes WHERE id = ?",
+    )
+    .bind(server.universe_id())
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let mut hall = mudd::objects::Object::new("/rooms/hall", "second-world", "room").unwrap();
+    hall.set_property("name", serde_json::json!("Second Hall"));
+    server.world().store().create(&hall).await.unwrap();
+    server
+        .world()
+        .store()
+        .set_portal("second-world", "/rooms/hall")
+        .await
+        .unwrap();
+
+    let reg: serde_json::Value = server
+        .post(
+            "/auth/register",
+            &serde_json::json!({"username": "two_worlds", "password": "test123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = reg["token"].as_str().unwrap().to_string();
+    let url = |u: &str| format!("ws://{}/ws?universe={}&token={}", server.addr, u, token);
+
+    let (mut a, _) = tokio_tungstenite::connect_async(url(server.universe_id()))
+        .await
+        .unwrap();
+    let (mut b, _) = tokio_tungstenite::connect_async(url("second-world"))
+        .await
+        .unwrap();
+
+    async fn look(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> String {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        ws.send(Message::Text(
+            serde_json::json!({"type": "command", "text": "look"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                let v: serde_json::Value =
+                    serde_json::from_str(msg.to_text().unwrap_or("{}")).unwrap_or_default();
+                if v["type"] == "room" {
+                    return v["name"].as_str().unwrap_or_default().to_string();
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    assert_eq!(look(&mut a).await, "Cave Entrance");
+    assert_eq!(look(&mut b).await, "Second Hall");
+
+    // Closing one session leaves the other working
+    a.close(None).await.ok();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(look(&mut b).await, "Second Hall");
+}

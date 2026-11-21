@@ -31,25 +31,29 @@ pub struct PlayerSession {
     pub room_id: Option<String>,
     pub access_level: AccessLevel,
     pub sender: mpsc::Sender<ServerMessage>,
+    /// Unique per WebSocket connection, so a replaced connection's cleanup
+    /// never removes its replacement
+    pub conn_id: u64,
+}
+
+/// Sessions are keyed by (universe, player): player ids are per universe,
+/// and one account may play several universes at once
+type SessionKey = (String, String);
+
+fn key(universe_id: &str, player_id: &str) -> SessionKey {
+    (universe_id.to_string(), player_id.to_string())
 }
 
 /// Grace period for reconnection (prevents inventory drop on brief disconnects)
 const RECONNECT_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Connection manager for all active WebSocket connections
+#[derive(Default)]
 pub struct ConnectionManager {
-    sessions: RwLock<BTreeMap<String, PlayerSession>>,
+    sessions: RwLock<BTreeMap<SessionKey, PlayerSession>>,
     /// Pending disconnect tasks that can be cancelled on reconnect
-    pending_disconnects: RwLock<BTreeMap<String, tokio::sync::oneshot::Sender<()>>>,
-}
-
-impl Default for ConnectionManager {
-    fn default() -> Self {
-        Self {
-            sessions: RwLock::new(BTreeMap::new()),
-            pending_disconnects: RwLock::new(BTreeMap::new()),
-        }
-    }
+    pending_disconnects: RwLock<BTreeMap<SessionKey, tokio::sync::oneshot::Sender<()>>>,
+    next_conn_id: std::sync::atomic::AtomicU64,
 }
 
 impl ConnectionManager {
@@ -57,9 +61,20 @@ impl ConnectionManager {
         Self::default()
     }
 
+    /// A fresh connection id
+    pub fn next_conn_id(&self) -> u64 {
+        self.next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Cancel any pending disconnect for this player (called on reconnect)
-    pub async fn cancel_pending_disconnect(&self, player_id: &str) -> bool {
-        if let Some(cancel_tx) = self.pending_disconnects.write().await.remove(player_id) {
+    pub async fn cancel_pending_disconnect(&self, universe_id: &str, player_id: &str) -> bool {
+        let pending = self
+            .pending_disconnects
+            .write()
+            .await
+            .remove(&key(universe_id, player_id));
+        if let Some(cancel_tx) = pending {
             // Send cancel signal - ignore result since receiver may be dropped
             let _ = cancel_tx.send(());
             info!("Cancelled pending disconnect for player {}", player_id);
@@ -72,38 +87,61 @@ impl ConnectionManager {
     /// Schedule a delayed disconnect (grace period for reconnection)
     pub async fn schedule_disconnect(
         &self,
-        player_id: String,
+        universe_id: &str,
+        player_id: &str,
     ) -> tokio::sync::oneshot::Receiver<()> {
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         self.pending_disconnects
             .write()
             .await
-            .insert(player_id, cancel_tx);
+            .insert(key(universe_id, player_id), cancel_tx);
         cancel_rx
     }
 
     /// Remove pending disconnect entry after grace period expires
-    pub async fn clear_pending_disconnect(&self, player_id: &str) {
-        self.pending_disconnects.write().await.remove(player_id);
+    pub async fn clear_pending_disconnect(&self, universe_id: &str, player_id: &str) {
+        self.pending_disconnects
+            .write()
+            .await
+            .remove(&key(universe_id, player_id));
     }
 
-    /// Register a new player session
+    /// Register a player session. A previous connection for the same
+    /// (universe, player) is replaced: its sender is dropped, which ends that
+    /// connection's loop.
     pub async fn register(&self, session: PlayerSession) {
-        let player_id = session.player_id.clone();
-        self.sessions.write().await.insert(player_id, session);
+        let k = key(&session.universe_id, &session.player_id);
+        self.sessions.write().await.insert(k, session);
     }
 
-    /// Remove a player session
-    pub async fn unregister(&self, player_id: &str) {
-        self.sessions.write().await.remove(player_id);
+    /// Remove a player session, but only if it is still `conn_id`'s
+    pub async fn unregister(&self, universe_id: &str, player_id: &str, conn_id: u64) {
+        let mut sessions = self.sessions.write().await;
+        let k = key(universe_id, player_id);
+        if sessions.get(&k).is_some_and(|s| s.conn_id == conn_id) {
+            sessions.remove(&k);
+        }
     }
 
-    /// Get a player's sender channel
-    pub async fn get_sender(&self, player_id: &str) -> Option<mpsc::Sender<ServerMessage>> {
+    /// Whether `conn_id` is still the live connection for this player
+    pub async fn is_current(&self, universe_id: &str, player_id: &str, conn_id: u64) -> bool {
         self.sessions
             .read()
             .await
-            .get(player_id)
+            .get(&key(universe_id, player_id))
+            .is_some_and(|s| s.conn_id == conn_id)
+    }
+
+    /// Get a player's sender channel
+    pub async fn get_sender(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+    ) -> Option<mpsc::Sender<ServerMessage>> {
+        self.sessions
+            .read()
+            .await
+            .get(&key(universe_id, player_id))
             .map(|s| s.sender.clone())
     }
 
@@ -112,20 +150,22 @@ impl ConnectionManager {
     /// Never blocks: if the player's queue is full (a client that stopped
     /// reading) the message is dropped, so one slow client cannot stall
     /// other players or the player's own command handler.
-    pub async fn send_to_player(&self, player_id: &str, msg: ServerMessage) {
-        if let Some(sender) = self.get_sender(player_id).await {
+    pub async fn send_to_player(&self, universe_id: &str, player_id: &str, msg: ServerMessage) {
+        if let Some(sender) = self.get_sender(universe_id, player_id).await {
             try_deliver(player_id, &sender, msg);
         }
     }
 
     /// Broadcast a message to all players in a room
-    pub async fn broadcast_room(&self, room_id: &str, msg: ServerMessage) {
-        self.broadcast_room_except(room_id, None, msg).await;
+    pub async fn broadcast_room(&self, universe_id: &str, room_id: &str, msg: ServerMessage) {
+        self.broadcast_room_except(universe_id, room_id, None, msg)
+            .await;
     }
 
     /// Broadcast to all players in a room except `exclude_id` (if given)
     pub async fn broadcast_room_except(
         &self,
+        universe_id: &str,
         room_id: &str,
         exclude_id: Option<&str>,
         msg: ServerMessage,
@@ -137,7 +177,9 @@ impl ConnectionManager {
             .await
             .values()
             .filter(|s| {
-                s.room_id.as_deref() == Some(room_id) && Some(s.player_id.as_str()) != exclude_id
+                s.universe_id == universe_id
+                    && s.room_id.as_deref() == Some(room_id)
+                    && Some(s.player_id.as_str()) != exclude_id
             })
             .map(|s| (s.player_id.clone(), s.sender.clone()))
             .collect();
@@ -146,39 +188,37 @@ impl ConnectionManager {
         }
     }
 
-    /// (player_id, room_id) for every connected player that is in a room
-    pub async fn player_rooms(&self) -> Vec<(String, String)> {
+    /// (player_id, room_id) for every connected player in the universe
+    /// that is in a room
+    pub async fn player_rooms(&self, universe_id: &str) -> Vec<(String, String)> {
         self.sessions
             .read()
             .await
             .values()
+            .filter(|s| s.universe_id == universe_id)
             .filter_map(|s| s.room_id.clone().map(|r| (s.player_id.clone(), r)))
             .collect()
     }
 
     /// Update player's room
-    pub async fn update_room(&self, player_id: &str, room_id: Option<String>) {
-        if let Some(session) = self.sessions.write().await.get_mut(player_id) {
+    pub async fn update_room(&self, universe_id: &str, player_id: &str, room_id: Option<String>) {
+        if let Some(session) = self
+            .sessions
+            .write()
+            .await
+            .get_mut(&key(universe_id, player_id))
+        {
             session.room_id = room_id;
         }
     }
 
     /// Get player's current room ID
-    pub async fn get_room_id(&self, player_id: &str) -> Option<String> {
+    pub async fn get_room_id(&self, universe_id: &str, player_id: &str) -> Option<String> {
         self.sessions
             .read()
             .await
-            .get(player_id)
+            .get(&key(universe_id, player_id))
             .and_then(|s| s.room_id.clone())
-    }
-
-    /// Get player's universe ID
-    pub async fn get_universe_id(&self, player_id: &str) -> Option<String> {
-        self.sessions
-            .read()
-            .await
-            .get(player_id)
-            .map(|s| s.universe_id.clone())
     }
 }
 
@@ -344,7 +384,7 @@ async fn handle_socket(
     if !account_id.is_empty() {
         let was_reconnect = state
             .connections
-            .cancel_pending_disconnect(&player_id)
+            .cancel_pending_disconnect(&universe_id, &player_id)
             .await;
         if was_reconnect {
             info!("Player {} reconnected within grace period", player_id);
@@ -391,7 +431,8 @@ async fn handle_socket(
             .flatten()
     };
 
-    // Create session
+    // Create session (replacing any older connection for this player)
+    let conn_id = state.connections.next_conn_id();
     let session = PlayerSession {
         player_id: player_id.clone(),
         account_id: account_id.clone(),
@@ -399,6 +440,7 @@ async fn handle_socket(
         room_id: spawn_room_id.clone(),
         access_level,
         sender: tx,
+        conn_id,
     };
 
     state.connections.register(session).await;
@@ -465,8 +507,10 @@ async fn handle_socket(
     // Main loop: handle incoming messages and outgoing messages
     loop {
         tokio::select! {
-            // Handle outgoing messages from our channel
-            Some(msg) = rx.recv() => {
+            // Handle outgoing messages from our channel. The channel closes
+            // when a newer connection for this player replaces us.
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
                 if let Ok(json) = serde_json::to_string(&msg) {
                     if socket.send(Message::Text(json.into())).await.is_err() {
                         break;
@@ -488,16 +532,25 @@ async fn handle_socket(
         }
     }
 
-    // Unregister session immediately (stops message delivery)
-    state.connections.unregister(&player_id_clone).await;
+    // Unregister session immediately (stops message delivery). A connection
+    // that was replaced by a newer one leaves the new session alone, and
+    // the player is still connected: no disconnect handling.
+    let replaced = !state
+        .connections
+        .is_current(&universe_id, &player_id_clone, conn_id)
+        .await;
+    state
+        .connections
+        .unregister(&universe_id, &player_id_clone, conn_id)
+        .await;
     info!("WebSocket disconnected: {}", player_id_clone);
 
     // For authenticated users, use grace period before handling disconnect
     // This allows reconnection without dropping inventory
-    if !account_id.is_empty() {
+    if !account_id.is_empty() && !replaced {
         let cancel_rx = state
             .connections
-            .schedule_disconnect(player_id_clone.clone())
+            .schedule_disconnect(&universe_id, &player_id_clone)
             .await;
 
         // Clone what we need for the spawned task
@@ -510,7 +563,7 @@ async fn handle_socket(
             tokio::select! {
                 _ = tokio::time::sleep(RECONNECT_GRACE_PERIOD) => {
                     // Grace period expired - execute disconnect handling
-                    state_clone.connections.clear_pending_disconnect(&player_id_for_task).await;
+                    state_clone.connections.clear_pending_disconnect(&universe_for_task, &player_id_for_task).await;
                     if let Err(e) = state_clone.player_manager.handle_disconnect(&universe_for_task, &player_id_for_task).await {
                         warn!("Error handling player disconnect: {}", e);
                     }
@@ -542,6 +595,7 @@ async fn handle_client_message(
             state
                 .connections
                 .send_to_player(
+                    universe_id,
                     player_id,
                     ServerMessage::Echo {
                         command: text.clone(),
@@ -564,7 +618,10 @@ async fn handle_client_message(
             )
             .await;
             if !matches!(response, ServerMessage::Silent) {
-                state.connections.send_to_player(player_id, response).await;
+                state
+                    .connections
+                    .send_to_player(universe_id, player_id, response)
+                    .await;
             }
             for hook in deferred {
                 run_hook(state, universe_id, hook).await;
@@ -785,7 +842,7 @@ async fn execute_command(
     match verb.as_str() {
         "look" | "l" => {
             // Get player's current room
-            if let Some(room_id) = state.connections.get_room_id(player_id).await {
+            if let Some(room_id) = state.connections.get_room_id(universe_id, player_id).await {
                 let acct_ref = if account_id.is_empty() {
                     None
                 } else {
@@ -814,7 +871,8 @@ async fn execute_command(
             };
 
             // Get player's current room
-            let current_room_id = match state.connections.get_room_id(player_id).await {
+            let current_room_id = match state.connections.get_room_id(universe_id, player_id).await
+            {
                 Some(id) => id,
                 None => {
                     return ServerMessage::Output {
@@ -854,7 +912,7 @@ async fn execute_command(
             // Update player's room in memory
             state
                 .connections
-                .update_room(player_id, Some(dest_room_id.clone()))
+                .update_room(universe_id, player_id, Some(dest_room_id.clone()))
                 .await;
 
             // Sync to database for authenticated users
@@ -900,11 +958,12 @@ async fn execute_command(
                     message: "Say what?".to_string(),
                 };
             }
-            if let Some(room_id) = state.connections.get_room_id(player_id).await {
+            if let Some(room_id) = state.connections.get_room_id(universe_id, player_id).await {
                 let speaker = display_name(state, universe_id, player_id).await;
                 state
                     .connections
                     .broadcast_room_except(
+                        universe_id,
                         &room_id,
                         Some(player_id),
                         ServerMessage::Output {
@@ -947,7 +1006,7 @@ async fn execute_command(
             // Arguments are passed as values, never spliced into the source
             execute_lua_with_args(
                 state,
-                player_id,
+                universe_id,
                 account_id,
                 "local pid, item = ...; return Commands.take(pid, item).message",
                 vec![player_id.to_string(), item_name],
@@ -968,7 +1027,7 @@ async fn execute_command(
             // Arguments are passed as values, never spliced into the source
             execute_lua_with_args(
                 state,
-                player_id,
+                universe_id,
                 account_id,
                 "local pid, item = ...; return Commands.drop(pid, item).message",
                 vec![player_id.to_string(), item_name],
@@ -979,7 +1038,7 @@ async fn execute_command(
             // Execute Commands.inventory() via Lua
             execute_lua_with_args(
                 state,
-                player_id,
+                universe_id,
                 account_id,
                 "local pid = ...; return Commands.inventory(pid).message",
                 vec![player_id.to_string()],
@@ -1006,7 +1065,7 @@ async fn execute_command(
             // Verify room exists (in this universe)
             match state.object_store.get(universe_id, &room_id).await {
                 Ok(Some(room)) if room.class == "room" => {
-                    let from = state.connections.get_room_id(player_id).await;
+                    let from = state.connections.get_room_id(universe_id, player_id).await;
                     if let Some(ref from_id) = from {
                         run_hook(
                             state,
@@ -1026,7 +1085,7 @@ async fn execute_command(
                     // the player object, which get/drop and respawn use
                     state
                         .connections
-                        .update_room(player_id, Some(room_id.clone()))
+                        .update_room(universe_id, player_id, Some(room_id.clone()))
                         .await;
                     if !account_id.is_empty() {
                         if let Err(e) = state
@@ -1083,7 +1142,7 @@ async fn execute_command(
             let room_id = if parts.len() > 1 {
                 parts[1].to_string()
             } else {
-                match state.connections.get_room_id(player_id).await {
+                match state.connections.get_room_id(universe_id, player_id).await {
                     Some(id) => id,
                     None => {
                         return ServerMessage::Error {
@@ -1142,7 +1201,7 @@ async fn execute_command(
             }
 
             // Execute Lua code
-            execute_lua(state, player_id, account_id, code).await
+            execute_lua(state, universe_id, account_id, code).await
         }
         "attack" | "kill" => {
             // Get target name from args
@@ -1155,7 +1214,7 @@ async fn execute_command(
             };
 
             // Get player's current room
-            let room_id = match state.connections.get_room_id(player_id).await {
+            let room_id = match state.connections.get_room_id(universe_id, player_id).await {
                 Some(id) => id,
                 None => {
                     return ServerMessage::Error {
@@ -1234,15 +1293,7 @@ async fn execute_command(
             if state.combat.get_state(&target_id).await.is_none() {
                 state
                     .combat
-                    .init_entity_with_universe(
-                        &target_id,
-                        state
-                            .connections
-                            .get_universe_id(player_id)
-                            .await
-                            .as_deref(),
-                        target_max_hp,
-                    )
+                    .init_entity_with_universe(&target_id, Some(universe_id), target_max_hp)
                     .await;
                 // Set current HP to match object property
                 if let Some(mut combat_state) = state.combat.get_state(&target_id).await {
@@ -1255,11 +1306,7 @@ async fn execute_command(
                     .combat
                     .init_entity_with_universe(
                         player_id,
-                        state
-                            .connections
-                            .get_universe_id(player_id)
-                            .await
-                            .as_deref(),
+                        Some(universe_id),
                         100, // Default player HP
                     )
                     .await;
@@ -1372,6 +1419,7 @@ async fn execute_command(
             state
                 .connections
                 .broadcast_room_except(
+                    universe_id,
                     &room_id,
                     Some(player_id),
                     ServerMessage::Output { text: seen },
@@ -1400,7 +1448,7 @@ async fn execute_command(
             };
 
             // Execute create command
-            execute_create_command(state, player_id, account_id, access_level, args).await
+            execute_create_command(state, universe_id, account_id, access_level, args).await
         }
         _ => {
             let args = parts[1..].join(" ");
@@ -1432,7 +1480,7 @@ async fn dispatch_custom_verb(
     verb: &str,
     args: &str,
 ) -> Option<ServerMessage> {
-    let room_id = state.connections.get_room_id(player_id).await;
+    let room_id = state.connections.get_room_id(universe_id, player_id).await;
 
     let mut nearby: Vec<String> = Vec::new();
     if let Ok(items) = state
@@ -1531,29 +1579,24 @@ async fn dispatch_custom_verb(
 /// Execute Lua code in sandbox with game API
 async fn execute_lua(
     state: &AppState,
-    player_id: &str,
+    universe_id: &str,
     account_id: &str,
     code: &str,
 ) -> ServerMessage {
-    execute_lua_with_args(state, player_id, account_id, code, Vec::new()).await
+    execute_lua_with_args(state, universe_id, account_id, code, Vec::new()).await
 }
 
 /// Execute a Lua chunk with `args` available as its varargs (`...`),
 /// as the player's account, in the player's universe
 async fn execute_lua_with_args(
     state: &AppState,
-    player_id: &str,
+    universe_id: &str,
     account_id: &str,
     code: &str,
     args: Vec<String>,
 ) -> ServerMessage {
-    let Some(universe_id) = state.connections.get_universe_id(player_id).await else {
-        return ServerMessage::Error {
-            message: "Session error: no universe".to_string(),
-        };
-    };
     let ctx = ScriptContext {
-        universe_id,
+        universe_id: universe_id.to_string(),
         user_id: Some(account_id.to_string()),
         room_id: None,
         object_id: None,
@@ -1568,21 +1611,11 @@ async fn execute_lua_with_args(
 /// Syntax: <type> <path> "<name>" ["<description>"] [key=value ...]
 async fn execute_create_command(
     state: &AppState,
-    player_id: &str,
+    universe_id: &str,
     account_id: &str,
     access_level: AccessLevel,
     args: &str,
 ) -> ServerMessage {
-    // Get universe from session
-    let universe_id = match state.connections.get_universe_id(player_id).await {
-        Some(id) => id,
-        None => {
-            return ServerMessage::Error {
-                message: "Session error: no universe".to_string(),
-            };
-        }
-    };
-
     // Parse create arguments
     let parsed = match parse_create_args(args) {
         Ok(p) => p,
@@ -1596,7 +1629,7 @@ async fn execute_create_command(
     // Check permission to create at this path
     let user_ctx = state
         .permissions
-        .get_user_context(account_id, &universe_id)
+        .get_user_context(account_id, universe_id)
         .await;
 
     // Override access level from session (in case it's newer than cached)
@@ -1621,7 +1654,7 @@ async fn execute_create_command(
     // Create the object
     let mut obj = match crate::objects::Object::new_with_owner(
         &parsed.path,
-        &universe_id,
+        universe_id,
         &parsed.class,
         account_id,
     ) {
@@ -1811,6 +1844,7 @@ mod tests {
                 room_id: Some(room.to_string()),
                 access_level: AccessLevel::Player,
                 sender: tx,
+                conn_id: 0,
             },
             rx,
         )
@@ -1835,17 +1869,44 @@ mod tests {
         let deliver = async {
             for i in 0..5 {
                 conns
-                    .broadcast_room_except("r", None, out(&format!("b{i}")))
+                    .broadcast_room_except("u", "r", None, out(&format!("b{i}")))
                     .await;
-                conns.send_to_player("stuck", out("direct")).await;
+                conns.send_to_player("u", "stuck", out("direct")).await;
             }
             // Writers still get the lock
-            conns.update_room("ok", Some("r2".to_string())).await;
+            conns.update_room("u", "ok", Some("r2".to_string())).await;
         };
         tokio::time::timeout(std::time::Duration::from_secs(2), deliver)
             .await
             .expect("delivery must not block on a full client queue");
 
         assert!(matches!(ok_rx.recv().await, Some(ServerMessage::Output { text }) if text == "b0"));
+    }
+
+    /// Sessions are per (universe, player); a replaced connection's
+    /// unregister leaves the replacement in place
+    #[tokio::test]
+    async fn test_sessions_keyed_by_universe_and_connection() {
+        let conns = ConnectionManager::new();
+        let (mut a, _a_rx) = session("p", "r", 4);
+        a.universe_id = "one".into();
+        a.conn_id = 1;
+        let (mut b, mut b_rx) = session("p", "r", 4);
+        b.universe_id = "two".into();
+        b.conn_id = 2;
+        conns.register(a).await;
+        conns.register(b).await;
+
+        // A replacement connection in universe "one"
+        let (mut a2, mut a2_rx) = session("p", "r", 4);
+        a2.universe_id = "one".into();
+        a2.conn_id = 3;
+        conns.register(a2).await;
+        conns.unregister("one", "p", 1).await; // the stale connection's cleanup
+
+        conns.send_to_player("one", "p", out("to one")).await;
+        conns.send_to_player("two", "p", out("to two")).await;
+        assert!(matches!(a2_rx.try_recv(), Ok(ServerMessage::Output { text }) if text == "to one"));
+        assert!(matches!(b_rx.try_recv(), Ok(ServerMessage::Output { text }) if text == "to two"));
     }
 }
