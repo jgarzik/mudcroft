@@ -76,9 +76,9 @@ combat_state(entity_id) <-- active_effects(entity_id)
 
 `mudd` opens an existing database only (`Database::open`): it checks that the
 required tables exist and that at least one admin or owner account exists, and never
-runs migrations. `mudd_init` creates a database, and re-running it refreshes
-the core mudlib (see [admin.md](admin.md)). Existing tables are never
-migrated.
+runs migrations. `mudd_init` creates or upgrades a database (see
+[admin.md](admin.md)); it is the only place schema upgrades live, and there
+are none yet.
 
 ## Startup Sequence
 

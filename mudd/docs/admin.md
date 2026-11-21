@@ -54,9 +54,10 @@ mudd_init --version
 
 ### mudd_init
 
-Creates a new database. Running it again on the same database is safe: it
-refreshes the core mudlib and creates any missing tables. It does not migrate
-existing tables, so a database made with an older schema must be recreated.
+Creates a new database, or upgrades an existing one in place. Running it again
+on the same database is safe. Schema upgrades live here, never in `mudd`;
+there are none yet, so today a re-run creates any missing tables and
+refreshes the core mudlib.
 
 ```
 mudd_init --database <PATH> [--lib-dir <DIR>] [--lib <FILE.lua>]... [--force]
