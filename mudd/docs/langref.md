@@ -1,1049 +1,1077 @@
-# Mudcroft Lua Language Reference
+# Mudcroft Lua API Reference
 
-This document covers Lua fundamentals and the complete game scripting API.
+This is the reference for the `game.*` Lua API that Mudcroft scripts use.
+For a guided introduction, see the [tutorial](langtutor.md). For access
+levels and path grants, see [permissions](permissions.md).
 
-## Part 1: Lua Crash Course
-
-### Variables and Types
-
-```lua
--- Variables are dynamically typed
-local name = "Sword"           -- string
-local damage = 10              -- number (integer)
-local weight = 2.5             -- number (float)
-local is_magic = true          -- boolean
-local nothing = nil            -- nil (absence of value)
-
--- Global variables (avoid in Mudcroft - use local)
-GlobalVar = "visible everywhere"
-```
-
-### Tables (Arrays and Objects)
-
-```lua
--- Arrays (1-indexed!)
-local items = {"sword", "shield", "potion"}
-print(items[1])  -- "sword" (NOT items[0])
-print(#items)    -- 3 (length)
-
--- Dictionaries/Objects
-local player = {
-    name = "Hero",
-    hp = 100,
-    level = 5
-}
-print(player.name)     -- "Hero"
-print(player["name"])  -- "Hero" (equivalent)
-
--- Mixed
-local room = {
-    name = "Dungeon Entrance",
-    exits = {north = "room_002", south = "room_001"},
-    items = {"torch", "key"}
-}
-```
-
-### Functions
-
-```lua
--- Function definition
-local function greet(name)
-    return "Hello, " .. name .. "!"
-end
-
--- Multiple return values
-local function get_stats()
-    return 100, 50  -- hp, mp
-end
-local hp, mp = get_stats()
-
--- Anonymous functions
-local double = function(x) return x * 2 end
-
--- Functions as table values (methods)
-local sword = {
-    name = "Longsword",
-    on_use = function(args)
-        return "You swing the sword!"
-    end
-}
-```
-
-### Control Flow
-
-```lua
--- if/elseif/else
-if hp <= 0 then
-    print("Dead!")
-elseif hp < 20 then
-    print("Critical!")
-else
-    print("Healthy")
-end
-
--- for loops
-for i = 1, 10 do          -- 1 to 10 inclusive
-    print(i)
-end
-
-for i = 10, 1, -1 do      -- countdown
-    print(i)
-end
-
--- pairs (dictionaries) and ipairs (arrays)
-for key, value in pairs(player) do
-    print(key .. " = " .. tostring(value))
-end
-
-for index, item in ipairs(items) do
-    print(index .. ": " .. item)
-end
-
--- while loop
-local count = 0
-while count < 5 do
-    count = count + 1
-end
-```
-
-### String Operations
-
-```lua
-local s = "Hello World"
-print(string.upper(s))           -- "HELLO WORLD"
-print(string.lower(s))           -- "hello world"
-print(string.sub(s, 1, 5))       -- "Hello"
-print(string.len(s))             -- 11
-print(string.find(s, "World"))   -- 7, 11
-print(string.gsub(s, "World", "Lua"))  -- "Hello Lua"
-
--- Concatenation
-local greeting = "Hello" .. " " .. "World"
-
--- Format strings
-local msg = string.format("HP: %d/%d", 50, 100)
-```
-
-### Math Operations
-
-```lua
-print(math.abs(-5))      -- 5
-print(math.floor(3.7))   -- 3
-print(math.ceil(3.2))    -- 4
-print(math.max(1, 5, 3)) -- 5
-print(math.min(1, 5, 3)) -- 1
-print(math.sqrt(16))     -- 4
-print(math.random(1, 6)) -- random 1-6
-```
-
-### Common Gotchas
-
-1. **Arrays are 1-indexed**: `items[1]` is the first element, not `items[0]`
-2. **nil vs false**: Both are falsy, but `nil` means "no value" while `false` is a boolean
-3. **String concatenation uses `..`**, not `+`
-4. **No increment operator**: Use `x = x + 1`, not `x++`
-5. **Equality is `==`**, assignment is `=`
-6. **Not equal is `~=`**, not `!=`
+- [Where Lua runs](#where-lua-runs)
+- [Execution model](#execution-model)
+- [Function index](#function-index)
+- [Objects](#objects)
+- [Object code and handlers](#object-code-and-handlers)
+- [Classes](#classes)
+- [Queries](#queries)
+- [Custom verbs](#custom-verbs)
+- [Messaging](#messaging)
+- [Timers](#timers)
+- [Permissions](#permissions)
+- [Credits](#credits)
+- [Venice AI](#venice-ai)
+- [Utilities](#utilities)
+- [Core library](#core-library)
+- [Built-in classes](#built-in-classes)
+- [Built-in combat](#built-in-combat)
+- [Not yet supported](#not-yet-supported)
+- [Lua quick reference](#lua-quick-reference)
 
 ---
 
-## Part 2: External Resources
+## Where Lua runs
 
-- [Official Lua 5.4 Manual](https://www.lua.org/manual/5.4/)
-- [Learn Lua in Y Minutes](https://learnxinyminutes.com/docs/lua/)
-- [Lua Users Wiki](http://lua-users.org/wiki/)
-- [Programming in Lua (book)](https://www.lua.org/pil/)
+| Entry point | Who can start it | Runs as | Limits |
+|---|---|---|---|
+| `eval <lua>` command | wizard+ | the wizard | eval |
+| `POST /universe/{id}/run_script` (see [API](API.md)) | admin+ or the universe owner | the caller, or an account below an admin caller | eval |
+| Object hooks (`on_enter`, `on_damage`, ...) | gameplay | the object's **owner** | object code |
+| Custom verbs (`game.add_action`) | a player typing the verb | the object's **owner** | object code |
+| Timers (`call_out`, `heart_beat`) | the timer loop | the object's **owner** | object code |
+| `game.use_object` | another script | the used object's **owner** | object code |
+| Universe libraries | loaded before every script above | the same identity as that script | — |
+
+Builders can't run Lua directly. `eval` requires wizard, and
+`game.store_code` requires wizard. Builders build with the `create`
+command and own what they create. See [Built-in commands](langtutor.md#built-in-commands).
 
 ---
 
-## Part 3: Game API Reference
+## Execution model
 
-All game functions are accessed via the `game` table.
+### Identity: object code runs as its owner
 
-### Object CRUD Operations
+Object code always runs as the object's **owner** (the account in
+`owner_id`). This is the LPC "effective user" model. The player who
+triggered the code is passed in as data (`args.actor_id`), so their
+privileges are never used.
+
+- An object owned by a wizard can change any object.
+- An object owned by a builder can change only what that builder owns or holds a path grant for.
+- An object with no owner runs with no user, so every permission-checked write fails.
+
+`game.create_object` and `game.clone_object` set the new object's owner to
+the acting user. Details: [Who a script runs as](permissions.md#who-a-script-runs-as).
+
+`actor_id` is a **player object ID** such as `/players/p-<account-id>`, not
+an account ID. To find the account, read the player object's `owner_id`:
+
+```lua
+local account_id = game.get_object(args.actor_id).owner_id
+```
+
+Guests have a random UUID as their player ID and no player object.
+
+### Contexts
+
+Each execution may have a **room context** and an **object context**:
+
+| Execution | Room context | Object context |
+|---|---|---|
+| `eval`, `run_script` | none | none |
+| Hook | the room where it happened | the hooked object |
+| Custom verb | the player's room | the verb's object |
+| Timer callback | the object's `parent_id` | the object |
+| `game.use_object` | the used object's `parent_id` | the used object |
+
+The context decides how some functions behave:
+
+- **Room context:** `game.add_action` registers a *room* action. Without a room context it registers an *object* action.
+- **Object context:** `game.call_out`, `game.set_heart_beat` and `game.remove_heart_beat` need one. Without it they do nothing.
+
+### Output
+
+- `print` is a **no-op**. To see a value, `return` it or `game.send` it.
+- `eval` shows the chunk's return value as text. Strings, numbers and booleans print as-is, `nil` prints `nil`, and a table prints `[table]`. Return a string to see table contents.
+- `eval` accepts a bare expression too: `eval 1 + 2` prints `3`.
+- The web client sends one line at a time. Separate statements with spaces or `;`.
+- Messages from `game.send`, `game.broadcast` and `game.broadcast_region` are queued and delivered **after the script finishes**, in the order they were queued. A script that raises an error still delivers the messages it queued before the error.
+- A custom verb's return value is the player's reply. See [Custom verbs](#custom-verbs).
+
+### Sandbox limits
+
+Limits apply per execution. Each hook, verb, timer callback and `use_object`
+call is one execution.
+
+| Limit | Object code | `eval` and `run_script` |
+|---|---|---|
+| Lua instructions | 1,000,000 | 10,000,000 |
+| Wall-clock timeout | 500 ms | 5 s |
+| Memory | 64 MB | 64 MB |
+| Database-backed `game.*` calls | 100 | 10,000 |
+| Venice AI calls (`llm_chat`, `llm_image`) | 5 | 5 |
+
+Exceeding a limit raises an error, for example `database query limit exceeded (101 > 100)`.
+
+The instruction, memory and call limits stop a script as soon as it
+exceeds them. The timeout works differently: it is checked only after a
+chunk finishes, and not at all for the handler call in object code. Rely
+on the instruction limit to stop runaway loops.
+
+Every `game.*` function counts as a database call except these:
+`add_action`, `remove_action`, `send`, `broadcast`, `broadcast_region`,
+`get_actor`, `can_access_path`, `time` and `roll_dice`. The Venice
+functions count against the Venice limit instead. The global
+`parent()` also counts as a database call.
+
+Each `game.use_object` call runs in a fresh sandbox with its own
+object-code budget. One top-level execution may make at most 32
+`use_object` calls in total, counted across all nesting levels.
+
+### Sandbox globals
+
+- **Available:** `string`, `table`, `math`, `utf8`, the Lua base functions (`pairs`, `ipairs`, `pcall`, `error`, `tostring`, `type`, ...), and `print`, which does nothing.
+- **Removed:** `os`, `io`, `load`, `loadstring`, `loadfile`, `dofile`, `require`, `package`, `debug`, `collectgarbage`.
+- **Added:** the `game` table, the [`parent`](#parentclass_name-handler_name-args) function, and any globals defined by the universe's libraries (see [Core library](#core-library)).
+
+The interpreter is Lua 5.4.
+
+---
+
+## Function index
+
+Permission requirements apply to the **acting user**: the object's owner
+for object code, or the `game.set_actor` override if one is set.
+
+| Function | Returns | Requirement |
+|---|---|---|
+| [`create_object(path, class, parent_id, props)`](#gamecreate_objectpath-class-parent_id-props) | object or `{error}` | create rights at `path` |
+| [`get_object(id)`](#gameget_objectid) | object or `nil` | — |
+| [`update_object(id, changes)`](#gameupdate_objectid-changes) | `true`, or `false` if not found | Modify; owner or superior for `code_hash` |
+| [`delete_object(id)`](#gamedelete_objectid) | `true`, or `false` if not found | Delete |
+| [`move_object(id, new_parent_id)`](#gamemove_objectid-new_parent_id) | `true` | Move |
+| [`clone_object(id, new_path, new_parent_id)`](#gameclone_objectid-new_path-new_parent_id) | object, `nil` or `{error}` | create rights at `new_path` |
+| [`store_code(source)`](#gamestore_codesource) | hash | wizard+ |
+| [`get_code(hash)`](#gameget_codehash) | source or `nil` | — |
+| [`define_class(name, definition)`](#gamedefine_classname-definition) | `true` | wizard+ |
+| [`get_class(name)`](#gameget_classname) | table or `nil` | — |
+| [`is_a(obj_id, class_name)`](#gameis_aobj_id-class_name) | boolean | — |
+| [`get_class_chain(class_name)`](#gameget_class_chainclass_name) | array | — |
+| [`environment(obj_id)`](#gameenvironmentobj_id) | object or `nil` | — |
+| [`all_inventory(obj_id)`](#gameall_inventoryobj_id) | array | — |
+| [`get_children(parent_id, filter)`](#gameget_childrenparent_id-filter) | array | — |
+| [`present(name, env_id)`](#gamepresentname-env_id) | object or `nil` | — |
+| [`get_living_in(env_id)`](#gameget_living_inenv_id) | array | — |
+| [`add_action(verb, object_id, method)`](#gameadd_actionverb-object_id-method) | boolean | Modify, and owner or wizard+ outranking the owner |
+| [`remove_action(verb, object_id)`](#gameremove_actionverb-object_id) | boolean | Modify, and owner or wizard+ outranking the owner |
+| [`send(player_id, message)`](#gamesendplayer_id-message) | `true` | — |
+| [`broadcast(room_id, message, exclude_id)`](#gamebroadcastroom_id-message-exclude_id) | `true` | — |
+| [`broadcast_region(region_id, message)`](#gamebroadcast_regionregion_id-message) | `true` | — |
+| [`call_out(delay_secs, method, args)`](#gamecall_outdelay_secs-method-args) | timer ID or `""` | object context |
+| [`remove_call_out(timer_id)`](#gameremove_call_outtimer_id) | boolean | — |
+| [`set_heart_beat(interval_ms)`](#gameset_heart_beatinterval_ms) | `true` | object context |
+| [`remove_heart_beat()`](#gameremove_heart_beat) | boolean | object context |
+| [`set_actor(account_id)`](#gameset_actoraccount_id) | boolean | wizard+, target below caller |
+| [`get_actor()`](#gameget_actor) | account ID or `nil` | — |
+| [`check_permission(action, target_id, is_fixed, owner_id)`](#gamecheck_permissionaction-target_id-is_fixed-owner_id) | `{allowed, error}` | — |
+| [`can_access_path(path)`](#gamecan_access_pathpath) | boolean | — |
+| [`get_access_level(account_id)`](#gameget_access_levelaccount_id) | level string | — |
+| [`set_access_level(account_id, level)`](#gameset_access_levelaccount_id-level) | boolean | admin+ (see rules) |
+| [`grant_path(grantee_id, path_prefix, can_delegate)`](#gamegrant_pathgrantee_id-path_prefix-can_delegate) | grant or `{error}` | wizard+, or a delegable grant |
+| [`revoke_path(grant_id)`](#gamerevoke_pathgrant_id) | boolean or `{error}` | wizard+, the grantor, or a delegable grant |
+| [`get_path_grants(account_id)`](#gameget_path_grantsaccount_id) | array | — |
+| [`get_credits()`](#gameget_credits) | integer | — |
+| [`deduct_credits(amount, reason)`](#gamededuct_creditsamount-reason) | boolean | — |
+| [`admin_grant_credits(account_id, amount)`](#gameadmin_grant_creditsaccount_id-amount) | boolean | admin+ |
+| [`llm_chat(messages, tier)`](#gamellm_chatmessages-tier) | string or `{error}` | Venice configured |
+| [`llm_image(prompt, style, size)`](#gamellm_imageprompt-style-size) | image hash or `{error}` | Venice configured |
+| [`time()`](#gametime) | milliseconds | — |
+| [`set_time(time_ms)`](#gameset_timetime_ms) | boolean | wizard+ |
+| [`roll_dice(dice)`](#gameroll_dicedice) | integer | — |
+| [`set_rng_seed(seed)`](#gameset_rng_seedseed) | boolean | wizard+ |
+| [`use_object(obj_id, actor_id, verb, target_id)`](#gameuse_objectobj_id-actor_id-verb-target_id) | handler result or `nil` | — |
+| [`get_universe()`](#gameget_universe) | table or `nil` | — |
+| [`update_universe(config)`](#gameupdate_universeconfig) | boolean | admin+ |
+| [`parent(class_name, handler_name, args)`](#parentclass_name-handler_name-args) (global) | handler result or `nil` | — |
+
+---
+
+## Objects
+
+### Object paths
+
+Every object ID is a filesystem-style path such as `/d/forest/clearing`.
+
+- A path starts with `/`.
+- Each segment matches `[a-z][a-z0-9-]*`: it starts with a letter, followed by lowercase letters, digits or hyphens.
+- A path is at most 255 characters.
+- Uppercase letters are converted to lowercase.
+
+Object IDs are unique across the **whole server**, not per universe.
+Writes stay in the script's universe: `update_object`, `delete_object` and
+`move_object` refuse objects (and move destinations) that belong to another
+universe, and `clone_object` refuses a source from another universe.
+Player objects are the exception: one is shared by every universe its
+account visits (it carries inventory and HP), so scripts may update it and
+move items into it from any universe. Reads such as `get_object` are not
+universe-checked.
+
+Path grants work on prefixes, so group an area under one prefix such as
+`/d/crypt/...`. Then a single grant covers the whole area.
+
+### Object tables
+
+Functions that return objects return tables like this:
+
+| Field | Meaning |
+|---|---|
+| `id` | the object's path |
+| `universe_id` | the universe it belongs to |
+| `class` | class name |
+| `parent_id` | containing object (room, container, player), or `nil` |
+| `owner_id` | owning account ID, or `nil` |
+| `code_hash` | attached code hash, or `nil` |
+| `name`, `description` | copied to the top level for convenience |
+| `metadata` | every other property, e.g. `obj.metadata.hp`, `obj.metadata.exits` |
+
+The table is a copy. Changing it does nothing; use `game.update_object`
+to write changes.
 
 #### `game.create_object(path, class, parent_id, props)`
 
-Create a new object in the database with a path-based ID.
+Creates and saves an object. The acting user becomes its owner.
+
+- `path` (string): the new object's ID.
+- `class` (string): its class. The server doesn't check that the class exists.
+- `parent_id` (string or nil): its container. The container must exist.
+- `props` (table or nil): property values. These override the class defaults.
+
+The new object starts with the default properties of its class and every
+ancestor class, then `props` are applied on top. Two kinds of default are
+skipped: empty-string defaults (such as the root class's `name` and
+`description`), and a class's `code_hash` default.
+
+If `props.code_hash` is set, it attaches that stored code instead of
+becoming a property. This is the only way `create_object` attaches code.
+See [Attaching code](#attaching-code).
 
 ```lua
--- Create a sword in a room
-local sword = game.create_object("/items/iron-sword", "weapon", "/rooms/armory", {
+local sword = game.create_object("/d/keep/armory/sword", "weapon", "/d/keep/armory", {
     name = "Iron Sword",
-    description = "A sturdy iron blade",
+    description = "A sturdy iron blade.",
     damage_dice = "1d8",
-    damage_type = "physical"
 })
-print(sword.id)  -- "/items/iron-sword"
+if sword.error then return sword.error end
+return sword.id   -- "/d/keep/armory/sword"
 ```
 
-**Parameters:**
-- `path` (string): Path-based ID (e.g., "/items/sword", "/rooms/tavern"). Must start with `/`, use lowercase, segments `[a-z][a-z0-9-]*`
-- `class` (string): Class name (e.g., "item", "weapon", "npc")
-- `parent_id` (string|nil): Container object ID (room, player inventory)
-- `props` (table|nil): Property overrides
+**Returns** the new object, or `{error = "..."}` in these cases:
 
-**Returns:** Object table with `id`, `class`, `parent_id`, `name`, `description`, `metadata`. On path validation error, returns `{error = "message"}`
+- the path is invalid
+- the acting user can't create at that path
+- `code_hash` is not a string, or is not a known hash
 
----
+Other database errors, such as a duplicate path or a missing parent, raise
+a Lua error.
 
 #### `game.get_object(id)`
 
-Fetch an object by ID.
+**Returns** the object, or `nil` if it doesn't exist.
 
 ```lua
-local obj = game.get_object("uuid-here")
-if obj then
-    print(obj.name)
-    print(obj.class)
-    print(obj.metadata.hp)  -- Extra properties in metadata
-end
+local npc = game.get_object("/d/keep/guard")
+return npc and npc.metadata.hp
 ```
-
-**Returns:** Object table or `nil` if not found
-
----
 
 #### `game.update_object(id, changes)`
 
-Update object properties.
+Merges `changes` into the object's properties. Each top-level key replaces
+the old value: `{exits = {north = ...}}` replaces the whole `exits` table.
+
+A `code_hash` key attaches stored code, or detaches it if set to `nil`. It
+is never stored as a property. See [Attaching code](#attaching-code).
 
 ```lua
--- Reduce HP
-game.update_object(npc_id, {hp = 50})
-
--- Update multiple properties
-game.update_object(item_id, {
-    name = "Enchanted Sword",
-    damage_dice = "2d6"
-})
+game.update_object("/d/keep/guard", {hp = 40, mood = "angry"})
 ```
 
-**Returns:** `true` if updated, `false` if object not found
+**Returns** `true`, or `false` if the object doesn't exist.
 
----
+**Raises** an error in these cases:
+
+- the acting user lacks Modify permission (`update_object: permission denied: ...`)
+- `code_hash` names an unknown hash or is not a string
+- the acting user may not attach code to this object
 
 #### `game.delete_object(id)`
 
-Delete an object from the database.
+Deletes the object. Deleting also cancels the object's pending
+`call_out`s, its heartbeat, and every custom verb registered for it.
 
-```lua
-local deleted = game.delete_object("item-uuid")
-```
+An object that still contains other objects can't be deleted. Move or
+delete its contents first.
 
-**Returns:** `true` if deleted, `false` if not found
-
----
+**Returns** `true`, or `false` if the object doesn't exist. **Raises** an
+error if the acting user lacks Delete permission.
 
 #### `game.move_object(id, new_parent_id)`
 
-Move an object to a new container.
+Sets the object's container. Pass `nil` to take it out of any container.
 
 ```lua
--- Move item to player inventory
-game.move_object(sword_id, player_id)
-
--- Move to room (drop)
-game.move_object(sword_id, room_id)
-
--- Remove from container (orphan)
-game.move_object(sword_id, nil)
+game.move_object("/d/keep/armory/sword", args.actor_id)   -- into a player's inventory
 ```
 
-**Returns:** `true` on success
+Anyone may move an object that isn't `fixed`. Fixed objects can be moved only by wizards+, their owner, or a holder of a path grant covering them.
 
----
+`move_object` does **not** run `on_enter` or `on_leave` hooks. Moving a
+connected player only changes the database; the player's session stays
+in the old room. Don't use it to teleport players.
+
+**Returns** `true`. **Raises** an error if the object or destination
+doesn't exist, either belongs to another universe, or the acting user
+lacks Move permission.
 
 #### `game.clone_object(id, new_path, new_parent_id)`
 
-Create a copy of an object with a new path-based ID.
+Copies an object to a new path. The copy keeps the original's properties
+and `code_hash`, and the acting user becomes its owner.
 
-```lua
-local copy = game.clone_object("/items/template-sword", "/items/player-sword", "/rooms/chest")
-print(copy.id)  -- "/items/player-sword"
-```
-
-**Parameters:**
-- `id` (string): Source object ID to clone
-- `new_path` (string): Path-based ID for the clone (e.g., "/items/sword-copy")
-- `new_parent_id` (string|nil): Container for the clone
-
-**Returns:** New object table, `nil` if source not found, or `{error = "message"}` on path validation error
+**Returns** the copy, `nil` if the source doesn't exist, or
+`{error = "..."}` if the source belongs to another universe, `new_path` is
+invalid, or the acting user can't create there.
 
 ---
 
-### Code Storage
+## Object code and handlers
 
-#### `game.store_code(source)`
+### `game.store_code(source)`
 
-Store Lua source code (content-addressed by SHA256 hash).
+Stores Lua source in the content-addressed code store. Requires
+**wizard+**.
+
+**Returns** the SHA-256 hex hash. The same source always gives the same
+hash. Raises an error for non-wizards.
+
+### `game.get_code(hash)`
+
+**Returns** the stored source, or `nil`.
+
+### Writing object code
+
+Object code must evaluate to a table of handler functions. Each handler
+takes one `args` table:
 
 ```lua
-local code = [[
 return {
-    on_use = function(args)
-        game.send(args.actor_id, "You drink the potion!")
-        game.update_object(args.object_id, {used = true})
-        return true
-    end
+    on_enter = function(args)
+        game.send(args.actor_id, "Cold air rushes past you.")
+    end,
+    pull = function(args)
+        return "You pull the lever."
+    end,
 }
-]]
-local hash = game.store_code(code)
 ```
 
-**Returns:** SHA256 hash string
+The code is evaluated fresh for every execution, so Lua variables don't
+persist between calls. Keep state in object properties with
+`game.update_object`.
+
+Code that has no handler for an event is skipped silently.
+
+### Attaching code
+
+Attach stored code by setting `code_hash`:
+
+```lua
+local h = game.store_code([[return { on_enter = function(a) game.send(a.actor_id, "Welcome!") end }]])
+game.update_object("/d/keep/hall", {code_hash = h})   -- attach to an existing object
+game.create_object("/d/keep/bell", "item", "/d/keep/hall", {name = "bell", code_hash = h})   -- or attach at creation
+game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
+```
+
+- The hash must already exist in the code store. Unknown hashes are rejected.
+- With `update_object`, only the object's owner, or an account that outranks the owner, may set `code_hash`. The code will run as the owner, so this stops a wizard from planting code on an admin's object. Ownerless objects have no such restriction.
+- A class's `code_hash` property default is used only by [`parent()`](#parentclass_name-handler_name-args). It is never attached to objects created from the class; pass `code_hash` in `props` to attach code.
+
+### When handlers run
+
+| Handler | Fires when | Runs on | `args` fields (all include `object_id`) |
+|---|---|---|---|
+| `on_enter` | a player walks in, arrives by `goto`, or connects and spawns there | the room | `actor_id`, `room_id`, `from` (`nil` on spawn), `direction` (walking only) |
+| `on_leave` | a player walks out, or leaves by `goto` | the room | `actor_id`, `room_id`, `to`, `direction` (walking only) |
+| `on_damage` | the `attack` command hits | the target NPC | `actor_id`, `room_id`, `attacker_id`, `damage` |
+| `on_death` | the `attack` command kills | the target NPC | `actor_id`, `room_id`, `killer_id` |
+| `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
+| any name | a `call_out` is due | the object | `room_id`, `args` (the string given to `call_out`, or `nil`) |
+| any name | a custom verb is typed | the verb's object | `actor_id`, `room_id`, `verb`, `args` (the rest of the line) |
+| any name | `game.use_object` is called | the used object | `actor_id`, `verb`, `target_id`, `code_hash` |
+
+`room_id` is the room the event happened in. For timers it is the object's
+`parent_id` at the moment the timer fires.
+
+Hook details:
+
+- **Room hooks:** `on_enter` and `on_leave` run only on the room's code.
+  - `on_leave` runs before the player moves. A broadcast to that room still reaches the leaving player unless you exclude them.
+  - `on_enter` runs after the move and after the player has seen the new room's description.
+- **Combat hooks:** `on_damage` and `on_death` run after the attacker's combat report. A killing blow fires both.
+  - By the time `on_death` runs, the dead NPC has been removed from the room (`parent_id = nil`). Use `args.room_id`, not `game.environment`.
+- **Return values:** hook return values are ignored. Errors are logged on the server.
+- **Unwired hooks:** region objects get no hooks. `game.move_object` fires no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
+
+### `parent(class_name, handler_name, args)`
+
+A global function, not part of `game`, for class-based code. It finds
+the parent class of `class_name`, loads that class's code from its
+`code_hash` property default, and calls `handler_name(args)`.
+
+The parent's code runs in the current sandbox with the current identity.
+
+**Returns** the handler's result, or `nil` in any of these cases:
+
+- the class has no parent
+- the parent class has no code
+- the parent's code has no such handler
+
+```lua
+-- code attached to class "fire_sword" (parent "weapon")
+return {
+    on_hit = function(args)
+        local base = parent("fire_sword", "on_hit", args) or 0
+        return base + game.roll_dice("1d6")
+    end,
+}
+```
 
 ---
 
-#### `game.get_code(hash)`
+## Classes
 
-Retrieve stored code by hash.
+Classes are shared by **every universe** on the server.
 
-```lua
-local source = game.get_code("abc123...")
-if source then
-    -- Execute or inspect
-end
-```
+### `game.define_class(name, definition)`
 
-**Returns:** Source string or `nil`
+Defines a class, or redefines one you created earlier. Requires
+**wizard+**. Built-in classes can't be redefined. An existing custom class
+can be redefined only by the account that defined it, or by an admin+.
 
----
+`definition` takes two fields:
 
-### Class System
-
-#### `game.define_class(name, definition)`
-
-Define a custom class with inheritance.
+- `parent`: the parent class name.
+- `properties`: a table of `{type = "...", default = value}` entries. Only `default` is used; `type` is informational.
 
 ```lua
-game.define_class("fire_sword", {
-    parent = "weapon",
+game.define_class("lantern", {
+    parent = "item",
     properties = {
-        fire_damage = {type = "string", default = "1d6"},
-        burn_chance = {type = "number", default = 25}
-    }
+        lit  = {type = "boolean", default = false},
+        fuel = {type = "number",  default = 100},
+    },
 })
 ```
 
-**Definition fields:**
-- `parent` (string|nil): Parent class name
-- `properties` (table): Property definitions with `type` and `default`
+**Returns** `true`. Raises an error for non-wizards, built-in names, or a
+class defined by another account (`define_class: <name> is already defined
+by another account`).
+
+Custom classes are currently **not saved** to the database: the server's
+attempt to persist them fails. They are lost when the server restarts.
+Objects keep the properties they were created with. Run your
+`define_class` calls again after a restart if you create more objects
+from those classes.
+
+### `game.get_class(name)`
+
+**Returns** `{name, parent, properties, handlers}` or `nil`.
+
+- `properties` holds only this class's own defaults; inherited ones aren't included.
+- `handlers` lists the handler names declared by a built-in class. It is informational.
+
+### `game.is_a(obj_id, class_name)`
+
+**Returns** `true` if the object's class is `class_name` or inherits from
+it. Returns `false` if the object doesn't exist.
+
+### `game.get_class_chain(class_name)`
+
+**Returns** the inheritance chain from the class up to the root, for
+example `{"weapon", "item", "thing"}`.
 
 ---
 
-#### `game.get_class(name)`
-
-Get a class definition.
-
-```lua
-local cls = game.get_class("weapon")
-print(cls.name)        -- "weapon"
-print(cls.parent)      -- "item"
-print(cls.handlers)    -- {"on_move", "on_use", ...}
-```
-
-**Returns:** Class table or `nil`
-
----
-
-#### `game.is_a(obj_id, class_name)`
-
-Check if object is instance of class (including inheritance).
-
-```lua
-if game.is_a(item_id, "weapon") then
-    print("It's a weapon!")
-end
-
-if game.is_a(player_id, "living") then
-    print("It can fight!")
-end
-```
-
-**Returns:** `true` or `false`
-
----
-
-#### `game.get_class_chain(class_name)`
-
-Get inheritance chain from child to root.
-
-```lua
-local chain = game.get_class_chain("fire_sword")
--- {"fire_sword", "weapon", "item", "thing"}
-```
-
-**Returns:** Array of class names
-
----
-
-#### `parent(class_name, handler_name, args)`
-
-Call parent class handler (global function, not on game table).
-
-```lua
--- In a fire_sword's on_use handler:
-return {
-    on_use = function(args)
-        -- Do fire-specific stuff first
-        game.send(args.actor_id, "The blade bursts into flames!")
-
-        -- Then call parent weapon's on_use
-        return parent("fire_sword", "on_use", args)
-    end
-}
-```
-
----
-
-### Query Functions
+## Queries
 
 #### `game.environment(obj_id)`
 
-Get the containing object (room, container, player).
-
-```lua
-local container = game.environment(item_id)
-if container then
-    print("Item is in: " .. container.name)
-end
-```
-
-**Returns:** Object table or `nil`
-
----
+**Returns** the object's container (its `parent_id` object), or `nil`.
 
 #### `game.all_inventory(obj_id)`
 
-Get all objects contained by an object.
-
-```lua
-local contents = game.all_inventory(room_id)
-for _, obj in ipairs(contents) do
-    print(obj.name)
-end
-```
-
-**Returns:** Array of object tables
-
----
-
-#### `game.present(name, env_id)`
-
-Find object by name within a container.
-
-```lua
-local sword = game.present("sword", room_id)
-if sword then
-    game.send(player_id, "You see a " .. sword.name)
-end
-```
-
-**Returns:** Object table or `nil`
-
----
-
-#### `game.get_living_in(env_id)`
-
-Get all living entities (players, NPCs) in a location.
-
-```lua
-local fighters = game.get_living_in(room_id)
-for _, npc in ipairs(fighters) do
-    if npc.class == "npc" and npc.metadata.aggro then
-        -- Start combat!
-    end
-end
-```
-
-**Returns:** Array of living object tables
-
----
+**Returns** an array of every object whose `parent_id` is `obj_id`.
 
 #### `game.get_children(parent_id, filter)`
 
-Get objects with optional class filter.
+Like `all_inventory`, with an optional class filter `{class = "name"}`.
+The filter matches the class name exactly; subclasses don't match.
+`parent_id` is required.
 
 ```lua
--- All items in a room
-local items = game.get_children(room_id, {class = "item"})
-
--- All objects (no filter)
-local all = game.get_children(room_id)
+local rooms = game.get_children("/d/crypt", {class = "room"})
 ```
 
-**Returns:** Array of object tables
+#### `game.present(name, env_id)`
+
+Finds an object directly inside `env_id` whose `name` contains `name`,
+ignoring case. `%` and `_` in `name` match literally. If several match,
+which one you get is unspecified.
+
+**Returns** the object or `nil`.
+
+#### `game.get_living_in(env_id)`
+
+**Returns** objects in `env_id` whose class is exactly `player`, `npc` or
+`living`. Objects of custom subclasses are **not** included; use
+`all_inventory` with `game.is_a` for those.
+
+Connected guests have no player object, so they never appear.
 
 ---
 
-### Action System
+## Custom verbs
+
+Objects can add verbs such as `pull lever`. When a player types a command
+that isn't built in, the server looks for a registered verb.
 
 #### `game.add_action(verb, object_id, method)`
 
-Register a contextual verb for the current room.
+Registers `verb` to call handler `method` on `object_id`'s code. The
+handler will run as the object's owner, so the acting user needs
+**Modify** permission on the object **and** must be its owner or a
+wizard+ who outranks the owner (the same rule as attaching code).
+Ownerless objects need only Modify.
+
+`method` can't be private: names starting with `_` and the engine hooks
+(`on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`,
+`on_create`, `on_destroy`) are refused.
+
+Where the action is registered depends on the script's context:
+
+- **With a room context** (hooks, verbs, timers): it becomes a *room action* for that room.
+- **Without one** (`eval`, `run_script`): it becomes an *object action* that follows the object wherever it goes.
+
+**Returns** `true` if registered, or `false` if permission is denied or
+`method` is private.
 
 ```lua
--- Make "pull lever" trigger lever's do_pull method
-game.add_action("pull", lever_id, "do_pull")
+game.add_action("pull", "/d/keep/hall/lever", "pull")
 ```
-
-Players can then type `pull lever` to trigger the action.
-
----
 
 #### `game.remove_action(verb, object_id)`
 
-Remove a registered action.
+Removes the action from the same scope that `add_action` would use in
+this context. It needs the same permission as `add_action`. **Returns**
+`true`, or `false` if permission is denied.
 
-```lua
-game.remove_action("pull", lever_id)
-```
+### How a typed verb is dispatched
 
----
+1. Built-in commands always win. These verbs can't be overridden: `look`, `l`, the directions and their abbreviations, `say`, `help`, `get`, `take`, `drop`, `inventory`, `inv`, `i`, `attack`, `kill`, `goto`, `setportal`, `eval` and `create`.
+2. The first word, lowercased, is the verb. The rest of the line is `args`.
+3. Candidates are collected in this order:
+   - room actions registered for the player's room, but only for objects that are nearby;
+   - object actions on items in the player's inventory;
+   - object actions on objects in the room;
+   - object actions on the room itself.
 
-### Messaging
+   "Nearby" means one of the player's inventory items, an object in the room, or the room itself.
+4. If the player typed more after the verb, the first candidate whose object `name` matches the text is chosen. The match works either way: the name contains the text, or the text contains the name. Otherwise the first candidate wins.
+5. The handler runs as the object's owner with `{verb, args, actor_id, object_id, room_id}`. Actions whose method is private (`_name` or an engine hook) are never dispatched.
+6. The handler's return value is the reply. Return a string. Returning `nil` sends no reply, which is useful if the handler already used `game.send`.
+7. If nothing matches, the player sees `Unknown command: <verb>`.
+8. If the handler raises an error, players see `Something went wrong.` and wizards+ see the error text.
 
-#### `game.send(target_id, message)`
-
-Send a private message to a player.
-
-```lua
-game.send(player_id, "You feel a chill run down your spine.")
-game.send(player_id, "The sword glows with an eerie light.")
-```
-
----
-
-#### `game.broadcast(room_id, message)`
-
-Send a message to all players in a room.
-
-```lua
-game.broadcast(room_id, "The ground shakes violently!")
-game.broadcast(room_id, player_name .. " has entered the room.")
-```
+Actions live **in memory only** and are lost when the server restarts.
+Register them again after a restart, for example from a setup function you
+run with `eval`, or from a room's `on_enter` hook. Registering the same
+room action twice has no effect.
 
 ---
+
+## Messaging
+
+Messages are delivered after the script finishes. They reach only
+connected players. `game.send` and `game.broadcast_region` skip players
+connected to other universes; `game.broadcast` reaches whoever is in the
+room.
+
+#### `game.send(player_id, message)`
+
+Sends `message` to one player. `player_id` is a player object ID such as
+`args.actor_id`.
+
+#### `game.broadcast(room_id, message, exclude_id)`
+
+Sends `message` to every player in the room, except `exclude_id` if given.
+
+```lua
+game.send(args.actor_id, "You ring the bell.")
+game.broadcast(args.room_id, "Someone rings the bell.", args.actor_id)
+```
 
 #### `game.broadcast_region(region_id, message)`
 
-Send a message to all players in a region.
+Sends `message` to every player whose room matches either rule:
 
-```lua
-game.broadcast_region(dungeon_region_id, "A distant roar echoes through the halls.")
-```
+- the room's path is under `region_id` (e.g. `/d/crypt/hall` for region `/d/crypt`);
+- the room's `parent_id` is `region_id`.
 
----
-
-### Permission System
-
-#### `game.set_actor(actor_id)`
-
-Set the current actor for permission checks.
-
-```lua
-game.set_actor("player-uuid")
-```
+All three functions return `true`.
 
 ---
 
-#### `game.get_actor()`
+## Timers
 
-Get the current actor ID.
-
-```lua
-local actor = game.get_actor()
-```
-
----
-
-#### `game.check_permission(action, target_id, is_fixed, region_id)`
-
-Check if current actor can perform an action.
-
-```lua
-local result = game.check_permission("modify", obj_id, false, nil)
-if result.allowed then
-    -- Proceed with modification
-else
-    game.send(actor_id, "Permission denied: " .. result.error)
-end
-```
-
-**Actions:** `"read"`, `"modify"`, `"move"`, `"delete"`, `"create"`, `"execute"`, `"admin_config"`, `"grant_credits"`
-
-**Returns:** `{allowed = true}` or `{allowed = false, error = "reason"}`
-
----
-
-#### `game.get_access_level(account_id)`
-
-Get a user's access level.
-
-```lua
-local level = game.get_access_level(account_id)
--- "player", "builder", "wizard", "admin", or "owner"
-```
-
----
-
-#### `game.set_access_level(account_id, level)`
-
-Set a user's access level (admin only).
-
-```lua
-game.set_access_level("user-uuid", "builder")
-```
-
-**Levels:** `"player"`, `"builder"`, `"wizard"`, `"admin"`, `"owner"`
-
----
-
-#### `game.assign_region(account_id, region_id)`
-
-Assign a region to a builder.
-
-```lua
-game.assign_region(builder_id, "dungeon_region")
-```
-
----
-
-#### `game.unassign_region(account_id, region_id)`
-
-Remove region assignment from a builder.
-
-```lua
-game.unassign_region(builder_id, "dungeon_region")
-```
-
----
-
-### Timer System
+Timers need an **object context**, so call them from object code. The
+callback runs that object's code, as its owner.
 
 #### `game.call_out(delay_secs, method, args)`
 
-Schedule a one-shot timer callback.
+Schedules handler `method` on the current object after `delay_secs`
+seconds. Fractions are allowed.
+
+- `args` is an optional **string**. It arrives as `args.args` in the callback. To pass structured data, encode it in a string or store it in a property.
+- The callback receives `{object_id, room_id, args}`, where `room_id` is the object's `parent_id` when the timer fires.
+- The timer loop runs every 100 ms, so timing is accurate to about 0.1 s.
+- Each object may have at most **32** pending call_outs.
+
+**Returns** a timer ID, or `""` in two cases: there is no object context
+(for example in `eval`), or the object already has 32 pending call_outs.
 
 ```lua
--- Explode after 5 seconds
-local timer_id = game.call_out(5.0, "do_explode", "boom!")
-
--- In the object's code:
 return {
-    do_explode = function(args)
-        game.broadcast(room_id, "BOOM! The bomb explodes!")
-        game.delete_object(bomb_id)
-    end
+    light_fuse = function(a)
+        game.call_out(5, "explode", a.actor_id)
+        return "The fuse starts to hiss."
+    end,
+    explode = function(a)
+        game.broadcast(a.room_id, "BOOM!")
+        game.send(a.args, "You were standing far too close.")
+    end,
 }
 ```
-
-**Returns:** Timer ID for cancellation
-
----
 
 #### `game.remove_call_out(timer_id)`
 
-Cancel a scheduled timer.
-
-```lua
-local removed = game.remove_call_out(timer_id)
-```
-
-**Returns:** `true` if removed, `false` if not found
-
----
+Cancels a pending call_out. **Returns** `true` if it was pending.
 
 #### `game.set_heart_beat(interval_ms)`
 
-Set recurring heartbeat for current object.
+Calls the current object's `heart_beat` handler every `interval_ms`
+milliseconds. Calling it again replaces the interval.
 
-```lua
--- Tick every 2 seconds
-game.set_heart_beat(2000)
+- The minimum interval is 100 ms.
+- The callback receives `{object_id, room_id, args = nil}`.
+- Heartbeats are **in memory only** and stop when the server restarts.
 
--- In object code:
-return {
-    heart_beat = function(args)
-        -- Called every 2 seconds
-        local npc = game.get_object(args.object_id)
-        if npc.metadata.in_combat then
-            -- Do combat AI
-        else
-            -- Do idle behavior
-        end
-    end
-}
-```
-
----
+**Returns** `true`. Without an object context it does nothing.
 
 #### `game.remove_heart_beat()`
 
-Stop heartbeat for current object.
+Stops the current object's heartbeat. **Returns** `true` if one was
+running.
 
-```lua
-game.remove_heart_beat()
-```
+Pending call_outs are saved to the database and reloaded at startup. Heartbeats are not.
+
+Deleting an object cancels both its call_outs and its heartbeat.
 
 ---
 
-### Credits (Economy)
+## Permissions
+
+See [permissions](permissions.md) for the check order and path grants. In
+short, levels rank `player < builder < wizard < admin < owner`. Wizards and
+above can change any object. Owners can change their own objects. Builders
+can change objects under their path grants.
+
+#### `game.set_actor(account_id)`
+
+Makes later calls in this script act as `account_id`.
+
+- Only **wizards+** may switch, and only to accounts **strictly below** their own level.
+- Switching to yourself is always allowed.
+- `nil` clears the override.
+- Ownerless object code can't switch.
+
+**Returns** `true` on success, `false` if refused.
+
+The override applies to these functions:
+
+- object writes and `add_action` / `remove_action`
+- `store_code` and `define_class`
+- `check_permission` and `can_access_path`
+- `set_access_level`, `grant_path` and `revoke_path`
+- `admin_grant_credits`
+- `set_time` and `set_rng_seed`
+- `update_universe`
+
+It does not apply to the credit functions or Venice billing.
+
+#### `game.get_actor()`
+
+**Returns** the current override, or `nil` if none is set.
+
+#### `game.check_permission(action, target_id, is_fixed, owner_id)`
+
+Asks whether the acting user may perform `action` on a target described
+by the arguments. The object itself is not looked up, so pass its
+`fixed` flag and owner yourself.
+
+- `action`: one of `"read"`, `"modify"`, `"move"`, `"delete"`, `"create"`, `"execute"`, `"store_code"`, `"admin_config"`, `"grant_credits"`.
+- `target_id`: the object path, used for path-grant checks.
+- `is_fixed` (boolean or nil): affects `"move"`.
+- `owner_id` (string or nil): the owner account, used for the owner check.
+
+**Returns** `{allowed = true}` or `{allowed = false, error = "reason"}`.
+An unknown action returns `allowed = false`.
+
+```lua
+local obj = game.get_object(id)
+local r = game.check_permission("modify", obj.id, obj.metadata.fixed, obj.owner_id)
+if not r.allowed then return "Denied: " .. r.error end
+```
+
+#### `game.can_access_path(path)`
+
+**Returns** `true` if the acting user is wizard+, or holds a path grant
+covering `path`.
+
+#### `game.get_access_level(account_id)`
+
+**Returns** `"player"`, `"builder"`, `"wizard"`, `"admin"` or `"owner"`.
+Unknown IDs, including player object paths, return `"player"`.
+
+#### `game.set_access_level(account_id, level)`
+
+Changes an account's level. The caller must be **admin+**, and the target's
+current level must be **below** the caller's. Only an **owner** may grant
+`admin` or `owner`; owners may set any level.
+
+**Returns** `true` if changed, `false` if refused or `level` is unknown.
+
+#### `game.grant_path(grantee_id, path_prefix, can_delegate)`
+
+Grants `grantee_id` access to every object under `path_prefix` in this
+universe. The caller must be wizard+, or hold a grant covering the prefix
+with `can_delegate = true`.
+
+**Returns** the grant `{id, grantee_id, path_prefix, can_delegate,
+granted_by, granted_at}` or `{error = "..."}`.
+
+#### `game.revoke_path(grant_id)`
+
+Revokes a grant. Allowed for wizards+, the original grantor, or anyone
+with a delegable grant covering the path.
+
+**Returns** `true`, `false` if no such grant exists, or `{error = "..."}`
+if refused.
+
+#### `game.get_path_grants(account_id)`
+
+**Returns** an array of that account's grants in this universe, in the
+same shape as `grant_path`'s result.
+
+---
+
+## Credits
+
+The credit functions act on the script's **real user**, which for object
+code is the object's **owner**, not the player. `game.set_actor` doesn't
+change this. Object code can't charge the player who triggered it.
 
 #### `game.get_credits()`
 
-Get current player's credit balance.
-
-```lua
-local balance = game.get_credits()
-game.send(player_id, "You have " .. balance .. " credits.")
-```
-
----
+**Returns** the real user's balance in this universe, or `0` if there is
+no user.
 
 #### `game.deduct_credits(amount, reason)`
 
-Deduct credits from current player.
-
-```lua
-local cost = 100
-if game.deduct_credits(cost, "Bought healing potion") then
-    -- Give the potion
-else
-    game.send(player_id, "Not enough credits!")
-end
-```
-
-**Returns:** `true` if successful, `false` if insufficient funds
-
----
+Deducts from the real user. **Returns** `true` on success, or `false` if
+funds are insufficient or there is no user.
 
 #### `game.admin_grant_credits(account_id, amount)`
 
-Grant credits to a player (wizard+ only).
-
-```lua
-game.admin_grant_credits(player_id, 1000)
-```
-
-**Returns:** `true` if granted, `false` if permission denied
+Adds credits to `account_id`. Requires **admin+**. **Returns** `true` on
+success, `false` if refused.
 
 ---
 
-### Venice AI Integration
+## Venice AI
+
+These calls need a Venice API key on the server (see [admin](admin.md))
+and count against the Venice limit of 5 calls per execution. Usage is
+billed to the script's real user, which is the owner for object code.
 
 #### `game.llm_chat(messages, tier)`
 
-Send chat completion request to Venice AI.
+- `messages`: an array of `{role = "system"|"user"|"assistant", content = "..."}`.
+- `tier` (optional): `"fast"`, `"balanced"` (the default) or `"quality"`.
+
+**Returns** the reply text, or `{error = "..."}`.
 
 ```lua
-local response = game.llm_chat({
-    {role = "system", content = "You are a wise wizard NPC."},
-    {role = "user", content = "What is the meaning of life?"}
-}, "balanced")
-
-if type(response) == "string" then
-    game.send(player_id, "The wizard says: " .. response)
-else
-    game.send(player_id, "The wizard seems confused...")
-end
+local reply = game.llm_chat({
+    {role = "system", content = "You are a grumpy dwarf blacksmith. Answer in one sentence."},
+    {role = "user", content = args.args},
+}, "fast")
+if type(reply) == "table" then return "The smith ignores you." end
+return "The smith says: " .. reply
 ```
-
-**Tiers:** `"fast"`, `"balanced"`, `"quality"`
-
-**Returns:** Response string or `{error = "message"}`
-
----
 
 #### `game.llm_image(prompt, style, size)`
 
-Generate an image using Venice AI.
+- `style`: `"realistic"` (the default), `"anime"`, `"digital"` or `"painterly"`.
+- `size`: `"small"`, `"medium"` (the default) or `"large"`.
+
+**Returns** an image **hash** string, or `{error = "..."}`. The image is
+served at `/images/{hash}`.
+
+To set a room's picture, store the hash as `image_hash`; the web client
+displays it:
 
 ```lua
-local url = game.llm_image(
-    "A dark dungeon entrance with torches",
-    "realistic",
-    "medium"
-)
-
-if type(url) == "string" then
-    game.update_object(room_id, {image_url = url})
-end
+local h = game.llm_image("A torch-lit crypt entrance", "painterly")
+if type(h) == "string" then game.update_object(args.room_id, {image_hash = h}) end
 ```
-
-**Styles:** `"realistic"`, `"anime"`, `"digital"`, `"painterly"`
-
-**Sizes:** `"small"`, `"medium"`, `"large"`
-
-**Returns:** URL string or `{error = "message"}`
 
 ---
 
-### Utility Functions
+## Utilities
 
 #### `game.time()`
 
-Get current time in milliseconds since epoch.
-
-```lua
-local now = game.time()
-local last_use = obj.metadata.last_use or 0
-if now - last_use < 60000 then
-    game.send(player_id, "Item on cooldown!")
-end
-```
-
----
+**Returns** the current time in milliseconds since the Unix epoch, or the
+`set_time` override if one is set.
 
 #### `game.set_time(time_ms)`
 
-Override current time for testing (wizard+ only).
+Overrides `game.time()` for the rest of **this execution**, including
+nested `use_object` calls. `0` restores real time. Requires **wizard+**.
+**Returns** `true`, or `false` if refused.
 
-```lua
-game.set_time(1700000000000)  -- Set specific time
-game.set_time(0)              -- Return to real time
-```
+#### `game.roll_dice(dice)`
 
----
+Rolls dice in `NdM`, `NdM+K` or `NdM-K` notation, for example `"2d6+3"`
+or `"d20"`. N is 1–100 (default 1) and M is 1–1000.
 
-#### `game.roll_dice(dice_str)`
-
-Parse and roll dice notation.
-
-```lua
-local damage = game.roll_dice("2d6+3")  -- 2 six-sided dice + 3
-local check = game.roll_dice("1d20")     -- Single d20
-local healing = game.roll_dice("3d8-2")  -- 3d8 minus 2
-```
-
-**Format:** `NdM+K` or `NdM-K` where N=count, M=sides, K=modifier
-
-**Returns:** Total roll result
-
----
+**Returns** the total. Raises an error for invalid notation.
 
 #### `game.set_rng_seed(seed)`
 
-Set RNG seed for reproducible testing (wizard+ only).
-
-```lua
-game.set_rng_seed(12345)
-local roll1 = game.roll_dice("1d20")  -- Always same sequence
-```
-
----
+Seeds `game.roll_dice` for the rest of **this execution**. Use it for
+reproducible tests. Requires **wizard+**. **Returns** `true`, or `false`
+if refused. Doesn't affect `math.random`.
 
 #### `game.use_object(obj_id, actor_id, verb, target_id)`
 
-Invoke an object's handler method.
+Calls a handler on another object's code.
+
+- `verb` picks the handler: `"use"` runs `on_use`, `"hit"` runs `on_hit`, `"look"` runs `on_look`, `"init"` runs `on_init`. Any other verb is used as the handler name.
+- The handler gets `{object_id, actor_id, verb, code_hash, target_id}`.
+- It runs in a **fresh sandbox, as that object's owner**, with object-code limits. Its object context is that object, and its room context is the object's `parent_id`.
+- The caller's identity is never passed on.
+- `actor_id` is whatever the caller passed. Handlers must treat it as untrusted: it need not be the player who acted.
+- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create` and `on_destroy`. Such calls return `nil`.
+- Nesting is limited to 8 levels, and one top-level execution may make at most 32 `use_object` calls in total, across all levels. Call 33 raises an error.
+
+**Returns** the handler's result as plain data: tables, strings, numbers
+and booleans. Functions don't cross back. Returns `nil` if the object
+doesn't exist, has no code, has no such handler, or the handler is private.
+Raises an error if the handler fails.
 
 ```lua
-local result = game.use_object(potion_id, player_id, "use", nil)
+-- wake the guard when someone enters (in the room's on_enter)
+game.use_object("/d/keep/guard", args.actor_id, "wake")
 ```
-
-**Verb mapping:**
-- `"use"` → `on_use`
-- `"hit"` → `on_hit`
-- `"look"` → `on_look`
-- `"init"` → `on_init`
-
----
 
 #### `game.get_universe()`
 
-Get current universe info.
-
-```lua
-local universe = game.get_universe()
-print(universe.id)
-print(universe.name)
-print(universe.owner_id)
-print(universe.config)  -- Config table
-```
-
----
+**Returns** `{id, name, owner_id, config, created_at}` for the current
+universe.
 
 #### `game.update_universe(config)`
 
-Update universe config (wizard+ only).
+Merges the top-level keys of `config` into the universe config. Requires
+**admin+**. **Returns** `true`, or `false` if refused.
+
+The server reads only one config key, `lib_hashes`, which maps library
+names to code hashes (see [Core library](#core-library)). Other keys are
+yours to read with `get_universe()`. Use the `setportal` command to set
+the spawn room; config keys don't affect it.
+
+---
+
+## Core library
+
+Every universe has a set of libraries: Lua code that runs before **every**
+script in that universe.
+
+- **Core libraries** from the server's `lib/` directory are installed for new universes as `commands`, `combat` and `utils`.
+- **Custom libraries** can be added or replaced when the universe is created, through the `libs` field of `POST /universe/create` or the `.lua` files in a ZIP upload. See [API](API.md).
+- The list lives in the universe config as `lib_hashes`.
+
+Libraries run on every execution, so they should **only define
+functions and tables**. Top-level code that creates objects would run
+every time.
+
+### `Commands`
+
+The built-in `get`/`take`, `drop` and `inventory` commands call these
+functions as the player:
+
+- `Commands.take(player_id, item)`
+- `Commands.drop(player_id, item)`
+- `Commands.inventory(player_id)`
+
+Each returns `{success, message}`. The message is the player's reply, and
+the onlookers' broadcast excludes the player.
+
+`Commands.take` finds the item with `game.present` and refuses objects
+that are `fixed` or living (`game.is_a(id, "living")`: NPCs, players and
+their subclasses).
+
+The library also defines `Commands.give`, `Commands.look`, `Commands.flee`,
+`Commands.say` and `Commands.use`, but no player command calls them.
+
+### `Combat`
+
+A Lua combat helper that stores HP in object properties. It is separate
+from the built-in `attack` command (see [Built-in combat](#built-in-combat)).
+
+- `Combat.attack(attacker_id, defender_id, weapon_id)`
+- `Combat.deal_damage(target_id, amount, damage_type)`: applies `metadata.resistances[damage_type]` as a percentage.
+- `Combat.heal(target_id, amount)`
+- `Combat.apply_effect(target_id, effect, duration_secs, strength)` and `Combat.remove_effect(target_id, effect)`
+- `Combat.process_effects(id)`: call it from a heartbeat; poison and burn deal damage, regen heals.
+- `Combat.is_dead(id)` and `Combat.get_stats(id)`
+- Constants:
+  - `Combat.DAMAGE_TYPES`: `physical`, `fire`, `ice`, `lightning`, `poison`, `holy`, `dark`
+  - `Combat.EFFECTS`: `stun`, `poison`, `burn`, `freeze`, `bleed`, `regen`
+
+These functions write object properties as the acting user, so they need
+Modify permission on the target.
+
+### `Utils`
+
+Small helpers:
+
+- `get_prop(id, prop, default)`, `set_prop(id, prop, value)`, `exists(id)`
+- `find_by_class(parent, class)`, `living_in(room)`
+- `split`, `trim`, `capitalize`, `contains`, `deep_copy`, `random_element`
+- `clamp`, `lerp`, `format_number`, `format_duration`
+
+---
+
+## Built-in classes
+
+Objects start with the defaults of their class and its ancestors. The
+`create` command doesn't apply class defaults; `game.create_object` does.
+
+| Class | Parent | Default properties |
+|---|---|---|
+| `thing` | — | `name = ""`, `description = ""` |
+| `item` | thing | `weight = 0`, `value = 0`, `fixed = false` |
+| `living` | thing | `hp = 100`, `max_hp = 100`, `attack_bonus = 0`, `armor_class = 10`, `in_combat = false` |
+| `room` | thing | `exits = {}`, `lighting = "normal"`, `region_id = nil` |
+| `region` | thing | `environment_type = "dungeon"`, `danger_level = 1`, `ambient_sounds = {}` |
+| `weapon` | item | `damage_dice = "1d6"`, `damage_bonus = 0`, `damage_type = "physical"` |
+| `armor` | item | `armor_value = 0`, `slot = "body"` |
+| `container` | item | `capacity = 10`, `locked = false` |
+| `player` | living | `access_level = "player"` |
+| `npc` | living | `aggro = false`, `respawn_time = nil` |
+
+Which properties the server reads:
+
+| Property | Used by |
+|---|---|
+| `name`, `description` | room display, `present`, verb matching |
+| `exits` | movement: maps a direction (`north`, `south`, `east`, `west`, `up`, `down`) to a room ID |
+| `fixed` | blocks moving by non-builders, and the `take` command |
+| `image_hash` (room) | the room picture. If it is missing and Venice is configured, the server generates one in the background the first time a logged-in player sees the room. |
+| `region_id` (room), `environment_type` (region) | style hint for those generated pictures |
+| `is_portal` (room) | marks a safe room, where returning players respawn |
+| `last_safe_location`, `workroom_id` (player) | where a returning player respawns |
+| `hp`, `max_hp` (npc) | seed the `attack` command's combat state |
+
+All other properties, including `weight`, `value`, `lighting`, `aggro`, `respawn_time`, the weapon and armor fields,
+`capacity` and `locked`, are data for your own scripts.
+
+---
+
+## Built-in combat
+
+The built-in `attack <name>` (or `kill`) command works like this:
+
+- It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`.
+- On the first attack, combat state is created from the NPC's `hp` and `max_hp` properties. After that, HP is tracked in the combat system, not in the property.
+- Each attack is a d20 roll against armor class 10. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit). A natural 1 always misses.
+- NPCs don't fight back. Write that in Lua (see the [tutorial](langtutor.md)).
+- A hit fires `on_damage`. A kill fires `on_death` and removes the NPC from the room (`parent_id = nil`) without deleting it.
+
+The Rust combat engine knows these damage types: `physical`, `slashing`,
+`piercing`, `bludgeoning`, `fire`, `cold` (alias `ice`), `lightning`,
+`acid`, `poison`, `necrotic`, `radiant` (alias `holy`), `psychic`,
+`force` and `thunder`. Its status effects include poisoned, stunned,
+blinded, burning, frozen, paralyzed, slowed, hasted, strengthened,
+weakened, protected, exposed, invisible, regenerating and silenced.
+
+Lua has **no bindings** to the Rust combat engine. For combat in Lua, use
+the [`Combat`](#combat) library or your own code.
+
+---
+
+## Not yet supported
+
+These are not built yet. See the [roadmap](../../docs/roadmap.md).
+
+- **Unfired handlers:** `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` never fire on their own. Call the ones other than `on_create` and `on_destroy` with `game.use_object` (which refuses engine hooks), or start a heartbeat yourself.
+- **Unused NPC properties:** `aggro` and `respawn_time` do nothing.
+- **Missing player commands:** there is no `use`, `give` or `flee` command. Add verbs with `game.add_action`.
+- **Combat gaps:** the server has no NPC counter-attacks and no PvP. Lua has no bindings to the combat engine.
+- **Movement from Lua:** `game.move_object` fires no hooks and can't teleport connected players.
+- **Persistence:** custom verbs, heartbeats and classes defined with `define_class` don't survive a restart.
+- **Universe config:** keys such as `pvp_mode` or `spawn_room` are not read by the server.
+
+---
+
+## Lua quick reference
+
+Mudcroft uses standard Lua 5.4. These are the points that most often trip
+up newcomers. Each comment shows the value of the expression on its left.
 
 ```lua
-game.update_universe({
-    pvp_enabled = true,
-    spawn_room = "new_room_id"
-})
+local items = {"sword", "shield"}    -- arrays start at 1
+local first = items[1]               -- "sword"
+local count = #items                 -- 2
+local npc = {name = "Guard", hp = 50}
+local hp = npc.hp                    -- 50, same as npc["hp"]
+
+local msg = "HP: " .. hp             -- concatenation is .., not +
+local s = string.format("%s has %d HP", npc.name, hp)
+
+if hp <= 0 then                      -- not-equal is ~=, not !=
+    -- ...
+elseif hp < 20 then
+    -- ...
+end
+
+for i = 1, 3 do end                  -- 1, 2, 3
+for i, v in ipairs(items) do end     -- arrays, in order
+for k, v in pairs(npc) do end        -- tables, any order
+
+local ok, err = pcall(game.update_object, "/d/x", {hp = 1})   -- catch errors
 ```
 
----
+- `nil` and `false` are the only false values; `0` and `""` are true.
+- Declare variables with `local`. Globals leak into the rest of the script.
+- There is no `x++`; write `x = x + 1`.
 
-## Part 4: Sandbox Limits
-
-Scripts execute in a secure sandbox with resource limits:
-
-| Resource | Default Limit |
-|----------|---------------|
-| Instructions | 1,000,000 (wizard eval: 10,000,000) |
-| Memory | 64 MB |
-| Timeout | 500 ms (wizard eval: 5 seconds) |
-| Database queries | 100 per execution |
-| Venice API calls | 5 per execution |
-
-### Removed Globals
-
-The following are **not available** in the sandbox:
-
-- `os` - Operating system access
-- `io` - File I/O
-- `loadfile`, `dofile`, `load`, `loadstring` - Code loading
-- `require`, `package` - Module system
-- `debug` - Debug library
-- `collectgarbage` - GC control
-
-### Available Libraries
-
-- `string` - String manipulation
-- `table` - Table operations
-- `math` - Math functions
-- `utf8` - UTF-8 handling
-- `print` - Safe print (does nothing)
-
----
-
-## Part 5: Base Classes Reference
-
-### thing (root)
-
-The base class for all objects.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `name` | string | `""` | Display name |
-| `description` | string | `""` | Description text |
-
-**Handlers:** `on_create`, `on_destroy`, `on_init`
-
----
-
-### item (extends thing)
-
-Movable objects that can be picked up.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `weight` | number | `0` | Weight in pounds |
-| `value` | number | `0` | Value in credits |
-| `fixed` | boolean | `false` | If true, cannot be moved |
-
-**Handlers:** `on_move`, `on_use`
-
----
-
-### living (extends thing)
-
-Entities that can engage in combat.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `hp` | number | `100` | Current hit points |
-| `max_hp` | number | `100` | Maximum hit points |
-| `attack_bonus` | number | `0` | Bonus to attack rolls |
-| `armor_class` | number | `10` | Defense value |
-| `in_combat` | boolean | `false` | Currently fighting |
-
-**Handlers:** `heart_beat`, `on_damage`, `on_death`
-
----
-
-### room (extends thing)
-
-Locations that contain other objects.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `exits` | object | `{}` | Direction → room_id mapping |
-| `lighting` | string | `"normal"` | Lighting level |
-| `region_id` | string | `null` | Parent region |
-
-**Handlers:** `on_enter`, `on_leave`
-
----
-
-### region (extends thing)
-
-Groups of rooms with shared properties.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `environment_type` | string | `"dungeon"` | Environment theme |
-| `danger_level` | number | `1` | Difficulty rating |
-| `ambient_sounds` | array | `[]` | Background sounds |
-
----
-
-### weapon (extends item)
-
-Items used for dealing damage.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `damage_dice` | string | `"1d6"` | Dice notation |
-| `damage_bonus` | number | `0` | Flat damage bonus |
-| `damage_type` | string | `"physical"` | Damage type |
-
-**Damage Types:** `physical`, `fire`, `ice`, `lightning`, `poison`, `necrotic`, `radiant`, `psychic`
-
----
-
-### armor (extends item)
-
-Protective equipment.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `armor_value` | number | `0` | AC bonus |
-| `slot` | string | `"body"` | Equipment slot |
-
----
-
-### container (extends item)
-
-Objects that hold other objects.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `capacity` | number | `10` | Max items |
-| `locked` | boolean | `false` | Requires key |
-
----
-
-### player (extends living)
-
-Player characters.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `access_level` | string | `"player"` | Permission level |
-
----
-
-### npc (extends living)
-
-Non-player characters.
-
-**Properties:**
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `aggro` | boolean | `false` | Auto-attack players |
-| `respawn_time` | number | `null` | Respawn delay (ms) |
-
-**Handlers:** `ai_idle_tick`, `ai_combat_tick`
+Further reading: [Lua 5.4 manual](https://www.lua.org/manual/5.4/) ·
+[Programming in Lua](https://www.lua.org/pil/) ·
+[Learn Lua in Y minutes](https://learnxinyminutes.com/docs/lua/)
