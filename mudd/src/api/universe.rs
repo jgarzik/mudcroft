@@ -404,6 +404,12 @@ async fn run_script(
     Path(universe_id): Path<String>,
     Json(request): Json<RunScriptRequest>,
 ) -> impl IntoResponse {
+    // Require authentication
+    let account = match authenticate(&headers, &state).await {
+        Ok(acc) => acc,
+        Err(e) => return e.into_response(),
+    };
+
     // Normalize like create and /ws (ids are case-insensitive)
     let universe_id = match validate_universe_id(&universe_id) {
         Ok(id) => id,
@@ -416,11 +422,6 @@ async fn run_script(
             )
                 .into_response()
         }
-    };
-    // Require authentication
-    let account = match authenticate(&headers, &state).await {
-        Ok(acc) => acc,
-        Err(e) => return e.into_response(),
     };
 
     // Validate universe exists and check ownership

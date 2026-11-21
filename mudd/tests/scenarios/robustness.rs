@@ -176,3 +176,77 @@ async fn test_server_starts_with_owner_but_no_admin() {
         .await
         .expect("restart with an owner account");
 }
+
+/// get_living_in includes subclasses of npc and player
+#[tokio::test]
+async fn test_get_living_in_includes_subclasses() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = connect(
+        &server,
+        Role::Wizard {
+            username: "living_wiz".into(),
+        },
+    )
+    .await;
+    let text = reply_text(
+        &mut wiz,
+        &format!(
+            r#"eval game.define_class("hound", {{parent = "npc"}})
+               game.create_object("/npcs/hound", "hound", "{room}", {{name = "Hound"}})
+               local names = {{}}
+               for _, o in ipairs(game.get_living_in("{room}")) do names[#names + 1] = o.name end
+               return table.concat(names, ",")"#,
+            room = entrance
+        ),
+    )
+    .await;
+    assert!(text.contains("Hound"), "living list: {}", text);
+}
+
+/// A verb handler that returns "" (or nil) sends no reply line
+#[tokio::test]
+async fn test_verb_empty_result_is_silent() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = connect(
+        &server,
+        Role::Wizard {
+            username: "silent_wiz".into(),
+        },
+    )
+    .await;
+    reply_text(
+        &mut wiz,
+        &format!(
+            r#"eval local h = game.store_code([[return {{ hum = function(a) game.send(a.actor_id, "hmm"); return "" end }}]])
+               game.create_object("/items/drone", "item", "{}", {{name = "drone", code_hash = h}})
+               return game.add_action("hum", "/items/drone", "hum")"#,
+            entrance
+        ),
+    )
+    .await;
+
+    wiz.command("hum").await.unwrap();
+    let _ = wiz.expect("echo").await;
+    let first = wiz.expect_any().await.unwrap();
+    assert_eq!(first["text"], "hmm");
+    // The very next message must be the echo of our next command
+    wiz.command("look").await.unwrap();
+    let next = wiz.expect_any().await.unwrap();
+    assert_eq!(next["type"], "echo", "no blank output in between: {}", next);
+}
+
+/// Unauthenticated run_script calls get 401 before any input validation
+#[tokio::test]
+async fn test_run_script_requires_auth_first() {
+    let server = TestServer::start_with_world(false).await.expect("server");
+    let resp = server
+        .post(
+            "/universe/BAD!!/run_script",
+            &serde_json::json!({"script": "x.lua"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}

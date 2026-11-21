@@ -1177,14 +1177,25 @@ impl GameApi {
         game.set("present", present)?;
 
         // game.get_living_in(env_id)
-        // Returns living entities (players, npcs) in a location
+        // Returns living entities in a location: anything whose class is
+        // living or descends from it (players, npcs and their subclasses)
+        let classes = self.classes.clone();
         let get_living_in = lua.create_function(move |lua, env_id: String| {
             charge_db(lua)?;
             let store = store.clone();
+            let classes = classes.clone();
 
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(async { store.get_living_in(&env_id).await })
+                tokio::runtime::Handle::current().block_on(async {
+                    let contents = store.get_contents(&env_id).await?;
+                    let registry = classes.read().await;
+                    Ok::<_, anyhow::Error>(
+                        contents
+                            .into_iter()
+                            .filter(|o| registry.is_a(&o.class, "living"))
+                            .collect::<Vec<_>>(),
+                    )
+                })
             });
 
             match result {

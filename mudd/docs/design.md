@@ -272,7 +272,8 @@ command looks for candidates in this order: room actions for the player's
 room (only if their object is nearby), then object actions on inventory
 items, objects in the room, and the room itself. If the player named a target
 ("pull lever"), the candidate whose object name matches wins; otherwise the
-first one does. A string result becomes the reply. Handler errors show
+first one does. A non-empty string result becomes the reply (`nil` or `""`
+sends none). Handler errors show
 players "Something went wrong." while wizards+ see the details.
 
 ## Script Runner

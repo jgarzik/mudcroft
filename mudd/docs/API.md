@@ -333,7 +333,7 @@ Any other verb is offered to custom verbs registered with `game.add_action`.
 The candidates, in order, are: room actions, then actions on objects you carry,
 on objects in the room, and on the room itself. If you name a target
 (`pull lever`), an object whose name matches wins. The handler runs as the
-object's owner. A string result becomes the reply, even an empty one. A `nil` result sends
+object's owner. A non-empty string result becomes the reply. A `nil` or `""` result sends
 no reply, which is useful when the handler already used `game.send`. If no verb
 matches: `{"type":"output","text":"Unknown command: <verb>"}`.
 

@@ -529,9 +529,9 @@ which one you get is unspecified.
 
 #### `game.get_living_in(env_id)`
 
-**Returns** objects in `env_id` whose class is exactly `player`, `npc` or
-`living`. Objects of custom subclasses are **not** included; use
-`all_inventory` with `game.is_a` for those.
+**Returns** objects in `env_id` whose class is `living` or descends from it:
+players, NPCs and their subclasses (including classes made with
+`define_class`).
 
 Connected guests have no player object, so they never appear.
 

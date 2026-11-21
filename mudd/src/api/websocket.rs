@@ -1511,7 +1511,8 @@ async fn dispatch_custom_verb(
     )
     .await;
     Some(match result {
-        Ok(Some(text)) if text != "nil" => ServerMessage::Output { text },
+        // nil or "" means the handler already said everything (game.send)
+        Ok(Some(text)) if text != "nil" && !text.is_empty() => ServerMessage::Output { text },
         Ok(_) => ServerMessage::Silent,
         Err(message) => {
             warn!(
