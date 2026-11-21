@@ -86,17 +86,14 @@ impl CreditManager {
             }
         }
 
-        // Load from DB if available
-        if let Some(ref pool) = self.pool {
-            if let Ok(balance) = self.load_balance(universe_id, account_id, pool).await {
-                let mut balances = self.balances.write().await;
-                balances.insert(key, balance);
-                return balance;
-            }
-        }
-
-        // Default to 0 if not found
-        0
+        // Cache miss: load under the write lock, so a concurrent grant or
+        // deduct cannot be overwritten by the stale value read here
+        let mut balances = self.balances.write().await;
+        let balance = self
+            .cached_or_stored(&balances, universe_id, account_id)
+            .await;
+        balances.insert(key, balance);
+        balance
     }
 
     /// Deduct credits from a player's balance
