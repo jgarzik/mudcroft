@@ -845,6 +845,50 @@ async fn test_take_works_in_second_universe() {
     .await
     .expect("reply");
     assert_eq!(reply["text"], "You take gem.", "{}", reply);
+
+    // Back in the first universe the gem stays in the pack: dropping it
+    // there would move another universe's object into this one
+    ws.close(None).await.ok();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (mut back, _) = tokio_tungstenite::connect_async(url(server.universe_id()))
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while back.next().await.is_some() {}
+    })
+    .await;
+    back.send(Message::Text(
+        serde_json::json!({"type": "command", "text": "drop gem"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(msg)) = back.next().await {
+            let v: serde_json::Value =
+                serde_json::from_str(msg.to_text().unwrap_or("{}")).unwrap_or_default();
+            if v["type"] == "output" || v["type"] == "error" {
+                return v;
+            }
+        }
+        serde_json::Value::Null
+    })
+    .await
+    .expect("reply");
+    assert_eq!(
+        reply["type"], "output",
+        "a clean refusal, not an error: {}",
+        reply
+    );
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("another world"),
+        "{}",
+        reply
+    );
 }
 
 /// Only an account's real player object is shared across universes: an
@@ -880,4 +924,83 @@ async fn test_player_exemption_requires_real_player_object() {
     ] {
         assert_eq!(eval(&mut wiz, code).await, "refused", "{}", code);
     }
+}
+
+/// Universe confinement also covers room broadcasts and the parent of new
+/// objects
+#[tokio::test]
+async fn test_broadcast_and_create_parent_stay_in_universe() {
+    use futures_util::StreamExt;
+    let server = TestServer::start().await.expect("server");
+    sqlx::query(
+        "INSERT INTO universes (id, name, owner_id, config)
+         SELECT 'other-world', 'Other', owner_id, config FROM universes WHERE id = ?",
+    )
+    .bind(server.universe_id())
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let store = server.world().store();
+    let mut plaza = mudd::objects::Object::new("/d/other/plaza", "other-world", "room").unwrap();
+    plaza.set_property("name", serde_json::json!("Plaza"));
+    store.create(&plaza).await.unwrap();
+    store
+        .set_portal("other-world", "/d/other/plaza")
+        .await
+        .unwrap();
+
+    let reg: serde_json::Value = server
+        .post(
+            "/auth/register",
+            &serde_json::json!({"username": "plaza_bob", "password": "test123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = format!(
+        "ws://{}/ws?universe=other-world&token={}",
+        server.addr,
+        reg["token"].as_str().unwrap()
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while ws.next().await.is_some() {}
+    })
+    .await;
+
+    let mut wiz = connect(&server, wizard("plaza_wiz")).await;
+    eval(
+        &mut wiz,
+        r#"game.broadcast("/d/other/plaza", "cross-room spam"); return true"#,
+    )
+    .await;
+    let leaked = tokio::time::timeout(std::time::Duration::from_millis(600), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if msg
+                .to_text()
+                .unwrap_or_default()
+                .contains("cross-room spam")
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!leaked, "broadcast reached another universe's room");
+
+    let out = eval(
+        &mut wiz,
+        r#"local r = game.create_object("/d/here/junk", "item", "/d/other/plaza", {name = "junk"})
+           local c = game.clone_object("/d/here/junk2-src", "/d/here/junk2", "/d/other/plaza")
+           return (r.error and "refused" or "created")"#,
+    )
+    .await;
+    assert_eq!(
+        out, "refused",
+        "create with a foreign parent must be refused"
+    );
 }

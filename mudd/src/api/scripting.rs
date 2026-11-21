@@ -276,14 +276,21 @@ pub async fn deliver(state: &AppState, queue: &MessageQueue, universe_id: &str) 
                 message,
                 exclude_id,
             } => {
-                state
-                    .connections
-                    .broadcast_room_except(
-                        &room_id,
-                        exclude_id.as_deref(),
-                        ServerMessage::Output { text: message },
-                    )
-                    .await;
+                // Only rooms of the script's own universe
+                let in_universe = matches!(
+                    state.object_store.get(&room_id).await,
+                    Ok(Some(room)) if room.universe_id == universe_id
+                );
+                if in_universe {
+                    state
+                        .connections
+                        .broadcast_room_except(
+                            &room_id,
+                            exclude_id.as_deref(),
+                            ServerMessage::Output { text: message },
+                        )
+                        .await;
+                }
             }
             GameMessage::BroadcastRegion { region_id, message } => {
                 broadcast_region(state, universe_id, &region_id, &message).await;

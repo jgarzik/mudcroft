@@ -1433,8 +1433,16 @@ async fn dispatch_custom_verb(
     let room_id = state.connections.get_room_id(player_id).await;
 
     let mut nearby: Vec<String> = Vec::new();
+    // Only objects of this universe (an inventory may hold items carried in
+    // from elsewhere; their code cannot run here)
+    let universe = state.connections.get_universe_id(player_id).await?;
     if let Ok(items) = state.object_store.get_contents(player_id).await {
-        nearby.extend(items.into_iter().map(|o| o.id));
+        nearby.extend(
+            items
+                .into_iter()
+                .filter(|o| o.universe_id == universe)
+                .map(|o| o.id),
+        );
     }
     if let Some(ref room) = room_id {
         if let Ok(objs) = state.object_store.get_contents(room).await {

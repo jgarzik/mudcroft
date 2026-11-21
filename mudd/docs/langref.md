@@ -599,9 +599,9 @@ room action twice has no effect.
 ## Messaging
 
 Messages are delivered after the script finishes. They reach only
-connected players. `game.send` and `game.broadcast_region` skip players
-connected to other universes; `game.broadcast` reaches whoever is in the
-room.
+connected players in the script's universe: `game.send` and
+`game.broadcast_region` skip players connected to other universes, and
+`game.broadcast` to a room of another universe is dropped.
 
 #### `game.send(player_id, message)`
 
@@ -936,7 +936,9 @@ the onlookers' broadcast excludes the player.
 
 `Commands.take` finds the item with `game.present` and refuses objects
 that are `fixed` or living (`game.is_a(id, "living")`: NPCs, players and
-their subclasses).
+their subclasses). Because a player object (and so the inventory) is shared
+by every universe the player visits, `Commands.drop` and `Commands.give`
+refuse an item that belongs to another universe; it stays in the pack.
 
 The library also defines `Commands.give`, `Commands.look`, `Commands.flee`,
 `Commands.say` and `Commands.use`, but no player command calls them.

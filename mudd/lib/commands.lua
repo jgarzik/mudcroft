@@ -7,6 +7,16 @@
 
 Commands = {}
 
+-- Player objects (and so inventories) are shared by every universe a player
+-- visits. An item carried in from another universe stays in the pack: it
+-- cannot be dropped or given here.
+local function from_another_world(item)
+    local here = game.get_universe()
+    return here ~= nil and item.universe_id ~= here.id
+end
+
+local ANOTHER_WORLD = "That belongs to another world; it stays in your pack here."
+
 -- Take an item from the current room into player inventory
 -- Returns {success: bool, message: string}
 function Commands.take(player_id, item_name)
@@ -61,6 +71,9 @@ function Commands.drop(player_id, item_name)
     if not item then
         return {success = false, message = "You don't have that"}
     end
+    if from_another_world(item) then
+        return {success = false, message = ANOTHER_WORLD}
+    end
 
     -- Move item to room
     game.move_object(item.id, room_id)
@@ -91,6 +104,9 @@ function Commands.give(player_id, item_name, target_name)
     local item = game.present(item_name, player_id)
     if not item then
         return {success = false, message = "You don't have that"}
+    end
+    if from_another_world(item) then
+        return {success = false, message = ANOTHER_WORLD}
     end
 
     -- Find the target in the room

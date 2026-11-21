@@ -54,6 +54,23 @@ fn is_account_player_object(obj: &Object) -> bool {
             .is_some_and(|owner| obj.id == crate::player::PlayerManager::player_path(owner))
 }
 
+/// Check that `parent_id` (if any) may contain objects of `universe_id`: it
+/// must exist and belong to that universe, or be an account's player object
+async fn check_parent(
+    store: &ObjectStore,
+    universe_id: &str,
+    parent_id: Option<&str>,
+) -> anyhow::Result<Result<(), String>> {
+    let Some(parent_id) = parent_id else {
+        return Ok(Ok(()));
+    };
+    Ok(match store.get(parent_id).await? {
+        Some(p) if p.universe_id == universe_id || is_account_player_object(&p) => Ok(()),
+        Some(_) => Err(format!("{} belongs to another universe", parent_id)),
+        None => Err(format!("parent not found: {}", parent_id)),
+    })
+}
+
 /// Objects only the server may create: player-class objects and anything
 /// under /players/ (player objects are made on connect)
 fn is_reserved_object(path: &str, class: &str) -> bool {
@@ -464,6 +481,12 @@ impl GameApi {
                             {
                                 return Ok(Err(format!("permission denied: {}", reason)));
                             }
+                            if let Err(reason) =
+                                check_parent(&store, &universe_id, obj_clone.parent_id.as_deref())
+                                    .await?
+                            {
+                                return Ok(Err(reason));
+                            }
                             if let Some(ref hash) = obj_clone.code_hash {
                                 if store.get_code(hash).await?.is_none() {
                                     return Ok(Err(format!("unknown code_hash {}", hash)));
@@ -762,6 +785,12 @@ impl GameApi {
                                     }
                                     let mut cloned = original.clone();
                                     cloned.id = validated_path;
+                                    if let Err(reason) =
+                                        check_parent(&store, &universe_id, new_parent_id.as_deref())
+                                            .await?
+                                    {
+                                        return Ok(Err(reason));
+                                    }
                                     cloned.parent_id = new_parent_id;
                                     cloned.owner_id = user.clone();
                                     cloned.created_at = chrono::Utc::now().to_rfc3339();

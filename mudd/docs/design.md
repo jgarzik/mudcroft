@@ -331,6 +331,10 @@ Object ids are global, so isolation is enforced at each write:
   objects or anything under `/players/`.
 - Spawning ignores a remembered room (`last_safe_location`, current room)
   that belongs to another universe and uses the portal instead.
+- Queued `game.broadcast` messages to rooms of other universes are dropped.
+- `create_object`/`clone_object` refuse a parent in another universe
+  (except an account's player object), and verb dispatch ignores inventory
+  items from other universes; `drop`/`give` keep such items in the pack.
 - Queued `game.send` and `game.broadcast_region` messages skip sessions
   connected to other universes.
 - `goto` and `setportal` refuse rooms outside the session's universe.
