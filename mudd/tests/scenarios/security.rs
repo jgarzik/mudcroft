@@ -270,3 +270,81 @@ async fn test_created_object_owned_by_creator() {
             .expect("object row");
     assert_eq!(owner.as_deref(), Some(wiz_id.as_str()));
 }
+
+/// Lua object writes are permission-checked for the acting user:
+/// a player identity may not create, modify or delete objects it does not
+/// own and has no path grant for, but may move non-fixed items.
+#[tokio::test]
+async fn test_lua_object_writes_are_permission_checked() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("perm_wiz")).await;
+    let pl = connect(&server, player("perm_player")).await;
+    let pl_id = pl.account_id().unwrap().to_string();
+
+    // Wizard sets up objects (wizards bypass path checks)
+    eval(
+        &mut wiz,
+        r#"game.create_object("/d/perm/box", "item", nil, {name = "box"})
+           game.create_object("/d/perm/statue", "item", nil, {name = "statue", fixed = true})
+           return true"#,
+    )
+    .await;
+
+    let as_player = |code: &str| {
+        format!(
+            r#"game.set_actor("{}"); local ok, r = pcall(function() {} end); if not ok then return "denied" end; if type(r) == "table" and r.error then return "denied" end; return tostring(r)"#,
+            pl_id, code
+        )
+    };
+
+    let out = eval(
+        &mut wiz,
+        &as_player(r#"return game.create_object("/d/perm/new", "item", nil, {})"#),
+    )
+    .await;
+    assert_eq!(out, "denied", "player must not create objects");
+
+    let out = eval(
+        &mut wiz,
+        &as_player(r#"return game.update_object("/d/perm/box", {name = "mine"})"#),
+    )
+    .await;
+    assert_eq!(out, "denied", "player must not modify others' objects");
+
+    let out = eval(
+        &mut wiz,
+        &as_player(r#"return game.delete_object("/d/perm/box")"#),
+    )
+    .await;
+    assert_eq!(out, "denied", "player must not delete others' objects");
+
+    let out = eval(
+        &mut wiz,
+        &as_player(r#"return game.move_object("/d/perm/statue", nil)"#),
+    )
+    .await;
+    assert_eq!(out, "denied", "player must not move fixed objects");
+
+    let out = eval(
+        &mut wiz,
+        &as_player(r#"return game.clone_object("/d/perm/box", "/d/perm/box2", nil)"#),
+    )
+    .await;
+    assert_eq!(out, "denied", "player must not clone into unowned paths");
+
+    let out = eval(
+        &mut wiz,
+        &as_player(r#"return game.move_object("/d/perm/box", nil)"#),
+    )
+    .await;
+    assert_eq!(out, "true", "player may move non-fixed items");
+
+    // The box is untouched by the denied writes
+    let name: String = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.name') FROM objects WHERE id = '/d/perm/box'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .expect("box still exists");
+    assert_eq!(name, "box");
+}

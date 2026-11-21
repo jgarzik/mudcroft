@@ -42,6 +42,56 @@ where
     .expect("permission lookup thread panicked")
 }
 
+/// Check `action` on an existing object for the acting user.
+/// Returns the denial reason on failure; no user context is always denied.
+async fn object_permission(
+    permissions: &PermissionManager,
+    user_id: Option<&str>,
+    universe_id: &str,
+    obj: &Object,
+    action: PermAction,
+) -> Result<(), String> {
+    let Some(user_id) = user_id else {
+        return Err("no user context".to_string());
+    };
+    let ctx = permissions.get_user_context(user_id, universe_id).await;
+    let target = ObjectContext {
+        object_id: obj.id.clone(),
+        owner_id: obj.owner_id.clone(),
+        is_fixed: obj
+            .properties
+            .get("fixed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+    match permissions.check_permission(&ctx, action, &target) {
+        crate::permissions::PermissionResult::Allowed => Ok(()),
+        crate::permissions::PermissionResult::Denied(reason) => Err(reason),
+    }
+}
+
+/// Check permission to create an object at `path` for the acting user
+async fn create_permission(
+    permissions: &PermissionManager,
+    user_id: Option<&str>,
+    universe_id: &str,
+    path: &str,
+) -> Result<(), String> {
+    let Some(user_id) = user_id else {
+        return Err("no user context".to_string());
+    };
+    let ctx = permissions.get_user_context(user_id, universe_id).await;
+    match permissions.check_create_permission(&ctx, path) {
+        crate::permissions::PermissionResult::Allowed => Ok(()),
+        crate::permissions::PermissionResult::Denied(reason) => Err(reason),
+    }
+}
+
+/// Lua error for a denied object operation
+fn denied(op: &str, reason: String) -> mlua::Error {
+    mlua::Error::runtime(format!("{}: permission denied: {}", op, reason))
+}
+
 /// Game API context shared with Lua
 #[allow(dead_code)]
 pub struct GameApi {
@@ -243,6 +293,7 @@ impl GameApi {
         let store_clone = store.clone();
         let universe_clone = universe_id.clone();
         let user_clone = current_user.clone();
+        let permissions_clone = permissions.clone();
         let create_object = lua.create_function(
             move |lua,
                   (path, class, parent_id, props): (
@@ -279,15 +330,33 @@ impl GameApi {
                     }
                 }
 
-                // Save to database
+                // Check permission, then save to database
                 let obj_clone = obj.clone();
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { store.create(&obj_clone).await })
-                });
+                let permissions = permissions_clone.clone();
+                let result: anyhow::Result<Result<(), String>> =
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            if let Err(reason) = create_permission(
+                                &permissions,
+                                obj_clone.owner_id.as_deref(),
+                                &universe_id,
+                                &obj_clone.id,
+                            )
+                            .await
+                            {
+                                return Ok(Err(reason));
+                            }
+                            store.create(&obj_clone).await.map(Ok)
+                        })
+                    });
 
                 match result {
-                    Ok(()) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
+                    Ok(Ok(())) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
+                    Ok(Err(reason)) => {
+                        let error_table = lua.create_table()?;
+                        error_table.set("error", format!("permission denied: {}", reason))?;
+                        Ok(Value::Table(error_table))
+                    }
                     Err(e) => Err(mlua::Error::external(e)),
                 }
             },
@@ -315,8 +384,15 @@ impl GameApi {
         // game.update_object(id, changes)
         // Actually updates object in database
         let store_clone = store.clone();
-        let update_object = lua.create_function(move |_, (id, changes): (String, Table)| {
+        let ctx_clone = (
+            current_user.clone(),
+            universe_id.clone(),
+            permissions.clone(),
+        );
+        let update_object = lua.create_function(move |lua, (id, changes): (String, Table)| {
             let store = store_clone.clone();
+            let (user, universe_id, permissions) = ctx_clone.clone();
+            let user = actor_override(lua).or(user);
 
             // Collect changes into a vec first (outside async)
             let mut changes_vec = Vec::new();
@@ -326,26 +402,38 @@ impl GameApi {
                 changes_vec.push((k, json_val));
             }
 
-            let result: anyhow::Result<bool> = tokio::task::block_in_place(|| {
+            let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     // First get the existing object
                     let obj_result = store.get(&id).await?;
                     match obj_result {
                         Some(mut obj) => {
+                            if let Err(reason) = object_permission(
+                                &permissions,
+                                user.as_deref(),
+                                &universe_id,
+                                &obj,
+                                PermAction::Modify,
+                            )
+                            .await
+                            {
+                                return Ok(Err(reason));
+                            }
                             // Apply changes
                             for (k, v) in changes_vec {
                                 obj.properties.insert(k, v);
                             }
                             store.update(&obj).await?;
-                            Ok(true)
+                            Ok(Ok(true))
                         }
-                        None => Ok(false),
+                        None => Ok(Ok(false)),
                     }
                 })
             });
 
             match result {
-                Ok(success) => Ok(success),
+                Ok(Ok(success)) => Ok(success),
+                Ok(Err(reason)) => Err(denied("update_object", reason)),
                 Err(e) => Err(mlua::Error::external(e)),
             }
         })?;
@@ -354,15 +442,39 @@ impl GameApi {
         // game.delete_object(id)
         // Actually deletes from database
         let store_clone = store.clone();
-        let delete_object = lua.create_function(move |_, id: String| {
+        let ctx_clone = (
+            current_user.clone(),
+            universe_id.clone(),
+            permissions.clone(),
+        );
+        let delete_object = lua.create_function(move |lua, id: String| {
             let store = store_clone.clone();
+            let (user, universe_id, permissions) = ctx_clone.clone();
+            let user = actor_override(lua).or(user);
 
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async { store.delete(&id).await })
+            let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let Some(obj) = store.get(&id).await? else {
+                        return Ok(Ok(false));
+                    };
+                    if let Err(reason) = object_permission(
+                        &permissions,
+                        user.as_deref(),
+                        &universe_id,
+                        &obj,
+                        PermAction::Delete,
+                    )
+                    .await
+                    {
+                        return Ok(Err(reason));
+                    }
+                    store.delete(&id).await.map(Ok)
+                })
             });
 
             match result {
-                Ok(deleted) => Ok(deleted),
+                Ok(Ok(deleted)) => Ok(deleted),
+                Ok(Err(reason)) => Err(denied("delete_object", reason)),
                 Err(e) => Err(mlua::Error::external(e)),
             }
         })?;
@@ -371,17 +483,44 @@ impl GameApi {
         // game.move_object(id, new_parent_id)
         // Actually moves object in database
         let store_clone = store.clone();
+        let ctx_clone = (
+            current_user.clone(),
+            universe_id.clone(),
+            permissions.clone(),
+        );
         let move_object =
-            lua.create_function(move |_, (id, new_parent_id): (String, Option<String>)| {
+            lua.create_function(move |lua, (id, new_parent_id): (String, Option<String>)| {
                 let store = store_clone.clone();
+                let (user, universe_id, permissions) = ctx_clone.clone();
+                let user = actor_override(lua).or(user);
 
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { store.move_object(&id, new_parent_id.as_deref()).await })
-                });
+                let result: anyhow::Result<Result<(), String>> =
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let Some(obj) = store.get(&id).await? else {
+                                anyhow::bail!("Object not found: {}", id);
+                            };
+                            if let Err(reason) = object_permission(
+                                &permissions,
+                                user.as_deref(),
+                                &universe_id,
+                                &obj,
+                                PermAction::Move,
+                            )
+                            .await
+                            {
+                                return Ok(Err(reason));
+                            }
+                            store
+                                .move_object(&id, new_parent_id.as_deref())
+                                .await
+                                .map(Ok)
+                        })
+                    });
 
                 match result {
-                    Ok(()) => Ok(true),
+                    Ok(Ok(())) => Ok(true),
+                    Ok(Err(reason)) => Err(denied("move_object", reason)),
                     Err(e) => Err(mlua::Error::external(e)),
                 }
             })?;
@@ -391,9 +530,16 @@ impl GameApi {
         // Actually clones object in database
         // Returns object on success, nil if not found, or {error = "message"} on path validation failure
         let store_clone = store.clone();
+        let ctx_clone = (
+            current_user.clone(),
+            universe_id.clone(),
+            permissions.clone(),
+        );
         let clone_object = lua.create_function(
             move |lua, (id, new_path, new_parent_id): (String, String, Option<String>)| {
                 let store = store_clone.clone();
+                let (user, universe_id, permissions) = ctx_clone.clone();
+                let user = actor_override(lua).or(user);
 
                 // Validate new path first
                 let validated_path = match crate::objects::validate_object_path(&new_path) {
@@ -405,27 +551,45 @@ impl GameApi {
                     }
                 };
 
-                let result: anyhow::Result<Option<Object>> = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        let obj_result = store.get(&id).await?;
-                        match obj_result {
-                            Some(original) => {
-                                let mut cloned = original.clone();
-                                cloned.id = validated_path;
-                                cloned.parent_id = new_parent_id;
-                                cloned.created_at = chrono::Utc::now().to_rfc3339();
-                                cloned.updated_at = cloned.created_at.clone();
-                                store.create(&cloned).await?;
-                                Ok(Some(cloned))
+                let result: anyhow::Result<Result<Option<Object>, String>> =
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let obj_result = store.get(&id).await?;
+                            match obj_result {
+                                Some(original) => {
+                                    // Creating the copy needs create rights at the new path
+                                    if let Err(reason) = create_permission(
+                                        &permissions,
+                                        user.as_deref(),
+                                        &universe_id,
+                                        &validated_path,
+                                    )
+                                    .await
+                                    {
+                                        return Ok(Err(reason));
+                                    }
+                                    let mut cloned = original.clone();
+                                    cloned.id = validated_path;
+                                    cloned.parent_id = new_parent_id;
+                                    cloned.owner_id = user.clone();
+                                    cloned.created_at = chrono::Utc::now().to_rfc3339();
+                                    cloned.updated_at = cloned.created_at.clone();
+                                    store.create(&cloned).await?;
+                                    Ok(Ok(Some(cloned)))
+                                }
+                                None => Ok(Ok(None)),
                             }
-                            None => Ok(None),
-                        }
-                    })
-                });
+                        })
+                    });
 
                 match result {
-                    Ok(Some(obj)) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
-                    Ok(None) => Ok(Value::Nil),
+                    Ok(Ok(Some(obj))) => Ok(Value::Table(object_to_lua(lua, &obj)?)),
+                    Ok(Ok(None)) => Ok(Value::Nil),
+                    Ok(Err(reason)) => {
+                        let error_table = lua.create_table()?;
+                        error_table.set("error", format!("permission denied: {}", reason))?;
+                        Ok(Value::Table(error_table))
+                    }
                     Err(e) => Err(mlua::Error::external(e)),
                 }
             },
