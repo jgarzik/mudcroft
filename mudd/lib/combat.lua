@@ -1,4 +1,4 @@
--- Combat system library for HemiMUD
+-- Combat system library for Mudcroft
 -- Provides high-level combat functions built on game.* primitives
 
 Combat = {}

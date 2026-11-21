@@ -1,4 +1,4 @@
-//! Scenario Tests for HemiMUD
+//! Scenario Tests for Mudcroft
 //!
 //! Modular play test scenarios covering:
 //! - Movement: Room navigation via cardinal directions

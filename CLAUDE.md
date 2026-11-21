@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HemiMUD is a multi-user dungeon (MUD) game server in Rust featuring:
+Mudcroft is a multi-user dungeon (MUD) game server in Rust featuring:
 - Sandboxed Lua scripting for programmable game mechanics
 - Raft-based distributed consensus for cluster replication
 - WebSocket-based multiplayer gameplay

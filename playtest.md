@@ -1,4 +1,4 @@
-# HemiMUD Playtest Guide
+# Mudcroft Playtest Guide
 
 ## Quick Start
 

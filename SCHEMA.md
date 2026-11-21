@@ -1,6 +1,6 @@
-# HemiMUD Database Schema
+# Mudcroft Database Schema
 
-SQLite database schema for the HemiMUD game server.
+SQLite database schema for the Mudcroft game server.
 
 ## Core Tables
 

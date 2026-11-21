@@ -1,4 +1,4 @@
-# HemiMUD Lua Language Reference
+# Mudcroft Lua Language Reference
 
 This document covers Lua fundamentals and the complete game scripting API.
 
@@ -14,7 +14,7 @@ local weight = 2.5             -- number (float)
 local is_magic = true          -- boolean
 local nothing = nil            -- nil (absence of value)
 
--- Global variables (avoid in HemiMUD - use local)
+-- Global variables (avoid in Mudcroft - use local)
 GlobalVar = "visible everywhere"
 ```
 

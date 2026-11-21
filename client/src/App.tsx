@@ -22,7 +22,7 @@ function GameScreen() {
           background: 'var(--color-surface)',
         }}
       >
-        <span className="text-highlight">HemiMUD</span>
+        <span className="text-highlight">Mudcroft</span>
         <div className="flex items-center gap-4">
           <span className="text-sm text-muted">{username}</span>
           <button

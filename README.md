@@ -1,5 +1,5 @@
 
-# HemiMUD Design Specification
+# Mudcroft Design Specification
 
 Modern MUD game integrating:
 - **AI visuals** via Venice AI (OpenAI-compatible, DIEM tokens)

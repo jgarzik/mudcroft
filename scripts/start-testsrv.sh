@@ -88,7 +88,7 @@ wait_for_server() {
 main() {
     echo ""
     echo "========================================="
-    echo "   HemiMUD E2E Test Server Setup"
+    echo "   Mudcroft E2E Test Server Setup"
     echo "========================================="
     echo ""
 

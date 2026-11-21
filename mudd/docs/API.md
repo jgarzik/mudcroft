@@ -1,4 +1,4 @@
-# HemiMUD Server API Reference
+# Mudcroft Server API Reference
 
 HTTP REST API and WebSocket protocol documentation.
 

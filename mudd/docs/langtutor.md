@@ -1,4 +1,4 @@
-# HemiMUD Content Creator Tutorial
+# Mudcroft Content Creator Tutorial
 
 A hands-on guide for programmers new to Lua and MUD development.
 

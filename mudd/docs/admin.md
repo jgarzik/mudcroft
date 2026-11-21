@@ -106,7 +106,7 @@ RUST_LOG=mudd::api=debug,mudd::lua=trace mudd --database /var/lib/mudd/game.db
 ```ini
 # /etc/systemd/system/mudd.service
 [Unit]
-Description=HemiMUD Server
+Description=Mudcroft Server
 After=network.target
 
 [Service]

@@ -43,7 +43,7 @@ export function AuthScreen() {
     <div className="auth-screen flex items-center justify-center h-full">
       <div className="auth-container panel p-4" style={{ width: '320px' }}>
         <h1 className="text-xl text-highlight" style={{ marginBottom: '1rem', textAlign: 'center' }}>
-          HemiMUD
+          Mudcroft
         </h1>
 
         <div className="auth-tabs flex gap-2" style={{ marginBottom: '1rem' }}>

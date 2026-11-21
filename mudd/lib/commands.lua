@@ -1,4 +1,4 @@
--- Commands library for HemiMUD
+-- Commands library for Mudcroft
 -- Provides high-level player commands built on game.* primitives
 
 Commands = {}

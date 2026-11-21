@@ -1,4 +1,4 @@
-# HemiMUD
+# Mudcroft
 
 Multi-user dungeon server with Lua scripting, Raft replication, and AI integration.
 

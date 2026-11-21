@@ -1,5 +1,5 @@
 -- game_logic_tests.lua
--- User story validation tests for HemiMUD game engine
+-- User story validation tests for Mudcroft game engine
 -- Run via: cargo test --test test_lua_game_logic
 
 local Test = {}

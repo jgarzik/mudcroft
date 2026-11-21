@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
 
-# HemiMUD Docker Entrypoint Script
+# Mudcroft Docker Entrypoint Script
 # Initializes database and starts supervisord
 
 echo "========================================="
-echo "HemiMUD Container Initialization"
+echo "Mudcroft Container Initialization"
 echo "========================================="
 
 # Environment variable defaults
@@ -66,7 +66,7 @@ if [ ! -r "$DB_PATH" ]; then
 fi
 
 echo "========================================="
-echo "Starting HemiMUD Services"
+echo "Starting Mudcroft Services"
 echo "========================================="
 echo ""
 echo "Services:"

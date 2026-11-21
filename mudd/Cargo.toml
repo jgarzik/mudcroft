@@ -2,7 +2,7 @@
 name = "mudd"
 version = "0.1.0"
 edition = "2021"
-description = "HemiMUD server daemon"
+description = "Mudcroft server daemon"
 
 [[bin]]
 name = "mudd"

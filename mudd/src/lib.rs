@@ -1,4 +1,4 @@
-//! mudd - HemiMUD server daemon
+//! mudd - Mudcroft server daemon
 //!
 //! A modern MUD engine with Lua scripting, Raft replication, and AI integration.
 

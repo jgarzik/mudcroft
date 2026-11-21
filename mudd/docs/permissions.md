@@ -1,6 +1,6 @@
 # Permission System Reference
 
-HemiMUD implements an LPMud-style path-based permission system with mandatory Rust enforcement.
+Mudcroft implements an LPMud-style path-based permission system with mandatory Rust enforcement.
 
 ## Overview
 

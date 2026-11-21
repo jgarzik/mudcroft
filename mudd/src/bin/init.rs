@@ -10,12 +10,12 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// HemiMUD database initialization and upgrade tool
+/// Mudcroft database initialization and upgrade tool
 #[derive(Parser, Debug)]
 #[command(
     name = "mudd_init",
     version,
-    about = "Initialize or upgrade a HemiMUD database"
+    about = "Initialize or upgrade a Mudcroft database"
 )]
 struct Args {
     /// Path to SQLite database file (creates new or upgrades existing)

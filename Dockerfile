@@ -52,7 +52,7 @@ FROM debian:bookworm-slim AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/jgarzik/mudcroft"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.description="HemiMUD multi-user dungeon server"
+LABEL org.opencontainers.image.description="Mudcroft multi-user dungeon server"
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

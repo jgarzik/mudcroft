@@ -1,4 +1,4 @@
-# HemiMUD Design Specification
+# Mudcroft Design Specification
 
 **Version:** 1.6.0 | **Updated:** 2025-01-16 | **Status:** Active Development
 
@@ -36,7 +36,7 @@ Modern MUD game integrating:
 ### Monorepo Structure
 
 ```
-hemimud/
+mudcroft/
 ├── README.md
 ├── Makefile                    # Top-level build/test/deploy commands
 ├── docker-compose.yml          # Local dev cluster
@@ -46,7 +46,7 @@ hemimud/
 │       └── deploy.yml
 │
 ├── docs/
-│   └── hemimud-design-spec.md
+│   └── mudcroft-design-spec.md
 │
 ├── server/                     # Rust game server
 │   ├── Cargo.toml
@@ -252,7 +252,7 @@ venice_api_url = "https://api.venice.ai/api/v1"
 ### Runtime Data Directory
 
 ```
-/var/lib/hemimud/
+/var/lib/mudcroft/
 ├── raft/{log/, snapshots/, state.json}
 ├── shared.db          # Accounts, universe registry
 └── universes/*.db     # Per-universe data
@@ -1911,7 +1911,7 @@ GET  /api/universes/:id      -> universe details
 
 ### WebSocket
 
-`wss://play.hemimud.com/ws` — Auth via JWT in first message.
+`wss://play.mudcroft.com/ws` — Auth via JWT in first message.
 
 ## 14. Deployment & Operations
 
@@ -1979,7 +1979,7 @@ Phase 9+  (Days 25+):   Auth, Venice, Client
 **Goal**: Rust project compiles, SQLite works, HTTP server runs.
 
 **Tasks**:
-- `cargo new hemimud-server`
+- `cargo new mudcroft-server`
 - Dependencies: `tokio`, `axum`, `rusqlite`, `serde`, `serde_json`
 - Create `shared.db` schema (accounts table only)
 - Create universe DB schema (objects, rooms, lua_code)

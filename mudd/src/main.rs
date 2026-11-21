@@ -1,4 +1,4 @@
-//! mudd - HemiMUD server daemon
+//! mudd - Mudcroft server daemon
 
 use std::net::SocketAddr;
 
@@ -7,7 +7,7 @@ use clap::Parser;
 use mudd::{Config, Server};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// HemiMUD server daemon
+/// Mudcroft server daemon
 #[derive(Parser, Debug)]
 #[command(name = "mudd", version, about)]
 struct Args {
