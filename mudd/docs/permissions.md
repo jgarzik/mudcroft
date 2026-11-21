@@ -69,16 +69,9 @@ target object. The first matching rule decides:
 Creating an object uses a separate check, `check_create_permission`:
 allowed for wizard+, otherwise only if a path grant covers the new object's path.
 
-Before this algorithm runs, Lua object writes (`update_object`,
-`delete_object`, `move_object`, `add_action`, `remove_action`) refuse an
-object that belongs to another universe, whatever the acting account's
-level; `move_object` also refuses a destination in another universe, and
-`clone_object` a source in another universe. An account's own player object
-(`/players/p-<account>`, owned by that account) is exempt, since one is
-shared by every universe its account visits; scripts cannot create
-player-class objects or anything under `/players/`. Object ids are global, so
-this is what keeps scripts inside their universe. Reads (`game.get_object` and the
-query functions) are not universe-checked.
+Object ids are scoped per universe, and a script reads and writes only its
+own universe's objects, whatever the acting account's level. Scripts cannot
+create player-class objects or anything under `/players/`.
 
 ## Actions
 
@@ -130,8 +123,8 @@ calls it. To keep that from lending the owner's rights to arbitrary callers:
 
 ### Classes
 
-`game.define_class` requires wizard+. Class definitions are shared by every
-universe. The built-in base classes cannot be redefined, and an existing
+`game.define_class` requires wizard+. A defined class belongs to the
+script's universe (the built-in classes are global). The built-in base classes cannot be redefined, and an existing
 custom class may be redefined only by the account that defined it, or by an
 admin+ (`ClassDef::defined_by`).
 

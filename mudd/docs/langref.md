@@ -204,16 +204,12 @@ Every object ID is a filesystem-style path such as `/d/forest/clearing`.
 - A path is at most 255 characters.
 - Uppercase letters are converted to lowercase.
 
-Object IDs are unique across the **whole server**, not per universe.
-Writes stay in the script's universe: `update_object`, `delete_object` and
-`move_object` refuse objects (and move destinations) that belong to another
-universe, and `clone_object` refuses a source from another universe.
-An account's player object (`/players/p-<account>`, owned by that account)
-is the exception: one is shared by every universe its account visits (it
-carries inventory and HP), so scripts may update it and move items into it
-from any universe. Scripts cannot create player objects: `create_object`
-and `clone_object` refuse class `player` and paths under `/players/`. Reads such as `get_object` are not
-universe-checked.
+Object IDs are scoped per universe: two universes may both have
+`/rooms/start`, and every `game.*` function reads and writes only the
+script's own universe. An account has its own player object
+(`/players/p-<account>`, with its own inventory and HP) in each universe it
+visits. Scripts cannot create player objects: `create_object` and
+`clone_object` refuse class `player` and paths under `/players/`.
 
 Path grants work on prefixes, so group an area under one prefix such as
 `/d/crypt/...`. Then a single grant covers the whole area.
@@ -936,9 +932,7 @@ the onlookers' broadcast excludes the player.
 
 `Commands.take` finds the item with `game.present` and refuses objects
 that are `fixed` or living (`game.is_a(id, "living")`: NPCs, players and
-their subclasses). Because a player object (and so the inventory) is shared
-by every universe the player visits, `Commands.drop` and `Commands.give`
-refuse an item that belongs to another universe; it stays in the pack.
+their subclasses).
 
 The library also defines `Commands.give`, `Commands.look`, `Commands.flee`,
 `Commands.say` and `Commands.use`, but no player command calls them.

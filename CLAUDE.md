@@ -86,11 +86,11 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
 - `use_object` is bounded: 8 levels deep, 32 calls per top-level execution.
 - Lua object writes (`create/update/delete/move/clone_object`) are permission-checked against the acting user; keep new `game.*` writes checked the same way and charge the call budget (`charge_db` / `charge_venice`).
 - Never splice user input into Lua source. Pass values with `Sandbox::execute_with_args` (the chunk's `...`).
-- Keep object code within the session's universe. Object ids are global, so Lua writes check `universe_id` (`object_permission` in `lua/game_api.rs`) and script message delivery skips sessions in other universes. Reads are not yet universe-checked (see `docs/roadmap.md`).
+- Keep object code within the session's universe. Object ids are scoped per universe (`objects` PK `(universe_id, id)`), and every `ObjectStore` call, in-memory map (sessions, timers, actions, combat, classes) and message delivery takes the universe. Thread the universe through any new code rather than keying by object id alone.
 
 ### Database
 
-One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, credits, timers, path_grants, builder_regions (legacy), combat_state, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
+One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, credits, timers, path_grants, combat_state, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
 
 ### WebSocket Protocol
 

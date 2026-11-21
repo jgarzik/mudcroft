@@ -180,10 +180,11 @@ done in Lua (Part B).
 
 ### Lesson 4: Custom classes
 
-A class supplies default properties. Classes are shared by every
-universe on the server. Only wizards+ can define them, built-in classes
-can't be redefined, and a custom class can be redefined only by the
-account that defined it (or an admin).
+A class supplies default properties. A class you define belongs to
+your universe (the built-in classes exist everywhere) and is stored, so it
+survives a restart. Only wizards+ can define them, built-in classes can't
+be redefined, and a custom class can be redefined only by the account that
+defined it (or an admin).
 
 ```lua
 game.define_class("potion", {
@@ -497,11 +498,9 @@ Everything is created and owned by the wizard who runs `build_crypt()`,
 so all the crypt's code runs with that wizard's rights. That's needed
 here, because the code updates the HP of player objects.
 
-Player objects are shared by every universe (they are created in the
-first one the player joins), so the crypt can hurt, heal and hand items to
-any visiting player; Lua's universe confinement exempts player objects
-(see the [roadmap](../../docs/roadmap.md#known-issues) for the open issues
-around global player objects).
+Each player has a separate player object in every universe they visit,
+created on their first visit, so the crypt hurts, heals and hands items to
+the visitor's player object in this universe only.
 
 `build_crypt()` is meant for a fresh universe. To rebuild, delete the
 `/d/crypt/...` objects first, contents before containers.

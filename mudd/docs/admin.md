@@ -329,7 +329,7 @@ Wizard commands:
 | `setportal [room_id]` | Set the universe's spawn room: the given room, or the current one |
 | `eval <lua>` | Run Lua as yourself, with the larger eval budget |
 
-Both `goto` and `setportal` refuse rooms that belong to another universe.
+Both `goto` and `setportal` only see rooms in the current universe.
 
 The portal is stored in `universe_settings` under the key `portal_room_id`:
 

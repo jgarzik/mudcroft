@@ -62,7 +62,7 @@ and Raft metadata. Tables are created by `Database::run_migrations`
 | Objects and code | `objects`, `code_store`, `core_lib_hashes` |
 | Classes | `classes`, `class_properties`, `class_handlers` |
 | Gameplay | `credits`, `timers`, `combat_state`, `active_effects` |
-| Permissions | `path_grants` (`builder_regions` is a legacy table nothing reads) |
+| Permissions | `path_grants` |
 | Images | `image_store` |
 | Raft | `raft_log`, `raft_vote`, `raft_meta` |
 
@@ -320,28 +320,21 @@ For every execution it:
 
 ### Universe Isolation
 
-Object ids are global, so isolation is enforced at each write:
+Object ids are scoped per universe: `objects` is keyed `(universe_id, id)`,
+and a container must be in the same universe (composite foreign key). Every
+`ObjectStore` method takes the universe, and a script only ever passes its
+own, so Lua reads and writes cannot reach another universe's objects. The
+same `(universe, id)` keying applies to the in-memory state: sessions
+(`ConnectionManager`), heartbeats and call_out caps (`TimerManager`),
+contextual verbs (`ActionRegistry`), combat state (`CombatManager`) and
+Lua-defined classes (`ClassRegistry`; the built-in classes are global).
 
-- The runner refuses to run an object's code in a universe it does not belong
-  to, and `game.use_object` ignores objects from other universes.
-- `update_object`, `delete_object`, `move_object` (object and destination),
-  `add_action` and `remove_action` refuse objects of other universes;
-  `clone_object` refuses a foreign source. An account's own player object
-  (`/players/p-<account>`, owned by that account) is exempt: one is shared by
-  every universe its account visits. Scripts cannot create player-class
-  objects or anything under `/players/`.
-- Spawning ignores a remembered room (`last_safe_location`, current room)
-  that belongs to another universe and uses the portal instead.
-- Queued `game.broadcast` messages to rooms of other universes are dropped.
-- `create_object`/`clone_object` refuse a parent in another universe
-  (except an account's player object), and verb dispatch ignores inventory
-  items from other universes; `drop`/`give` keep such items in the pack.
-- Queued `game.send` and `game.broadcast_region` messages skip sessions
-  connected to other universes.
-- `goto` and `setportal` refuse rooms outside the session's universe.
-
-Reads (`game.get_object` and the query functions) are not universe-checked;
-see [docs/roadmap.md](../../docs/roadmap.md#known-issues).
+- An account has a separate player object, `/players/p-<account>`, with its
+  own inventory and HP, in each universe it visits, and may be connected to
+  several universes at once.
+- Script messages (`game.send`, `game.broadcast`, `game.broadcast_region`)
+  only reach sessions in the script's universe.
+- Scripts cannot create player-class objects or anything under `/players/`.
 
 ### Timer Loop
 

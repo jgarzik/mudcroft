@@ -43,28 +43,8 @@ affected feature.
 
 ### Universes and objects
 
-- **Object ids and player objects are global.** `objects.id` is the primary
-  key and paths carry no universe, so two universes cannot both use
-  `/rooms/start`. A player's object `/players/p-<account>` is created in the
-  first universe joined and reused in every other one, carrying one
-  inventory and one HP pool across universes (`mudd/src/player.rs`). Lua's
-  universe confinement exempts player objects so play works everywhere, and
-  spawning ignores remembered rooms from other universes, but inventory and
-  stats should become per-universe.
-- **Lua reads are not universe-checked.** `game.get_object` and the query
-  functions return objects from any universe; only writes are confined
-  (`object_permission` in `mudd/src/lua/game_api.rs`).
-- **One session per account.** `ConnectionManager` keys sessions by player id
-  (`mudd/src/api/websocket.rs`), so the same account connected to two
-  universes at once collides.
 - **`game.move_object` on a connected player** changes only the database; the
   session stays in the old room.
-- **Lua-defined classes are not persisted.** `ClassRegistry::define_class`
-  (`mudd/src/objects/class.rs`) writes `classes`, `class_properties` and
-  `class_handlers` rows with `universe_id = ''` and with built-in parents
-  that are not rows in `classes`; both violate foreign keys
-  (`mudd/src/db/mod.rs`), so the write fails with a logged warning. The class
-  registry is global across universes.
 - **Room image generation** writes back a room snapshot loaded before the
   slow Venice calls, overwriting changes made meanwhile, and can run several
   times for the same room (`mudd/src/images/gen.rs`).

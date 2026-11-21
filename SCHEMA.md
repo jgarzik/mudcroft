@@ -15,9 +15,10 @@ Conventions used below:
   no `--`. Examples: `my-game`, `test-world`.
 - **Object ids** are lowercase paths, e.g. `/rooms/cave-entrance`. Every
   segment starts with a letter and contains only `[a-z0-9-]`. The maximum
-  length is 255 characters. Object ids are the primary key of `objects`, so a
-  path is unique across the whole database, not per universe. Player objects
-  are `/players/p-<account_id>`.
+  length is 255 characters. Object ids are scoped per universe: the primary
+  key of `objects` is `(universe_id, id)`, so two universes can both have
+  `/rooms/start`. An account has one player object in each universe it
+  visits, `/players/p-<account_id>`.
 - **Account ids**, and the ids of credits, timers, grants and effects, are
   UUIDs.
 - Timestamps are text from SQLite `datetime('now')` (`YYYY-MM-DD HH:MM:SS`,
@@ -73,18 +74,18 @@ Rooms, items, NPCs, players: every game object.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| id | TEXT PRIMARY KEY | Object path |
 | universe_id | TEXT NOT NULL REFERENCES universes(id) | |
+| id | TEXT NOT NULL | Object path, unique within the universe |
 | class | TEXT NOT NULL | Class name, e.g. `room`, `item`, `npc`, `player` |
-| parent_id | TEXT REFERENCES objects(id) | Container: the room an item or player is in, or the player carrying an item. `NULL` = nowhere. |
+| parent_id | TEXT | Container: the room an item or player is in, or the player carrying an item. `NULL` = nowhere. Foreign key `(universe_id, parent_id)` to `objects(universe_id, id)`, so a container is always in the same universe. |
 | properties | TEXT NOT NULL DEFAULT '{}' | JSON object (`name`, `description`, `exits`, `fixed`, `hp`, ...) |
 | code_hash | TEXT | `code_store.hash` of the object's attached Lua code. No foreign key. |
 | created_at | TEXT NOT NULL DEFAULT (datetime('now')) | |
 | updated_at | TEXT NOT NULL DEFAULT (datetime('now')) | |
-| owner_id | TEXT REFERENCES accounts(id) | Creator. Object code runs as this account. Added by `ALTER TABLE` migration, so it is the last column. |
+| owner_id | TEXT REFERENCES accounts(id) | Creator. Object code runs as this account. |
 
-Indexes: `idx_objects_universe (universe_id)`, `idx_objects_parent (parent_id)`,
-`idx_objects_owner (owner_id)`.
+Primary key: `(universe_id, id)`. Indexes: `idx_objects_universe (universe_id)`,
+`idx_objects_parent (universe_id, parent_id)`, `idx_objects_owner (owner_id)`.
 
 ### code_store
 
@@ -124,45 +125,45 @@ Content-addressed images, served at `GET /images/{hash}`.
 
 ## Classes
 
-These tables are meant to persist classes defined with `game.define_class`.
-The built-in base classes are compiled in and never stored.
-
-**Known limitation:** Lua-defined classes do not persist in practice. The
-writer inserts `universe_id = ''`, which fails the foreign key to `universes`
-(and a `parent` naming a built-in class fails `REFERENCES classes(name)`). A
-custom class therefore lives only in memory until restart. See
-[docs/roadmap.md](docs/roadmap.md).
+Classes defined with `game.define_class`, per universe. The built-in base
+classes are compiled in and never stored; a stored class may name one as its
+parent. `define_class` writes the three tables in one atomic Raft batch.
 
 ### classes
 
 | Column | Type | Notes |
 |--------|------|-------|
-| name | TEXT PRIMARY KEY | Global across universes |
 | universe_id | TEXT NOT NULL REFERENCES universes(id) | |
-| parent | TEXT REFERENCES classes(name) | |
+| name | TEXT NOT NULL | |
+| parent | TEXT | Built-in or same-universe class. No foreign key. |
 | code_hash | TEXT | No foreign key |
+| defined_by | TEXT REFERENCES accounts(id) | Only this account (or an admin+) may redefine the class |
 | created_at | TEXT NOT NULL DEFAULT (datetime('now')) | |
+
+Primary key: `(universe_id, name)`.
 
 ### class_properties
 
 | Column | Type | Notes |
 |--------|------|-------|
-| class_name | TEXT NOT NULL REFERENCES classes(name) ON DELETE CASCADE | |
-| universe_id | TEXT NOT NULL REFERENCES universes(id) | |
+| universe_id | TEXT NOT NULL | |
+| class_name | TEXT NOT NULL | |
 | key | TEXT NOT NULL | |
 | value | TEXT NOT NULL | JSON-encoded default |
 
-Primary key: `(class_name, key)`. Index: `idx_class_props_universe (universe_id)`.
+Primary key: `(universe_id, class_name, key)`. Foreign key
+`(universe_id, class_name)` to `classes(universe_id, name)` ON DELETE CASCADE.
 
 ### class_handlers
 
 | Column | Type | Notes |
 |--------|------|-------|
-| class_name | TEXT NOT NULL REFERENCES classes(name) ON DELETE CASCADE | |
-| universe_id | TEXT NOT NULL REFERENCES universes(id) | |
+| universe_id | TEXT NOT NULL | |
+| class_name | TEXT NOT NULL | |
 | handler | TEXT NOT NULL | Handler name, e.g. `on_init` |
 
-Primary key: `(class_name, handler)`. Index: `idx_class_handlers_universe (universe_id)`.
+Primary key: `(universe_id, class_name, handler)`. Foreign key
+`(universe_id, class_name)` to `classes(universe_id, name)` ON DELETE CASCADE.
 
 ## Permissions
 
@@ -183,18 +184,6 @@ Delegated access to an object-path prefix. See
 
 Unique: `(universe_id, grantee_id, path_prefix)`. Index:
 `idx_path_grants_grantee (universe_id, grantee_id)`.
-
-### builder_regions (legacy)
-
-Still created for backward compatibility, but no code reads or writes it.
-Path grants replaced it.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| account_id | TEXT NOT NULL | No foreign key |
-| region_id | TEXT NOT NULL | No foreign key |
-
-Primary key: `(account_id, region_id)`.
 
 ## Economy
 
@@ -217,12 +206,14 @@ HP and combat stats for entities that have been in combat.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| entity_id | TEXT PRIMARY KEY | Object id (NPC or player) |
 | universe_id | TEXT NOT NULL | No foreign key |
+| entity_id | TEXT NOT NULL | Object id (NPC or player) in that universe |
 | hp | INTEGER NOT NULL | |
 | max_hp | INTEGER NOT NULL | |
 | armor_class | INTEGER NOT NULL DEFAULT 10 | |
 | attack_bonus | INTEGER NOT NULL DEFAULT 0 | |
+
+Primary key: `(universe_id, entity_id)`.
 
 ### active_effects
 
@@ -231,7 +222,8 @@ Status effects (poison, stun, ...).
 | Column | Type | Notes |
 |--------|------|-------|
 | id | TEXT PRIMARY KEY | UUID |
-| entity_id | TEXT NOT NULL REFERENCES combat_state(entity_id) ON DELETE CASCADE | |
+| universe_id | TEXT | |
+| entity_id | TEXT NOT NULL | No foreign key |
 | effect_type | TEXT NOT NULL | |
 | remaining_ticks | INTEGER NOT NULL | |
 | magnitude | INTEGER NOT NULL DEFAULT 0 | |
@@ -319,14 +311,12 @@ It also checks that an `admin` or `owner` account exists. If either check fails,
 | Index | Table (columns) |
 |-------|-----------------|
 | idx_objects_universe | objects(universe_id) |
-| idx_objects_parent | objects(parent_id) |
+| idx_objects_parent | objects(universe_id, parent_id) |
 | idx_objects_owner | objects(owner_id) |
 | idx_path_grants_grantee | path_grants(universe_id, grantee_id) |
 | idx_active_effects_entity | active_effects(entity_id) |
 | idx_timers_fire_at | timers(fire_at) |
 | idx_raft_log_term | raft_log(term) |
-| idx_class_props_universe | class_properties(universe_id) |
-| idx_class_handlers_universe | class_handlers(universe_id) |
 
 SQLite also creates automatic indexes for the PRIMARY KEY and UNIQUE
 constraints listed above.
