@@ -1401,3 +1401,32 @@ async fn test_server_restarts_on_existing_database() {
         .await
         .expect("data survives restart");
 }
+
+/// eval parses its code after the verb, whatever whitespace precedes it,
+/// and always replies (even with an empty string)
+#[tokio::test]
+async fn test_eval_argument_parsing_and_empty_reply() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "parse_wiz".to_string(),
+        })
+        .await
+        .expect("connect");
+    wizard.drain().await;
+
+    for (cmd, expected) in [
+        ("   eval return 1 + 1", "2"),
+        ("\u{3000}eval return 40 + 2", "42"),
+        ("eval return ''", ""),
+    ] {
+        wizard.command(cmd).await.unwrap();
+        let _ = wizard.expect("echo").await;
+        let reply = wizard
+            .expect_any_timeout(std::time::Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("no reply to {:?}: {}", cmd, e));
+        assert_eq!(reply["type"], "output", "{:?}: {}", cmd, reply);
+        assert_eq!(reply["text"], expected, "{:?}", cmd);
+    }
+}

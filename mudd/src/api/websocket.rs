@@ -229,6 +229,10 @@ pub enum ServerMessage {
     /// Command echo (for confirmation)
     #[serde(rename = "echo")]
     Echo { command: String },
+    /// No reply: the command already said everything it had to (e.g. a verb
+    /// handler that only used game.send). Never sent to clients.
+    #[serde(skip)]
+    Silent,
 }
 
 /// Messages sent from client to server
@@ -552,9 +556,7 @@ async fn handle_client_message(
                 &mut deferred,
             )
             .await;
-            // An empty output means the command already said everything
-            // (e.g. a verb handler that only used game.send)
-            if !matches!(&response, ServerMessage::Output { text } if text.is_empty()) {
+            if !matches!(response, ServerMessage::Silent) {
                 state.connections.send_to_player(player_id, response).await;
             }
             for hook in deferred {
@@ -565,6 +567,16 @@ async fn handle_client_message(
             // Just keep the connection alive, no response needed
         }
     }
+}
+
+/// Everything after a command's verb, verbatim apart from surrounding
+/// whitespace (for commands whose argument is free text, like eval)
+fn args_after_verb(command: &str) -> &str {
+    command
+        .trim()
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim_start())
+        .unwrap_or("")
 }
 
 /// Name shown to other players: the player object's `name`, else "Someone"
@@ -1118,14 +1130,12 @@ async fn execute_command(
                 };
             }
 
-            // Get the code after "eval "
-            let code = if command.len() > 5 {
-                &command[5..]
-            } else {
+            let code = args_after_verb(command);
+            if code.is_empty() {
                 return ServerMessage::Error {
                     message: "Usage: eval <lua code>".to_string(),
                 };
-            };
+            }
 
             // Execute Lua code
             execute_lua(state, player_id, account_id, code).await
@@ -1367,10 +1377,8 @@ async fn execute_command(
                 };
             }
 
-            // Get the arguments after "create "
-            let args = if command.len() > 7 {
-                &command[7..]
-            } else {
+            let args = args_after_verb(command);
+            if args.is_empty() {
                 return ServerMessage::Error {
                     message:
                         "Usage: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]"
@@ -1480,9 +1488,7 @@ async fn dispatch_custom_verb(
     .await;
     Some(match result {
         Ok(Some(text)) if text != "nil" => ServerMessage::Output { text },
-        Ok(_) => ServerMessage::Output {
-            text: String::new(),
-        },
+        Ok(_) => ServerMessage::Silent,
         Err(message) => {
             warn!(
                 "{} handler on {} failed: {}",
