@@ -901,8 +901,9 @@ async fn test_timer_persistence() {
     use mudd::timers::{Timer, TimerManager};
 
     // Create a shared temp file for the database
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     // First phase: Create timer
     {
@@ -968,8 +969,9 @@ async fn test_timer_persistence() {
 async fn test_permission_persistence() {
     use mudd::permissions::{AccessLevel, PermissionManager};
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     let account_id: String;
 
@@ -1053,8 +1055,9 @@ async fn test_permission_persistence() {
 async fn test_path_grants_persistence() {
     use mudd::permissions::{PermissionManager, UserContext};
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     let grantee_id = "builder_test_account";
     let grantor_id = "admin_test_account";
@@ -1140,8 +1143,9 @@ async fn test_path_grants_persistence() {
 async fn test_combat_state_persistence() {
     use mudd::combat::CombatManager;
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     // First phase: Take damage
     {
@@ -1208,8 +1212,9 @@ async fn test_combat_state_persistence() {
 async fn test_effects_persistence() {
     use mudd::combat::{EffectRegistry, EffectType, StatusEffect};
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     // First phase: Apply effect
     {

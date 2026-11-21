@@ -6,8 +6,9 @@
 
 #![allow(dead_code)]
 
+use std::fs::File;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -23,8 +24,12 @@ use super::world::TestWorld;
 pub struct TestServer {
     pub addr: SocketAddr,
     pub client: Client,
-    child: Child,
+    /// Server process; killed on drop. Declared before `_temp_dir` so the
+    /// process is gone before its directory is removed.
+    child: ChildGuard,
     world: Option<TestWorld>,
+    /// Path to the server log file (inside the temp dir)
+    pub log_path: PathBuf,
     /// Temp directory for database and other files (cleaned up on drop)
     _temp_dir: TempDir,
     /// Path to the database file
@@ -57,36 +62,51 @@ impl TestServer {
         // Find the core mudlib directory (lib/ relative to mudd crate root)
         let lib_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
 
-        // Run mudd_init to create the database with core mudlib
-        let init_status = Command::new(&init_path)
+        // Run mudd_init to create the database with core mudlib.
+        // Output goes to a log file: piped-but-unread output can block a child.
+        let init_log = temp_dir.path().join("mudd_init.log");
+        let init_out = File::create(&init_log)?;
+        let init_child = die_with_parent(&mut Command::new(&init_path))
             .arg("--database")
             .arg(db_path.to_string_lossy().as_ref())
             .arg("--lib-dir")
             .arg(lib_dir.to_string_lossy().as_ref())
             .env("MUDD_ADMIN_USERNAME", "test_admin")
             .env("MUDD_ADMIN_PASSWORD", "testpass123")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .status()
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(init_out.try_clone()?))
+            .stderr(Stdio::from(init_out))
+            .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to run mudd_init at {:?}: {}", init_path, e))?;
+        let init_status = ChildGuard::new(init_child).wait()?;
 
         if !init_status.success() {
-            anyhow::bail!("mudd_init failed with exit code: {:?}", init_status.code());
+            anyhow::bail!(
+                "mudd_init failed with exit code {:?}:\n{}",
+                init_status.code(),
+                log_tail(&init_log, 40)
+            );
         }
 
-        // Spawn the server process (inherit stderr to see server logs)
-        let child = Command::new(&mudd_path)
-            .arg("--bind")
-            .arg(addr.to_string())
-            .arg("--database")
-            .arg(db_path.to_string_lossy().as_ref())
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", mudd_path, e)
-            })?;
+        // Spawn the server process. Guard it immediately so any early return
+        // below (startup timeout, DB error) still kills it.
+        let log_path = temp_dir.path().join("mudd.log");
+        let log_out = File::create(&log_path)?;
+        let child = ChildGuard::new(
+            die_with_parent(&mut Command::new(&mudd_path))
+                .arg("--bind")
+                .arg(addr.to_string())
+                .arg("--database")
+                .arg(db_path.to_string_lossy().as_ref())
+                .env("RUST_LOG", "info")
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_out.try_clone()?))
+                .stderr(Stdio::from(log_out))
+                .spawn()
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to spawn mudd binary at {:?}: {}", mudd_path, e)
+                })?,
+        );
 
         // Wait for server to be ready
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
@@ -107,7 +127,10 @@ impl TestServer {
         }
 
         if !ready {
-            panic!("Server failed to start within 5 seconds");
+            anyhow::bail!(
+                "Server failed to start within 5 seconds. Log tail:\n{}",
+                log_tail(&log_path, 40)
+            );
         }
 
         // Open a separate database connection for test setup
@@ -129,6 +152,7 @@ impl TestServer {
             client,
             child,
             world: None,
+            log_path,
             _temp_dir: temp_dir,
             db_path,
             db_pool,
@@ -391,9 +415,77 @@ impl RawWsClient {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Kill the server process
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Kill the server before the temp dir (and its log) is removed
+        self.child.kill();
+        // A failing test loses the temp dir, so surface the server log now
+        if std::thread::panicking() {
+            eprintln!(
+                "---- mudd log tail ({}) ----\n{}",
+                self.addr,
+                log_tail(&self.log_path, 60)
+            );
+        }
+    }
+}
+
+/// Owns a child process and kills it when dropped, so no exit path
+/// (early return, `?`, panic) can leak a running server.
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// Wait for the process to exit normally
+    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = self.0.take().expect("child already taken");
+        child.wait()
+    }
+
+    /// Kill and reap the process (idempotent)
+    fn kill(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Ask the kernel to SIGKILL the child if the test process dies without
+/// running destructors (Ctrl-C, timeout kill). Linux only; elsewhere the
+/// `ChildGuard` drop is the only cleanup.
+fn die_with_parent(cmd: &mut Command) -> &mut Command {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: prctl is async-signal-safe and touches no parent state.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd
+}
+
+/// Last `lines` lines of a log file (best effort)
+fn log_tail(path: &Path, lines: usize) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let all: Vec<&str> = text.lines().collect();
+            all[all.len().saturating_sub(lines)..].join("\n")
+        }
+        Err(e) => format!("<could not read {}: {}>", path.display(), e),
     }
 }
 
