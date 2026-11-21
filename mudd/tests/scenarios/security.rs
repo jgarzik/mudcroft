@@ -670,3 +670,21 @@ async fn test_use_object_limits() {
         assert_eq!(out, "nil", "{} must not be callable via use_object", verb);
     }
 }
+
+/// Class defaults never attach code to new objects (that would bypass the
+/// code-attach rules), and empty default names are not copied
+#[tokio::test]
+async fn test_class_defaults_do_not_attach_code() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("classdef_wiz")).await;
+    let out = eval(
+        &mut wiz,
+        r#"local h = game.store_code("return {}")
+           game.define_class("trapped_chest", {parent = "item",
+             properties = {code_hash = {type = "string", default = h}, lock = {type = "string", default = "iron"}}})
+           local c = game.create_object("/items/chest1", "trapped_chest", nil, {})
+           return tostring(c.code_hash) .. ":" .. tostring(c.metadata.lock) .. ":" .. tostring(c.name)"#,
+    )
+    .await;
+    assert_eq!(out, "nil:iron:nil");
+}

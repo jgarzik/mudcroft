@@ -389,6 +389,12 @@ impl GameApi {
                     tokio::runtime::Handle::current()
                         .block_on(async { classes.read().await.resolve_properties(&class_name) })
                 });
+                // A class's code (its code_hash default, used by parent()) is
+                // never attached to instances implicitly: attaching code is an
+                // explicit, permission-checked act. Empty placeholder strings
+                // (the root class's name/description) are not real values.
+                obj.properties.remove("code_hash");
+                obj.properties.retain(|_, v| v.as_str() != Some(""));
 
                 // Copy properties from Lua table if provided
                 if let Some(props_table) = props {
