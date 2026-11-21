@@ -1,3 +1,7 @@
-
 .env
 
+# Local databases and logs (servers, tests, manual runs)
+*.db
+*.db-wal
+*.db-shm
+*.log

@@ -3,3 +3,7 @@ dist
 .vite
 *.local
 .DS_Store
+
+# Playwright output
+test-results/
+playwright-report/
