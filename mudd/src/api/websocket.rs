@@ -52,7 +52,8 @@ const RECONNECT_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_se
 pub struct ConnectionManager {
     sessions: RwLock<BTreeMap<SessionKey, PlayerSession>>,
     /// Pending disconnect tasks that can be cancelled on reconnect
-    pending_disconnects: RwLock<BTreeMap<SessionKey, tokio::sync::oneshot::Sender<()>>>,
+    /// Scheduled disconnects: (generation, cancel signal)
+    pending_disconnects: RwLock<BTreeMap<SessionKey, (u64, tokio::sync::oneshot::Sender<()>)>>,
     next_conn_id: std::sync::atomic::AtomicU64,
 }
 
@@ -74,7 +75,7 @@ impl ConnectionManager {
             .write()
             .await
             .remove(&key(universe_id, player_id));
-        if let Some(cancel_tx) = pending {
+        if let Some((_, cancel_tx)) = pending {
             // Send cancel signal - ignore result since receiver may be dropped
             let _ = cancel_tx.send(());
             info!("Cancelled pending disconnect for player {}", player_id);
@@ -84,26 +85,41 @@ impl ConnectionManager {
         }
     }
 
-    /// Schedule a delayed disconnect (grace period for reconnection)
+    /// Schedule a delayed disconnect (grace period for reconnection).
+    /// Returns the cancel signal and the disconnect's generation, for
+    /// `claim_expired_disconnect`.
     pub async fn schedule_disconnect(
         &self,
         universe_id: &str,
         player_id: &str,
-    ) -> tokio::sync::oneshot::Receiver<()> {
+    ) -> (tokio::sync::oneshot::Receiver<()>, u64) {
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let gen = self.next_conn_id();
         self.pending_disconnects
             .write()
             .await
-            .insert(key(universe_id, player_id), cancel_tx);
-        cancel_rx
+            .insert(key(universe_id, player_id), (gen, cancel_tx));
+        (cancel_rx, gen)
     }
 
-    /// Remove pending disconnect entry after grace period expires
-    pub async fn clear_pending_disconnect(&self, universe_id: &str, player_id: &str) {
-        self.pending_disconnects
-            .write()
-            .await
-            .remove(&key(universe_id, player_id));
+    /// When a grace period expires: claim the disconnect for handling. True
+    /// only if it is still the pending one (`gen`) and the player has no
+    /// session, checked under the sessions lock so a reconnect that raced
+    /// past the cancel is never treated as gone.
+    pub async fn claim_expired_disconnect(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        gen: u64,
+    ) -> bool {
+        let k = key(universe_id, player_id);
+        let sessions = self.sessions.read().await;
+        let mut pending = self.pending_disconnects.write().await;
+        if !pending.get(&k).is_some_and(|(g, _)| *g == gen) {
+            return false;
+        }
+        pending.remove(&k);
+        !sessions.contains_key(&k)
     }
 
     /// Register a player session. A previous connection for the same
@@ -114,22 +130,16 @@ impl ConnectionManager {
         self.sessions.write().await.insert(k, session);
     }
 
-    /// Remove a player session, but only if it is still `conn_id`'s
-    pub async fn unregister(&self, universe_id: &str, player_id: &str, conn_id: u64) {
+    /// Remove a player session, but only if it is still `conn_id`'s.
+    /// Returns false if a newer connection had replaced it.
+    pub async fn unregister(&self, universe_id: &str, player_id: &str, conn_id: u64) -> bool {
         let mut sessions = self.sessions.write().await;
         let k = key(universe_id, player_id);
         if sessions.get(&k).is_some_and(|s| s.conn_id == conn_id) {
             sessions.remove(&k);
+            return true;
         }
-    }
-
-    /// Whether `conn_id` is still the live connection for this player
-    pub async fn is_current(&self, universe_id: &str, player_id: &str, conn_id: u64) -> bool {
-        self.sessions
-            .read()
-            .await
-            .get(&key(universe_id, player_id))
-            .is_some_and(|s| s.conn_id == conn_id)
+        false
     }
 
     /// Get a player's sender channel
@@ -515,10 +525,6 @@ async fn handle_socket(
     // the player is still connected: no disconnect handling.
     let replaced = !state
         .connections
-        .is_current(&universe_id, &player_id_clone, conn_id)
-        .await;
-    state
-        .connections
         .unregister(&universe_id, &player_id_clone, conn_id)
         .await;
     info!("WebSocket disconnected: {}", player_id_clone);
@@ -526,7 +532,7 @@ async fn handle_socket(
     // Grace period before handling disconnect, so a reconnect does not drop
     // inventory
     if !replaced {
-        let cancel_rx = state
+        let (cancel_rx, gen) = state
             .connections
             .schedule_disconnect(&universe_id, &player_id_clone)
             .await;
@@ -540,8 +546,12 @@ async fn handle_socket(
             // Wait for grace period or cancellation
             tokio::select! {
                 _ = tokio::time::sleep(RECONNECT_GRACE_PERIOD) => {
-                    // Grace period expired - execute disconnect handling
-                    state_clone.connections.clear_pending_disconnect(&universe_for_task, &player_id_for_task).await;
+                    // Grace period expired: handle the disconnect, unless
+                    // the player is connected again
+                    if !state_clone.connections.claim_expired_disconnect(&universe_for_task, &player_id_for_task, gen).await {
+                        info!("Disconnect handling skipped for {} (connected again)", player_id_for_task);
+                        return;
+                    }
                     if let Err(e) = state_clone.player_manager.handle_disconnect(&universe_for_task, &player_id_for_task).await {
                         warn!("Error handling player disconnect: {}", e);
                     }
@@ -1907,5 +1917,48 @@ mod tests {
         conns.send_to_player("two", "p", out("to two")).await;
         assert!(matches!(a2_rx.try_recv(), Ok(ServerMessage::Output { text }) if text == "to one"));
         assert!(matches!(b_rx.try_recv(), Ok(ServerMessage::Output { text }) if text == "to two"));
+    }
+
+    /// A stale connection's unregister reports that it removed nothing
+    #[tokio::test]
+    async fn test_unregister_reports_replacement() {
+        let conns = ConnectionManager::new();
+        let (mut a, _a_rx) = session("p", "r", 4);
+        a.universe_id = "u".into();
+        a.conn_id = 1;
+        conns.register(a).await;
+        let (mut a2, _a2_rx) = session("p", "r", 4);
+        a2.universe_id = "u".into();
+        a2.conn_id = 2;
+        conns.register(a2).await;
+        assert!(
+            !conns.unregister("u", "p", 1).await,
+            "replaced: nothing removed"
+        );
+        assert!(conns.unregister("u", "p", 2).await);
+    }
+
+    /// An expired disconnect is not handled for a player who is connected
+    /// again, even if the reconnect raced past the cancel
+    #[tokio::test]
+    async fn test_expired_disconnect_skips_connected_player() {
+        let conns = ConnectionManager::new();
+        let (_rx, gen) = conns.schedule_disconnect("u", "p").await;
+        // A new connection registers without having cancelled anything
+        let (mut s, _s_rx) = session("p", "r", 4);
+        s.universe_id = "u".into();
+        conns.register(s).await;
+        assert!(!conns.claim_expired_disconnect("u", "p", gen).await);
+
+        // With nobody connected, the matching disconnect is claimed once
+        let (_rx, gen) = conns.schedule_disconnect("u", "q").await;
+        assert!(conns.claim_expired_disconnect("u", "q", gen).await);
+        assert!(!conns.claim_expired_disconnect("u", "q", gen).await);
+
+        // A newer scheduled disconnect is not claimed by an older one
+        let (_rx, old) = conns.schedule_disconnect("u", "r").await;
+        let (_rx2, new) = conns.schedule_disconnect("u", "r").await;
+        assert!(!conns.claim_expired_disconnect("u", "r", old).await);
+        assert!(conns.claim_expired_disconnect("u", "r", new).await);
     }
 }
