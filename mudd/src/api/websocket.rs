@@ -1290,30 +1290,49 @@ async fn execute_command(
                 .unwrap_or(target_hp as i64) as i32;
 
             // Initialize combat states if needed
-            if state.combat.get_state(&target_id).await.is_none() {
+            if state
+                .combat
+                .get_state(universe_id, &target_id)
+                .await
+                .is_none()
+            {
                 state
                     .combat
-                    .init_entity_with_universe(&target_id, Some(universe_id), target_max_hp)
+                    .init_entity(universe_id, &target_id, target_max_hp)
                     .await;
                 // Set current HP to match object property
-                if let Some(mut combat_state) = state.combat.get_state(&target_id).await {
+                if let Some(mut combat_state) =
+                    state.combat.get_state(universe_id, &target_id).await
+                {
                     combat_state.hp = target_hp;
-                    state.combat.update_state(&target_id, combat_state).await;
+                    state
+                        .combat
+                        .update_state(universe_id, &target_id, combat_state)
+                        .await;
                 }
             }
-            if state.combat.get_state(player_id).await.is_none() {
+            if state
+                .combat
+                .get_state(universe_id, player_id)
+                .await
+                .is_none()
+            {
                 state
                     .combat
-                    .init_entity_with_universe(
+                    .init_entity(
+                        universe_id,
                         player_id,
-                        Some(universe_id),
                         100, // Default player HP
                     )
                     .await;
             }
 
             // Initiate combat
-            if let Err(e) = state.combat.initiate(player_id, &target_id).await {
+            if let Err(e) = state
+                .combat
+                .initiate(universe_id, player_id, &target_id)
+                .await
+            {
                 return ServerMessage::Error {
                     message: format!("Combat error: {}", e),
                 };
@@ -1327,7 +1346,13 @@ async fn execute_command(
             };
             let attack_result = match state
                 .combat
-                .attack(player_id, &target_id, damage_roll, DamageType::Physical)
+                .attack(
+                    universe_id,
+                    player_id,
+                    &target_id,
+                    damage_roll,
+                    DamageType::Physical,
+                )
                 .await
             {
                 Ok(result) => result,
@@ -1367,7 +1392,7 @@ async fn execute_command(
                 }
 
                 // Check if target is dead
-                if state.combat.is_dead(&target_id).await {
+                if state.combat.is_dead(universe_id, &target_id).await {
                     messages.push(format!("{} is slain!", target_display_name));
                     deferred.push(Hook::new(
                         &target_id,
@@ -1378,8 +1403,8 @@ async fn execute_command(
                     ));
 
                     // End combat and remove target from room
-                    state.combat.end_combat(player_id).await;
-                    state.combat.remove_entity(&target_id).await;
+                    state.combat.end_combat(universe_id, player_id).await;
+                    state.combat.remove_entity(universe_id, &target_id).await;
 
                     // Remove NPC from room (set parent_id to None)
                     if let Ok(Some(mut dead_target)) =
@@ -1390,7 +1415,9 @@ async fn execute_command(
                     }
                 } else {
                     // Show remaining HP
-                    if let Some(target_state) = state.combat.get_state(&target_id).await {
+                    if let Some(target_state) =
+                        state.combat.get_state(universe_id, &target_id).await
+                    {
                         messages.push(format!(
                             "{} has {} HP remaining.",
                             target_display_name, target_state.hp
@@ -1413,7 +1440,12 @@ async fn execute_command(
             // detailed result as this command's reply
             let attacker_name = display_name(state, universe_id, player_id).await;
             let mut seen = format!("{} attacks {}.", attacker_name, target_display_name);
-            if state.combat.get_state(&target_id).await.is_none() {
+            if state
+                .combat
+                .get_state(universe_id, &target_id)
+                .await
+                .is_none()
+            {
                 seen.push_str(&format!(" {} is slain!", target_display_name));
             }
             state
@@ -1502,14 +1534,18 @@ async fn dispatch_custom_verb(
         candidates.extend(
             state
                 .actions
-                .get_room_actions(room, verb)
+                .get_room_actions(universe_id, room, verb)
                 .await
                 .into_iter()
                 .filter(|a| nearby.contains(&a.object_id)),
         );
     }
     for object_id in &nearby {
-        if let Some(action) = state.actions.get_object_action(object_id, verb).await {
+        if let Some(action) = state
+            .actions
+            .get_object_action(universe_id, object_id, verb)
+            .await
+        {
             candidates.push(action);
         }
     }

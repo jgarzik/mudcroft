@@ -203,11 +203,18 @@ impl AttackResult {
     }
 }
 
-/// Combat manager for a universe
+/// (universe_id, entity_id): object ids are scoped per universe
+type EntityKey = (String, String);
+
+fn ek(universe_id: &str, entity_id: &str) -> EntityKey {
+    (universe_id.to_string(), entity_id.to_string())
+}
+
+/// Combat manager for all universes
 #[derive(Debug)]
 pub struct CombatManager {
-    /// Combat states by entity ID
-    states: RwLock<BTreeMap<String, CombatState>>,
+    /// Combat states by (universe, entity)
+    states: RwLock<BTreeMap<EntityKey, CombatState>>,
     /// Universe PvP policy
     pvp_policy: RwLock<PvpPolicy>,
     /// Database pool for persistence
@@ -259,56 +266,42 @@ impl CombatManager {
         *self.pvp_policy.read().await
     }
 
-    /// Initialize combat state for an entity
-    pub async fn init_entity(&self, entity_id: &str, max_hp: i32) {
-        self.init_entity_with_universe(entity_id, None, max_hp)
-            .await;
-    }
+    /// Initialize combat state for an entity in a universe
+    pub async fn init_entity(&self, universe_id: &str, entity_id: &str, max_hp: i32) {
+        let state = CombatState::new_with_universe(max_hp, universe_id);
 
-    /// Initialize combat state for an entity with universe ID
-    pub async fn init_entity_with_universe(
-        &self,
-        entity_id: &str,
-        universe_id: Option<&str>,
-        max_hp: i32,
-    ) {
-        let state = match universe_id {
-            Some(uid) => CombatState::new_with_universe(max_hp, uid),
-            None => CombatState::new(max_hp),
-        };
-
-        // Persist to database
         if let Some(ref pool) = self.db_pool {
-            if let Some(uid) = universe_id {
-                if let Err(e) = self.persist_state(entity_id, uid, &state, pool).await {
-                    warn!("Failed to persist combat state for {}: {}", entity_id, e);
-                }
+            if let Err(e) = self
+                .persist_state(universe_id, entity_id, &state, pool)
+                .await
+            {
+                warn!("Failed to persist combat state for {}: {}", entity_id, e);
             }
         }
 
         self.states
             .write()
             .await
-            .insert(entity_id.to_string(), state);
+            .insert(ek(universe_id, entity_id), state);
     }
 
     /// Persist combat state to database
     async fn persist_state(
         &self,
-        entity_id: &str,
         universe_id: &str,
+        entity_id: &str,
         state: &CombatState,
         pool: &SqlitePool,
     ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
             INSERT OR REPLACE INTO combat_state
-            (entity_id, universe_id, hp, max_hp, armor_class, attack_bonus)
+            (universe_id, entity_id, hp, max_hp, armor_class, attack_bonus)
             VALUES (?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(entity_id)
         .bind(universe_id)
+        .bind(entity_id)
         .bind(state.hp)
         .bind(state.max_hp)
         .bind(state.armor_class)
@@ -319,16 +312,18 @@ impl CombatManager {
     }
 
     /// Save current state to database (for HP changes)
-    async fn save_entity_state(&self, entity_id: &str, state: &CombatState) {
-        if let Some(ref pool) = self.db_pool {
-            if let Some(ref universe_id) = state.universe_id {
-                if let Err(e) = self
-                    .persist_state(entity_id, universe_id, state, pool)
-                    .await
-                {
-                    warn!("Failed to save combat state for {}: {}", entity_id, e);
-                }
-            }
+    async fn save_entity_state(&self, universe_id: &str, entity_id: &str) {
+        let Some(ref pool) = self.db_pool else {
+            return;
+        };
+        let Some(state) = self.get_state(universe_id, entity_id).await else {
+            return;
+        };
+        if let Err(e) = self
+            .persist_state(universe_id, entity_id, &state, pool)
+            .await
+        {
+            warn!("Failed to save combat state for {}: {}", entity_id, e);
         }
     }
 
@@ -339,18 +334,18 @@ impl CombatManager {
         };
 
         let rows: Vec<(String, String, i32, i32, i32, i32)> = sqlx::query_as(
-            "SELECT entity_id, universe_id, hp, max_hp, armor_class, attack_bonus FROM combat_state",
+            "SELECT universe_id, entity_id, hp, max_hp, armor_class, attack_bonus FROM combat_state",
         )
         .fetch_all(pool)
         .await?;
 
         let mut states = self.states.write().await;
-        for (entity_id, universe_id, hp, max_hp, armor_class, attack_bonus) in rows {
+        for (universe_id, entity_id, hp, max_hp, armor_class, attack_bonus) in rows {
             let mut state = CombatState::new_with_universe(max_hp, &universe_id);
             state.hp = hp;
             state.armor_class = armor_class;
             state.attack_bonus = attack_bonus;
-            states.insert(entity_id, state);
+            states.insert((universe_id, entity_id), state);
         }
 
         debug!("Loaded {} combat states from database", states.len());
@@ -358,49 +353,64 @@ impl CombatManager {
     }
 
     /// Get combat state for an entity
-    pub async fn get_state(&self, entity_id: &str) -> Option<CombatState> {
-        let states = self.states.read().await;
-        states.get(entity_id).cloned()
+    pub async fn get_state(&self, universe_id: &str, entity_id: &str) -> Option<CombatState> {
+        self.states
+            .read()
+            .await
+            .get(&ek(universe_id, entity_id))
+            .cloned()
     }
 
     /// Update combat state for an entity
-    pub async fn update_state(&self, entity_id: &str, state: CombatState) {
-        let mut states = self.states.write().await;
-        states.insert(entity_id.to_string(), state);
+    pub async fn update_state(&self, universe_id: &str, entity_id: &str, state: CombatState) {
+        self.states
+            .write()
+            .await
+            .insert(ek(universe_id, entity_id), state);
     }
 
     /// Check if entity is in combat
-    pub async fn is_in_combat(&self, entity_id: &str) -> bool {
-        let states = self.states.read().await;
-        states.get(entity_id).is_some_and(|s| s.in_combat)
+    pub async fn is_in_combat(&self, universe_id: &str, entity_id: &str) -> bool {
+        self.states
+            .read()
+            .await
+            .get(&ek(universe_id, entity_id))
+            .is_some_and(|s| s.in_combat)
     }
 
     /// Check if entity is dead
-    pub async fn is_dead(&self, entity_id: &str) -> bool {
-        let states = self.states.read().await;
-        states.get(entity_id).is_some_and(|s| s.is_dead())
+    pub async fn is_dead(&self, universe_id: &str, entity_id: &str) -> bool {
+        self.states
+            .read()
+            .await
+            .get(&ek(universe_id, entity_id))
+            .is_some_and(|s| s.is_dead())
     }
 
-    /// Initiate combat between attacker and defender
-    pub async fn initiate(&self, attacker_id: &str, defender_id: &str) -> Result<(), String> {
-        // Check PvP policy if both are players
-        // (In a real implementation, we'd check if they're players)
-
+    /// Initiate combat between attacker and defender (same universe)
+    pub async fn initiate(
+        &self,
+        universe_id: &str,
+        attacker_id: &str,
+        defender_id: &str,
+    ) -> Result<(), String> {
         let mut states = self.states.write().await;
+        let attacker_key = ek(universe_id, attacker_id);
+        let defender_key = ek(universe_id, defender_id);
 
         // Ensure both entities have combat states
-        if !states.contains_key(attacker_id) {
-            states.insert(attacker_id.to_string(), CombatState::new(100));
-        }
-        if !states.contains_key(defender_id) {
-            states.insert(defender_id.to_string(), CombatState::new(100));
-        }
+        states
+            .entry(attacker_key.clone())
+            .or_insert_with(|| CombatState::new_with_universe(100, universe_id));
+        states
+            .entry(defender_key.clone())
+            .or_insert_with(|| CombatState::new_with_universe(100, universe_id));
 
         // Set up combat relationship
-        if let Some(attacker) = states.get_mut(attacker_id) {
+        if let Some(attacker) = states.get_mut(&attacker_key) {
             attacker.start_attacking(defender_id);
         }
-        if let Some(defender) = states.get_mut(defender_id) {
+        if let Some(defender) = states.get_mut(&defender_key) {
             defender.add_attacker(attacker_id);
         }
 
@@ -411,6 +421,7 @@ impl CombatManager {
     /// rolled by the caller; doubled on a critical) of `damage_type`
     pub async fn attack(
         &self,
+        universe_id: &str,
         attacker_id: &str,
         defender_id: &str,
         damage: i32,
@@ -418,9 +429,12 @@ impl CombatManager {
     ) -> Result<AttackResult, String> {
         let result = {
             let mut states = self.states.write().await;
+            let defender_key = ek(universe_id, defender_id);
 
-            let attacker = states.get(attacker_id).ok_or("Attacker not found")?;
-            let defender = states.get(defender_id).ok_or("Defender not found")?;
+            let attacker = states
+                .get(&ek(universe_id, attacker_id))
+                .ok_or("Attacker not found")?;
+            let defender = states.get(&defender_key).ok_or("Defender not found")?;
 
             // Roll to hit
             let roll = roll_d20();
@@ -429,7 +443,7 @@ impl CombatManager {
             if result.hit {
                 // Calculate and apply damage
                 let is_crit = result.critical;
-                let defender_mut = states.get_mut(defender_id).unwrap();
+                let defender_mut = states.get_mut(&defender_key).unwrap();
                 let damage_result = defender_mut.take_damage(damage, damage_type, is_crit);
                 result = result.with_damage(damage_result);
             }
@@ -439,9 +453,7 @@ impl CombatManager {
 
         // Persist HP change if damage was dealt
         if result.hit {
-            if let Some(state) = self.get_state(defender_id).await {
-                self.save_entity_state(defender_id, &state).await;
-            }
+            self.save_entity_state(universe_id, defender_id).await;
         }
 
         Ok(result)
@@ -450,6 +462,7 @@ impl CombatManager {
     /// Deal direct damage (bypassing attack roll)
     pub async fn deal_damage(
         &self,
+        universe_id: &str,
         target_id: &str,
         amount: i32,
         damage_type: DamageType,
@@ -457,46 +470,48 @@ impl CombatManager {
     ) -> Result<DamageResult, String> {
         let result = {
             let mut states = self.states.write().await;
-            let target = states.get_mut(target_id).ok_or("Target not found")?;
+            let target = states
+                .get_mut(&ek(universe_id, target_id))
+                .ok_or("Target not found")?;
             target.take_damage(amount, damage_type, is_crit)
         };
 
-        // Persist HP change
-        if let Some(state) = self.get_state(target_id).await {
-            self.save_entity_state(target_id, &state).await;
-        }
-
+        self.save_entity_state(universe_id, target_id).await;
         Ok(result)
     }
 
     /// Heal an entity
-    pub async fn heal(&self, target_id: &str, amount: i32) -> Result<i32, String> {
+    pub async fn heal(
+        &self,
+        universe_id: &str,
+        target_id: &str,
+        amount: i32,
+    ) -> Result<i32, String> {
         let healed = {
             let mut states = self.states.write().await;
-            let target = states.get_mut(target_id).ok_or("Target not found")?;
+            let target = states
+                .get_mut(&ek(universe_id, target_id))
+                .ok_or("Target not found")?;
             target.heal(amount)
         };
 
-        // Persist HP change
-        if let Some(state) = self.get_state(target_id).await {
-            self.save_entity_state(target_id, &state).await;
-        }
-
+        self.save_entity_state(universe_id, target_id).await;
         Ok(healed)
     }
 
     /// End combat for an entity
-    pub async fn end_combat(&self, entity_id: &str) {
+    pub async fn end_combat(&self, universe_id: &str, entity_id: &str) {
         let mut states = self.states.write().await;
+        let key = ek(universe_id, entity_id);
 
         // Remove this entity from all attackers lists
         let attacker_ids: Vec<String> = states
-            .get(entity_id)
+            .get(&key)
             .map(|s| s.attackers.iter().cloned().collect())
             .unwrap_or_default();
 
         for attacker_id in &attacker_ids {
-            if let Some(attacker) = states.get_mut(attacker_id) {
+            if let Some(attacker) = states.get_mut(&ek(universe_id, attacker_id)) {
                 if attacker.attacking.as_deref() == Some(entity_id) {
                     attacker.stop_attacking();
                 }
@@ -504,48 +519,52 @@ impl CombatManager {
         }
 
         // Get who this entity was attacking
-        let target_id = states.get(entity_id).and_then(|s| s.attacking.clone());
+        let target_id = states.get(&key).and_then(|s| s.attacking.clone());
 
         if let Some(ref tid) = target_id {
-            if let Some(target) = states.get_mut(tid) {
+            if let Some(target) = states.get_mut(&ek(universe_id, tid)) {
                 target.remove_attacker(entity_id);
             }
         }
 
         // Clear this entity's combat state
-        if let Some(state) = states.get_mut(entity_id) {
+        if let Some(state) = states.get_mut(&key) {
             state.leave_combat();
         }
     }
 
     /// Remove entity from combat system (on death/disconnect)
-    pub async fn remove_entity(&self, entity_id: &str) {
-        self.end_combat(entity_id).await;
+    pub async fn remove_entity(&self, universe_id: &str, entity_id: &str) {
+        self.end_combat(universe_id, entity_id).await;
 
-        // Remove from database (cascades to active_effects)
         if let Some(ref pool) = self.db_pool {
-            if let Err(e) = sqlx::query("DELETE FROM combat_state WHERE entity_id = ?")
-                .bind(entity_id)
-                .execute(pool)
-                .await
+            if let Err(e) =
+                sqlx::query("DELETE FROM combat_state WHERE universe_id = ? AND entity_id = ?")
+                    .bind(universe_id)
+                    .bind(entity_id)
+                    .execute(pool)
+                    .await
             {
                 warn!("Failed to remove combat state for {}: {}", entity_id, e);
             }
         }
 
-        let mut states = self.states.write().await;
-        states.remove(entity_id);
+        self.states
+            .write()
+            .await
+            .remove(&ek(universe_id, entity_id));
     }
 
     /// Set damage modifier for an entity
     pub async fn set_damage_modifier(
         &self,
+        universe_id: &str,
         entity_id: &str,
         damage_type: DamageType,
         modifier: super::damage::DamageModifier,
     ) {
         let mut states = self.states.write().await;
-        if let Some(state) = states.get_mut(entity_id) {
+        if let Some(state) = states.get_mut(&ek(universe_id, entity_id)) {
             state.damage_profile.set(damage_type, modifier);
         }
     }
@@ -554,6 +573,23 @@ impl CombatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same entity id in two universes has independent combat state
+    #[tokio::test]
+    async fn test_combat_state_is_per_universe() {
+        let manager = CombatManager::new();
+        manager.init_entity("a", "/npcs/rat", 10).await;
+        manager.init_entity("b", "/npcs/rat", 10).await;
+        manager.init_entity("a", "/players/p-x", 100).await;
+        manager
+            .deal_damage("a", "/npcs/rat", 7, DamageType::Physical, false)
+            .await
+            .unwrap();
+        assert_eq!(manager.get_state("a", "/npcs/rat").await.unwrap().hp, 3);
+        assert_eq!(manager.get_state("b", "/npcs/rat").await.unwrap().hp, 10);
+        manager.remove_entity("b", "/npcs/rat").await;
+        assert!(manager.get_state("a", "/npcs/rat").await.is_some());
+    }
 
     #[test]
     fn test_combat_state() {
@@ -630,28 +666,28 @@ mod tests {
         let manager = CombatManager::new();
 
         // Init entities
-        manager.init_entity("player1", 100).await;
-        manager.init_entity("goblin", 20).await;
+        manager.init_entity("u", "player1", 100).await;
+        manager.init_entity("u", "goblin", 20).await;
 
         // Initiate combat
-        manager.initiate("player1", "goblin").await.unwrap();
+        manager.initiate("u", "player1", "goblin").await.unwrap();
 
-        assert!(manager.is_in_combat("player1").await);
-        assert!(manager.is_in_combat("goblin").await);
+        assert!(manager.is_in_combat("u", "player1").await);
+        assert!(manager.is_in_combat("u", "goblin").await);
 
         // Deal damage
         let result = manager
-            .deal_damage("goblin", 15, DamageType::Slashing, false)
+            .deal_damage("u", "goblin", 15, DamageType::Slashing, false)
             .await
             .unwrap();
         assert_eq!(result.final_damage, 15);
 
-        let state = manager.get_state("goblin").await.unwrap();
+        let state = manager.get_state("u", "goblin").await.unwrap();
         assert_eq!(state.hp, 5);
 
         // End combat
-        manager.end_combat("player1").await;
-        assert!(!manager.is_in_combat("player1").await);
+        manager.end_combat("u", "player1").await;
+        assert!(!manager.is_in_combat("u", "player1").await);
     }
 
     #[test]

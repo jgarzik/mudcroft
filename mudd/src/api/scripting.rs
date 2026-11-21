@@ -133,7 +133,10 @@ pub async fn run_timer_loop(state: AppState) {
                 Ok(Some(obj)) => obj.parent_id,
                 Ok(None) => {
                     // Object is gone: stop its heartbeat too
-                    state.timers.remove_heartbeat(&fired.object_id).await;
+                    state
+                        .timers
+                        .remove_heartbeat(&fired.universe_id, &fired.object_id)
+                        .await;
                     continue;
                 }
                 Err(e) => {

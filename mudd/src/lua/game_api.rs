@@ -642,9 +642,9 @@ impl GameApi {
                         // Nothing may keep running for (or be dispatched to)
                         // the deleted object, nor for a later object reusing
                         // its path
-                        timers.remove_timers_for_object(&id).await;
-                        timers.remove_heartbeat(&id).await;
-                        actions.clear_by_object(&id).await;
+                        timers.remove_timers_for_object(&universe_id, &id).await;
+                        timers.remove_heartbeat(&universe_id, &id).await;
+                        actions.clear_by_object(&universe_id, &id).await;
                     }
                     Ok(Ok(deleted))
                 })
@@ -1259,10 +1259,12 @@ impl GameApi {
         let actions_clone = actions.clone();
         let room_id_clone = room_id.clone();
         let perm_clone = perm_ctx.clone();
+        let action_universe = self.universe_id.clone();
         let add_action = lua.create_function(
             move |lua, (verb, object_id, method): (String, String, String)| {
                 let actions = actions_clone.clone();
                 let room_id = room_id_clone.clone();
+                let universe_id = action_universe.clone();
                 if is_private_handler(&method) || !may_modify(lua, &perm_clone, &object_id) {
                     return Ok(false);
                 }
@@ -1281,11 +1283,11 @@ impl GameApi {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async {
                         if let Some(rid) = room_id {
-                            actions.add_room_action(&rid, action).await;
+                            actions.add_room_action(&universe_id, &rid, action).await;
                         } else {
                             // If no room context, add as object action
                             actions
-                                .add_object_action(&action.object_id, action.clone())
+                                .add_object_action(&universe_id, &action.object_id, action.clone())
                                 .await;
                         }
                     });
@@ -1302,10 +1304,12 @@ impl GameApi {
         // Removes a contextual action
         let actions_clone = actions.clone();
         let room_id_clone = room_id;
+        let action_universe = self.universe_id.clone();
         let remove_action =
             lua.create_function(move |lua, (verb, object_id): (String, String)| {
                 let actions = actions_clone.clone();
                 let room_id = room_id_clone.clone();
+                let universe_id = action_universe.clone();
                 if !may_modify(lua, &perm_ctx, &object_id) {
                     return Ok(false);
                 }
@@ -1314,9 +1318,13 @@ impl GameApi {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async {
                         if let Some(rid) = room_id {
-                            actions.remove_room_action(&rid, &verb, &object_id).await;
+                            actions
+                                .remove_room_action(&universe_id, &rid, &verb, &object_id)
+                                .await;
                         } else {
-                            actions.remove_object_action(&object_id, &verb).await;
+                            actions
+                                .remove_object_action(&universe_id, &object_id, &verb)
+                                .await;
                         }
                     });
                 })
@@ -1805,12 +1813,13 @@ impl GameApi {
             charge_db(lua)?;
             let timers = timers.clone();
             let object_id = object_clone.clone();
+            let universe_id = universe_id.clone();
 
             let removed = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     if let Some(obj_id) = object_id {
-                        timers.remove_heartbeat(&obj_id).await
+                        timers.remove_heartbeat(&universe_id, &obj_id).await
                     } else {
                         false
                     }

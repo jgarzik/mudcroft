@@ -127,8 +127,8 @@ pub const MIN_HEARTBEAT_MS: u64 = 100;
 pub struct TimerManager {
     /// One-shot timers (in memory)
     timers: RwLock<BTreeMap<String, Timer>>,
-    /// Heartbeats (in memory only, not persisted)
-    heartbeats: RwLock<BTreeMap<String, HeartBeat>>,
+    /// Heartbeats keyed by (universe, object) (in memory only, not persisted)
+    heartbeats: RwLock<BTreeMap<(String, String), HeartBeat>>,
     /// Database pool for persistence
     pool: Option<SqlitePool>,
     /// Raft writer for consensus
@@ -199,7 +199,7 @@ impl TimerManager {
             .read()
             .await
             .values()
-            .filter(|t| t.object_id == timer.object_id)
+            .filter(|t| t.universe_id == timer.universe_id && t.object_id == timer.object_id)
             .count();
         if pending >= MAX_TIMERS_PER_OBJECT {
             warn!(
@@ -232,12 +232,12 @@ impl TimerManager {
         self.timers.write().await.remove(timer_id).is_some()
     }
 
-    /// Remove all timers for an object
-    pub async fn remove_timers_for_object(&self, object_id: &str) {
+    /// Remove all timers for an object in a universe
+    pub async fn remove_timers_for_object(&self, universe_id: &str, object_id: &str) {
         let mut timers = self.timers.write().await;
         let ids_to_remove: Vec<String> = timers
             .values()
-            .filter(|t| t.object_id == object_id)
+            .filter(|t| t.universe_id == universe_id && t.object_id == object_id)
             .map(|t| t.id.clone())
             .collect();
 
@@ -263,15 +263,17 @@ impl TimerManager {
     /// Set a heartbeat for an object (interval clamped to [`MIN_HEARTBEAT_MS`])
     pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) {
         heartbeat.interval_ms = heartbeat.interval_ms.max(MIN_HEARTBEAT_MS);
+        let key = (heartbeat.universe_id.clone(), heartbeat.object_id.clone());
+        self.heartbeats.write().await.insert(key, heartbeat);
+    }
+
+    /// Remove the heartbeat for an object in a universe
+    pub async fn remove_heartbeat(&self, universe_id: &str, object_id: &str) -> bool {
         self.heartbeats
             .write()
             .await
-            .insert(heartbeat.object_id.clone(), heartbeat);
-    }
-
-    /// Remove heartbeat for an object
-    pub async fn remove_heartbeat(&self, object_id: &str) -> bool {
-        self.heartbeats.write().await.remove(object_id).is_some()
+            .remove(&(universe_id.to_string(), object_id.to_string()))
+            .is_some()
     }
 
     /// Check for due timers and heartbeats, returning fired callbacks
@@ -392,6 +394,34 @@ impl TimerManager {
 mod tests {
     use super::*;
 
+    /// The same object id in two universes has independent timers and
+    /// heartbeats
+    #[tokio::test]
+    async fn test_timers_are_per_universe() {
+        let mgr = TimerManager::new(None, None);
+        mgr.set_heartbeat(HeartBeat::new("a", "/clock", 1000)).await;
+        mgr.set_heartbeat(HeartBeat::new("b", "/clock", 1000)).await;
+        assert_eq!(mgr.heartbeat_count().await, 2, "one heartbeat per universe");
+
+        for _ in 0..MAX_TIMERS_PER_OBJECT {
+            assert!(mgr
+                .try_add_timer(Timer::new("a", "/clock", "tick", 60_000, None))
+                .await
+                .is_some());
+        }
+        // Universe b's object has its own cap
+        assert!(mgr
+            .try_add_timer(Timer::new("b", "/clock", "tick", 60_000, None))
+            .await
+            .is_some());
+
+        // Removing b's object's timers and heartbeat leaves a's alone
+        mgr.remove_timers_for_object("b", "/clock").await;
+        assert!(mgr.remove_heartbeat("b", "/clock").await);
+        assert_eq!(mgr.timer_count().await, MAX_TIMERS_PER_OBJECT);
+        assert_eq!(mgr.heartbeat_count().await, 1);
+    }
+
     #[test]
     fn test_timer_creation() {
         let timer = Timer::new("universe1", "obj1", "on_timer", 1000, None);
@@ -438,7 +468,7 @@ mod tests {
 
         assert_eq!(manager.heartbeat_count().await, 1);
 
-        let removed = manager.remove_heartbeat("obj1").await;
+        let removed = manager.remove_heartbeat("u1", "obj1").await;
         assert!(removed);
         assert_eq!(manager.heartbeat_count().await, 0);
     }
@@ -478,7 +508,7 @@ mod tests {
 
         assert_eq!(manager.timer_count().await, 3);
 
-        manager.remove_timers_for_object("obj1").await;
+        manager.remove_timers_for_object("u1", "obj1").await;
         assert_eq!(manager.timer_count().await, 1); // Only obj2's timer remains
     }
 }

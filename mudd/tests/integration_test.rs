@@ -1200,12 +1200,13 @@ async fn test_combat_state_persistence() {
         // Create combat_state table
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS combat_state (
-                entity_id TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
                 hp INTEGER NOT NULL,
                 max_hp INTEGER NOT NULL,
                 armor_class INTEGER NOT NULL DEFAULT 10,
-                attack_bonus INTEGER NOT NULL DEFAULT 0
+                attack_bonus INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (universe_id, entity_id)
             )",
         )
         .execute(&pool)
@@ -1213,21 +1214,31 @@ async fn test_combat_state_persistence() {
         .expect("Failed to create combat_state table");
 
         let combat = CombatManager::with_db(pool);
-        combat
-            .init_entity_with_universe("player1", Some("universe1"), 100)
-            .await;
+        combat.init_entity("universe1", "player1", 100).await;
 
         // Verify initial state
-        let state = combat.get_state("player1").await.expect("Entity not found");
+        let state = combat
+            .get_state("universe1", "player1")
+            .await
+            .expect("Entity not found");
         assert_eq!(state.hp, 100);
 
         // Take damage
         combat
-            .deal_damage("player1", 30, mudd::combat::DamageType::Physical, false)
+            .deal_damage(
+                "universe1",
+                "player1",
+                30,
+                mudd::combat::DamageType::Physical,
+                false,
+            )
             .await
             .expect("Failed to deal damage");
 
-        let state = combat.get_state("player1").await.expect("Entity not found");
+        let state = combat
+            .get_state("universe1", "player1")
+            .await
+            .expect("Entity not found");
         assert_eq!(state.hp, 70, "HP should be 70 after 30 damage");
     }
 
@@ -1244,7 +1255,10 @@ async fn test_combat_state_persistence() {
             .await
             .expect("Failed to load combat state");
 
-        let state = combat.get_state("player1").await.expect("Entity not found");
+        let state = combat
+            .get_state("universe1", "player1")
+            .await
+            .expect("Entity not found");
         assert_eq!(state.hp, 70, "HP should persist across restarts");
         assert_eq!(state.max_hp, 100, "Max HP should persist");
     }
