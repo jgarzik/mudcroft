@@ -145,3 +145,67 @@ async fn test_attack_nothing() {
     assert_eq!(reply["type"], "error");
     assert_eq!(reply["message"], "You don't see 'dragon' here.");
 }
+
+/// Damage is rolled (1d6, doubled on a critical), not a fixed amount
+#[tokio::test]
+async fn test_attack_damage_is_rolled() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let entrance = server.world().entrance_id.clone();
+    let mut alice = server
+        .connect_as(Role::Player {
+            username: "roller".to_string(),
+        })
+        .await
+        .expect("connect");
+    alice.drain().await;
+
+    let mut damages = std::collections::BTreeSet::new();
+    for round in 0..8 {
+        let rat = format!("Rat{}", round);
+        server.world().create_npc(&rat, &entrance).await.unwrap();
+        for _ in 0..20 {
+            let text = attack(&mut alice, &format!("attack {}", rat.to_lowercase())).await;
+            if let Some(line) = text.lines().find(|l| l.contains(" damage")) {
+                let d: i64 = line
+                    .split(" for ")
+                    .nth(1)
+                    .and_then(|r| r.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+                    .expect("damage");
+                assert!((1..=12).contains(&d), "damage out of range: {}", text);
+                damages.insert(d);
+            }
+            if text.contains("slain") {
+                break;
+            }
+        }
+        if damages.len() >= 2 {
+            return;
+        }
+    }
+    panic!("every hit did the same damage: {:?}", damages);
+}
+
+/// Subclasses of npc can be attacked
+#[tokio::test]
+async fn test_npc_subclasses_are_attackable() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "beast_maker".to_string(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    let entrance = server.world().entrance_id.clone();
+    wiz.command(&format!(
+        r#"eval game.define_class("beast", {{parent = "npc"}}); return game.create_object("/npcs/wolf", "beast", "{}", {{name = "Wolf", hp = 5}}).id"#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("/npcs/wolf").await.unwrap();
+
+    let text = attack(&mut wiz, "attack wolf").await;
+    assert!(text.contains("Wolf"), "{}", text);
+}

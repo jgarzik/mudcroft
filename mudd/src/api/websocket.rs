@@ -1212,7 +1212,9 @@ async fn execute_command(
                 .to_string();
 
             // Check if target is attackable (NPC or PvP-flagged player)
-            let is_npc = target.class == "npc" || target.class == "monster";
+            // Any npc, including subclasses defined with define_class
+            let is_npc =
+                target.class == "monster" || state.classes.read().await.is_a(&target.class, "npc");
             if !is_npc {
                 return ServerMessage::Error {
                     message: format!("You can't attack {}.", target_display_name),
@@ -1273,10 +1275,15 @@ async fn execute_command(
                 };
             }
 
-            // Perform attack (basic 1d6 physical damage)
+            // Perform attack (basic 1d6 physical damage; the combat manager
+            // takes the rolled amount and doubles it on a critical)
+            let damage_roll = {
+                use rand::Rng;
+                rand::rng().random_range(1..=6)
+            };
             let attack_result = match state
                 .combat
-                .attack(player_id, &target_id, 6, DamageType::Physical)
+                .attack(player_id, &target_id, damage_roll, DamageType::Physical)
                 .await
             {
                 Ok(result) => result,
