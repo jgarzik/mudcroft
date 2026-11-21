@@ -117,6 +117,7 @@ impl Database {
             "class_properties",
             "class_handlers",
             "timers",
+            "universe_members",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -317,6 +318,20 @@ impl Database {
                 granted_by TEXT NOT NULL REFERENCES accounts(id),
                 granted_at TEXT NOT NULL,
                 UNIQUE(universe_id, grantee_id, path_prefix)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Per-universe access levels (absent row = player)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS universe_members (
+                universe_id TEXT NOT NULL REFERENCES universes(id),
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                level TEXT NOT NULL,
+                PRIMARY KEY (universe_id, account_id)
             )
             "#,
         )

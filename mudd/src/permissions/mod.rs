@@ -61,6 +61,17 @@ impl FromStr for AccessLevel {
 }
 
 impl AccessLevel {
+    /// The level's name as stored in the database
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccessLevel::Player => "player",
+            AccessLevel::Builder => "builder",
+            AccessLevel::Wizard => "wizard",
+            AccessLevel::Admin => "admin",
+            AccessLevel::Owner => "owner",
+        }
+    }
+
     /// Check if this level can perform builder actions
     pub fn can_build(&self) -> bool {
         *self >= AccessLevel::Builder
@@ -295,10 +306,20 @@ pub struct ObjectContext {
     pub is_fixed: bool,
 }
 
-/// Permission manager for a universe
+/// Permission manager for all universes.
+///
+/// An account's effective level in a universe is the highest of:
+/// - its global level (`accounts.access_level`), but only admin or owner;
+///   lower global levels mean nothing
+/// - its member level in that universe (`universe_members`)
+/// - owner, if it owns the universe (`universes.owner_id`)
 pub struct PermissionManager {
-    /// User access levels by account ID (in-memory cache)
-    user_levels: RwLock<HashMap<String, AccessLevel>>,
+    /// Global account levels (`accounts.access_level`) by account ID
+    global_levels: RwLock<HashMap<String, AccessLevel>>,
+    /// Member levels by (universe_id, account_id)
+    member_levels: RwLock<HashMap<(String, String), AccessLevel>>,
+    /// Universe owners by universe ID
+    universe_owners: RwLock<HashMap<String, Option<String>>>,
     /// Path grants by (universe_id, grantee_id) -> Vec<PathGrant>
     path_grants: RwLock<HashMap<(String, String), Vec<PathGrant>>>,
     /// Database pool for fallback lookups
@@ -319,7 +340,9 @@ impl std::fmt::Debug for PermissionManager {
 impl Default for PermissionManager {
     fn default() -> Self {
         Self {
-            user_levels: RwLock::new(HashMap::new()),
+            global_levels: RwLock::new(HashMap::new()),
+            member_levels: RwLock::new(HashMap::new()),
+            universe_owners: RwLock::new(HashMap::new()),
             path_grants: RwLock::new(HashMap::new()),
             db_pool: None,
             raft_writer: None,
@@ -336,7 +359,9 @@ impl PermissionManager {
     /// Create a new permission manager with database pool and optional raft writer
     pub fn with_db(db_pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self {
-            user_levels: RwLock::new(HashMap::new()),
+            global_levels: RwLock::new(HashMap::new()),
+            member_levels: RwLock::new(HashMap::new()),
+            universe_owners: RwLock::new(HashMap::new()),
             path_grants: RwLock::new(HashMap::new()),
             db_pool: Some(db_pool),
             raft_writer,
@@ -353,72 +378,132 @@ impl PermissionManager {
         Arc::new(Self::with_db(db_pool, raft_writer))
     }
 
-    /// Set a user's access level
-    pub async fn set_access_level(&self, account_id: &str, level: AccessLevel) {
-        let level_str = match level {
-            AccessLevel::Player => "player",
-            AccessLevel::Builder => "builder",
-            AccessLevel::Wizard => "wizard",
-            AccessLevel::Admin => "admin",
-            AccessLevel::Owner => "owner",
-        };
-
-        // Persist via Raft if available, otherwise direct SQL
+    /// Set an account's member level in a universe. Admin is the highest
+    /// member level; owner comes only from owning the universe (or a global
+    /// owner account). The cache changes only after the write succeeds.
+    pub async fn set_access_level(
+        &self,
+        universe_id: &str,
+        account_id: &str,
+        level: AccessLevel,
+    ) -> anyhow::Result<()> {
+        if level > AccessLevel::Admin {
+            anyhow::bail!("owner is not a member level");
+        }
+        let sql = "INSERT OR REPLACE INTO universe_members (universe_id, account_id, level)
+                   VALUES (?, ?, ?)";
         if let Some(ref raft_writer) = self.raft_writer {
-            if let Err(e) = raft_writer
+            raft_writer
                 .execute(
-                    "UPDATE accounts SET access_level = ? WHERE id = ?",
-                    vec![serde_json::json!(level_str), serde_json::json!(account_id)],
+                    sql,
+                    vec![
+                        serde_json::json!(universe_id),
+                        serde_json::json!(account_id),
+                        serde_json::json!(level.as_str()),
+                    ],
                 )
-                .await
-            {
-                tracing::warn!("Failed to persist access level for {}: {}", account_id, e);
-            }
+                .await?;
         } else if let Some(ref pool) = self.db_pool {
-            // Direct SQL fallback (for tests)
-            if let Err(e) = sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
-                .bind(level_str)
+            // Direct SQL fallback (unit tests without Raft)
+            sqlx::query(sql)
+                .bind(universe_id)
                 .bind(account_id)
+                .bind(level.as_str())
                 .execute(pool)
-                .await
-            {
-                tracing::warn!("Failed to persist access level for {}: {}", account_id, e);
-            }
+                .await?;
         }
 
-        self.user_levels
+        self.member_levels
+            .write()
+            .await
+            .insert((universe_id.to_string(), account_id.to_string()), level);
+        Ok(())
+    }
+
+    /// An account's global level (`accounts.access_level`)
+    pub async fn get_global_level(&self, account_id: &str) -> AccessLevel {
+        if let Some(level) = self.global_levels.read().await.get(account_id).copied() {
+            return level;
+        }
+        let Some(ref pool) = self.db_pool else {
+            return AccessLevel::Player;
+        };
+        let Ok(Some((level,))) =
+            sqlx::query_as::<_, (String,)>("SELECT access_level FROM accounts WHERE id = ?")
+                .bind(account_id)
+                .fetch_optional(pool)
+                .await
+        else {
+            return AccessLevel::Player;
+        };
+        let level = AccessLevel::from_str(&level).unwrap_or(AccessLevel::Player);
+        self.global_levels
             .write()
             .await
             .insert(account_id.to_string(), level);
+        level
     }
 
-    /// Get a user's access level
-    /// Checks in-memory cache first, then falls back to database if available
-    pub async fn get_access_level(&self, account_id: &str) -> AccessLevel {
-        // Check in-memory cache first
-        if let Some(level) = self.user_levels.read().await.get(account_id).copied() {
+    async fn get_member_level(&self, universe_id: &str, account_id: &str) -> AccessLevel {
+        let key = (universe_id.to_string(), account_id.to_string());
+        if let Some(level) = self.member_levels.read().await.get(&key).copied() {
             return level;
         }
+        let Some(ref pool) = self.db_pool else {
+            return AccessLevel::Player;
+        };
+        let level = match sqlx::query_as::<_, (String,)>(
+            "SELECT level FROM universe_members WHERE universe_id = ? AND account_id = ?",
+        )
+        .bind(universe_id)
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(Some((level,))) => AccessLevel::from_str(&level).unwrap_or(AccessLevel::Player),
+            Ok(None) => AccessLevel::Player,
+            // Don't cache a failed lookup
+            Err(_) => return AccessLevel::Player,
+        };
+        self.member_levels.write().await.insert(key, level);
+        level
+    }
 
-        // Fall back to database lookup if pool is available
-        if let Some(ref pool) = self.db_pool {
-            if let Ok(Some(row)) =
-                sqlx::query_as::<_, (String,)>("SELECT access_level FROM accounts WHERE id = ?")
-                    .bind(account_id)
-                    .fetch_optional(pool)
-                    .await
-            {
-                let level = AccessLevel::from_str(&row.0).unwrap_or(AccessLevel::Player);
-                // Cache for future lookups
-                self.user_levels
-                    .write()
-                    .await
-                    .insert(account_id.to_string(), level);
-                return level;
-            }
+    async fn get_universe_owner(&self, universe_id: &str) -> Option<String> {
+        if let Some(owner) = self.universe_owners.read().await.get(universe_id) {
+            return owner.clone();
         }
+        let pool = self.db_pool.as_ref()?;
+        let owner =
+            match sqlx::query_as::<_, (String,)>("SELECT owner_id FROM universes WHERE id = ?")
+                .bind(universe_id)
+                .fetch_optional(pool)
+                .await
+            {
+                Ok(row) => row.map(|(o,)| o),
+                Err(_) => return None,
+            };
+        self.universe_owners
+            .write()
+            .await
+            .insert(universe_id.to_string(), owner.clone());
+        owner
+    }
 
-        AccessLevel::Player
+    /// An account's effective access level in a universe (see the struct
+    /// docs for the rule)
+    pub async fn get_access_level(&self, universe_id: &str, account_id: &str) -> AccessLevel {
+        let global = self.get_global_level(account_id).await;
+        let mut level = if global >= AccessLevel::Admin {
+            global
+        } else {
+            AccessLevel::Player
+        };
+        level = level.max(self.get_member_level(universe_id, account_id).await);
+        if self.get_universe_owner(universe_id).await.as_deref() == Some(account_id) {
+            level = AccessLevel::Owner;
+        }
+        level
     }
 
     /// Grant a path to a user
@@ -641,7 +726,7 @@ impl PermissionManager {
 
     /// Build a user context for permission checks in a specific universe
     pub async fn get_user_context(&self, account_id: &str, universe_id: &str) -> UserContext {
-        let access_level = self.get_access_level(account_id).await;
+        let access_level = self.get_access_level(universe_id, account_id).await;
         let path_grants = self.get_path_grants(account_id, universe_id).await;
 
         UserContext {
@@ -886,11 +971,83 @@ mod tests {
         let pm = PermissionManager::new();
 
         // Default is player
-        assert_eq!(pm.get_access_level("user1").await, AccessLevel::Player);
+        assert_eq!(pm.get_access_level("u", "user1").await, AccessLevel::Player);
 
         // Set and get
-        pm.set_access_level("user1", AccessLevel::Builder).await;
-        assert_eq!(pm.get_access_level("user1").await, AccessLevel::Builder);
+        pm.set_access_level("u", "user1", AccessLevel::Builder)
+            .await
+            .unwrap();
+        assert_eq!(
+            pm.get_access_level("u", "user1").await,
+            AccessLevel::Builder
+        );
+
+        // Owner is not a member level
+        assert!(pm
+            .set_access_level("u", "user1", AccessLevel::Owner)
+            .await
+            .is_err());
+    }
+
+    /// Levels are per universe: member levels apply only in their universe,
+    /// global admin/owner apply everywhere, lower global levels nowhere, and
+    /// a universe's owner is owner inside it
+    #[tokio::test]
+    async fn test_levels_are_per_universe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::new(Some(dir.path().join("t.db").to_str().unwrap()))
+            .await
+            .unwrap();
+        let pool = db.pool().clone();
+        for (id, level) in [("alice", "player"), ("gadmin", "admin"), ("gwiz", "wizard")] {
+            sqlx::query(
+                "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+                 VALUES (?, ?, 'x', ?, '2026-01-01')",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(level)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (u, owner) in [("ua", "alice"), ("ub", "gadmin")] {
+            sqlx::query(
+                "INSERT INTO universes (id, name, owner_id, config, created_at)
+                 VALUES (?, ?, ?, '{}', '2026-01-01')",
+            )
+            .bind(u)
+            .bind(u)
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let pm = PermissionManager::with_db(pool, None);
+
+        // alice owns ua but is a plain player in ub
+        assert_eq!(pm.get_access_level("ua", "alice").await, AccessLevel::Owner);
+        assert_eq!(
+            pm.get_access_level("ub", "alice").await,
+            AccessLevel::Player
+        );
+
+        // A member level applies only in its universe
+        pm.set_access_level("ub", "alice", AccessLevel::Wizard)
+            .await
+            .unwrap();
+        let fresh = PermissionManager::with_db(pm.db_pool.clone().unwrap(), None);
+        assert_eq!(
+            fresh.get_access_level("ub", "alice").await,
+            AccessLevel::Wizard
+        );
+
+        // Global admin applies everywhere; a global wizard means nothing
+        assert_eq!(
+            pm.get_access_level("ua", "gadmin").await,
+            AccessLevel::Admin
+        );
+        assert_eq!(pm.get_access_level("ua", "gwiz").await, AccessLevel::Player);
     }
 
     #[test]

@@ -69,9 +69,6 @@ affected feature.
 - **Weak password hashing.** One salted SHA-256 round compared with `==`
   (`mudd/src/auth/mod.rs`). Needs a slow KDF (argon2 or bcrypt) and a
   constant-time compare.
-- `PermissionManager::set_access_level` logs a failed database write but
-  still updates its cache and reports success, so a promotion can vanish on
-  restart.
 - A session's access level is fixed at connect (`mudd/src/api/websocket.rs`);
   promotions and demotions apply after the player reconnects.
 - Guests connect with an empty account id and a random UUID player id
@@ -256,8 +253,6 @@ Ideas from the original design, beyond today's `/auth/*` and `/universe/*`:
 
 - REST universe resources: `GET /api/universes`, `POST /api/universes`,
   `GET /api/universes/:id`, and universe deletion.
-- Universe memberships: per-universe access level and player object
-  (`universe_memberships`), instead of one global access level per account.
 - Account fields such as last login and bans.
 - Cross-universe identity: the account as the global identity with friends,
   and whisper/mail between universes through shared messaging.

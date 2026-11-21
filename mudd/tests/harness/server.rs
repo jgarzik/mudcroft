@@ -272,6 +272,33 @@ impl TestServer {
         TestClient::connect(self, role).await
     }
 
+    /// Connect as a role to another universe on this server
+    pub async fn connect_in(&self, role: Role, universe_id: &str) -> Result<TestClient> {
+        TestClient::connect_in(self, role, universe_id).await
+    }
+
+    /// Create another universe with one portal room, owned by `owner_id`
+    pub async fn create_universe(&self, universe_id: &str, owner_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO universes (id, name, owner_id, config)
+             SELECT ?, ?, ?, config FROM universes WHERE id = ?",
+        )
+        .bind(universe_id)
+        .bind(universe_id)
+        .bind(owner_id)
+        .bind(self.universe_id())
+        .execute(self.pool())
+        .await?;
+        let mut hall = mudd::objects::Object::new("/rooms/hall", universe_id, "room")?;
+        hall.set_property("name", serde_json::json!("Hall"));
+        self.world().store().create(&hall).await?;
+        self.world()
+            .store()
+            .set_portal(universe_id, "/rooms/hall")
+            .await?;
+        Ok(())
+    }
+
     /// Connect multiple clients with specified roles
     pub async fn connect_clients(&self, roles: &[Role]) -> Result<Vec<TestClient>> {
         let mut clients = Vec::with_capacity(roles.len());

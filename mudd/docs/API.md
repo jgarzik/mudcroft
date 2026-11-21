@@ -129,7 +129,7 @@ Creates a universe. Requires an **admin+** token.
 |-------|----------|-------------|
 | `id` | yes | Universe id. DNS-style: 3-64 characters, `[a-z0-9-]`, starts and ends alphanumeric, no `--`. Uppercase is lowercased. |
 | `name` | yes | Display name |
-| `owner_id` | yes | An existing account id. That account may later call `run_script` on this universe. |
+| `owner_id` | yes | An existing account id. That account is `owner` inside this universe (see [permissions.md](permissions.md#access-levels)). |
 | `config` | no | JSON object, stored as-is plus the server-set `lib_hashes` key. Lua reads it with `game.get_universe().config`. |
 | `libs` | no | Map of library name to Lua source. These are added to the core libraries from `mudd_init`, and override any with the same name. |
 
@@ -173,9 +173,11 @@ Runs a Lua file from the server's `scripts/` directory inside a universe.
 {"script": "cave_adventure.lua", "account_id": "<optional account id>"}
 ```
 
-- **Who may call:** an admin+, or the account that owns universe `{id}`.
+- **Who may call:** an account that is admin+ in universe `{id}`: a global
+  admin or owner, an admin member, or the universe's owner.
 - **Runs as:** the authenticated caller. If `account_id` names another account,
-  the caller must be admin+ **and** strictly outrank that account. Otherwise
+  the caller must be admin+ **and** strictly outrank that account (levels in
+  universe `{id}`). Otherwise
   the response is 403. Objects the script creates are owned by the account it
   runs as.
 - **Script path:** read from `scripts/<script>`, relative to `mudd`'s working

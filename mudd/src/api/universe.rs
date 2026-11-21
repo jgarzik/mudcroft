@@ -447,10 +447,13 @@ async fn run_script(
         }
     };
 
-    // Must be admin OR universe owner
-    let level: AccessLevel = account.access_level.parse().unwrap_or_default();
-    let is_owner = universe.owner_id == account.id;
-    if !level.can_admin() && !is_owner {
+    // Must be admin+ in this universe (global admin, member admin, or the
+    // universe's owner)
+    let level = state
+        .permissions
+        .get_access_level(&universe.id, &account.id)
+        .await;
+    if !level.can_admin() {
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -465,7 +468,10 @@ async fn run_script(
     // superiors).
     let run_as = match request.account_id {
         Some(other) if other != account.id => {
-            let target_level = state.permissions.get_access_level(&other).await;
+            let target_level = state
+                .permissions
+                .get_access_level(&universe.id, &other)
+                .await;
             if !(level.can_admin() && target_level < level) {
                 return (
                     StatusCode::FORBIDDEN,

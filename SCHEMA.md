@@ -35,7 +35,7 @@ Conventions used below:
 | password_hash | TEXT | Hex SHA-256 of `salt` + password |
 | salt | TEXT | 16 random bytes, hex |
 | token | TEXT | Current session token: 64 hex characters, opaque, not a JWT. `NULL` after logout. A new login replaces it. |
-| access_level | TEXT NOT NULL DEFAULT 'player' | `player`, `builder`, `wizard`, `admin` or `owner`. See [permissions.md](mudd/docs/permissions.md#access-levels). |
+| access_level | TEXT NOT NULL DEFAULT 'player' | Global level. Only `admin` and `owner` have an effect (in every universe); per-universe levels are in `universe_members`. See [permissions.md](mudd/docs/permissions.md#access-levels). |
 | created_at | TEXT NOT NULL DEFAULT (datetime('now')) | |
 
 `mudd` refuses to start unless at least one row has `access_level` `admin` or
@@ -51,6 +51,19 @@ Conventions used below:
 | config | TEXT NOT NULL DEFAULT '{}' | JSON. The server sets `lib_hashes` (library name to `code_store` hash) at creation. Other keys are free-form. |
 | theme_id | TEXT NOT NULL DEFAULT 'sierra-retro' | Not yet read: the server always sends `sierra-retro` |
 | created_at | TEXT NOT NULL DEFAULT (datetime('now')) | |
+
+### universe_members
+
+Per-universe access levels. No row means `player`. Owner is never stored
+here: it comes from `universes.owner_id` or a global owner account.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL REFERENCES universes(id) | |
+| account_id | TEXT NOT NULL REFERENCES accounts(id) | |
+| level | TEXT NOT NULL | `player`, `builder`, `wizard` or `admin` |
+
+Primary key: `(universe_id, account_id)`.
 
 ### universe_settings
 
@@ -301,7 +314,7 @@ Keys:
 run migrations. It checks that these tables exist:
 
 `accounts`, `universes`, `objects`, `code_store`, `credits`, `classes`,
-`class_properties`, `class_handlers`, `timers`, `raft_log`, `raft_vote`, `raft_meta`.
+`class_properties`, `class_handlers`, `timers`, `universe_members`, `raft_log`, `raft_vote`, `raft_meta`.
 
 It also checks that an `admin` or `owner` account exists. If either check fails, run
 `mudd_init` against the database.

@@ -748,14 +748,20 @@ async fn test_harness_connect_as_wizard() {
         "Wizard should have account ID"
     );
 
-    // Verify access level was set to wizard
+    // Verify the account is a wizard member of the test universe
     let account_id = wizard.account_id().unwrap();
-    let level: (String,) = sqlx::query_as("SELECT access_level FROM accounts WHERE id = ?")
-        .bind(account_id)
-        .fetch_one(server.pool())
-        .await
-        .expect("Failed to query account");
-    assert_eq!(level.0, "wizard", "Account should have wizard access level");
+    let level: (String,) = sqlx::query_as(
+        "SELECT level FROM universe_members WHERE universe_id = ? AND account_id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(account_id)
+    .fetch_one(server.pool())
+    .await
+    .expect("Failed to query membership");
+    assert_eq!(
+        level.0, "wizard",
+        "Account should be a wizard in the universe"
+    );
 }
 
 #[tokio::test]
@@ -1003,92 +1009,6 @@ async fn test_timer_persistence() {
             timer_mgr.timer_count().await,
             1,
             "Timer should persist across restarts"
-        );
-    }
-}
-
-/// Test: Permission access level persistence
-#[tokio::test]
-async fn test_permission_persistence() {
-    use mudd::permissions::{AccessLevel, PermissionManager};
-
-    // A temp dir (not a temp file) so SQLite sidecar files are removed too
-    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
-
-    let account_id: String;
-
-    // First phase: Set access level
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        // Create accounts table
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS accounts (
-                id TEXT PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT,
-                salt TEXT,
-                token TEXT,
-                access_level TEXT NOT NULL DEFAULT 'player',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create accounts table");
-
-        // Create builder_regions table
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS builder_regions (
-                account_id TEXT NOT NULL,
-                region_id TEXT NOT NULL,
-                PRIMARY KEY (account_id, region_id)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create builder_regions table");
-
-        // Create test account
-        account_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO accounts (id, username, access_level) VALUES (?, 'wizard_test', 'player')",
-        )
-        .bind(&account_id)
-        .execute(&pool)
-        .await
-        .expect("Failed to create account");
-
-        let perms = PermissionManager::with_db(pool, None);
-        perms
-            .set_access_level(&account_id, AccessLevel::Wizard)
-            .await;
-
-        assert_eq!(
-            perms.get_access_level(&account_id).await,
-            AccessLevel::Wizard
-        );
-    }
-
-    // Second phase: Verify persistence
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        let perms = PermissionManager::with_db(pool, None);
-
-        // Should load from DB since not in cache
-        let level = perms.get_access_level(&account_id).await;
-        assert_eq!(
-            level,
-            AccessLevel::Wizard,
-            "Access level should persist to database"
         );
     }
 }

@@ -412,8 +412,11 @@ need wizard+; privileged functions such as `set_access_level`,
 
 Access levels (player < builder < wizard < admin < owner), path grants and
 ownership rules are described in [permissions.md](permissions.md).
-`PermissionManager` caches access levels and loads path grants at startup.
-Each WebSocket session records the account's access level at connect time.
+Levels are per universe: `PermissionManager::get_access_level(universe,
+account)` combines the member level (`universe_members`), a global admin or
+owner level, and universe ownership. It caches them and loads path grants at
+startup. Each WebSocket session records the account's effective level at
+connect time.
 
 ## Combat
 

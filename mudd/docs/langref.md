@@ -742,16 +742,20 @@ covering `path`.
 
 #### `game.get_access_level(account_id)`
 
-**Returns** `"player"`, `"builder"`, `"wizard"`, `"admin"` or `"owner"`.
-Unknown IDs, including player object paths, return `"player"`.
+**Returns** the account's effective level in this universe (see
+[permissions.md](permissions.md#access-levels)): `"player"`, `"builder"`,
+`"wizard"`, `"admin"` or `"owner"`. Unknown IDs, including player object
+paths, return `"player"`.
 
 #### `game.set_access_level(account_id, level)`
 
-Changes an account's level. The caller must be **admin+**, and the target's
-current level must be **below** the caller's. Only an **owner** may grant
-`admin` or `owner`; owners may set any level.
+Sets an account's member level in this universe. The caller must be
+**admin+**, and the target's current level must be **below** the caller's.
+Only an **owner** may grant `admin`. `owner` is not a member level and is
+always refused.
 
-**Returns** `true` if changed, `false` if refused or `level` is unknown.
+**Returns** `true` if changed, `false` if refused, `level` is unknown or the
+write failed.
 
 #### `game.grant_path(grantee_id, path_prefix, can_delegate)`
 

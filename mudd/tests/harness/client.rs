@@ -85,6 +85,12 @@ pub struct TestClient {
 impl TestClient {
     /// Connect and authenticate as the specified role
     pub async fn connect(server: &TestServer, role: Role) -> Result<Self> {
+        Self::connect_in(server, role, server.universe_id()).await
+    }
+
+    /// Connect to a given universe as the specified role; a builder or
+    /// wizard role is made a member of that universe at that level
+    pub async fn connect_in(server: &TestServer, role: Role, universe_id: &str) -> Result<Self> {
         // Register account if needed
         let (account_id, auth_token) = match &role {
             Role::Guest => (None, None),
@@ -132,13 +138,26 @@ impl TestClient {
                     )
                 };
 
-                // Set access level if not player
+                // Builders and wizards are members of the test universe;
+                // admins are global
                 match &role {
-                    Role::Builder { .. } | Role::Wizard { .. } | Role::Admin { .. } => {
-                        let level = role.access_level();
+                    Role::Builder { .. } | Role::Wizard { .. } => {
+                        sqlx::query(
+                            "INSERT OR REPLACE INTO universe_members (universe_id, account_id, level)
+                             VALUES (?, ?, ?)",
+                        )
+                        .bind(universe_id)
+                        .bind(&account_id)
+                        .bind(role.access_level())
+                        .execute(server.pool())
+                        .await?;
+                    }
+                    Role::Admin { .. } => {
                         let account_service =
                             mudd::auth::accounts::AccountService::new(server.pool().clone());
-                        account_service.set_access_level(&account_id, level).await?;
+                        account_service
+                            .set_access_level(&account_id, role.access_level())
+                            .await?;
                     }
                     _ => {}
                 }
@@ -157,8 +176,11 @@ impl TestClient {
 
         // Connect WebSocket with or without token
         let ws_url = match &auth_token {
-            Some(token) => server.ws_url_with_token(token),
-            None => server.ws_url(),
+            Some(token) => format!(
+                "ws://{}/ws?token={}&universe={}",
+                server.addr, token, universe_id
+            ),
+            None => format!("ws://{}/ws?universe={}", server.addr, universe_id),
         };
 
         let (ws_stream, _) = connect_async(&ws_url).await?;

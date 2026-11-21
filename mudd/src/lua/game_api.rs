@@ -569,10 +569,12 @@ impl GameApi {
                                     if let Some(ref owner) = obj.owner_id {
                                         let actor = user.as_deref().unwrap_or_default();
                                         if actor != owner {
-                                            let actor_level =
-                                                permissions.get_access_level(actor).await;
-                                            let owner_level =
-                                                permissions.get_access_level(owner).await;
+                                            let actor_level = permissions
+                                                .get_access_level(&universe_id, actor)
+                                                .await;
+                                            let owner_level = permissions
+                                                .get_access_level(&universe_id, owner)
+                                                .await;
                                             if !actor_level.can_act_as(owner_level) {
                                                 return Ok(Err(
                                                     "only the owner or a superior may attach code"
@@ -1256,8 +1258,8 @@ impl GameApi {
                     (None, _) => true,
                     (Some(owner), Some(actor)) if owner == actor => true,
                     (Some(owner), Some(actor)) => {
-                        let actor_level = permissions.get_access_level(actor).await;
-                        let owner_level = permissions.get_access_level(owner).await;
+                        let actor_level = permissions.get_access_level(&universe_id, actor).await;
+                        let owner_level = permissions.get_access_level(&universe_id, owner).await;
                         actor_level.can_act_as(owner_level)
                     }
                     (Some(_), None) => false,
@@ -1397,6 +1399,7 @@ impl GameApi {
         // (see AccessLevel::can_act_as); nil clears the override.
         let permissions_clone = permissions.clone();
         let current_user_clone = current_user.clone();
+        let actor_universe = self.universe_id.clone();
         let set_actor = lua.create_function(move |lua, actor_id: Option<String>| {
             charge_db(lua)?;
             let Some(id) = actor_id else {
@@ -1410,9 +1413,10 @@ impl GameApi {
             if id != real {
                 let permissions = permissions_clone.clone();
                 let target = id.clone();
+                let universe_id = actor_universe.clone();
                 let allowed = block_on_perm(async move {
-                    let real_level = permissions.get_access_level(&real).await;
-                    let target_level = permissions.get_access_level(&target).await;
+                    let real_level = permissions.get_access_level(&universe_id, &real).await;
+                    let target_level = permissions.get_access_level(&universe_id, &target).await;
                     real_level.can_act_as(target_level)
                 });
                 if !allowed {
@@ -1536,33 +1540,29 @@ impl GameApi {
         // game.get_access_level(account_id)
         // Returns the access level of a user as a string
         let permissions_clone = permissions.clone();
+        let level_universe = self.universe_id.clone();
         let get_access_level = lua.create_function(move |lua, account_id: String| {
             charge_db(lua)?;
             let permissions = permissions_clone.clone();
+            let universe_id = level_universe.clone();
 
-            let level = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async { permissions.get_access_level(&account_id).await })
-            })
-            .join()
-            .expect("Thread panicked");
-
-            let level_str = match level {
-                AccessLevel::Player => "player",
-                AccessLevel::Builder => "builder",
-                AccessLevel::Wizard => "wizard",
-                AccessLevel::Admin => "admin",
-                AccessLevel::Owner => "owner",
-            };
-            Ok(level_str.to_string())
+            let level = block_on_perm(async move {
+                permissions
+                    .get_access_level(&universe_id, &account_id)
+                    .await
+            });
+            Ok(level.as_str().to_string())
         })?;
         game.set("get_access_level", get_access_level)?;
 
         // game.set_access_level(account_id, level_str)
-        // Sets a user's access level. Rules: AccessLevel::can_set_access_level
-        // (admin+, target below caller, admin/owner grants need owner).
+        // Sets an account's level in the script's universe. Rules:
+        // AccessLevel::can_set_access_level (admin+, target below caller,
+        // admin grants need owner); "owner" is not a member level. Returns
+        // false if refused or if the write fails.
         let permissions_clone = permissions.clone();
         let current_user_clone = current_user.clone();
+        let level_universe = self.universe_id.clone();
         let set_access_level =
             lua.create_function(move |lua, (account_id, level_str): (String, String)| {
                 charge_db(lua)?;
@@ -1581,14 +1581,19 @@ impl GameApi {
                     return Ok(false);
                 };
 
+                let universe_id = level_universe.clone();
                 let changed = block_on_perm(async move {
-                    let caller_level = permissions.get_access_level(&caller).await;
-                    let target_level = permissions.get_access_level(&account_id).await;
+                    let caller_level = permissions.get_access_level(&universe_id, &caller).await;
+                    let target_level = permissions
+                        .get_access_level(&universe_id, &account_id)
+                        .await;
                     if !caller_level.can_set_access_level(target_level, level) {
                         return false;
                     }
-                    permissions.set_access_level(&account_id, level).await;
-                    true
+                    permissions
+                        .set_access_level(&universe_id, &account_id, level)
+                        .await
+                        .is_ok()
                 });
 
                 Ok(changed)
@@ -2095,11 +2100,13 @@ impl GameApi {
         let time_override_clone = time_override.clone();
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
+        let time_universe = self.universe_id.clone();
         let set_time = lua.create_function(move |lua, time_ms: u64| {
             charge_db(lua)?;
             let permissions = permissions_clone.clone();
             let user_id = user_clone.clone();
             let time_override = time_override_clone.clone();
+            let universe_id = time_universe.clone();
 
             // Check for actor override from game.set_actor()
             let actor_override: Option<String> = actor_override(lua);
@@ -2110,7 +2117,7 @@ impl GameApi {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     if let Some(ref uid) = effective_user {
-                        let level = permissions.get_access_level(uid).await;
+                        let level = permissions.get_access_level(&universe_id, uid).await;
                         level >= AccessLevel::Wizard
                     } else {
                         false
@@ -2134,8 +2141,10 @@ impl GameApi {
         let rng_clone = rng.clone();
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
+        let seed_universe = self.universe_id.clone();
         let set_rng_seed = lua.create_function(move |lua, seed: u64| {
             charge_db(lua)?;
+            let universe_id = seed_universe.clone();
             let permissions = permissions_clone.clone();
             let user_id = user_clone.clone();
             let rng = rng_clone.clone();
@@ -2149,7 +2158,7 @@ impl GameApi {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     if let Some(ref uid) = effective_user {
-                        let level = permissions.get_access_level(uid).await;
+                        let level = permissions.get_access_level(&universe_id, uid).await;
                         level >= AccessLevel::Wizard
                     } else {
                         false

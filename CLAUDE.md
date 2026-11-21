@@ -71,7 +71,7 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
 - **raft/** - openraft storage/state machine (log entries are SQL requests), network, RaftWriter
 - **timers/** - call_out (one-shot, persisted) and heartbeat (recurring, in memory)
 - **permissions/** - LPMud-style path-based access control
-  - Access levels: player < builder < wizard < admin < owner
+  - Access levels: player < builder < wizard < admin < owner, per universe (`universe_members`); global admin/owner apply everywhere; a universe's `owner_id` is owner inside it
   - Path grants: `/d/forest` grants access to all objects under that prefix
   - Ownership: creators can always modify their own objects
 - **credits/** - per-universe balances
@@ -90,7 +90,7 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
 
 ### Database
 
-One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, credits, timers, path_grants, combat_state, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
+One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, universe_members, credits, timers, path_grants, combat_state, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
 
 ### WebSocket Protocol
 

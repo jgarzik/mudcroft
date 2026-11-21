@@ -3,7 +3,8 @@
 Mudcroft uses an LPMud-style permission model. The Rust server enforces it,
 and Lua code cannot bypass it. It combines three things:
 
-1. **Access level**: a global role stored on the account (`accounts.access_level`).
+1. **Access level**: a role per universe (`universe_members`), plus global
+   admin/owner accounts (`accounts.access_level`).
 2. **Path grants**: per-universe delegation of an object-path prefix such as `/d/forest`.
 3. **Ownership**: every object records the account that created it (`objects.owner_id`).
 
@@ -13,20 +14,28 @@ This page is the canonical reference for access levels. Other documents link her
 
 Levels are ordered. Each level has everything the levels below it have.
 
+Levels are **per universe**. An account's effective level in a universe is
+the highest of:
+
+- its member level there (`universe_members`; no row means `player`)
+- its global level (`accounts.access_level`), but only if that is `admin` or
+  `owner`: global admins and owners have their level in every universe, and
+  lower global values mean nothing
+- `owner`, if it owns the universe (`universes.owner_id`)
+
+So a wizard of one universe is a plain player in another, and a universe's
+owner has owner power inside that universe only.
+
 | Level | Rank | Adds |
 |-------|------|------|
 | `player` | 0 | The default for new accounts. Play: look, move, `say`, take and drop objects that are neither `fixed` nor living, attack NPCs. Can read objects and modify objects it owns. |
 | `builder` | 1 | The `create` command. Can create, modify, move and delete objects under its path grants. |
 | `wizard` | 2 | Bypasses object checks: can create, modify, move or delete any object. Can use the `eval`, `goto` and `setportal` commands, `game.store_code`, `game.define_class`, `game.set_time` and `game.set_rng_seed`. Can grant any path. Can `game.set_actor` to accounts below wizard. |
-| `admin` | 3 | `POST /universe/create` and `/universe/upload`, and `run_script` on any universe. `game.admin_grant_credits` and `game.update_universe`. `game.set_access_level` on accounts below admin, to levels below admin. |
-| `owner` | 4 | Can set any account to any level, including granting or revoking `admin` and `owner`. |
+| `admin` | 3 | `run_script` on the universe. `game.admin_grant_credits` and `game.update_universe`. `game.set_access_level` on accounts below admin, to levels below admin. A **global** admin can also `POST /universe/create` and `/universe/upload`. |
+| `owner` | 4 | `game.set_access_level` on any account, including granting or revoking `admin` membership. |
 
-`mudd_init` creates the first account at `admin`. No tool creates an `owner`;
-use SQL (see [Changing access levels](#changing-access-levels)).
-
-Universe ownership (`universes.owner_id`) is a separate thing. It lets that
-account call `POST /universe/{id}/run_script` for its own universe. It grants
-nothing else, and in particular no extra Lua permissions.
+`mudd_init` creates the first account as a global `admin`. No tool creates a
+global `owner`; use SQL (see [Changing access levels](#changing-access-levels)).
 
 ## Who a Script Runs As
 
@@ -191,16 +200,22 @@ end
 ```lua
 local level = game.get_access_level(account_id)  -- "player", "builder", ...
 
--- Returns true if changed, false if refused or the level name is unknown
+-- Returns true if changed, false if refused, the level name is unknown or
+-- the write failed
 local ok = game.set_access_level(account_id, "wizard")
 ```
 
-`game.set_access_level` follows `AccessLevel::can_set_access_level`:
+Both act on the script's universe: `get_access_level` returns the effective
+level there, and `set_access_level` writes the account's member level there.
+`game.set_access_level` follows `AccessLevel::can_set_access_level`, using
+effective levels:
 
-- An owner may set any account to any level.
+- An owner may set any account to `player`, `builder`, `wizard` or `admin`.
 - An admin may change only accounts strictly below admin, and only to
   `player`, `builder` or `wizard`.
 - Anyone below admin is refused.
+- `owner` is never a member level; it comes from owning the universe or from
+  a global owner account.
 
 ### Path grants
 
@@ -222,15 +237,15 @@ end
 
 ## Changing Access Levels
 
-Prefer `game.set_access_level` from an `eval` session. For example, an admin
-promoting a player to wizard:
+Prefer `game.set_access_level` from an `eval` session in the universe. For
+example, an admin promoting a player to wizard in that universe:
 
 ```
 eval return game.set_access_level("<account_id>", "wizard")
 ```
 
-Admins cannot grant `admin` or `owner`. To create the first owner, stop the
-server and use SQL:
+Global levels have no Lua or HTTP path. To make an account a global admin or
+owner, stop the server and use SQL:
 
 ```sql
 UPDATE accounts SET access_level = 'owner' WHERE username = 'alice';
@@ -243,14 +258,15 @@ without one (see [admin.md](admin.md#troubleshooting)).
 
 Different checks read the level at different times:
 
-- **HTTP endpoints** read the level from the database on every request.
+- **HTTP endpoints**: `create` and `upload` read the global level from the
+  database on every request; `run_script` uses `PermissionManager`.
 - **WebSocket commands** (`eval`, `goto`, `setportal`, `create`, role-aware
   `help`) use the level read when the connection opened. A promoted player
   must reconnect.
-- **Lua permission checks** go through `PermissionManager`. It caches each
-  account's level in memory after the first lookup, and only
-  `game.set_access_level` updates that cache. An `UPDATE accounts` run by hand
-  against a live server may not affect Lua checks until `mudd` restarts.
+- **Lua permission checks** go through `PermissionManager`. It caches global
+  levels, member levels and universe owners in memory after the first
+  lookup, and only `game.set_access_level` updates that cache. SQL run by
+  hand against a live server may not take effect until `mudd` restarts.
 
 Path grants are also cached in memory. They are loaded at startup and updated
 by `grant_path` and `revoke_path`. Do not edit the `path_grants` table while

@@ -364,7 +364,10 @@ async fn handle_socket(
 
     let (account_id, username, access_level) = match &account {
         Some(acc) => {
-            let access = acc.access_level.parse().unwrap_or(AccessLevel::Player);
+            let access = state
+                .permissions
+                .get_access_level(&universe_id, &acc.id)
+                .await;
             (acc.id.clone(), Some(acc.username.clone()), access)
         }
         None => (String::new(), None, AccessLevel::Player),

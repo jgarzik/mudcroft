@@ -25,12 +25,20 @@ async fn eval(client: &mut TestClient, code: &str) -> String {
     reply["text"].as_str().unwrap_or_default().to_string()
 }
 
+/// The account's stored level in the test universe: its member level, or
+/// its global level when it is not a member
 async fn db_access_level(server: &TestServer, account_id: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT access_level FROM accounts WHERE id = ?")
-        .bind(account_id)
-        .fetch_one(server.pool())
-        .await
-        .expect("account row")
+    sqlx::query_scalar::<_, String>(
+        "SELECT COALESCE(
+            (SELECT level FROM universe_members WHERE universe_id = ? AND account_id = ?),
+            (SELECT access_level FROM accounts WHERE id = ?))",
+    )
+    .bind(server.universe_id())
+    .bind(account_id)
+    .bind(account_id)
+    .fetch_one(server.pool())
+    .await
+    .expect("account row")
 }
 
 async fn connect(server: &TestServer, role: Role) -> TestClient {
@@ -482,7 +490,7 @@ async fn test_use_object_runs_as_owner() {
     assert_eq!(db_access_level(&server, &bld_id).await, "builder");
 }
 
-/// Classes are shared by every universe: only wizards+ may define them, and
+/// Only wizards+ may define classes (in their universe), and
 /// built-in base classes cannot be redefined
 #[tokio::test]
 async fn test_define_class_restrictions() {
@@ -1013,4 +1021,59 @@ async fn test_broadcast_and_create_parent_stay_in_universe() {
         out, "refused",
         "create with a foreign parent must be refused"
     );
+}
+
+/// Access levels are per universe: a wizard of the test universe is a plain
+/// player elsewhere, and a universe's owner is owner inside it only
+#[tokio::test]
+async fn test_access_levels_are_per_universe() {
+    let server = TestServer::start().await.expect("server");
+    let realm_owner = connect(&server, player("realm_owner")).await;
+    let owner_id = realm_owner.account_id().unwrap().to_string();
+    server
+        .create_universe("owned-realm", &owner_id)
+        .await
+        .expect("second universe");
+
+    // The test universe's wizard is a player in owned-realm
+    let wiz = connect(&server, wizard("home_wiz")).await;
+    let wiz_id = wiz.account_id().unwrap().to_string();
+    let mut wiz_away = server
+        .connect_in(player("home_wiz"), "owned-realm")
+        .await
+        .expect("connect");
+    wiz_away.drain().await;
+    wiz_away.command("eval return 1").await.unwrap();
+    let _ = wiz_away.expect("echo").await;
+    let err = wiz_away.expect("error").await.expect("eval refused");
+    assert!(err["message"].as_str().unwrap().contains("wizard+"));
+
+    // The realm's owner is owner there and may promote the wizard there
+    let mut owner_home = server
+        .connect_in(player("realm_owner"), "owned-realm")
+        .await
+        .expect("connect");
+    owner_home.drain().await;
+    let level = eval(
+        &mut owner_home,
+        &format!(r#"return game.get_access_level("{}")"#, owner_id),
+    )
+    .await;
+    assert_eq!(level, "owner");
+    let out = eval(
+        &mut owner_home,
+        &format!(r#"return game.set_access_level("{}", "builder")"#, wiz_id),
+    )
+    .await;
+    assert_eq!(out, "true");
+
+    // ...which leaves the wizard's level in the test universe alone
+    assert_eq!(db_access_level(&server, &wiz_id).await, "wizard");
+
+    // In the test universe the realm owner is a plain player
+    let mut owner_away = connect(&server, player("realm_owner")).await;
+    owner_away.drain().await;
+    owner_away.command("eval return 1").await.unwrap();
+    let _ = owner_away.expect("echo").await;
+    assert!(owner_away.expect("error").await.is_ok());
 }
