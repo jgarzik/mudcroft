@@ -55,6 +55,10 @@ async fn object_permission(
     let Some(user_id) = user_id else {
         return Err("no user context".to_string());
     };
+    // Object ids are global: never touch another universe's objects
+    if obj.universe_id != universe_id {
+        return Err(format!("{} belongs to another universe", obj.id));
+    }
     let ctx = permissions.get_user_context(user_id, universe_id).await;
     let target = ObjectContext {
         object_id: obj.id.clone(),
@@ -618,6 +622,18 @@ impl GameApi {
                             {
                                 return Ok(Err(reason));
                             }
+                            if let Some(ref dest) = new_parent_id {
+                                match store.get(dest).await? {
+                                    Some(d) if d.universe_id == universe_id => {}
+                                    Some(_) => {
+                                        return Ok(Err(format!(
+                                            "{} belongs to another universe",
+                                            dest
+                                        )))
+                                    }
+                                    None => anyhow::bail!("Destination not found: {}", dest),
+                                }
+                            }
                             store
                                 .move_object(&id, new_parent_id.as_deref())
                                 .await
@@ -664,6 +680,9 @@ impl GameApi {
                         tokio::runtime::Handle::current().block_on(async {
                             let obj_result = store.get(&id).await?;
                             match obj_result {
+                                Some(original) if original.universe_id != universe_id => {
+                                    Ok(Err(format!("{} belongs to another universe", original.id)))
+                                }
                                 Some(original) => {
                                     // Creating the copy needs create rights at the new path
                                     if let Err(reason) = create_permission(

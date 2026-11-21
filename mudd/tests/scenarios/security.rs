@@ -515,3 +515,118 @@ async fn test_define_class_restrictions() {
     .await;
     assert_eq!(out, "false", "players may not define classes");
 }
+
+/// Insert a second universe ("other-world") with one non-fixed item
+async fn other_universe(server: &TestServer) {
+    let owner = server.world().wizard_account_id.clone();
+    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('other-world', 'Other', ?)")
+        .bind(&owner)
+        .execute(server.pool())
+        .await
+        .expect("create universe");
+    let mut gem = mudd::objects::Object::new("/d/other/gem", "other-world", "item").unwrap();
+    gem.set_property("name", serde_json::json!("gem"));
+    server
+        .world()
+        .store()
+        .create(&gem)
+        .await
+        .expect("create gem");
+}
+
+/// Scripts cannot modify, move, delete or clone objects of another universe
+#[tokio::test]
+async fn test_lua_writes_stay_in_universe() {
+    let server = TestServer::start().await.expect("server");
+    other_universe(&server).await;
+    let mut wiz = connect(&server, wizard("xuni_writer")).await;
+
+    for code in [
+        r#"return tostring(pcall(game.update_object, "/d/other/gem", {name = "mine"}))"#,
+        r#"return tostring(pcall(game.move_object, "/d/other/gem", nil))"#,
+        r#"return tostring(pcall(game.delete_object, "/d/other/gem"))"#,
+    ] {
+        assert_eq!(eval(&mut wiz, code).await, "false", "{}", code);
+    }
+    let out = eval(
+        &mut wiz,
+        r#"local c = game.clone_object("/d/other/gem", "/d/here/gem", nil)
+           return c == nil and "none" or (c.error and "error" or c.universe_id)"#,
+    )
+    .await;
+    assert_ne!(
+        out, "other-world",
+        "clone must not land in the other universe"
+    );
+    assert_ne!(
+        out,
+        server.universe_id(),
+        "nor copy another universe's object"
+    );
+}
+
+/// Script messages only reach players in the script's universe
+#[tokio::test]
+async fn test_script_messages_stay_in_universe() {
+    use futures_util::StreamExt;
+    let server = TestServer::start().await.expect("server");
+    other_universe(&server).await;
+    let mut wiz = connect(&server, wizard("xuni_sender")).await;
+
+    // Bob's account exists, but he never connects to the main universe
+    let reg: serde_json::Value = server
+        .post(
+            "/auth/register",
+            &serde_json::json!({"username": "xuni_bob", "password": "test123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = reg["token"].as_str().unwrap().to_string();
+    let bob_pid = format!("/players/p-{}", reg["account_id"].as_str().unwrap());
+
+    // Bob plays in the other universe only
+    let url = format!(
+        "ws://{}/ws?universe=other-world&token={}",
+        server.addr, token
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("ws");
+    // Wait for the welcome (it names bob's player id), then the greeting
+    let welcome = ws.next().await.unwrap().unwrap();
+    assert!(
+        welcome.to_text().unwrap().contains(&bob_pid),
+        "player id format: {}",
+        welcome
+    );
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while ws.next().await.is_some() {}
+    })
+    .await;
+
+    eval(
+        &mut wiz,
+        &format!(
+            r#"game.send("{}", "cross-universe hello"); return true"#,
+            bob_pid
+        ),
+    )
+    .await;
+
+    let leaked = tokio::time::timeout(std::time::Duration::from_millis(600), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if msg
+                .to_text()
+                .unwrap_or_default()
+                .contains("cross-universe hello")
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!leaked, "message crossed universes");
+}

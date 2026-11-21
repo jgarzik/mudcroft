@@ -67,7 +67,7 @@ pub async fn run_lua(
             .map_err(|e| e.to_string())
     };
 
-    deliver(state, &queue).await;
+    deliver(state, &queue, &ctx.universe_id).await;
     result
 }
 
@@ -108,7 +108,7 @@ pub async fn invoke_handler(
         call_handler(&mut sandbox, &code, method, &args)
     };
 
-    deliver(state, &queue).await;
+    deliver(state, &queue, &ctx.universe_id).await;
     result
 }
 
@@ -251,15 +251,25 @@ fn prepare(
     Ok(sandbox)
 }
 
-/// Deliver queued script messages to connected players
-pub async fn deliver(state: &AppState, queue: &MessageQueue) {
+/// Deliver queued script messages to connected players in `universe_id`.
+/// Player ids are the same in every universe, so sessions elsewhere are
+/// skipped.
+pub async fn deliver(state: &AppState, queue: &MessageQueue, universe_id: &str) {
     for msg in queue.drain() {
         match msg {
             GameMessage::Send { target_id, message } => {
-                state
+                if state
                     .connections
-                    .send_to_player(&target_id, ServerMessage::Output { text: message })
-                    .await;
+                    .get_universe_id(&target_id)
+                    .await
+                    .as_deref()
+                    == Some(universe_id)
+                {
+                    state
+                        .connections
+                        .send_to_player(&target_id, ServerMessage::Output { text: message })
+                        .await;
+                }
             }
             GameMessage::Broadcast {
                 room_id,
@@ -276,7 +286,7 @@ pub async fn deliver(state: &AppState, queue: &MessageQueue) {
                     .await;
             }
             GameMessage::BroadcastRegion { region_id, message } => {
-                broadcast_region(state, &region_id, &message).await;
+                broadcast_region(state, universe_id, &region_id, &message).await;
             }
         }
     }
@@ -284,9 +294,18 @@ pub async fn deliver(state: &AppState, queue: &MessageQueue) {
 
 /// Send to every player whose room is in the region: the room's path is
 /// under the region's path, or the room's parent is the region object.
-async fn broadcast_region(state: &AppState, region_id: &str, message: &str) {
+async fn broadcast_region(state: &AppState, universe_id: &str, region_id: &str, message: &str) {
     let prefix = format!("{}/", region_id.trim_end_matches('/'));
     for (player_id, room_id) in state.connections.player_rooms().await {
+        if state
+            .connections
+            .get_universe_id(&player_id)
+            .await
+            .as_deref()
+            != Some(universe_id)
+        {
+            continue;
+        }
         let in_region = room_id.starts_with(&prefix)
             || matches!(
                 state.object_store.get(&room_id).await,
