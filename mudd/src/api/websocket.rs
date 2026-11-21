@@ -1017,11 +1017,18 @@ async fn execute_command(
                         .await;
                     }
 
-                    // Update player's room
+                    // Update player's room, in the session and (for accounts)
+                    // the player object, which get/drop and respawn use
                     state
                         .connections
                         .update_room(player_id, Some(room_id.clone()))
                         .await;
+                    if !account_id.is_empty() {
+                        if let Err(e) = state.player_manager.move_player(player_id, &room_id).await
+                        {
+                            warn!("Failed to sync player location to DB: {}", e);
+                        }
+                    }
                     deferred.push(Hook::new(
                         &room_id,
                         Some(&room_id),

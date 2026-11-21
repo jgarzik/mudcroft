@@ -11,6 +11,7 @@
 //! - Security: Access-level enforcement in privileged Lua functions
 //! - Scripting: Object code, hooks, custom verbs, timers
 //! - Static files: Serving the web client with --static-dir
+//! - Robustness: Input handling and state consistency
 
 pub mod chat;
 pub mod combat;
@@ -19,6 +20,7 @@ pub mod messaging;
 pub mod movement;
 pub mod multiuser;
 pub mod player_lifecycle;
+pub mod robustness;
 pub mod scripting;
 pub mod security;
 pub mod static_files;

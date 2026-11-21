@@ -26,8 +26,8 @@ function Commands.take(player_id, item_name)
         return {success = false, message = "You don't see that here"}
     end
 
-    -- Check if item is takeable
-    if item.metadata and item.metadata.fixed then
+    -- Check if item is takeable: not fixed, and not alive (NPCs, players)
+    if (item.metadata and item.metadata.fixed) or game.is_a(item.id, "living") then
         return {success = false, message = "You can't take that"}
     end
 
