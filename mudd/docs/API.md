@@ -1,580 +1,408 @@
-# HemiMUD Server API Reference
+# Mudcroft Server API Reference
 
-HTTP REST API and WebSocket protocol documentation.
+The HTTP REST API and WebSocket protocol served by `mudd`. For command-line
+flags and environment variables, see [admin.md](admin.md#command-line-reference).
+For access levels, see [permissions.md](permissions.md#access-levels).
 
----
+## Conventions
 
-## Base URL
+- **Base URL:** `http://127.0.0.1:8080`, the default `--bind`.
+- **Request bodies** are JSON (`Content-Type: application/json`), except
+  `/universe/upload`, which takes raw ZIP bytes.
+- **Authentication:** `POST /auth/login` or `/auth/register` returns a token.
+  Authenticated HTTP endpoints take it as `Authorization: Bearer <token>`. The
+  WebSocket takes it as the `token` query parameter.
+- **Tokens** are opaque: 64 random hex characters stored on the account row.
+  They are not JWTs and do not expire. Each account has one token at a time:
+  a new login replaces it, and logout clears it.
+- **Passwords** are stored as salted SHA-256 hashes.
+- **Errors** are JSON `{"error": "<message>"}`, with these exceptions, which
+  return plain text:
+  - `GET /images/{hash}` failures
+  - WebSocket upgrade failures (`/ws`)
+  - Requests the framework rejects before a handler runs: a missing or wrong
+    `Content-Type` (415), malformed or incomplete JSON (400 or 422), or a
+    missing required query parameter (400)
 
-```
-http://localhost:8080
-```
-
----
-
-## Health & Info
+## Server
 
 ### GET /
 
-Server information.
+Server name and version:
 
-**Response:**
 ```json
-{
-    "name": "mudd",
-    "version": "0.1.0"
-}
+{"name": "mudd", "version": "0.1.0"}
 ```
 
----
+This route exists only when `mudd` runs **without** `--static-dir`. With
+`--static-dir`, `/` and every path no API route claims serve the web client
+(files from the directory, otherwise `index.html`).
 
 ### GET /health
 
-Health check endpoint.
-
-**Response (200 OK):**
-```json
-{
-    "status": "healthy",
-    "database": "ok"
-}
-```
-
-**Response (503 Service Unavailable):**
-```json
-{
-    "status": "unhealthy",
-    "database": "error"
-}
-```
-
----
+| Status | Body |
+|--------|------|
+| 200 | `{"status": "healthy", "database": "ok"}` |
+| 503 | `{"status": "unhealthy", "database": "error"}` |
 
 ## Authentication
 
 ### POST /auth/register
 
-Create a new account.
+Creates a `player` account and logs it in. Usernames must be 3-32 ASCII
+letters, digits, `_` or `-`; passwords must be at least 6 characters.
 
-**Request:**
 ```json
-{
-    "username": "player1",
-    "password": "secretpassword123"
-}
+{"username": "player1", "password": "secretpassword123"}
 ```
 
-**Response (201 Created):**
-```json
-{
-    "token": "eyJhbGciOiJIUzI1NiIs...",
-    "account_id": "550e8400-e29b-41d4-a716-446655440000",
-    "username": "player1",
-    "access_level": "player"
-}
-```
-
-**Response (409 Conflict):**
-```json
-{
-    "error": "username already exists"
-}
-```
-
----
+| Status | Body |
+|--------|------|
+| 201 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player"}` |
+| 400 | `{"error": "username must be 3-32 characters"}`, `{"error": "username may contain only letters, digits, _ and -"}` or `{"error": "password must be at least 6 characters"}` |
+| 409 | `{"error": "username already exists"}` |
+| 500 | `{"error": "database error: ..."}` |
 
 ### POST /auth/login
 
-Authenticate and get a JWT token.
-
-**Request:**
 ```json
-{
-    "username": "player1",
-    "password": "secretpassword123"
-}
+{"username": "player1", "password": "secretpassword123"}
 ```
 
-**Response (200 OK):**
-```json
-{
-    "token": "eyJhbGciOiJIUzI1NiIs...",
-    "account_id": "550e8400-e29b-41d4-a716-446655440000",
-    "username": "player1",
-    "access_level": "player"
-}
-```
+| Status | Body |
+|--------|------|
+| 200 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player"}` |
+| 401 | `{"error": "invalid credentials"}` (unknown user or wrong password) |
 
-**Response (401 Unauthorized):**
-```json
-{
-    "error": "invalid credentials"
-}
-```
-
----
+Logging in issues a new token and invalidates the account's previous one.
 
 ### POST /auth/logout
 
-Invalidate a token.
-
-**Request:**
 ```json
-{
-    "token": "eyJhbGciOiJIUzI1NiIs..."
-}
+{"token": "<token>"}
 ```
 
-**Response (200 OK):**
+Response 200: `{"success": true}`, or `{"success": false}` if no account had
+that token.
+
+### GET /auth/validate?token=\<token\>
+
+Always returns 200:
+
 ```json
-{
-    "success": true
-}
+{"valid": true, "account_id": "<uuid>", "username": "player1", "access_level": "player"}
 ```
 
----
-
-### GET /auth/validate
-
-Check if a token is valid.
-
-**Query Parameters:**
-- `token` (required): JWT token to validate
-
-**Example:**
-```
-GET /auth/validate?token=eyJhbGciOiJIUzI1NiIs...
-```
-
-**Response (valid):**
 ```json
-{
-    "valid": true,
-    "account_id": "550e8400-e29b-41d4-a716-446655440000",
-    "username": "player1",
-    "access_level": "player"
-}
+{"valid": false}
 ```
 
-**Response (invalid):**
-```json
-{
-    "valid": false
-}
-```
+## Universes
 
----
+### GET /universe/list
 
-## WebSocket Protocol
+Lists every universe. Any valid token works.
 
-### Connection
-
-Connect to the WebSocket endpoint with authentication and universe selection.
-
-**Endpoint:**
-```
-ws://localhost:8080/ws?universe=<universe_id>&token=<jwt_token>
-```
-
-**Parameters:**
-- `universe` (required): Universe ID to connect to (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens)
-- `token` (optional): JWT token for authentication. If omitted, connects as guest.
-
-**Example (wscat):**
 ```bash
-wscat -c "ws://localhost:8080/ws?universe=my-game&token=eyJhbGciOiJIUzI1NiIs..."
+curl -s http://127.0.0.1:8080/universe/list -H "Authorization: Bearer $TOKEN"
 ```
-
-**Error Responses:**
-- `400 Bad Request`: Invalid universe ID format
-- `404 Not Found`: Universe does not exist
-
----
-
-### Client → Server Messages
-
-All messages are JSON with a `type` field.
-
-#### Command
-
-Send a player command.
 
 ```json
-{
-    "type": "command",
-    "text": "look"
-}
+[{"id": "test-world", "name": "Test Universe"}]
 ```
-
-**Built-in Commands:**
-
-| Command | Description |
-|---------|-------------|
-| `look` or `l` | View current room |
-| `north` or `n` | Move north |
-| `south` or `s` | Move south |
-| `east` or `e` | Move east |
-| `west` or `w` | Move west |
-| `up` or `u` | Move up |
-| `down` or `d` | Move down |
-| `say <message>` | Speak in current room |
-| `help` | Show available commands |
-| `eval <lua>` | Execute Lua code (wizard+ only) |
-
-#### Ping
-
-Keep connection alive.
-
-```json
-{
-    "type": "ping"
-}
-```
-
----
-
-### Server → Client Messages
-
-All messages are JSON with a `type` field.
-
-#### Welcome
-
-Sent immediately upon connection.
-
-```json
-{
-    "type": "welcome",
-    "player_id": "550e8400-e29b-41d4-a716-446655440000",
-    "theme_id": "default"
-}
-```
-
-#### Output
-
-Text output to display.
-
-```json
-{
-    "type": "output",
-    "text": "You say: Hello everyone!"
-}
-```
-
-#### Room
-
-Room description with exits and contents.
-
-```json
-{
-    "type": "room",
-    "name": "Town Square",
-    "description": "A bustling square at the heart of town.",
-    "exits": ["north", "south", "east"],
-    "contents": ["Iron Sword", "Wooden Shield"],
-    "image_hash": "abc123..."
-}
-```
-
-**Fields:**
-- `name`: Room title
-- `description`: Room description text
-- `exits`: Array of available exit directions
-- `contents`: Array of visible item/NPC names
-- `image_hash`: (optional) Hash for `/images/{hash}` endpoint
-
-#### Error
-
-Error message.
-
-```json
-{
-    "type": "error",
-    "message": "Permission denied: wizard+ required for eval"
-}
-```
-
-#### Echo
-
-Command echo (confirmation of received command).
-
-```json
-{
-    "type": "echo",
-    "command": "look"
-}
-```
-
----
-
-### WebSocket Flow Example
-
-```
-Client                              Server
-  |                                   |
-  |------ WS Connect w/ token ------->|
-  |                                   |
-  |<-------- Welcome message ---------|
-  |<-------- Room description --------|
-  |                                   |
-  |-------- {"type":"command",------->|
-  |          "text":"look"}           |
-  |                                   |
-  |<-------- Echo: "look" ------------|
-  |<-------- Room description --------|
-  |                                   |
-  |-------- {"type":"command",------->|
-  |          "text":"north"}          |
-  |                                   |
-  |<-------- Echo: "north" -----------|
-  |<-------- New room description ----|
-  |                                   |
-  |-------- {"type":"ping"} --------->|
-  |                                   |
-  |-------- Connection closed ------->|
-```
-
----
-
-## Universe Management
 
 ### POST /universe/create
 
-Create a new universe from JSON.
+Creates a universe. Requires an **admin+** token.
 
-**Request:**
 ```json
 {
-    "id": "my-universe",
-    "name": "My Adventure World",
-    "owner_id": "account-uuid",
-    "config": {
-        "pvp_enabled": false,
-        "spawn_room": "starting-room-id"
-    },
-    "libs": {
-        "combat": "Combat = { ... lua code ... }",
-        "commands": "Commands = { ... lua code ... }"
-    }
+  "id": "my-game",
+  "name": "My Adventure World",
+  "owner_id": "<account_id>",
+  "config": {"motd": "Welcome!"},
+  "libs": {"quests": "Quests = {}"}
 }
 ```
 
-**Fields:**
-- `id` (required): Universe ID (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens, e.g., `my-game`, `test123`)
-- `name` (required): Display name
-- `owner_id` (required): Account ID of owner
-- `config` (optional): Configuration object
-- `libs` (optional): Map of library name to Lua source code
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | yes | Universe id. DNS-style: 3-64 characters, `[a-z0-9-]`, starts and ends alphanumeric, no `--`. Uppercase is lowercased. |
+| `name` | yes | Display name |
+| `owner_id` | yes | An existing account id. That account may later call `run_script` on this universe. |
+| `config` | no | JSON object, stored as-is plus the server-set `lib_hashes` key. Lua reads it with `game.get_universe().config`. |
+| `libs` | no | Map of library name to Lua source. These are added to the core libraries from `mudd_init`, and override any with the same name. |
 
-**ID Validation Rules:**
-- Length: 3-64 characters
-- Characters: lowercase letters, numbers, and hyphens
-- Must start and end with alphanumeric character
-- No consecutive hyphens (`--`)
+| Status | Body |
+|--------|------|
+| 201 | `{"id": "my-game", "name": "My Adventure World", "libs_loaded": ["combat", "commands", "quests", "utils"]}` |
+| 400 | `{"error": "Invalid universe ID: ..."}` or `{"error": "Failed to create universe: ..."}` (duplicate id, unknown `owner_id`) |
+| 401 | Missing, malformed or invalid token |
+| 403 | `{"error": "Admin access required"}` |
 
-**Response (201 Created):**
-```json
-{
-    "id": "my-universe",
-    "name": "My Adventure World",
-    "libs_loaded": ["combat", "commands"]
-}
-```
-
-**Response (400 Bad Request):**
-```json
-{
-    "error": "Failed to create universe: ..."
-}
-```
-
----
+`libs_loaded` lists the core libraries in sorted order, followed by any new
+names from `libs`.
 
 ### POST /universe/upload
 
-Create a universe from a ZIP file.
+Creates a universe from a ZIP file. Requires an **admin+** token.
 
-**Request:**
-- Content-Type: `application/octet-stream`
-- Body: ZIP file bytes
-
-**ZIP Structure:**
 ```
 universe.zip
-├── universe.json       # Required: universe config
+├── universe.json   # required: {"id", "name", "owner_id", "config"?}, same rules as /universe/create
 └── lib/
-    ├── combat.lua      # Optional: Lua libraries
-    ├── commands.lua
-    └── items.lua
+    └── quests.lua  # every *.lua file in the ZIP becomes a library named after its file stem
 ```
 
-**universe.json format:**
-```json
-{
-    "id": "my-universe",
-    "name": "My Universe",
-    "owner_id": "account-uuid",
-    "config": { ... }
-}
+```bash
+curl -s -X POST http://127.0.0.1:8080/universe/upload \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/octet-stream' \
+    --data-binary @universe.zip
 ```
 
-Note: The `id` field is required and must follow DNS-style naming (see `/universe/create`).
+Responses are the same as for `/universe/create`, plus these 400 errors:
+`Invalid ZIP file: ...`, `Missing universe.json in ZIP file` and
+`Invalid universe.json: ...`.
 
-**Response (201 Created):**
-```json
-{
-    "id": "my-universe",
-    "name": "My Universe",
-    "libs_loaded": ["combat", "commands", "items"]
-}
-```
+### POST /universe/{id}/run_script
 
-**Response (400 Bad Request):**
-```json
-{
-    "error": "Invalid ZIP file: ..."
-}
-```
+Runs a Lua file from the server's `scripts/` directory inside a universe.
 
 ```json
-{
-    "error": "Missing universe.json in ZIP file"
-}
+{"script": "cave_adventure.lua", "account_id": "<optional account id>"}
 ```
 
----
+- **Who may call:** an admin+, or the account that owns universe `{id}`.
+- **Runs as:** the authenticated caller. If `account_id` names another account,
+  the caller must be admin+ **and** strictly outrank that account. Otherwise
+  the response is 403. Objects the script creates are owned by the account it
+  runs as.
+- **Script path:** read from `scripts/<script>`, relative to `mudd`'s working
+  directory. Names containing `..` or starting with `/` are rejected.
+- **Environment:** the universe's libraries are loaded first. The script gets
+  the larger eval budget (10M instructions, 5 s, 10,000 DB calls), and any
+  `game.send` / `game.broadcast` messages it queues are delivered.
+- `{id}` is lowercased before lookup, as for `/universe/create` and `/ws`.
+
+| Status | Body |
+|--------|------|
+| 200 | `{"result": "<the script's return value as text>"}`. A table renders as `[table]`, nothing as `nil`. |
+| 400 | `{"error": "Invalid universe ID: ..."}`, `{"error": "Invalid script path"}` or `{"error": "Script error: ..."}` |
+| 401 | Missing, malformed or invalid token |
+| 403 | `{"error": "Admin access or universe ownership required"}` or `{"error": "Cannot run a script as that account"}` |
+| 404 | `{"error": "Universe not found: <id>"}` or `{"error": "Script not found: <name> (...)"}` |
 
 ## Images
 
 ### GET /images/{hash}
 
-Retrieve a stored image by content hash.
+Returns a stored image by the hex SHA-256 of its bytes.
 
-**Parameters:**
-- `hash`: SHA256 hash of the image content
+- **200:** the image bytes, with `Content-Type` set to the stored MIME type
+  and `Cache-Control: public, max-age=31536000, immutable`
+- **404:** plain text `Image not found`
+- **500:** plain text `Error: ...`
 
-**Response (200 OK):**
-- Content-Type: `image/png` (or appropriate MIME type)
-- Cache-Control: `public, max-age=31536000, immutable`
-- Body: Image bytes
+Room messages carry `image_hash` when a room has an image. If `VENICE_API_KEY`
+is set, the server generates a missing room image in the background when a
+logged-in player views the room.
 
-**Response (404 Not Found):**
+## WebSocket Protocol
+
+### Connecting
+
 ```
-Image not found
+ws://127.0.0.1:8080/ws?universe=<universe_id>&token=<token>
 ```
 
-**Usage:**
-Images are referenced by hash in room descriptions (via `image_hash` field) or generated via Venice AI (`game.llm_image()`).
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `universe` | yes | Universe id (lowercased before lookup) |
+| `token` | no | Session token. If it is missing **or invalid**, the connection is accepted as a guest. No error is returned. |
 
----
+Upgrade failures are plain-text HTTP responses:
 
-## Error Responses
+| Status | Body |
+|--------|------|
+| 400 | `Universe ID required in query param: ?universe=<id>` or `Invalid universe ID: ...` |
+| 404 | `Universe not found: <id>` |
+| 500 | `Failed to verify universe` |
 
-All error responses follow this format:
+**Logged-in players** have a persistent player object,
+`/players/p-<account_id>`, which holds their inventory. A player spawns at
+their `last_safe_location`. If that is not set, they spawn in the room they
+were last in, if it is a safe zone (the portal, a room with `is_portal = true`,
+or their workroom). Otherwise they spawn at the universe portal.
+
+When a logged-in player disconnects, the server waits 5 seconds for a
+reconnect. If the player does not return and is outside a safe zone, their
+inventory is dropped in the room.
+
+**Guests** get a random player id and no player object. They spawn at the
+portal and can look, move and `say` (shown as "Someone"). Commands that need a
+player object, such as `get` and `inventory`, fail.
+
+### Client to server
+
+Every message is JSON with a `type` field.
+
+```json
+{"type": "command", "text": "look"}
+```
+
+```json
+{"type": "ping"}
+```
+
+`ping` gets no reply. Messages that are not valid JSON, or have an unknown
+`type`, are ignored.
+
+### Server to client
+
+**welcome**: sent first, on connect.
+
+```json
+{"type": "welcome", "player_id": "/players/p-<account_id>", "theme_id": "sierra-retro"}
+```
+
+`theme_id` is always `sierra-retro` for now.
+
+**room**: the room description. Sent after `welcome` if the player has a
+spawn room, and in reply to `look` and to movement.
 
 ```json
 {
-    "error": "Description of what went wrong"
+  "type": "room",
+  "name": "Cave Entrance",
+  "description": "A dark opening in the mountainside...",
+  "exits": ["north"],
+  "contents": ["Rusty Short Sword"],
+  "image_hash": "9f86d08..."
 }
 ```
 
-### HTTP Status Codes
+`exits` holds the keys of the room's `exits` property. `contents` holds the
+`name` of every named object in the room, including NPCs and players. Your own
+name is included when you are logged in. `image_hash` is omitted when the room
+has no image.
+
+**output**: text to display. This covers command replies, `say` from others,
+and messages sent by Lua (`game.send`, `game.broadcast`).
+
+```json
+{"type": "output", "text": "You say: hello"}
+```
+
+**error**: a command failed.
+
+```json
+{"type": "error", "message": "Permission denied: wizard+ required for eval"}
+```
+
+**echo**: sent for every command, before its reply.
+
+```json
+{"type": "echo", "command": "look"}
+```
+
+If no spawn room exists, the server sends this right after `welcome`:
+`{"type":"output","text":"Universe not initialized. Wizards: use 'setportal' command."}`
+
+### Commands
+
+Verbs are case-insensitive. `help` lists only the commands available at your
+access level.
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `look`, `l` | any | Show the current room. Any argument is ignored. |
+| `north`/`n`, `south`/`s`, `east`/`e`, `west`/`w`, `up`/`u`, `down`/`d` | any | Move through an exit. Runs `on_leave` on the old room and `on_enter` on the new one. |
+| `say <message>` | any | You see `You say: <message>`. Others in the room see `<name> says: <message>`. |
+| `help` | any | List commands |
+| `get <item>`, `take <item>` | any | Pick up an object in the room. Name matching is partial and case-insensitive; `%` and `_` match literally. Objects with `fixed = true` and living things (NPCs, players) cannot be taken. |
+| `drop <item>` | any | Drop an object you carry |
+| `inventory`, `inv`, `i` | any | List what you carry |
+| `attack <target>`, `kill <target>` | any | One attack on an object in the room of class `npc` (or a class derived from it) or `monster`: d20 to hit, then 1d6 physical damage, doubled on a natural 20. Shows the damage and the target's remaining HP. At 0 HP the target is removed from the room. Targets do not fight back. |
+| `create <class> <path> "<name>" ["<description>"] [key=value ...]` | builder+ | Create an object you own. `parent=<id>` sets its container. Other `key=value` pairs become properties: numbers and `true`/`false` are typed, everything else is a string. Needs a path grant covering `<path>`, or wizard+. |
+| `eval <lua>` | wizard+ | Run Lua as yourself with the eval budget. The code is everything after the verb (leading whitespace is fine). The reply is the return value as text (`[table]` for tables), even when it is empty. |
+| `goto <room_id>` | wizard+ | Teleport to a room in this universe. Runs `on_leave`/`on_enter` and moves your player object too, so `get`, `drop` and reconnects use the new room. |
+| `setportal [room_id]` | wizard+ | Set this universe's spawn room: the given room, or your current one |
+
+Any other verb is offered to custom verbs registered with `game.add_action`.
+The candidates, in order, are: room actions, then actions on objects you carry,
+on objects in the room, and on the room itself. If you name a target
+(`pull lever`), an object whose name matches wins. The handler runs as the
+object's owner. A non-empty string result becomes the reply. A `nil` or `""` result sends
+no reply, which is useful when the handler already used `game.send`. If no verb
+matches: `{"type":"output","text":"Unknown command: <verb>"}`.
+
+Players below wizard see `Something went wrong.` when a custom verb's handler
+fails. Wizards see the Lua error.
+
+### Delivery
+
+Each connection has an outgoing queue of 256 messages. If a client stops
+reading and its queue fills, further messages **to that client** are dropped
+(and logged). Other players are not affected.
+
+### Example session
+
+```
+→ (connect) ws://127.0.0.1:8080/ws?universe=test-world&token=<token>
+← {"type":"welcome","player_id":"/players/p-…","theme_id":"sierra-retro"}
+← {"type":"room","name":"Cave Entrance","description":"…","exits":["north"],"contents":["Rusty Short Sword","hero"]}
+→ {"type":"command","text":"take sword"}
+← {"type":"echo","command":"take sword"}
+← {"type":"output","text":"You take Rusty Short Sword."}
+→ {"type":"command","text":"n"}
+← {"type":"echo","command":"n"}
+← {"type":"room","name":"Narrow Passage","description":"…","exits":["south","north","east"],"contents":["Giant Bat","hero"]}
+```
+
+## HTTP Status Codes
 
 | Code | Meaning |
 |------|---------|
 | 200 | Success |
-| 201 | Created (successful creation) |
-| 400 | Bad Request (invalid input) |
-| 401 | Unauthorized (invalid credentials) |
-| 404 | Not Found |
-| 409 | Conflict (e.g., username exists) |
-| 500 | Internal Server Error |
-| 503 | Service Unavailable |
-
----
-
-## Access Levels
-
-Account access levels control permissions:
-
-| Level | Description |
-|-------|-------------|
-| `player` | Default level, can play and interact |
-| `builder` | Can create/modify in assigned regions |
-| `wizard` | Full object control, can use `eval` |
-| `admin` | Universe config, grant credits |
-| `owner` | Can grant admin access |
-
-Access level is returned in auth responses and stored in the account.
-
----
-
-## Rate Limits
-
-The server does not currently implement rate limiting. For production deployments, consider placing a reverse proxy (nginx, Cloudflare) in front of the server.
-
----
-
-## CORS
-
-CORS is not enabled by default. For web client access, configure a reverse proxy or modify the server.
-
----
+| 201 | Created (`/auth/register`, `/universe/create`, `/universe/upload`) |
+| 400 | Invalid input: bad username or password on register, bad universe id, bad ZIP, script error, malformed JSON |
+| 401 | Missing, malformed or invalid token, or wrong login credentials |
+| 403 | Valid token, insufficient access (not admin, not universe owner, cannot run as that account) |
+| 404 | Unknown universe, script or image |
+| 409 | Username already exists |
+| 415 | Missing or wrong `Content-Type` on a JSON endpoint (plain text) |
+| 422 | JSON that does not match the expected fields (plain text) |
+| 500 | Internal error |
+| 503 | `/health`: the database is unavailable |
 
 ## Example: Full Session
 
 ```bash
-# 1. Register a new account
-curl -X POST http://localhost:8080/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"username":"hero","password":"password123"}'
+SERVER=http://127.0.0.1:8080
 
-# Response:
-# {"token":"eyJ...","account_id":"abc123","username":"hero","access_level":"player"}
+# 1. Register (or log in) and keep the token
+TOKEN=$(curl -s -X POST $SERVER/auth/register \
+    -H 'Content-Type: application/json' \
+    -d '{"username":"hero","password":"password123"}' | jq -r .token)
 
-# 2. Connect via WebSocket (specify universe)
-wscat -c "ws://localhost:8080/ws?universe=my-game&token=eyJ..."
+# 2. Find a universe
+curl -s $SERVER/universe/list -H "Authorization: Bearer $TOKEN"
 
-# Server sends:
-# {"type":"welcome","player_id":"def456","theme_id":"default"}
-# {"type":"room","name":"Starting Room","description":"...","exits":["north"],"contents":[]}
-
-# 3. Send commands
+# 3. Play over WebSocket (wscat: npm install -g wscat)
+wscat -c "ws://127.0.0.1:8080/ws?universe=test-world&token=$TOKEN"
 > {"type":"command","text":"look"}
-< {"type":"echo","command":"look"}
-< {"type":"room","name":"Starting Room",...}
 
-> {"type":"command","text":"north"}
-< {"type":"echo","command":"north"}
-< {"type":"room","name":"Forest Path",...}
-
-# 4. Logout
-curl -X POST http://localhost:8080/auth/logout \
-  -H "Content-Type: application/json" \
-  -d '{"token":"eyJ..."}'
+# 4. Log out
+curl -s -X POST $SERVER/auth/logout \
+    -H 'Content-Type: application/json' \
+    -d "{\"token\":\"$TOKEN\"}"
 ```
 
----
+## Not Provided
 
-## CLI Commands
-
-### Initialize Database
-
-```bash
-export MUDD_ADMIN_USERNAME=admin
-export MUDD_ADMIN_PASSWORD=secretpassword123
-mudd_init --database /path/to/game.db
-```
-
-### Start Server
-
-```bash
-mudd --database /path/to/game.db --bind 127.0.0.1:8080
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RUST_LOG` | Log level | `mudd=info,tower_http=debug` |
-| `MUDD_ADMIN_USERNAME` | Admin username (init only) | required |
-| `MUDD_ADMIN_PASSWORD` | Admin password (init only) | required |
+- **CORS:** no CORS headers are sent. Serve the web client from the same origin
+  with `mudd --static-dir`, use the Vite dev server's proxy
+  (`client/vite.config.ts`), or put a reverse proxy in front.
+- **Rate limiting:** none. Use a reverse proxy if you need it.
+- **TLS:** none. Terminate TLS in a reverse proxy.

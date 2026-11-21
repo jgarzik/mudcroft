@@ -44,10 +44,33 @@ pub struct ErrorResponse {
 }
 
 /// Register a new account
+/// Rules for new accounts: usernames are 3-32 ASCII letters, digits, `_`
+/// or `-`; passwords at least 6 characters (as the web client requires)
+fn validate_credentials(username: &str, password: &str) -> Result<(), String> {
+    let len = username.chars().count();
+    if !(3..=32).contains(&len) {
+        return Err("username must be 3-32 characters".to_string());
+    }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("username may contain only letters, digits, _ and -".to_string());
+    }
+    if password.chars().count() < 6 {
+        return Err("password must be at least 6 characters".to_string());
+    }
+    Ok(())
+}
+
 async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_credentials(&req.username, &req.password) {
+        return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+    }
+
     let service = AccountService::new(state.db.pool().clone());
 
     match service.create_account(&req.username, &req.password).await {

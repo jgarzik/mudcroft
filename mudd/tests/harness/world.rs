@@ -54,6 +54,29 @@ pub struct TestWorld {
     store: ObjectStore,
 }
 
+/// Account id from a /auth/register response; if registration failed
+/// because the account exists, look it up, otherwise report the failure
+async fn account_id_from(
+    server: &TestServer,
+    resp: reqwest::Response,
+    username: &str,
+) -> Result<String> {
+    let status = resp.status();
+    let body = resp.text().await?;
+    if status.is_success() {
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        return Ok(json["account_id"].as_str().unwrap_or_default().to_string());
+    }
+    let row: Option<(String,)> = sqlx::query_as("SELECT id FROM accounts WHERE username = ?")
+        .bind(username)
+        .fetch_optional(server.pool())
+        .await?;
+    match row {
+        Some((id,)) => Ok(id),
+        None => anyhow::bail!("registering {} failed: {} {}", username, status, body),
+    }
+}
+
 impl TestWorld {
     /// Create a fully populated test world using TestServer reference
     /// Uses HTTP API for account and universe creation
@@ -71,17 +94,7 @@ impl TestWorld {
             )
             .await?;
 
-        let wizard_account_id = if wizard_resp.status().is_success() {
-            let body: serde_json::Value = wizard_resp.json().await?;
-            body["account_id"].as_str().unwrap().to_string()
-        } else {
-            // Account may already exist (unlikely in fresh test), try to get it
-            let row: (String,) = sqlx::query_as("SELECT id FROM accounts WHERE username = ?")
-                .bind("test_wizard")
-                .fetch_one(server.pool())
-                .await?;
-            row.0
-        };
+        let wizard_account_id = account_id_from(server, wizard_resp, "test_wizard").await?;
 
         // Promote to wizard level
         sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
@@ -101,17 +114,7 @@ impl TestWorld {
             )
             .await?;
 
-        let builder_account_id = if builder_resp.status().is_success() {
-            let body: serde_json::Value = builder_resp.json().await?;
-            body["account_id"].as_str().unwrap().to_string()
-        } else {
-            // Account may already exist (unlikely in fresh test), try to get it
-            let row: (String,) = sqlx::query_as("SELECT id FROM accounts WHERE username = ?")
-                .bind("test_builder")
-                .fetch_one(server.pool())
-                .await?;
-            row.0
-        };
+        let builder_account_id = account_id_from(server, builder_resp, "test_builder").await?;
 
         // Promote to builder level
         sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")

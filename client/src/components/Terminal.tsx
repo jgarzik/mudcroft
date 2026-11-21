@@ -88,17 +88,27 @@ export function Terminal({ onCommand }: TerminalProps) {
         <span className="text-sm text-muted">Terminal</span>
         <div className="flex items-center">
           <span className={`connection-status ${connectionStatus}`} />
-          <span className="text-sm text-muted">{connectionStatus}</span>
+          <span className="text-sm text-muted" data-testid="connection-status">
+            {connectionStatus}
+          </span>
         </div>
       </div>
 
       {/* Messages */}
       <div
         className="terminal-messages flex-1 overflow-auto font-mono"
+        data-testid="terminal-messages"
+        role="log"
+        aria-live="polite"
         style={{ padding: '0.75rem' }}
       >
         {messages.map((msg) => (
-          <div key={msg.id} style={{ ...getMessageStyle(msg), marginBottom: '0.25rem' }}>
+          <div
+            key={msg.id}
+            data-testid="terminal-message"
+            data-type={msg.type}
+            style={{ ...getMessageStyle(msg), marginBottom: '0.25rem' }}
+          >
             {msg.text.split('\n').map((line, i) => (
               <div key={i}>{line || '\u00A0'}</div>
             ))}
@@ -120,6 +130,8 @@ export function Terminal({ onCommand }: TerminalProps) {
           <input
             ref={inputRef}
             type="text"
+            data-testid="command-input"
+            aria-label="Command"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}

@@ -9,16 +9,15 @@ use axum::{
     },
     response::IntoResponse,
 };
-use mlua::Value;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
+use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
 use crate::combat::DamageType;
 use crate::images::generate_room_image;
-use crate::lua::{GameApi, Sandbox, SandboxConfig};
 use crate::permissions::AccessLevel;
 use crate::theme::DEFAULT_THEME_ID;
 use crate::universe::validate_universe_id;
@@ -108,25 +107,53 @@ impl ConnectionManager {
             .map(|s| s.sender.clone())
     }
 
-    /// Send a message to a specific player
+    /// Send a message to a specific player.
+    ///
+    /// Never blocks: if the player's queue is full (a client that stopped
+    /// reading) the message is dropped, so one slow client cannot stall
+    /// other players or the player's own command handler.
     pub async fn send_to_player(&self, player_id: &str, msg: ServerMessage) {
         if let Some(sender) = self.get_sender(player_id).await {
-            if sender.send(msg).await.is_err() {
-                warn!("Failed to send message to player {}", player_id);
-            }
+            try_deliver(player_id, &sender, msg);
         }
     }
 
     /// Broadcast a message to all players in a room
     pub async fn broadcast_room(&self, room_id: &str, msg: ServerMessage) {
-        let sessions = self.sessions.read().await;
-        for session in sessions.values() {
-            if session.room_id.as_deref() == Some(room_id)
-                && session.sender.send(msg.clone()).await.is_err()
-            {
-                warn!("Failed to broadcast to player {}", session.player_id);
-            }
+        self.broadcast_room_except(room_id, None, msg).await;
+    }
+
+    /// Broadcast to all players in a room except `exclude_id` (if given)
+    pub async fn broadcast_room_except(
+        &self,
+        room_id: &str,
+        exclude_id: Option<&str>,
+        msg: ServerMessage,
+    ) {
+        // Copy the recipients out so the lock is not held while sending
+        let recipients: Vec<(String, mpsc::Sender<ServerMessage>)> = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .filter(|s| {
+                s.room_id.as_deref() == Some(room_id) && Some(s.player_id.as_str()) != exclude_id
+            })
+            .map(|s| (s.player_id.clone(), s.sender.clone()))
+            .collect();
+        for (player_id, sender) in recipients {
+            try_deliver(&player_id, &sender, msg.clone());
         }
+    }
+
+    /// (player_id, room_id) for every connected player that is in a room
+    pub async fn player_rooms(&self) -> Vec<(String, String)> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .filter_map(|s| s.room_id.clone().map(|r| (s.player_id.clone(), r)))
+            .collect()
     }
 
     /// Update player's room
@@ -155,6 +182,27 @@ impl ConnectionManager {
     }
 }
 
+/// Queue a message for one client without waiting; drop it if the client's
+/// queue is full or closed
+fn try_deliver(player_id: &str, sender: &mpsc::Sender<ServerMessage>, msg: ServerMessage) {
+    match sender.try_send(msg) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("Dropping message for player {}: queue full", player_id)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(
+                "Failed to send message to player {}: disconnected",
+                player_id
+            )
+        }
+    }
+}
+
+/// Per-connection outgoing queue size. Generous so a burst of script output
+/// fits; a client that stops reading only loses its own messages.
+const CLIENT_QUEUE_SIZE: usize = 256;
+
 /// Messages sent from server to client
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
@@ -181,6 +229,10 @@ pub enum ServerMessage {
     /// Command echo (for confirmation)
     #[serde(rename = "echo")]
     Echo { command: String },
+    /// No reply: the command already said everything it had to (e.g. a verb
+    /// handler that only used game.send). Never sent to clients.
+    #[serde(skip)]
+    Silent,
 }
 
 /// Messages sent from client to server
@@ -268,7 +320,7 @@ async fn handle_socket(
     universe_id: String,
 ) {
     // Create message channel for this connection
-    let (tx, mut rx) = mpsc::channel::<ServerMessage>(32);
+    let (tx, mut rx) = mpsc::channel::<ServerMessage>(CLIENT_QUEUE_SIZE);
 
     let (account_id, username, access_level) = match &account {
         Some(acc) => {
@@ -382,6 +434,20 @@ async fn handle_socket(
                 let _ = socket.send(Message::Text(json.into())).await;
             }
         }
+
+        // Arriving in the world counts as entering the spawn room
+        run_hook(
+            &state,
+            &player_id,
+            Hook::new(
+                &room_id,
+                Some(&room_id),
+                "on_enter",
+                &player_id,
+                serde_json::json!({ "from": null }),
+            ),
+        )
+        .await;
     } else {
         // No spawn location - player stays nowhere
         let msg = ServerMessage::Output {
@@ -477,13 +543,52 @@ async fn handle_client_message(
                 )
                 .await;
 
-            // Parse and execute the command
-            let response = execute_command(state, player_id, account_id, access_level, &text).await;
-            state.connections.send_to_player(player_id, response).await;
+            // Parse and execute the command; hooks it triggers that should
+            // follow the reply (e.g. on_enter after the room description)
+            // run once the reply is queued
+            let mut deferred = Vec::new();
+            let response = execute_command(
+                state,
+                player_id,
+                account_id,
+                access_level,
+                &text,
+                &mut deferred,
+            )
+            .await;
+            if !matches!(response, ServerMessage::Silent) {
+                state.connections.send_to_player(player_id, response).await;
+            }
+            for hook in deferred {
+                run_hook(state, player_id, hook).await;
+            }
         }
         ClientMessage::Ping => {
             // Just keep the connection alive, no response needed
         }
+    }
+}
+
+/// Everything after a command's verb, verbatim apart from surrounding
+/// whitespace (for commands whose argument is free text, like eval)
+fn args_after_verb(command: &str) -> &str {
+    command
+        .trim()
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim_start())
+        .unwrap_or("")
+}
+
+/// Name shown to other players: the player object's `name`, else "Someone"
+async fn display_name(state: &AppState, player_id: &str) -> String {
+    match state.object_store.get(player_id).await {
+        Ok(Some(obj)) => obj
+            .properties
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Someone")
+            .to_string(),
+        _ => "Someone".to_string(),
     }
 }
 
@@ -594,6 +699,62 @@ async fn build_room_message(
     })
 }
 
+/// An object hook to run on behalf of a player
+struct Hook {
+    /// Object whose attached code handles the hook
+    object_id: String,
+    /// Room the hook happens in (room context for the script)
+    room_id: Option<String>,
+    /// Handler name, e.g. "on_enter"
+    method: &'static str,
+    /// Handler argument table (object_id and actor_id are always set)
+    args: serde_json::Value,
+}
+
+impl Hook {
+    fn new(
+        object_id: &str,
+        room_id: Option<&str>,
+        method: &'static str,
+        actor_id: &str,
+        mut args: serde_json::Value,
+    ) -> Self {
+        if let Some(map) = args.as_object_mut() {
+            map.insert("object_id".into(), object_id.into());
+            map.insert("actor_id".into(), actor_id.into());
+            if let Some(room) = room_id {
+                map.insert("room_id".into(), room.into());
+            }
+        }
+        Self {
+            object_id: object_id.to_string(),
+            room_id: room_id.map(str::to_string),
+            method,
+            args,
+        }
+    }
+}
+
+/// Run an object hook triggered by a player. The hook runs as the
+/// object's owner (see scripting::invoke_handler); errors are logged.
+async fn run_hook(state: &AppState, player_id: &str, hook: Hook) {
+    let Some(universe_id) = state.connections.get_universe_id(player_id).await else {
+        return;
+    };
+    if let Err(e) = scripting::invoke_handler(
+        state,
+        &universe_id,
+        &hook.object_id,
+        hook.room_id,
+        hook.method,
+        hook.args,
+    )
+    .await
+    {
+        warn!("{} hook on {} failed: {}", hook.method, hook.object_id, e);
+    }
+}
+
 /// Parse and execute a player command
 async fn execute_command(
     state: &AppState,
@@ -601,6 +762,7 @@ async fn execute_command(
     account_id: &str,
     access_level: AccessLevel,
     command: &str,
+    deferred: &mut Vec<Hook>,
 ) -> ServerMessage {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
@@ -665,6 +827,20 @@ async fn execute_command(
                 }
             };
 
+            // Leaving hook runs before the move
+            run_hook(
+                state,
+                player_id,
+                Hook::new(
+                    &current_room_id,
+                    Some(&current_room_id),
+                    "on_leave",
+                    player_id,
+                    serde_json::json!({ "to": dest_room_id, "direction": direction }),
+                ),
+            )
+            .await;
+
             // Update player's room in memory
             state
                 .connections
@@ -673,10 +849,23 @@ async fn execute_command(
 
             // Sync to database for authenticated users
             if !account_id.is_empty() {
-                if let Err(e) = state.player_manager.move_player(player_id, &dest_room_id).await {
+                if let Err(e) = state
+                    .player_manager
+                    .move_player(player_id, &dest_room_id)
+                    .await
+                {
                     warn!("Failed to sync player location to DB: {}", e);
                 }
             }
+
+            // Entering hook runs after the new room description is sent
+            deferred.push(Hook::new(
+                &dest_room_id,
+                Some(&dest_room_id),
+                "on_enter",
+                player_id,
+                serde_json::json!({ "from": current_room_id, "direction": direction }),
+            ));
 
             // Return new room description
             let acct_ref = if account_id.is_empty() {
@@ -694,14 +883,44 @@ async fn execute_command(
         }
         "say" => {
             let message = parts[1..].join(" ");
+            if message.is_empty() {
+                return ServerMessage::Error {
+                    message: "Say what?".to_string(),
+                };
+            }
+            if let Some(room_id) = state.connections.get_room_id(player_id).await {
+                let speaker = display_name(state, player_id).await;
+                state
+                    .connections
+                    .broadcast_room_except(
+                        &room_id,
+                        Some(player_id),
+                        ServerMessage::Output {
+                            text: format!("{} says: {}", speaker, message),
+                        },
+                    )
+                    .await;
+            }
             ServerMessage::Output {
                 text: format!("You say: {}", message),
             }
         }
-        "help" => ServerMessage::Output {
-            text: "Commands: look, north/south/east/west, say <message>, get/take <item>, drop <item>, inventory/i, attack <target>, eval <lua>, goto <room_id>, setportal [room_id], help"
-                .to_string(),
-        },
+        "help" => {
+            let mut text = String::from(
+                "Commands: look, north/south/east/west/up/down, say <message>, \
+                 get/take <item>, drop <item>, inventory/i, attack/kill <target>, help. \
+                 Objects may offer their own verbs (e.g. 'pull lever').",
+            );
+            if access_level >= AccessLevel::Builder {
+                text.push_str(
+                    "\nBuilder: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]",
+                );
+            }
+            if access_level >= AccessLevel::Wizard {
+                text.push_str("\nWizard: eval <lua>, goto <room_id>, setportal [room_id]");
+            }
+            ServerMessage::Output { text }
+        }
         "get" | "take" => {
             // Get item name from args
             let item_name = if parts.len() > 1 {
@@ -713,12 +932,15 @@ async fn execute_command(
             };
 
             // Execute Commands.take() via Lua
-            let code = format!(
-                r#"local r = Commands.take("{}", "{}"); return r.message"#,
-                player_id.replace('"', r#"\""#),
-                item_name.replace('"', r#"\""#)
-            );
-            execute_lua(state, player_id, account_id, &code).await
+            // Arguments are passed as values, never spliced into the source
+            execute_lua_with_args(
+                state,
+                player_id,
+                account_id,
+                "local pid, item = ...; return Commands.take(pid, item).message",
+                vec![player_id.to_string(), item_name],
+            )
+            .await
         }
         "drop" => {
             // Get item name from args
@@ -731,20 +953,26 @@ async fn execute_command(
             };
 
             // Execute Commands.drop() via Lua
-            let code = format!(
-                r#"local r = Commands.drop("{}", "{}"); return r.message"#,
-                player_id.replace('"', r#"\""#),
-                item_name.replace('"', r#"\""#)
-            );
-            execute_lua(state, player_id, account_id, &code).await
+            // Arguments are passed as values, never spliced into the source
+            execute_lua_with_args(
+                state,
+                player_id,
+                account_id,
+                "local pid, item = ...; return Commands.drop(pid, item).message",
+                vec![player_id.to_string(), item_name],
+            )
+            .await
         }
         "inventory" | "inv" | "i" => {
             // Execute Commands.inventory() via Lua
-            let code = format!(
-                r#"local r = Commands.inventory("{}"); return r.message"#,
-                player_id.replace('"', r#"\""#)
-            );
-            execute_lua(state, player_id, account_id, &code).await
+            execute_lua_with_args(
+                state,
+                player_id,
+                account_id,
+                "local pid = ...; return Commands.inventory(pid).message",
+                vec![player_id.to_string()],
+            )
+            .await
         }
         "goto" => {
             // Wizard+ only
@@ -763,14 +991,51 @@ async fn execute_command(
                 };
             };
 
-            // Verify room exists
+            let session_universe = state.connections.get_universe_id(player_id).await;
+
+            // Verify room exists (in this universe)
             match state.object_store.get(&room_id).await {
+                Ok(Some(room)) if Some(&room.universe_id) != session_universe.as_ref() => {
+                    ServerMessage::Error {
+                        message: format!("Room not found: {}", room_id),
+                    }
+                }
                 Ok(Some(room)) if room.class == "room" => {
-                    // Update player's room
+                    let from = state.connections.get_room_id(player_id).await;
+                    if let Some(ref from_id) = from {
+                        run_hook(
+                            state,
+                            player_id,
+                            Hook::new(
+                                from_id,
+                                Some(from_id),
+                                "on_leave",
+                                player_id,
+                                serde_json::json!({ "to": room_id }),
+                            ),
+                        )
+                        .await;
+                    }
+
+                    // Update player's room, in the session and (for accounts)
+                    // the player object, which get/drop and respawn use
                     state
                         .connections
                         .update_room(player_id, Some(room_id.clone()))
                         .await;
+                    if !account_id.is_empty() {
+                        if let Err(e) = state.player_manager.move_player(player_id, &room_id).await
+                        {
+                            warn!("Failed to sync player location to DB: {}", e);
+                        }
+                    }
+                    deferred.push(Hook::new(
+                        &room_id,
+                        Some(&room_id),
+                        "on_enter",
+                        player_id,
+                        serde_json::json!({ "from": from }),
+                    ));
 
                     // Return room description
                     let acct_ref = if account_id.is_empty() {
@@ -822,15 +1087,19 @@ async fn execute_command(
                     Some(id) => id,
                     None => {
                         return ServerMessage::Error {
-                            message: "You are nowhere. Use 'setportal <room_id>' to specify a room."
-                                .to_string(),
+                            message:
+                                "You are nowhere. Use 'setportal <room_id>' to specify a room."
+                                    .to_string(),
                         };
                     }
                 }
             };
 
-            // Verify room exists
+            // Verify room exists (in this universe)
             match state.object_store.get(&room_id).await {
+                Ok(Some(room)) if room.universe_id != universe_id => ServerMessage::Error {
+                    message: format!("Room not found: {}", room_id),
+                },
                 Ok(Some(room)) if room.class == "room" => {
                     // Set portal
                     if let Err(e) = state.object_store.set_portal(&universe_id, &room_id).await {
@@ -868,14 +1137,12 @@ async fn execute_command(
                 };
             }
 
-            // Get the code after "eval "
-            let code = if command.len() > 5 {
-                &command[5..]
-            } else {
+            let code = args_after_verb(command);
+            if code.is_empty() {
                 return ServerMessage::Error {
                     message: "Usage: eval <lua code>".to_string(),
                 };
-            };
+            }
 
             // Execute Lua code
             execute_lua(state, player_id, account_id, code).await
@@ -907,13 +1174,25 @@ async fn execute_command(
                 .await
                 .unwrap_or_default();
 
-            let target = contents.iter().find(|obj| {
+            // Never yourself; an exact name match beats a partial one
+            let name_of = |obj: &crate::objects::Object| {
                 obj.properties
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .map(|n| n.to_lowercase().contains(&target_name))
-                    .unwrap_or(false)
-            });
+                    .map(|n| n.to_lowercase())
+            };
+            let others: Vec<_> = contents.iter().filter(|o| o.id != player_id).collect();
+            let target = others
+                .iter()
+                .find(|o| name_of(o).as_deref() == Some(target_name.as_str()))
+                .or_else(|| {
+                    others.iter().find(|o| {
+                        name_of(o)
+                            .map(|n| n.contains(&target_name))
+                            .unwrap_or(false)
+                    })
+                })
+                .copied();
 
             let target = match target {
                 Some(t) => t,
@@ -933,7 +1212,9 @@ async fn execute_command(
                 .to_string();
 
             // Check if target is attackable (NPC or PvP-flagged player)
-            let is_npc = target.class == "npc" || target.class == "monster";
+            // Any npc, including subclasses defined with define_class
+            let is_npc =
+                target.class == "monster" || state.classes.read().await.is_a(&target.class, "npc");
             if !is_npc {
                 return ServerMessage::Error {
                     message: format!("You can't attack {}.", target_display_name),
@@ -958,7 +1239,11 @@ async fn execute_command(
                     .combat
                     .init_entity_with_universe(
                         &target_id,
-                        state.connections.get_universe_id(player_id).await.as_deref(),
+                        state
+                            .connections
+                            .get_universe_id(player_id)
+                            .await
+                            .as_deref(),
                         target_max_hp,
                     )
                     .await;
@@ -973,7 +1258,11 @@ async fn execute_command(
                     .combat
                     .init_entity_with_universe(
                         player_id,
-                        state.connections.get_universe_id(player_id).await.as_deref(),
+                        state
+                            .connections
+                            .get_universe_id(player_id)
+                            .await
+                            .as_deref(),
                         100, // Default player HP
                     )
                     .await;
@@ -986,10 +1275,15 @@ async fn execute_command(
                 };
             }
 
-            // Perform attack (basic 1d6 physical damage)
+            // Perform attack (basic 1d6 physical damage; the combat manager
+            // takes the rolled amount and doubles it on a critical)
+            let damage_roll = {
+                use rand::Rng;
+                rand::rng().random_range(1..=6)
+            };
             let attack_result = match state
                 .combat
-                .attack(player_id, &target_id, 6, DamageType::Physical)
+                .attack(player_id, &target_id, damage_roll, DamageType::Physical)
                 .await
             {
                 Ok(result) => result,
@@ -1004,7 +1298,18 @@ async fn execute_command(
             let mut messages = Vec::new();
 
             if attack_result.hit {
-                let damage = attack_result.damage.as_ref().map(|d| d.final_damage).unwrap_or(0);
+                let damage = attack_result
+                    .damage
+                    .as_ref()
+                    .map(|d| d.final_damage)
+                    .unwrap_or(0);
+                deferred.push(Hook::new(
+                    &target_id,
+                    Some(&room_id),
+                    "on_damage",
+                    player_id,
+                    serde_json::json!({ "attacker_id": player_id, "damage": damage }),
+                ));
                 if attack_result.critical {
                     messages.push(format!(
                         "CRITICAL HIT! You strike {} for {} damage!",
@@ -1020,6 +1325,13 @@ async fn execute_command(
                 // Check if target is dead
                 if state.combat.is_dead(&target_id).await {
                     messages.push(format!("{} is slain!", target_display_name));
+                    deferred.push(Hook::new(
+                        &target_id,
+                        Some(&room_id),
+                        "on_death",
+                        player_id,
+                        serde_json::json!({ "killer_id": player_id }),
+                    ));
 
                     // End combat and remove target from room
                     state.combat.end_combat(player_id).await;
@@ -1051,16 +1363,25 @@ async fn execute_command(
                 ));
             }
 
-            // Broadcast combat message to room
-            let combat_msg = ServerMessage::Output {
-                text: messages.join("\n"),
-            };
+            // Onlookers get a third-person summary; the attacker gets the
+            // detailed result as this command's reply
+            let attacker_name = display_name(state, player_id).await;
+            let mut seen = format!("{} attacks {}.", attacker_name, target_display_name);
+            if state.combat.get_state(&target_id).await.is_none() {
+                seen.push_str(&format!(" {} is slain!", target_display_name));
+            }
             state
                 .connections
-                .broadcast_room(&room_id, combat_msg.clone())
+                .broadcast_room_except(
+                    &room_id,
+                    Some(player_id),
+                    ServerMessage::Output { text: seen },
+                )
                 .await;
 
-            combat_msg
+            ServerMessage::Output {
+                text: messages.join("\n"),
+            }
         }
         "create" => {
             // Builder+ only
@@ -1070,22 +1391,144 @@ async fn execute_command(
                 };
             }
 
-            // Get the arguments after "create "
-            let args = if command.len() > 7 {
-                &command[7..]
-            } else {
+            let args = args_after_verb(command);
+            if args.is_empty() {
                 return ServerMessage::Error {
-                    message: "Usage: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]".to_string(),
+                    message:
+                        "Usage: create <type> <path> \"<name>\" [\"<description>\"] [key=value ...]"
+                            .to_string(),
                 };
             };
 
             // Execute create command
             execute_create_command(state, player_id, account_id, access_level, args).await
         }
-        _ => ServerMessage::Output {
-            text: format!("Unknown command: {}", verb),
-        },
+        _ => {
+            let args = parts[1..].join(" ");
+            match dispatch_custom_verb(state, player_id, access_level, &verb, &args).await {
+                Some(reply) => reply,
+                None => ServerMessage::Output {
+                    text: format!("Unknown command: {}", verb),
+                },
+            }
+        }
     }
+}
+
+/// Run a verb registered with game.add_action, if one is in scope.
+///
+/// Candidates, in order: actions registered for the player's room, then
+/// object actions on inventory items, on objects in the room, and on the
+/// room itself. When the player names a target ("pull lever"), a candidate
+/// whose object name contains it wins; otherwise the first candidate does.
+/// The handler runs as the object's owner and gets {verb, args, actor_id,
+/// object_id, room_id}; a string result becomes the reply.
+async fn dispatch_custom_verb(
+    state: &AppState,
+    player_id: &str,
+    access_level: AccessLevel,
+    verb: &str,
+    args: &str,
+) -> Option<ServerMessage> {
+    let room_id = state.connections.get_room_id(player_id).await;
+
+    let mut nearby: Vec<String> = Vec::new();
+    // Only objects of this universe (an inventory may hold items carried in
+    // from elsewhere; their code cannot run here)
+    let universe = state.connections.get_universe_id(player_id).await?;
+    if let Ok(items) = state.object_store.get_contents(player_id).await {
+        nearby.extend(
+            items
+                .into_iter()
+                .filter(|o| o.universe_id == universe)
+                .map(|o| o.id),
+        );
+    }
+    if let Some(ref room) = room_id {
+        if let Ok(objs) = state.object_store.get_contents(room).await {
+            nearby.extend(objs.into_iter().map(|o| o.id));
+        }
+        nearby.push(room.clone());
+    }
+    // Room actions only count when their object is actually nearby
+    let mut candidates = Vec::new();
+    if let Some(ref room) = room_id {
+        candidates.extend(
+            state
+                .actions
+                .get_room_actions(room, verb)
+                .await
+                .into_iter()
+                .filter(|a| nearby.contains(&a.object_id)),
+        );
+    }
+    for object_id in &nearby {
+        if let Some(action) = state.actions.get_object_action(object_id, verb).await {
+            candidates.push(action);
+        }
+    }
+    // Never dispatch to private handlers or engine hooks
+    candidates.retain(|a| !crate::lua::is_private_handler(&a.method));
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Prefer the candidate the player named
+    let wanted = args.to_lowercase();
+    let mut chosen = candidates[0].clone();
+    if !wanted.is_empty() {
+        for action in &candidates {
+            if let Ok(Some(obj)) = state.object_store.get(&action.object_id).await {
+                let name = obj
+                    .properties
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !name.is_empty() && (wanted.contains(&name) || name.contains(&wanted)) {
+                    chosen = action.clone();
+                    break;
+                }
+            }
+        }
+    }
+
+    let universe_id = state.connections.get_universe_id(player_id).await?;
+    let handler_args = serde_json::json!({
+        "verb": verb,
+        "args": args,
+        "actor_id": player_id,
+        "object_id": chosen.object_id,
+        "room_id": room_id,
+    });
+    let result = scripting::invoke_handler(
+        state,
+        &universe_id,
+        &chosen.object_id,
+        room_id,
+        &chosen.method,
+        handler_args,
+    )
+    .await;
+    Some(match result {
+        // nil or "" means the handler already said everything (game.send)
+        Ok(Some(text)) if text != "nil" && !text.is_empty() => ServerMessage::Output { text },
+        Ok(_) => ServerMessage::Silent,
+        Err(message) => {
+            warn!(
+                "{} handler on {} failed: {}",
+                verb, chosen.object_id, message
+            );
+            // Script internals are for builders' eyes only
+            if access_level >= AccessLevel::Wizard {
+                ServerMessage::Error { message }
+            } else {
+                ServerMessage::Error {
+                    message: "Something went wrong.".to_string(),
+                }
+            }
+        }
+    })
 }
 
 /// Execute Lua code in sandbox with game API
@@ -1095,106 +1538,32 @@ async fn execute_lua(
     account_id: &str,
     code: &str,
 ) -> ServerMessage {
-    // Get universe from session
-    let universe_id = match state.connections.get_universe_id(player_id).await {
-        Some(id) => id,
-        None => {
-            return ServerMessage::Error {
-                message: "Session error: no universe".to_string(),
-            };
-        }
-    };
-
-    // Pre-load universe libraries (before creating sandbox)
-    let lib_codes = match load_universe_lib_codes(state, &universe_id).await {
-        Ok(codes) => codes,
-        Err(e) => {
-            return ServerMessage::Error {
-                message: format!("Failed to load universe libs: {}", e),
-            };
-        }
-    };
-
-    // Create game API with all managers
-    let mut game_api = GameApi::new(
-        state.object_store.clone(),
-        state.classes.clone(),
-        state.actions.clone(),
-        state.messages.clone(),
-        state.permissions.clone(),
-        state.timers.clone(),
-        state.credits.clone(),
-        state.venice.clone(),
-        state.image_store.clone(),
-        &universe_id,
-    );
-    game_api.set_user_context(Some(account_id.to_string()));
-
-    // Create sandbox with generous limits for wizards
-    let config = SandboxConfig {
-        max_instructions: 10_000_000, // 10M instructions
-        timeout: std::time::Duration::from_secs(5),
-        ..Default::default()
-    };
-
-    let mut sandbox = match Sandbox::new(config) {
-        Ok(s) => s,
-        Err(e) => {
-            return ServerMessage::Error {
-                message: format!("Failed to create sandbox: {}", e),
-            };
-        }
-    };
-
-    // Register game API
-    if let Err(e) = game_api.register(sandbox.lua()) {
-        return ServerMessage::Error {
-            message: format!("Failed to register game API: {}", e),
-        };
-    }
-
-    // Execute pre-loaded universe libraries
-    for (lib_name, lib_code) in &lib_codes {
-        let result: Result<(), _> = sandbox.execute(lib_code);
-        if let Err(e) = result {
-            return ServerMessage::Error {
-                message: format!("Failed to execute library {}: {}", lib_name, e),
-            };
-        }
-    }
-
-    // Execute the code
-    let result: Result<Value, _> = sandbox.execute(code);
-
-    match result {
-        Ok(value) => {
-            let text = lua_value_to_string(&value);
-            ServerMessage::Output { text }
-        }
-        Err(e) => ServerMessage::Error {
-            message: format!("Lua error: {}", e),
-        },
-    }
+    execute_lua_with_args(state, player_id, account_id, code, Vec::new()).await
 }
 
-/// Convert Lua value to displayable string
-fn lua_value_to_string(value: &Value) -> String {
-    match value {
-        Value::Nil => "nil".to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s
-            .to_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "<invalid utf8>".to_string()),
-        Value::Table(_) => "[table]".to_string(),
-        Value::Function(_) => "[function]".to_string(),
-        Value::Thread(_) => "[thread]".to_string(),
-        Value::UserData(_) => "[userdata]".to_string(),
-        Value::LightUserData(_) => "[lightuserdata]".to_string(),
-        Value::Error(e) => format!("[error: {}]", e),
-        _ => "[unknown]".to_string(),
+/// Execute a Lua chunk with `args` available as its varargs (`...`),
+/// as the player's account, in the player's universe
+async fn execute_lua_with_args(
+    state: &AppState,
+    player_id: &str,
+    account_id: &str,
+    code: &str,
+    args: Vec<String>,
+) -> ServerMessage {
+    let Some(universe_id) = state.connections.get_universe_id(player_id).await else {
+        return ServerMessage::Error {
+            message: "Session error: no universe".to_string(),
+        };
+    };
+    let ctx = ScriptContext {
+        universe_id,
+        user_id: Some(account_id.to_string()),
+        room_id: None,
+        object_id: None,
+    };
+    match scripting::run_lua(state, &ctx, code, args, scripting::eval_config()).await {
+        Ok(text) => ServerMessage::Output { text },
+        Err(message) => ServerMessage::Error { message },
     }
 }
 
@@ -1427,62 +1796,59 @@ fn parse_create_args(args: &str) -> Result<CreateParams, String> {
     })
 }
 
-/// Load universe library codes from database
-/// Returns Vec of (lib_name, code) pairs, sorted by name for determinism
-async fn load_universe_lib_codes(
-    state: &AppState,
-    universe_id: &str,
-) -> Result<Vec<(String, String)>, String> {
-    // Get universe config
-    let universe = match state.object_store.get_universe(universe_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return Ok(Vec::new()), // No universe = no libs to load
-        Err(e) => return Err(format!("Failed to get universe: {}", e)),
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Get lib_hashes from config
-    let lib_hashes = match universe.config.get("lib_hashes") {
-        Some(hashes) => hashes,
-        None => return Ok(Vec::new()), // No libs defined
-    };
-
-    // Parse lib_hashes as object
-    let hashes_obj = match lib_hashes.as_object() {
-        Some(obj) => obj,
-        None => return Ok(Vec::new()), // Invalid format, skip
-    };
-
-    // Load each library in order (sorted for determinism)
-    let mut lib_names: Vec<_> = hashes_obj.keys().collect();
-    lib_names.sort();
-
-    let mut lib_codes = Vec::new();
-
-    for lib_name in lib_names {
-        let hash = match hashes_obj.get(lib_name).and_then(|v| v.as_str()) {
-            Some(h) => h,
-            None => continue,
-        };
-
-        // Get code from code_store
-        let code = match state.object_store.get_code(hash).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                tracing::warn!(
-                    "Library {} with hash {} not found in code_store",
-                    lib_name,
-                    hash
-                );
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load library {}: {}", lib_name, e);
-                continue;
-            }
-        };
-
-        lib_codes.push((lib_name.clone(), code));
+    fn session(
+        player_id: &str,
+        room: &str,
+        cap: usize,
+    ) -> (PlayerSession, mpsc::Receiver<ServerMessage>) {
+        let (tx, rx) = mpsc::channel(cap);
+        (
+            PlayerSession {
+                player_id: player_id.to_string(),
+                account_id: String::new(),
+                universe_id: "u".to_string(),
+                room_id: Some(room.to_string()),
+                access_level: AccessLevel::Player,
+                sender: tx,
+            },
+            rx,
+        )
     }
 
-    Ok(lib_codes)
+    fn out(text: &str) -> ServerMessage {
+        ServerMessage::Output {
+            text: text.to_string(),
+        }
+    }
+
+    /// A client that stops reading must not block senders or the session
+    /// lock: messages to a full queue are dropped.
+    #[tokio::test]
+    async fn test_full_client_queue_does_not_block() {
+        let conns = ConnectionManager::new();
+        let (stuck, _stuck_rx) = session("stuck", "r", 1);
+        let (ok, mut ok_rx) = session("ok", "r", 8);
+        conns.register(stuck).await;
+        conns.register(ok).await;
+
+        let deliver = async {
+            for i in 0..5 {
+                conns
+                    .broadcast_room_except("r", None, out(&format!("b{i}")))
+                    .await;
+                conns.send_to_player("stuck", out("direct")).await;
+            }
+            // Writers still get the lock
+            conns.update_room("ok", Some("r2".to_string())).await;
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), deliver)
+            .await
+            .expect("delivery must not block on a full client queue");
+
+        assert!(matches!(ok_rx.recv().await, Some(ServerMessage::Output { text }) if text == "b0"));
+    }
 }

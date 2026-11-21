@@ -1,7 +1,21 @@
--- Commands library for HemiMUD
+-- Commands library for Mudcroft
 -- Provides high-level player commands built on game.* primitives
+--
+-- Convention: commands return {success, message}; the caller shows `message`
+-- to the acting player. Commands only use game.send/game.broadcast for
+-- *other* players (broadcasts exclude the actor).
 
 Commands = {}
+
+-- Player objects (and so inventories) are shared by every universe a player
+-- visits. An item carried in from another universe stays in the pack: it
+-- cannot be dropped or given here.
+local function from_another_world(item)
+    local here = game.get_universe()
+    return here ~= nil and item.universe_id ~= here.id
+end
+
+local ANOTHER_WORLD = "That belongs to another world; it stays in your pack here."
 
 -- Take an item from the current room into player inventory
 -- Returns {success: bool, message: string}
@@ -22,8 +36,8 @@ function Commands.take(player_id, item_name)
         return {success = false, message = "You don't see that here"}
     end
 
-    -- Check if item is takeable
-    if item.metadata and item.metadata.fixed then
+    -- Check if item is takeable: not fixed, and not alive (NPCs, players)
+    if (item.metadata and item.metadata.fixed) or game.is_a(item.id, "living") then
         return {success = false, message = "You can't take that"}
     end
 
@@ -31,11 +45,10 @@ function Commands.take(player_id, item_name)
     game.move_object(item.id, player_id)
 
     local name = item.name or item_name
-    game.send(player_id, string.format("You take %s.", name))
 
     -- Broadcast to room
     local player_name = player.name or "Someone"
-    game.broadcast(room_id, string.format("%s takes %s.", player_name, name))
+    game.broadcast(room_id, string.format("%s takes %s.", player_name, name), player_id)
 
     return {success = true, message = string.format("You take %s.", name)}
 end
@@ -58,16 +71,18 @@ function Commands.drop(player_id, item_name)
     if not item then
         return {success = false, message = "You don't have that"}
     end
+    if from_another_world(item) then
+        return {success = false, message = ANOTHER_WORLD}
+    end
 
     -- Move item to room
     game.move_object(item.id, room_id)
 
     local name = item.name or item_name
-    game.send(player_id, string.format("You drop %s.", name))
 
     -- Broadcast to room
     local player_name = player.name or "Someone"
-    game.broadcast(room_id, string.format("%s drops %s.", player_name, name))
+    game.broadcast(room_id, string.format("%s drops %s.", player_name, name), player_id)
 
     return {success = true, message = string.format("You drop %s.", name)}
 end
@@ -90,6 +105,9 @@ function Commands.give(player_id, item_name, target_name)
     if not item then
         return {success = false, message = "You don't have that"}
     end
+    if from_another_world(item) then
+        return {success = false, message = ANOTHER_WORLD}
+    end
 
     -- Find the target in the room
     local target = game.present(target_name, room_id)
@@ -109,7 +127,6 @@ function Commands.give(player_id, item_name, target_name)
     local target_display = target.name or target_name
     local player_name = player.name or "Someone"
 
-    game.send(player_id, string.format("You give %s to %s.", item_display, target_display))
     game.send(target.id, string.format("%s gives you %s.", player_name, item_display))
 
     return {success = true, message = string.format("You give %s to %s.", item_display, target_display)}
@@ -221,14 +238,13 @@ function Commands.flee(player_id)
     game.move_object(player_id, escape.dest)
 
     local player_name = player.name or "Someone"
-    game.broadcast(room_id, string.format("%s flees %s!", player_name, escape.dir))
-    game.send(player_id, string.format("You flee %s!", escape.dir))
+    game.broadcast(room_id, string.format("%s flees %s!", player_name, escape.dir), player_id)
 
     return {success = true, message = string.format("You flee %s!", escape.dir)}
 end
 
 -- Say something to the room
--- Returns {success: bool}
+-- Returns {success: bool, message: string}
 function Commands.say(player_id, message)
     local player = game.get_object(player_id)
     if not player then
@@ -241,10 +257,9 @@ function Commands.say(player_id, message)
     end
 
     local player_name = player.name or "Someone"
-    game.send(player_id, string.format('You say, "%s"', message))
-    game.broadcast(room_id, string.format('%s says, "%s"', player_name, message))
+    game.broadcast(room_id, string.format('%s says, "%s"', player_name, message), player_id)
 
-    return {success = true}
+    return {success = true, message = string.format('You say, "%s"', message)}
 end
 
 -- Show player inventory

@@ -23,6 +23,9 @@ pub struct ClassDef {
     pub handlers: Vec<String>,
     /// Code hash for this class's Lua implementation
     pub code_hash: Option<String>,
+    /// Account that defined the class via game.define_class (None for
+    /// built-in or loaded classes); only it (or an admin) may redefine it
+    pub defined_by: Option<String>,
 }
 
 impl ClassDef {
@@ -34,6 +37,7 @@ impl ClassDef {
             properties: Properties::new(),
             handlers: Vec::new(),
             code_hash: None,
+            defined_by: None,
         }
     }
 
@@ -91,7 +95,7 @@ impl ClassRegistry {
         registry
     }
 
-    /// Register the base classes from design.md
+    /// Register the built-in base classes (see mudd/docs/design.md, Classes)
     fn register_base_classes(&mut self) {
         // thing - root class
         let mut thing = ClassDef::new("thing", None);
@@ -160,7 +164,6 @@ impl ClassRegistry {
 
         // player - inherits from living
         let mut player = ClassDef::new("player", Some("living"));
-        player.set_property("wallet_address", serde_json::json!(null));
         player.set_property("access_level", serde_json::json!("player"));
         self.register(player);
 
@@ -202,6 +205,25 @@ impl ClassRegistry {
         }
 
         chain
+    }
+
+    /// Names of the built-in base classes, which scripts may not redefine
+    pub const BUILTIN: &'static [&'static str] = &[
+        "thing",
+        "item",
+        "living",
+        "room",
+        "region",
+        "weapon",
+        "armor",
+        "container",
+        "player",
+        "npc",
+    ];
+
+    /// Whether `name` is a built-in base class
+    pub fn is_builtin(name: &str) -> bool {
+        Self::BUILTIN.contains(&name)
     }
 
     /// Check if a class is a descendant of another class
@@ -262,8 +284,10 @@ impl ClassRegistry {
         name: &str,
         parent: Option<&str>,
         props_map: std::collections::HashMap<String, (String, serde_json::Value)>,
+        defined_by: Option<&str>,
     ) {
         let mut class = ClassDef::new(name, parent);
+        class.defined_by = defined_by.map(str::to_string);
         for (prop_name, (_type_name, default_val)) in props_map.iter() {
             class.set_property(prop_name, default_val.clone());
         }

@@ -14,9 +14,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
+use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::{Account, AccountService};
-use crate::lua::{GameApi, Sandbox, SandboxConfig};
 use crate::permissions::AccessLevel;
 use crate::universe::validate_universe_id;
 
@@ -410,6 +410,20 @@ async fn run_script(
         Err(e) => return e.into_response(),
     };
 
+    // Normalize like create and /ws (ids are case-insensitive)
+    let universe_id = match validate_universe_id(&universe_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid universe ID: {}", e),
+                }),
+            )
+                .into_response()
+        }
+    };
+
     // Validate universe exists and check ownership
     let universe = match state.object_store.get_universe(&universe_id).await {
         Ok(Some(u)) => u,
@@ -446,6 +460,26 @@ async fn run_script(
             .into_response();
     }
 
+    // Run as the authenticated caller. An admin+ may run as another account,
+    // but only one strictly below their own level (no impersonating peers or
+    // superiors).
+    let run_as = match request.account_id {
+        Some(other) if other != account.id => {
+            let target_level = state.permissions.get_access_level(&other).await;
+            if !(level.can_admin() && target_level < level) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse {
+                        error: "Cannot run a script as that account".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            other
+        }
+        _ => account.id.clone(),
+    };
+
     // Security: only allow scripts from the scripts/ directory, no path traversal
     let script_name = &request.script;
     if script_name.contains("..") || script_name.starts_with('/') {
@@ -473,51 +507,21 @@ async fn run_script(
         }
     };
 
-    // Create sandbox and game API
-    let mut sandbox = match Sandbox::new(SandboxConfig::default()) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to create sandbox: {}", e),
-                }),
-            )
-                .into_response();
-        }
+    // Run the script (universe libs loaded, script messages delivered)
+    let ctx = ScriptContext {
+        universe_id: universe_id.clone(),
+        user_id: Some(run_as),
+        room_id: None,
+        object_id: None,
     };
-
-    let mut game_api = GameApi::new(
-        state.object_store.clone(),
-        state.classes.clone(),
-        state.actions.clone(),
-        state.messages.clone(),
-        state.permissions.clone(),
-        state.timers.clone(),
-        state.credits.clone(),
-        state.venice.clone(),
-        state.image_store.clone(),
-        &universe_id,
-    );
-
-    // Set user context if provided
-    if let Some(account_id) = request.account_id {
-        game_api.set_user_context(Some(account_id));
-    }
-
-    // Register game API
-    if let Err(e) = game_api.register(sandbox.lua()) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to register game API: {}", e),
-            }),
-        )
-            .into_response();
-    }
-
-    // Execute script
-    let result: Result<String, _> = sandbox.execute(&script_content);
+    let result = scripting::run_lua(
+        &state,
+        &ctx,
+        &script_content,
+        Vec::new(),
+        scripting::eval_config(),
+    )
+    .await;
 
     match result {
         Ok(output) => (StatusCode::OK, Json(RunScriptResponse { result: output })).into_response(),

@@ -19,44 +19,52 @@ export function UniverseSelect() {
   const token = useGameStore((s) => s.token)
 
   useEffect(() => {
-    fetchUniverses()
-  }, [token])
+    // Ignore a response that arrives after the token changed or we unmounted
+    let cancelled = false
 
-  const fetchUniverses = async () => {
-    if (!token) {
-      setError('Not authenticated')
-      setLoading(false)
-      return
-    }
-    try {
-      const response = await fetch('/universe/list', {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-        },
-      })
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}))
-        throw new Error(errData.error || 'Failed to fetch universes')
+    const fetchUniverses = async () => {
+      if (!token) {
+        setError('Not authenticated')
+        setLoading(false)
+        return
       }
-      const data: Universe[] = await response.json()
-      setUniverses(data)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred')
-    } finally {
-      setLoading(false)
+      try {
+        const response = await fetch('/universe/list', {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          },
+        })
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}))
+          throw new Error(errData.error || 'Failed to fetch universes')
+        }
+        const data: Universe[] = await response.json()
+        if (!cancelled) setUniverses(data)
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'An error occurred')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
     }
-  }
+
+    fetchUniverses()
+    return () => {
+      cancelled = true
+    }
+  }, [token])
 
   const handleSelect = (id: string) => {
     setSelectedId(id)
   }
 
-  const handleEnter = () => {
-    if (!selectedId) return
+  // `id` lets a double-click enter before the selection state has updated
+  const handleEnter = (id: string | null = selectedId) => {
+    if (!id) return
+    setSelectedId(id)
     setEntering(true)
     // Brief delay for visual feedback
     setTimeout(() => {
-      setUniverse(selectedId)
+      setUniverse(id)
     }, 300)
   }
 
@@ -123,7 +131,7 @@ export function UniverseSelect() {
               className="flex flex-col items-center justify-center"
               style={{ padding: '2rem', gap: '1rem' }}
             >
-              <span className="text-muted">No worlds available</span>
+              <span className="text-muted" data-testid="no-universes">No worlds available</span>
               <span className="text-sm text-muted">
                 Contact an admin to create one
               </span>
@@ -131,15 +139,15 @@ export function UniverseSelect() {
           )}
 
           {!loading && !error && universes.length > 0 && (
-            <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+            <ul data-testid="universe-list" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
               {universes.map((universe, index) => (
                 <li
                   key={universe.id}
+                  data-testid="universe-item"
+                  data-universe-id={universe.id}
+                  aria-selected={selectedId === universe.id}
                   onClick={() => handleSelect(universe.id)}
-                  onDoubleClick={() => {
-                    setSelectedId(universe.id)
-                    handleEnter()
-                  }}
+                  onDoubleClick={() => handleEnter(universe.id)}
                   className={`universe-item ${selectedId === universe.id ? 'selected' : ''}`}
                   style={{
                     padding: '0.75rem 1rem',
@@ -205,7 +213,8 @@ export function UniverseSelect() {
           </button>
           <button
             type="button"
-            onClick={handleEnter}
+            data-testid="enter-world"
+            onClick={() => handleEnter()}
             disabled={!selectedId || entering}
             style={{
               flex: 2,

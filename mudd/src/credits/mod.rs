@@ -86,17 +86,23 @@ impl CreditManager {
             }
         }
 
-        // Load from DB if available
-        if let Some(ref pool) = self.pool {
-            if let Ok(balance) = self.load_balance(universe_id, account_id, pool).await {
-                let mut balances = self.balances.write().await;
+        // Cache miss: load under the write lock, so a concurrent grant or
+        // deduct cannot be overwritten by the stale value read here
+        let mut balances = self.balances.write().await;
+        match self
+            .cached_or_stored(&balances, universe_id, account_id)
+            .await
+        {
+            Ok(balance) => {
                 balances.insert(key, balance);
-                return balance;
+                balance
+            }
+            Err(e) => {
+                // Report 0 but do not cache it, so the next read retries
+                warn!("Failed to load credit balance: {}", e);
+                0
             }
         }
-
-        // Default to 0 if not found
-        0
     }
 
     /// Deduct credits from a player's balance
@@ -115,8 +121,16 @@ impl CreditManager {
         let key = (universe_id.to_string(), account_id.to_string());
         let mut balances = self.balances.write().await;
 
-        // Get current balance
-        let current = *balances.get(&key).unwrap_or(&0);
+        let current = match self
+            .cached_or_stored(&balances, universe_id, account_id)
+            .await
+        {
+            Ok(balance) => balance,
+            Err(e) => {
+                warn!("Failed to load credit balance: {}", e);
+                return false;
+            }
+        };
         if current < amount {
             debug!(
                 "Insufficient credits: {} has {} but needs {}",
@@ -125,19 +139,15 @@ impl CreditManager {
             return false;
         }
 
-        // Deduct
         let new_balance = current - amount;
-        balances.insert(key, new_balance);
-
-        // Persist via Raft
-        if let Some(ref raft_writer) = self.raft_writer {
-            if let Err(e) = self
-                .save_balance(universe_id, account_id, new_balance, raft_writer)
-                .await
-            {
-                warn!("Failed to persist credit balance: {}", e);
-            }
+        if let Err(e) = self
+            .save_balance(universe_id, account_id, new_balance)
+            .await
+        {
+            warn!("Failed to persist credit balance: {}", e);
+            return false;
         }
+        balances.insert(key, new_balance);
 
         debug!(
             "Deducted {} credits from {}: {} -> {} ({})",
@@ -147,33 +157,50 @@ impl CreditManager {
     }
 
     /// Grant credits to a player (admin function)
-    pub async fn grant(&self, universe_id: &str, account_id: &str, amount: i64, reason: &str) {
+    /// Returns false for a non-positive amount, an overflowing balance, or a
+    /// failed load/persist; the balance is unchanged in those cases.
+    pub async fn grant(
+        &self,
+        universe_id: &str,
+        account_id: &str,
+        amount: i64,
+        reason: &str,
+    ) -> bool {
         if amount <= 0 {
-            return;
+            return false;
         }
 
         let key = (universe_id.to_string(), account_id.to_string());
         let mut balances = self.balances.write().await;
 
-        // Get current balance
-        let current = *balances.get(&key).unwrap_or(&0);
-        let new_balance = current + amount;
-        balances.insert(key, new_balance);
-
-        // Persist via Raft
-        if let Some(ref raft_writer) = self.raft_writer {
-            if let Err(e) = self
-                .save_balance(universe_id, account_id, new_balance, raft_writer)
-                .await
-            {
-                warn!("Failed to persist credit balance: {}", e);
+        let current = match self
+            .cached_or_stored(&balances, universe_id, account_id)
+            .await
+        {
+            Ok(balance) => balance,
+            Err(e) => {
+                warn!("Failed to load credit balance: {}", e);
+                return false;
             }
+        };
+        let Some(new_balance) = current.checked_add(amount) else {
+            warn!("Credit grant to {} would overflow", account_id);
+            return false;
+        };
+        if let Err(e) = self
+            .save_balance(universe_id, account_id, new_balance)
+            .await
+        {
+            warn!("Failed to persist credit balance: {}", e);
+            return false;
         }
+        balances.insert(key, new_balance);
 
         debug!(
             "Granted {} credits to {}: {} -> {} ({})",
             amount, account_id, current, new_balance, reason
         );
+        true
     }
 
     /// Set balance directly (used for initialization)
@@ -181,13 +208,8 @@ impl CreditManager {
         let key = (universe_id.to_string(), account_id.to_string());
         self.balances.write().await.insert(key, balance);
 
-        if let Some(ref raft_writer) = self.raft_writer {
-            if let Err(e) = self
-                .save_balance(universe_id, account_id, balance, raft_writer)
-                .await
-            {
-                warn!("Failed to persist credit balance: {}", e);
-            }
+        if let Err(e) = self.save_balance(universe_id, account_id, balance).await {
+            warn!("Failed to persist credit balance: {}", e);
         }
     }
 
@@ -208,29 +230,60 @@ impl CreditManager {
         Ok(row.map(|(b,)| b).unwrap_or(0))
     }
 
-    /// Save balance to database via Raft
+    /// Current balance: the cached value, or the stored one on a cache miss
+    /// (e.g. after a restart). Callers hold the write lock across the
+    /// read-modify-write, so the DB read cannot race another update.
+    /// A failed DB read is an error, never a zero balance.
+    async fn cached_or_stored(
+        &self,
+        balances: &HashMap<(String, String), i64>,
+        universe_id: &str,
+        account_id: &str,
+    ) -> anyhow::Result<i64> {
+        let key = (universe_id.to_string(), account_id.to_string());
+        if let Some(&balance) = balances.get(&key) {
+            return Ok(balance);
+        }
+        match self.pool {
+            Some(ref pool) => self.load_balance(universe_id, account_id, pool).await,
+            None => Ok(0),
+        }
+    }
+
+    /// Persist a balance: via Raft when available, otherwise direct SQL
     async fn save_balance(
         &self,
         universe_id: &str,
         account_id: &str,
         balance: i64,
-        raft_writer: &RaftWriter,
     ) -> anyhow::Result<()> {
+        const UPSERT: &str = "INSERT INTO credits (id, universe_id, player_id, balance) VALUES (?, ?, ?, ?) ON CONFLICT(universe_id, player_id) DO UPDATE SET balance = ?";
         // Pre-compute UUID for deterministic replication
         let id = uuid::Uuid::new_v4().to_string();
 
-        raft_writer
-            .execute(
-                "INSERT INTO credits (id, universe_id, player_id, balance) VALUES (?, ?, ?, ?) ON CONFLICT(universe_id, player_id) DO UPDATE SET balance = ?",
-                vec![
-                    serde_json::json!(&id),
-                    serde_json::json!(universe_id),
-                    serde_json::json!(account_id),
-                    serde_json::json!(balance),
-                    serde_json::json!(balance),
-                ],
-            )
-            .await?;
+        if let Some(ref raft_writer) = self.raft_writer {
+            raft_writer
+                .execute(
+                    UPSERT,
+                    vec![
+                        serde_json::json!(&id),
+                        serde_json::json!(universe_id),
+                        serde_json::json!(account_id),
+                        serde_json::json!(balance),
+                        serde_json::json!(balance),
+                    ],
+                )
+                .await?;
+        } else if let Some(ref pool) = self.pool {
+            sqlx::query(UPSERT)
+                .bind(&id)
+                .bind(universe_id)
+                .bind(account_id)
+                .bind(balance)
+                .bind(balance)
+                .execute(pool)
+                .await?;
+        }
 
         Ok(())
     }
@@ -239,6 +292,81 @@ impl CreditManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Single-connection in-memory DB with a credits table holding one balance
+    async fn pool_with_balance(balance: i64) -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE credits (id TEXT PRIMARY KEY, universe_id TEXT NOT NULL,
+             player_id TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0,
+             UNIQUE(universe_id, player_id))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO credits VALUES ('c1', 'u1', 'player1', ?)")
+            .bind(balance)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    /// After a restart the cache is empty: grant must add to the stored
+    /// balance, not overwrite it, and the result must persist.
+    #[tokio::test]
+    async fn test_grant_on_cold_cache_adds_to_stored_balance() {
+        let pool = pool_with_balance(100).await;
+        let manager = CreditManager::new(Some(pool.clone()), None);
+        manager.grant("u1", "player1", 10, "test").await;
+        assert_eq!(manager.get_balance("u1", "player1").await, 110);
+
+        let restarted = CreditManager::new(Some(pool), None);
+        assert_eq!(restarted.get_balance("u1", "player1").await, 110);
+    }
+
+    /// A failed DB read must not be treated as a zero balance (and written
+    /// back over the real one)
+    #[tokio::test]
+    async fn test_failed_load_does_not_clobber_balance() {
+        // No credits table: every load fails
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let manager = CreditManager::new(Some(pool), None);
+        assert!(!manager.grant("u1", "player1", 10, "test").await);
+        assert!(!manager.deduct("u1", "player1", 1, "test").await);
+        // Nothing cached from the failed reads
+        assert!(manager.balances.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_grant_rejects_invalid_and_overflowing_amounts() {
+        let manager = CreditManager::new(None, None);
+        assert!(!manager.grant("u1", "player1", 0, "test").await);
+        assert!(!manager.grant("u1", "player1", -5, "test").await);
+        assert!(manager.grant("u1", "player1", i64::MAX, "test").await);
+        assert!(!manager.grant("u1", "player1", 1, "overflow").await);
+        assert_eq!(manager.get_balance("u1", "player1").await, i64::MAX);
+    }
+
+    /// Deduct must see the stored balance on a cold cache
+    #[tokio::test]
+    async fn test_deduct_on_cold_cache_uses_stored_balance() {
+        let pool = pool_with_balance(100).await;
+        let manager = CreditManager::new(Some(pool.clone()), None);
+        assert!(manager.deduct("u1", "player1", 30, "test").await);
+        assert_eq!(manager.get_balance("u1", "player1").await, 70);
+
+        let restarted = CreditManager::new(Some(pool), None);
+        assert_eq!(restarted.get_balance("u1", "player1").await, 70);
+    }
 
     #[tokio::test]
     async fn test_get_balance_default() {

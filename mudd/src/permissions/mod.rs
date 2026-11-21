@@ -8,9 +8,11 @@
 //! - Owner: Universe owner, can grant admin access
 //!
 //! Permission check order (first match wins):
+//! 0. AdminConfig/GrantCredits need Admin+; StoreCode needs Wizard+
 //! 1. Wizard+ bypass: access_level >= Wizard → Allowed
 //! 2. Owner check: object.owner_id == user.account_id → Allowed
-//! 3. Path grant: Any grant where object.id.starts_with(grant.path_prefix) → Allowed
+//! 3. Path grant: any grant that covers object.id on a `/` boundary
+//!    (PathGrant::covers_path) → Allowed
 //! 4. Player actions: Read/Execute/Move-non-fixed → Allowed
 //! 5. Default: Denied
 
@@ -77,6 +79,30 @@ impl AccessLevel {
     /// Check if this level can grant admin access
     pub fn can_grant_admin(&self) -> bool {
         *self >= AccessLevel::Owner
+    }
+
+    /// Whether a caller at this level may change an account currently at
+    /// `target_current` to `new_level`.
+    ///
+    /// Owners may set any level. Otherwise the caller must be admin+, the
+    /// target must be strictly below the caller (no changing peers or
+    /// superiors), and admin/owner may only be granted by an owner.
+    pub fn can_set_access_level(
+        &self,
+        target_current: AccessLevel,
+        new_level: AccessLevel,
+    ) -> bool {
+        if self.can_grant_admin() {
+            return true;
+        }
+        self.can_admin() && target_current < *self && new_level < AccessLevel::Admin
+    }
+
+    /// Whether a caller at this level may act as (impersonate) an account at
+    /// `target` level. Only wizards+ may switch actors, and only to accounts
+    /// strictly below their own level, so impersonation never gains power.
+    pub fn can_act_as(&self, target: AccessLevel) -> bool {
+        self.can_bypass_fixed() && target < *self
     }
 }
 
@@ -645,9 +671,12 @@ impl PermissionManager {
     /// Check if an action is permitted
     ///
     /// Permission check order (first match wins):
+    /// 0. AdminConfig/GrantCredits need Admin+; StoreCode needs Wizard+
+    ///    (decided here, before any bypass)
     /// 1. Wizard+ bypass: access_level >= Wizard → Allowed
     /// 2. Owner check: object.owner_id == user.account_id → Allowed
-    /// 3. Path grant: Any grant where object.id.starts_with(grant.path_prefix) → Allowed
+    /// 3. Path grant: any grant that covers object.id on a `/` boundary
+    ///    (PathGrant::covers_path) → Allowed
     /// 4. Player actions: Read/Execute/Move-non-fixed → Allowed
     /// 5. Default: Denied
     pub fn check_permission(
@@ -803,6 +832,38 @@ mod tests {
         assert!(AccessLevel::Admin > AccessLevel::Wizard);
         assert!(AccessLevel::Wizard > AccessLevel::Builder);
         assert!(AccessLevel::Builder > AccessLevel::Player);
+    }
+
+    #[test]
+    fn test_can_set_access_level() {
+        use AccessLevel::*;
+        // Owners may do anything, including granting admin/owner
+        assert!(Owner.can_set_access_level(Player, Admin));
+        assert!(Owner.can_set_access_level(Admin, Player));
+        assert!(Owner.can_set_access_level(Player, Owner));
+        // Admins may manage levels below admin on accounts below them
+        assert!(Admin.can_set_access_level(Player, Wizard));
+        assert!(Admin.can_set_access_level(Wizard, Player));
+        assert!(!Admin.can_set_access_level(Player, Admin));
+        assert!(!Admin.can_set_access_level(Player, Owner));
+        assert!(!Admin.can_set_access_level(Admin, Player));
+        assert!(!Admin.can_set_access_level(Owner, Player));
+        // Below admin: never
+        assert!(!Wizard.can_set_access_level(Player, Builder));
+        assert!(!Builder.can_set_access_level(Player, Player));
+        assert!(!Player.can_set_access_level(Player, Player));
+    }
+
+    #[test]
+    fn test_can_act_as() {
+        use AccessLevel::*;
+        assert!(Wizard.can_act_as(Player));
+        assert!(Wizard.can_act_as(Builder));
+        assert!(!Wizard.can_act_as(Wizard));
+        assert!(!Wizard.can_act_as(Admin));
+        assert!(Owner.can_act_as(Admin));
+        assert!(!Builder.can_act_as(Player));
+        assert!(!Player.can_act_as(Player));
     }
 
     #[test]

@@ -901,8 +901,9 @@ async fn test_timer_persistence() {
     use mudd::timers::{Timer, TimerManager};
 
     // Create a shared temp file for the database
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     // First phase: Create timer
     {
@@ -968,8 +969,9 @@ async fn test_timer_persistence() {
 async fn test_permission_persistence() {
     use mudd::permissions::{AccessLevel, PermissionManager};
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     let account_id: String;
 
@@ -1053,8 +1055,9 @@ async fn test_permission_persistence() {
 async fn test_path_grants_persistence() {
     use mudd::permissions::{PermissionManager, UserContext};
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     let grantee_id = "builder_test_account";
     let grantor_id = "admin_test_account";
@@ -1140,8 +1143,9 @@ async fn test_path_grants_persistence() {
 async fn test_combat_state_persistence() {
     use mudd::combat::CombatManager;
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     // First phase: Take damage
     {
@@ -1208,8 +1212,9 @@ async fn test_combat_state_persistence() {
 async fn test_effects_persistence() {
     use mudd::combat::{EffectRegistry, EffectType, StatusEffect};
 
-    let db_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    let db_path = db_file.path().to_string_lossy().to_string();
+    // A temp dir (not a temp file) so SQLite sidecar files are removed too
+    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
 
     // First phase: Apply effect
     {
@@ -1316,4 +1321,112 @@ async fn test_eval_create_object() {
         "Object creation failed: got '{}'",
         obj_id
     );
+}
+
+/// help lists the commands available at the caller's access level
+#[tokio::test]
+async fn test_help_lists_commands_for_role() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    for (role, has_create, has_eval) in [
+        (
+            harness::Role::Player {
+                username: "help_player".to_string(),
+            },
+            false,
+            false,
+        ),
+        (
+            harness::Role::Builder {
+                username: "help_builder".to_string(),
+                regions: vec![],
+            },
+            true,
+            false,
+        ),
+        (
+            harness::Role::Wizard {
+                username: "help_wizard".to_string(),
+            },
+            true,
+            true,
+        ),
+    ] {
+        let mut c = server.connect_as(role).await.expect("connect");
+        c.drain().await;
+        c.command("help").await.unwrap();
+        let text = c.expect_output_containing("Commands:").await.unwrap();
+        assert!(text.contains("attack/kill"), "{}", text);
+        assert_eq!(text.contains("create <type>"), has_create, "{}", text);
+        assert_eq!(text.contains("eval <lua>"), has_eval, "{}", text);
+    }
+}
+
+/// mudd must start again on a database it has already served, with its
+/// data intact (single-node Raft must not re-initialize)
+#[tokio::test]
+async fn test_server_restarts_on_existing_database() {
+    let mut server = TestServer::start().await.expect("Failed to start server");
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "restart_wiz".to_string(),
+        })
+        .await
+        .expect("connect");
+    wizard.drain().await;
+    wizard
+        .command(r#"eval return game.create_object("/items/keepsake", "item", nil, {name = "keepsake"}).id"#)
+        .await
+        .unwrap();
+    wizard
+        .expect_output_containing("/items/keepsake")
+        .await
+        .expect("object created");
+    wizard.close().await.ok();
+
+    server.restart().await.expect("server restarts");
+
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "restart_wiz".to_string(),
+        })
+        .await
+        .expect("reconnect after restart");
+    wizard.drain().await;
+    wizard
+        .command(r#"eval return game.get_object("/items/keepsake").name"#)
+        .await
+        .unwrap();
+    wizard
+        .expect_output_containing("keepsake")
+        .await
+        .expect("data survives restart");
+}
+
+/// eval parses its code after the verb, whatever whitespace precedes it,
+/// and always replies (even with an empty string)
+#[tokio::test]
+async fn test_eval_argument_parsing_and_empty_reply() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let mut wizard = server
+        .connect_as(harness::Role::Wizard {
+            username: "parse_wiz".to_string(),
+        })
+        .await
+        .expect("connect");
+    wizard.drain().await;
+
+    for (cmd, expected) in [
+        ("   eval return 1 + 1", "2"),
+        ("\u{3000}eval return 40 + 2", "42"),
+        ("eval return ''", ""),
+    ] {
+        wizard.command(cmd).await.unwrap();
+        let _ = wizard.expect("echo").await;
+        let reply = wizard
+            .expect_any_timeout(std::time::Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("no reply to {:?}: {}", cmd, e));
+        assert_eq!(reply["type"], "output", "{:?}: {}", cmd, reply);
+        assert_eq!(reply["text"], expected, "{:?}", cmd);
+    }
 }

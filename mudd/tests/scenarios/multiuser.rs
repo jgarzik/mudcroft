@@ -190,14 +190,11 @@ async fn test_multiuser_builder_creates_room() {
     let take_result = player.expect("output").await.expect("no take response");
     let take_text = take_result["text"].as_str().unwrap_or("");
 
-    // The take command should work (might say "picked up" or similar)
-    // If it says "Player not found", that's a known limitation
-    let sword_taken = take_text.to_lowercase().contains("pick")
-        || take_text.to_lowercase().contains("take")
-        || take_text.to_lowercase().contains("got");
-    if !sword_taken {
-        eprintln!("Note: Take sword result: {}", take_text);
-    }
+    assert!(
+        take_text.starts_with("You take"),
+        "player should take the sword: {}",
+        take_text
+    );
 
     // Go north to narrow passage
     player.command("north").await.expect("north failed");

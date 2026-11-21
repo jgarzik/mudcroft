@@ -1,6 +1,6 @@
 //! Integration Test Harness
 //!
-//! Professional-grade test infrastructure for HemiMUD:
+//! Professional-grade test infrastructure for Mudcroft:
 //! - `TestServer` - Spawns a real server on random port with in-memory DB
 //! - `TestClient` - Role-based authenticated WebSocket client
 //! - `TestWorld` - Pre-configured universe with regions and rooms

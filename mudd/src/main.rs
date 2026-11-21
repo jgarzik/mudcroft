@@ -1,4 +1,4 @@
-//! mudd - HemiMUD server daemon
+//! mudd - Mudcroft server daemon
 
 use std::net::SocketAddr;
 
@@ -7,7 +7,7 @@ use clap::Parser;
 use mudd::{Config, Server};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// HemiMUD server daemon
+/// Mudcroft server daemon
 #[derive(Parser, Debug)]
 #[command(name = "mudd", version, about)]
 struct Args {
@@ -30,6 +30,11 @@ struct Args {
     /// Cluster peers (format: "1=host1:9000,2=host2:9001"). Omit for single-node.
     #[arg(long)]
     peers: Option<String>,
+
+    /// Serve the built web client (e.g. client/dist) from this directory on
+    /// the same origin as the API. Must contain index.html.
+    #[arg(long)]
+    static_dir: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -53,6 +58,7 @@ async fn main() -> Result<()> {
         node_id: args.node_id,
         raft_port: args.raft_port,
         peers: args.peers,
+        static_dir: args.static_dir,
     };
 
     // Create and run server

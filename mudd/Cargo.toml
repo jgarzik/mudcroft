@@ -2,7 +2,7 @@
 name = "mudd"
 version = "0.1.0"
 edition = "2021"
-description = "HemiMUD server daemon"
+description = "Mudcroft server daemon"
 
 [[bin]]
 name = "mudd"
@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["full"] }
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
@@ -37,9 +37,6 @@ openraft = { version = "0.9", features = ["serde"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Configuration
-figment = { version = "0.10", features = ["toml", "env"] }
 
 # Logging/tracing
 tracing = "0.1"
@@ -72,3 +69,6 @@ regex = "1"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

@@ -105,7 +105,7 @@ export const useGameStore = create<GameStore>()(
         set({ messages: [] }),
     }),
     {
-      name: 'hemimud-storage',
+      name: 'mudcroft-storage',
       partialize: (state) => ({
         token: state.token,
         username: state.username,

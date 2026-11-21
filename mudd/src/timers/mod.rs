@@ -117,6 +117,12 @@ pub struct TimerFired {
     pub args: Option<String>,
 }
 
+/// Most pending one-shot timers a single object may have
+pub const MAX_TIMERS_PER_OBJECT: usize = 32;
+
+/// Shortest allowed heartbeat interval (one timer-loop tick)
+pub const MIN_HEARTBEAT_MS: u64 = 100;
+
 /// Timer manager for a universe
 pub struct TimerManager {
     /// One-shot timers (in memory)
@@ -185,6 +191,26 @@ impl TimerManager {
         id
     }
 
+    /// Add a one-shot timer unless its object already has
+    /// [`MAX_TIMERS_PER_OBJECT`] pending. Returns the timer id if added.
+    pub async fn try_add_timer(&self, timer: Timer) -> Option<String> {
+        let pending = self
+            .timers
+            .read()
+            .await
+            .values()
+            .filter(|t| t.object_id == timer.object_id)
+            .count();
+        if pending >= MAX_TIMERS_PER_OBJECT {
+            warn!(
+                "Object {} already has {} pending timers; refusing call_out",
+                timer.object_id, pending
+            );
+            return None;
+        }
+        Some(self.add_timer(timer).await)
+    }
+
     /// Remove a timer by ID
     pub async fn remove_timer(&self, timer_id: &str) -> bool {
         // Remove from DB via Raft if available, otherwise direct SQL
@@ -234,8 +260,9 @@ impl TimerManager {
         }
     }
 
-    /// Set a heartbeat for an object
-    pub async fn set_heartbeat(&self, heartbeat: HeartBeat) {
+    /// Set a heartbeat for an object (interval clamped to [`MIN_HEARTBEAT_MS`])
+    pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) {
+        heartbeat.interval_ms = heartbeat.interval_ms.max(MIN_HEARTBEAT_MS);
         self.heartbeats
             .write()
             .await

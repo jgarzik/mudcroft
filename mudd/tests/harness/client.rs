@@ -78,6 +78,8 @@ pub struct TestClient {
     account_id: Option<String>,
     auth_token: Option<String>,
     player_id: Option<String>,
+    /// Messages already read from the socket but not yet returned
+    pending: std::collections::VecDeque<Value>,
 }
 
 impl TestClient {
@@ -169,12 +171,20 @@ impl TestClient {
             account_id,
             auth_token,
             player_id: None,
+            pending: std::collections::VecDeque::new(),
         };
 
         // Receive and process welcome message
         let welcome = client.recv_json_timeout(Duration::from_secs(5)).await?;
         if welcome["type"] == "welcome" {
             client.player_id = welcome["player_id"].as_str().map(|s| s.to_string());
+
+            // The server always follows the welcome with the spawn room (or
+            // a "not initialized" notice). Wait for it here and queue it, so
+            // a later drain() or expect() sees it deterministically instead
+            // of racing its arrival.
+            let spawn = client.recv_json_timeout(Duration::from_secs(5)).await?;
+            client.pending.push_back(spawn);
         }
 
         Ok(client)
@@ -230,6 +240,9 @@ impl TestClient {
 
     /// Receive the next message as JSON
     pub async fn recv_json(&mut self) -> Result<Value> {
+        if let Some(msg) = self.pending.pop_front() {
+            return Ok(msg);
+        }
         loop {
             match self.read.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -282,6 +295,44 @@ impl TestClient {
     /// Wait for any message with custom timeout
     pub async fn expect_any_timeout(&mut self, timeout: Duration) -> Result<Value> {
         self.recv_json_timeout(timeout).await
+    }
+
+    /// Wait for an `output` message whose text contains `needle`
+    /// (skipping other messages). Returns the full text.
+    pub async fn expect_output_containing(&mut self, needle: &str) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                bail!("Timeout waiting for output containing {:?}", needle);
+            }
+            let msg = self.recv_json_timeout(remaining).await?;
+            if msg["type"] == "output" {
+                let text = msg["text"].as_str().unwrap_or_default();
+                if text.contains(needle) {
+                    return Ok(text.to_string());
+                }
+            }
+        }
+    }
+
+    /// Texts of all `output` messages received within `window`
+    pub async fn outputs_within(&mut self, window: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut texts = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return texts;
+            }
+            match self.recv_json_timeout(remaining).await {
+                Ok(msg) if msg["type"] == "output" => {
+                    texts.push(msg["text"].as_str().unwrap_or_default().to_string())
+                }
+                Ok(_) => {}
+                Err(_) => return texts,
+            }
+        }
     }
 
     /// Drain all pending messages (non-blocking)

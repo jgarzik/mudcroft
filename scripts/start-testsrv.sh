@@ -1,198 +1,169 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# Start Test Server Script
+# Start a local Mudcroft server for manual play-testing.
 #
-# Sets up the server infrastructure for browser-based E2E testing.
-# After running this script, use Claude Chrome browser automation
-# to perform the actual tests.
+# Creates a fresh database in a private temp dir, starts mudd serving the
+# built web client (client/dist) on the same origin, creates a universe and
+# loads scripts/cave_adventure.lua into it. Runs in the foreground; Ctrl+C
+# (or scripts/stop-testsrv.sh from another terminal) stops the server and
+# deletes the temp dir.
 #
 # Usage:
-#   ./scripts/start-testsrv.sh
-#
-# What it does:
-#   1. Stops any existing test server (via stop-testsrv.sh)
-#   2. Initializes database with admin user
-#   3. Starts server
-#   4. Creates default universe
-#   5. Starts client dev server
-#   6. Waits for browser-based testing (Ctrl+C to stop)
+#   scripts/start-testsrv.sh
 #
 # Environment:
-#   TESTDIR - Test directory (default: /tmp/mudcroft-e2e-test)
+#   PORT            port to listen on (default 8080; the Vite dev server's
+#                   proxy also expects 8080, so `npm run dev` in client/ works
+#                   against it)
+#   ADMIN_USERNAME  admin account (default admin)
+#   ADMIN_PASSWORD  admin password (default testpass123)
 #
+# Prerequisites: built binaries (cd mudd && cargo build --release), built
+# client (cd client && npm run build), curl, jq, node (for setportal).
+# For automated browser tests use scripts/e2e.sh instead.
 
-set -e
+set -euo pipefail
 
-# Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Stop any existing test server first
-"${SCRIPT_DIR}/stop-testsrv.sh"
-
-# Configuration
-TESTDIR="${TESTDIR:-/tmp/mudcroft-e2e-test}"
-ADMIN_USERNAME="admin"
-ADMIN_PASSWORD="testpass123"
-SERVER_HOST="127.0.0.1"
-SERVER_PORT="8080"
-SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
-
-# Project root
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# shellcheck source-path=SCRIPTDIR source=testsrv-common.sh
+source "${SCRIPT_DIR}/testsrv-common.sh"
 
-# PIDs for cleanup
+PORT="${PORT:-8080}"
+ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-testpass123}"
+UNIVERSE_ID="test-world"
+SERVER_URL="http://127.0.0.1:${PORT}"
+BIN_DIR="${PROJECT_ROOT}/mudd/target/release"
+DIST_DIR="${PROJECT_ROOT}/client/dist"
+
+for tool in curl jq node; do
+    command -v "$tool" >/dev/null || { echo "[ERROR] $tool is required"; exit 1; }
+done
+for bin in mudd mudd_init; do
+    [ -x "${BIN_DIR}/${bin}" ] || {
+        echo "[ERROR] ${BIN_DIR}/${bin} not found. Run: (cd mudd && cargo build --release)"
+        exit 1
+    }
+done
+[ -f "${DIST_DIR}/index.html" ] || {
+    echo "[ERROR] client not built. Run: (cd client && npm ci && npm run build)"
+    exit 1
+}
+if testsrv_running; then
+    echo "[ERROR] A test server is already running (PID $(testsrv_pid)). Stop it with scripts/stop-testsrv.sh"
+    exit 1
+fi
+if curl -s -o /dev/null "${SERVER_URL}/health"; then
+    echo "[ERROR] Something is already listening on port ${PORT}. Set PORT to use another port."
+    exit 1
+fi
+
+TESTDIR="$(mktemp -d "${TMPDIR:-/tmp}/mudcroft-testsrv.XXXXXX")"
 SERVER_PID=""
-CLIENT_PID=""
 
+# shellcheck disable=SC2317  # invoked via trap
 cleanup() {
+    trap - EXIT INT TERM
     echo ""
-    echo "[CLEANUP] Stopping services..."
-
-    if [ -n "$CLIENT_PID" ] && kill -0 "$CLIENT_PID" 2>/dev/null; then
-        kill "$CLIENT_PID" 2>/dev/null || true
-        wait "$CLIENT_PID" 2>/dev/null || true
-        echo "[CLEANUP] Client stopped"
-    fi
-
+    echo "[CLEANUP] Stopping server..."
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
-        echo "[CLEANUP] Server stopped"
     fi
-
-    if [ -d "$TESTDIR" ]; then
-        rm -rf "$TESTDIR"
-        echo "[CLEANUP] Test directory removed"
-    fi
-
+    rm -rf "$TESTDIR"
+    rm -f "$TESTSRV_STATE"
     echo "[CLEANUP] Done"
 }
-
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 
-wait_for_server() {
-    local max_attempts=50
-    local attempt=0
-
-    while [ $attempt -lt $max_attempts ]; do
-        if curl -s "${SERVER_URL}/health" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 0.1
-        ((attempt++))
-    done
-
-    return 1
+echo "[SETUP] Initializing database in ${TESTDIR}..."
+MUDD_ADMIN_USERNAME="$ADMIN_USERNAME" MUDD_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+    "${BIN_DIR}/mudd_init" --database "${TESTDIR}/mudcroft.db" \
+    --lib-dir "${PROJECT_ROOT}/mudd/lib" >"${TESTDIR}/init.log" 2>&1 || {
+    cat "${TESTDIR}/init.log"
+    exit 1
 }
 
-main() {
-    echo ""
-    echo "========================================="
-    echo "   HemiMUD E2E Test Server Setup"
-    echo "========================================="
-    echo ""
+# Optional local settings such as VENICE_API_KEY
+if [ -f "${PROJECT_ROOT}/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${PROJECT_ROOT}/.env"
+    set +a
+fi
 
-    # Check prerequisites
-    if [ ! -f "${PROJECT_ROOT}/mudd/target/release/mudd" ]; then
-        echo "[ERROR] mudd binary not found. Run: cd mudd && cargo build --release"
-        exit 1
-    fi
+echo "[START] Starting mudd on ${SERVER_URL}..."
+# run_script reads scripts/ relative to the working directory
+(cd "$PROJECT_ROOT" && exec "${BIN_DIR}/mudd" \
+    --bind "127.0.0.1:${PORT}" \
+    --database "${TESTDIR}/mudcroft.db" \
+    --static-dir "$DIST_DIR") >"${TESTDIR}/server.log" 2>&1 &
+SERVER_PID=$!
+printf '%s\n%s\n' "$SERVER_PID" "$TESTDIR" >"$TESTSRV_STATE"
 
-    if [ ! -f "${PROJECT_ROOT}/mudd/target/release/mudd_init" ]; then
-        echo "[ERROR] mudd_init binary not found. Run: cd mudd && cargo build --release"
-        exit 1
-    fi
+for _ in $(seq 1 300); do
+    curl -s -o /dev/null "${SERVER_URL}/health" && break
+    kill -0 "$SERVER_PID" 2>/dev/null || { cat "${TESTDIR}/server.log"; exit 2; }
+    sleep 0.1
+done
+curl -s -o /dev/null "${SERVER_URL}/health" || { echo "[ERROR] server did not start"; exit 2; }
 
-    # Phase 1: Setup (stop-testsrv.sh already cleaned up)
-    echo "[SETUP] Creating test directory..."
-    mkdir -p "$TESTDIR"
-
-    # Phase 2: Initialize Database
-    echo "[SETUP] Initializing database..."
-    MUDD_ADMIN_USERNAME="$ADMIN_USERNAME" \
-    MUDD_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-    "${PROJECT_ROOT}/mudd/target/release/mudd_init" \
-        --database "${TESTDIR}/mudcroft.db" 2>&1 | grep -v "^$"
-
-    # Phase 3: Start Server
-    echo "[START] Starting server..."
-
-    # Load .env if exists
-    if [ -f "${PROJECT_ROOT}/.env" ]; then
-        set -a
-        source "${PROJECT_ROOT}/.env"
-        set +a
-    fi
-
-    "${PROJECT_ROOT}/mudd/target/release/mudd" \
-        --bind "${SERVER_HOST}:${SERVER_PORT}" \
-        --database "${TESTDIR}/mudcroft.db" \
-        >"${TESTDIR}/server.log" 2>&1 &
-    SERVER_PID=$!
-
-    if ! wait_for_server; then
-        echo "[ERROR] Server failed to start"
-        cat "${TESTDIR}/server.log"
-        exit 2
-    fi
-    echo "[START] Server running (PID: $SERVER_PID)"
-
-    # Phase 4: Create Universe via API
-    echo "[START] Logging in as admin..."
-    LOGIN_RESPONSE=$(curl -s -X POST "${SERVER_URL}/auth/login" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}")
-
-    ADMIN_UUID=$(echo "$LOGIN_RESPONSE" | jq -r '.account_id')
-    if [ -z "$ADMIN_UUID" ] || [ "$ADMIN_UUID" = "null" ]; then
-        echo "[ERROR] Login failed: $LOGIN_RESPONSE"
-        exit 2
-    fi
-
-    echo "[START] Creating test universe..."
-    UNIVERSE_RESPONSE=$(curl -s -X POST "${SERVER_URL}/universe/create" \
-        -H "Content-Type: application/json" \
-        -d "{\"id\":\"test-world\",\"name\":\"Test Universe\",\"owner_id\":\"${ADMIN_UUID}\"}")
-
-    UNIVERSE_ID=$(echo "$UNIVERSE_RESPONSE" | jq -r '.id')
-    if [ -z "$UNIVERSE_ID" ] || [ "$UNIVERSE_ID" = "null" ]; then
-        echo "[ERROR] Universe creation failed: $UNIVERSE_RESPONSE"
-        exit 2
-    fi
-    echo "[START] Universe created: $UNIVERSE_ID"
-
-    # Phase 5: Start Client
-    echo "[START] Starting client..."
-    (cd "${PROJECT_ROOT}/client" && npm run dev >"${TESTDIR}/client.log" 2>&1) &
-    CLIENT_PID=$!
-    sleep 2
-
-    if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
-        echo "[WARN] Client failed to start"
-        CLIENT_PID=""
-    else
-        echo "[START] Client running (PID: $CLIENT_PID)"
-    fi
-
-    # Ready
-    echo ""
-    echo "========================================="
-    echo "   READY FOR BROWSER TESTING"
-    echo "========================================="
-    echo ""
-    echo "  Server:   ${SERVER_URL}"
-    echo "  Client:   http://localhost:5173"
-    echo "  Admin:    ${ADMIN_USERNAME} / ${ADMIN_PASSWORD}"
-    echo "  Universe: ${UNIVERSE_ID}"
-    echo ""
-    echo "  WebSocket: /ws?token=...&universe=${UNIVERSE_ID}"
-    echo ""
-    echo "  Press Ctrl+C to stop and cleanup"
-    echo ""
-    echo "========================================="
-
-    # Wait for interrupt
-    wait
+api() { # method path [json] -> body; fails on HTTP errors
+    curl -sf -X "$1" "${SERVER_URL}$2" -H "Content-Type: application/json" \
+        ${TOKEN:+-H "Authorization: Bearer ${TOKEN}"} ${3:+-d "$3"}
 }
 
-main "$@"
+echo "[SEED] Logging in as ${ADMIN_USERNAME}..."
+LOGIN="$(api POST /auth/login "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}")"
+TOKEN="$(jq -r .token <<<"$LOGIN")"
+ADMIN_ID="$(jq -r .account_id <<<"$LOGIN")"
+
+echo "[SEED] Creating universe ${UNIVERSE_ID}..."
+api POST /universe/create \
+    "{\"id\":\"${UNIVERSE_ID}\",\"name\":\"Test Universe\",\"owner_id\":\"${ADMIN_ID}\"}" >/dev/null
+
+echo "[SEED] Loading cave adventure..."
+api POST "/universe/${UNIVERSE_ID}/run_script" '{"script":"cave_adventure.lua"}' | jq -r .result
+
+echo "[SEED] Setting portal..."
+WS_URL="ws://127.0.0.1:${PORT}/ws?universe=${UNIVERSE_ID}&token=${TOKEN}" node -e '
+const ws = new WebSocket(process.env.WS_URL)
+// The reply is the first output/error after our command is echoed back
+let sent = false
+let echoed = false
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data)
+  if (msg.type === "welcome" && !sent) {
+    sent = true
+    ws.send(JSON.stringify({ type: "command", text: "setportal /rooms/cave-entrance" }))
+  } else if (msg.type === "echo") {
+    echoed = true
+  } else if (echoed && (msg.type === "output" || msg.type === "error")) {
+    console.log(msg.text || msg.message)
+    ws.close()
+    process.exit(msg.type === "error" ? 1 : 0)
+  }
+}
+setTimeout(() => { console.error("setportal timed out"); process.exit(1) }, 10000)
+'
+
+cat <<EOF
+
+=========================================
+   READY FOR PLAY-TESTING
+=========================================
+  Open:      ${SERVER_URL}
+  Admin:     ${ADMIN_USERNAME} / ${ADMIN_PASSWORD}
+  Universe:  ${UNIVERSE_ID}
+  Logs:      ${TESTDIR}/server.log
+  Stop:      Ctrl+C, or scripts/stop-testsrv.sh
+=========================================
+EOF
+
+# Exit 0 when stopped by stop-testsrv.sh (SIGTERM); report crashes
+status=0
+wait "$SERVER_PID" || status=$?
+[ "$status" -eq 143 ] && status=0
+exit "$status"

@@ -1,263 +1,163 @@
 //! Integration tests for Lua game logic
 //!
-//! This test runner executes the game_logic_tests.lua file which contains
-//! comprehensive tests for combat, permissions, class inheritance, and more.
+//! Runs the user-story suite in `tests/lua/game_logic_tests.lua` (regions,
+//! fixed objects, custom weapon class, spawner chest, combat, permissions,
+//! class inheritance) through a wizard's `eval` against a real server.
+//!
+//! Run from mudd/:
+//!
+//! ```text
+//! cargo test --release --test lua_game_logic_test
+//! ```
+//!
+//! The suite is run one SECTION per eval to stay inside the eval budget.
+//! Real player and builder accounts are created here and their ids passed
+//! to the suite in an `ACCOUNTS` table, since access levels come from the
+//! accounts table and `game.set_actor` needs a real account.
 
 mod harness;
 
-use harness::{Role, TestServer};
+use std::time::Duration;
 
-/// Execute Lua game logic tests via eval command
-///
-/// This test:
-/// 1. Starts a TestServer with the full test world (TestWorld::create sets up "default" universe)
-/// 2. Connects as a wizard (required for eval command)
-/// 3. Executes a subset of working tests
-/// 4. Parses the output for pass/fail count
+use harness::{Role, TestClient, TestServer};
+
+/// The Lua suite, embedded at compile time
+const SUITE: &str = include_str!("lua/game_logic_tests.lua");
+
+/// Quote a value for embedding in Lua source. Only ids and section names
+/// are embedded, so anything beyond a conservative charset is a bug.
+fn lua_str(value: &str) -> String {
+    assert!(
+        value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/')),
+        "unexpected characters in {:?}",
+        value
+    );
+    format!("\"{}\"", value)
+}
+
+/// Run the suite with `prelude` and `SECTION = section`; returns the report
+async fn run_section(wizard: &mut TestClient, prelude: &str, section: &str) -> String {
+    let code = format!("{}local SECTION = {}\n{}", prelude, lua_str(section), SUITE);
+    wizard.drain().await;
+    wizard
+        .command(&format!("eval {}", code))
+        .await
+        .expect("send eval");
+    let _ = wizard.expect("echo").await;
+
+    // Skip unrelated output (e.g. room broadcasts) until the suite's reply
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let reply = wizard
+            .expect_any_timeout(remaining)
+            .await
+            .unwrap_or_else(|e| panic!("no reply for section {}: {}", section, e));
+        match reply["type"].as_str() {
+            Some("error") => panic!("Lua error in section {}: {}", section, reply["message"]),
+            Some("output") => {
+                let text = reply["text"].as_str().unwrap_or_default();
+                if text.starts_with("LUA-SUITE") {
+                    return text.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse `key=<number>` out of a report line
+fn field(line: &str, key: &str) -> usize {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(&format!("{}=", key)))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("missing {} in {:?}", key, line))
+}
+
+/// Run every Lua game-logic test; fails if any Lua test fails
 #[tokio::test]
 async fn test_lua_game_logic() {
     let server = TestServer::start().await.expect("Failed to start server");
-    // Note: TestWorld::create() now sets up the "default" universe with a portal
 
-    // Connect as wizard
     let mut wizard = server
         .connect_as(Role::Wizard {
             username: "luatester".to_string(),
         })
         .await
         .expect("Failed to connect as wizard");
-
-    // Define the test code - a simplified version that matches current APIs
-    // This focuses on tests that work with existing game.* functions
-    let test_code = r#"
-local Test = {}
-Test.passed = 0
-Test.failed = 0
-
-function Test.assert(condition, msg)
-    if condition then
-        Test.passed = Test.passed + 1
-    else
-        Test.failed = Test.failed + 1
-        print("FAIL: " .. msg)
-    end
-end
-
-function Test.assert_eq(a, b, msg)
-    Test.assert(a == b, msg .. " (expected " .. tostring(b) .. ", got " .. tostring(a) .. ")")
-end
-
--- Test 1: Basic object creation
--- New API: game.create_object(path, class, parent_id, props)
-local function test_basic_object()
-    local obj = game.create_object("/items/test-sword", "item", nil, {name = "Test Sword", description = "A test item"})
-    Test.assert(obj ~= nil and obj.error == nil, "Object should be created")
-    Test.assert_eq(obj.name, "Test Sword", "Object name should match")
-    Test.assert_eq(obj.class, "item", "Object class should be item")
-    return obj
-end
-
--- Test 2: Get object
-local function test_get_object()
-    local obj = game.create_object("/items/retrieval-test", "item", nil, {name = "Retrieval Test"})
-    local retrieved = game.get_object(obj.id)
-    Test.assert(retrieved ~= nil, "Should retrieve object")
-    Test.assert_eq(retrieved.name, "Retrieval Test", "Retrieved name should match")
-end
-
--- Test 3: Update object
-local function test_update_object()
-    local obj = game.create_object("/items/update-test", "item", nil, {name = "Update Test"})
-    local success = game.update_object(obj.id, {description = "Updated description"})
-    Test.assert(success, "Update should succeed")
-    local updated = game.get_object(obj.id)
-    Test.assert_eq(updated.description, "Updated description", "Description should be updated")
-end
-
--- Test 4: Delete object
-local function test_delete_object()
-    local obj = game.create_object("/items/delete-test", "item", nil, {name = "Delete Test"})
-    local deleted = game.delete_object(obj.id)
-    Test.assert(deleted, "Delete should succeed")
-    local gone = game.get_object(obj.id)
-    Test.assert(gone == nil, "Object should be gone after delete")
-end
-
--- Test 5: Parent/child relationships
-local function test_parent_child()
-    local parent = game.create_object("/rooms/parent-room", "room", nil, {name = "Parent Room"})
-    local child = game.create_object("/items/child-item", "item", parent.id, {name = "Child Item"})
-    Test.assert_eq(child.parent_id, parent.id, "Child should have parent_id set")
-
-    local children = game.get_children(parent.id)
-    Test.assert(#children >= 1, "Parent should have children")
-end
-
--- Test 6: Move object
-local function test_move_object()
-    local room1 = game.create_object("/rooms/room1", "room", nil, {name = "Room 1"})
-    local room2 = game.create_object("/rooms/room2", "room", nil, {name = "Room 2"})
-    local item = game.create_object("/items/movable-item", "item", room1.id, {name = "Movable Item"})
-
-    game.move_object(item.id, room2.id)
-    local moved = game.get_object(item.id)
-    Test.assert_eq(moved.parent_id, room2.id, "Item should have moved to room2")
-end
-
--- Test 7: Code storage
-local function test_code_storage()
-    local code = "return { on_use = function() return 'used' end }"
-    local hash = game.store_code(code)
-    Test.assert(hash ~= nil, "Code should be stored")
-    Test.assert(#hash == 64, "Hash should be 64 chars (SHA-256)")
-
-    local retrieved = game.get_code(hash)
-    Test.assert_eq(retrieved, code, "Retrieved code should match")
-end
-
--- Test 8: Define class
-local function test_define_class()
-    game.define_class("test_weapon", {
-        parent = "item",
-        properties = {
-            damage_dice = { type = "string", default = "1d6" },
-            damage_bonus = { type = "number", default = 0 }
-        }
-    })
-
-    local class_info = game.get_class("test_weapon")
-    Test.assert(class_info ~= nil, "Class should be defined")
-    Test.assert_eq(class_info.parent, "item", "Parent should be item")
-end
-
--- Test 9: Time functions
-local function test_time()
-    local t1 = game.time()
-    Test.assert(t1 > 0, "Time should be positive")
-
-    -- Set time override (requires wizard permission)
-    local success = game.set_time(1000000)
-    Test.assert(success, "set_time should succeed for wizard")
-
-    local t2 = game.time()
-    Test.assert_eq(t2, 1000000, "Time should be overridden")
-
-    -- Reset
-    game.set_time(0)
-end
-
--- Test 10: RNG seed
-local function test_rng()
-    local success = game.set_rng_seed(12345)
-    Test.assert(success, "set_rng_seed should succeed for wizard")
-
-    local roll1 = game.roll_dice("1d20")
-    game.set_rng_seed(12345)  -- Reset seed
-    local roll2 = game.roll_dice("1d20")
-    Test.assert_eq(roll1, roll2, "Same seed should produce same roll")
-end
-
--- Test 11: set_actor / get_actor
-local function test_set_actor()
-    game.set_actor("test_user_123")
-    local actor = game.get_actor()
-    Test.assert_eq(actor, "test_user_123", "Actor should be set")
-
-    game.set_actor(nil)
-    local cleared = game.get_actor()
-    Test.assert(cleared == nil, "Actor should be cleared")
-end
-
--- Run all tests
-local test_names = {
-    "test_basic_object",
-    "test_get_object",
-    "test_update_object",
-    "test_delete_object",
-    "test_parent_child",
-    "test_move_object",
-    "test_code_storage",
-    "test_define_class",
-    "test_time",
-    "test_rng",
-    "test_set_actor",
-}
-local tests = {
-    test_basic_object,
-    test_get_object,
-    test_update_object,
-    test_delete_object,
-    test_parent_child,
-    test_move_object,
-    test_code_storage,
-    test_define_class,
-    test_time,
-    test_rng,
-    test_set_actor,
-}
-
-local errors = {}
-local assertion_errors = {}
-for i, test_fn in ipairs(tests) do
-    local before_failed = Test.failed
-    local ok, err = pcall(test_fn)
-    if not ok then
-        Test.failed = Test.failed + 1
-        table.insert(errors, test_names[i] .. ": " .. tostring(err))
-    elseif Test.failed > before_failed then
-        -- Test completed but had assertion failures
-        table.insert(assertion_errors, test_names[i])
-    end
-end
-
-local result = Test.passed .. " passed, " .. Test.failed .. " failed"
-if #errors > 0 then
-    result = result .. " ERRORS: " .. table.concat(errors, " | ")
-end
-if #assertion_errors > 0 then
-    result = result .. " ASSERTIONS FAILED IN: " .. table.concat(assertion_errors, ", ")
-end
-return result
-"#;
-
-    // Send eval command
-    wizard
-        .command(&format!("eval {}", test_code))
+    // Kept connected for the whole run: the player's body is its player object
+    let player = server
+        .connect_as(Role::Player {
+            username: "luaplayer".to_string(),
+        })
         .await
-        .expect("Failed to send eval command");
+        .expect("Failed to connect as player");
+    let builder = server
+        .connect_as(Role::Builder {
+            username: "luabuilder".to_string(),
+            regions: vec![],
+        })
+        .await
+        .expect("Failed to connect as builder");
 
-    // Skip the echo
-    let _ = wizard.expect("echo").await;
+    let prelude = format!(
+        "local ACCOUNTS = {{ wizard = {}, player = {}, builder = {}, player_body = {} }}\n",
+        lua_str(wizard.account_id().expect("wizard account")),
+        lua_str(player.account_id().expect("player account")),
+        lua_str(builder.account_id().expect("builder account")),
+        lua_str(player.player_id().expect("player body")),
+    );
 
-    // Get output (may be output or error)
-    let output = wizard.expect_any().await.expect("Should receive response");
+    // Section names and the total test count come from the suite itself
+    let listing = run_section(&mut wizard, &prelude, "list").await;
+    let sections: Vec<String> = listing
+        .split_whitespace()
+        .nth(1)
+        .expect("section list")
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let total = field(&listing, "total");
 
-    if output["type"] == "error" {
-        panic!("Lua error: {}", output["message"]);
-    }
-
-    let text = output["text"].as_str().expect("Should have text output");
-    println!("Test results: {}", text);
-
-    // Parse result - show full output
-    println!("Full output: {}", text);
-    assert!(text.contains("passed"), "Should have pass count");
-
-    // For now, just check that most tests pass (we can tighten this later)
-    // The key goal is to have a working test runner
-    if text.contains("ERRORS") {
-        println!("Some tests failed (this is expected during development)");
-    }
-    // Parse the numbers
-    let parts: Vec<&str> = text.split(' ').collect();
-    if let Some(pos) = parts.iter().position(|&s| s == "passed,") {
-        if pos > 0 {
-            if let Ok(passed) = parts[pos - 1].parse::<u32>() {
-                // At least some tests should pass
-                assert!(passed >= 10, "At least 10 tests should pass, got: {}", text);
+    let (mut passed, mut failed, mut skipped) = (0, 0, 0);
+    let mut failures = Vec::new();
+    let mut skips = Vec::new();
+    for section in &sections {
+        let report = run_section(&mut wizard, &prelude, section).await;
+        println!("{}", report);
+        for line in report.lines() {
+            if line.starts_with("FAIL ") {
+                failures.push(line.to_string());
+            } else if line.starts_with("SKIP ") {
+                skips.push(line.to_string());
+            } else if line.starts_with("RESULT ") {
+                passed += field(line, "passed");
+                failed += field(line, "failed");
+                skipped += field(line, "skipped");
             }
         }
     }
+
+    println!(
+        "\nLua game logic: {} passed, {} failed, {} skipped (of {})",
+        passed, failed, skipped, total
+    );
+    for skip in &skips {
+        println!("  {}", skip);
+    }
+    assert!(
+        failures.is_empty() && failed == 0,
+        "{} Lua test(s) failed:\n{}",
+        failed,
+        failures.join("\n")
+    );
+    assert_eq!(
+        passed + skipped,
+        total,
+        "every Lua test must run in exactly one section"
+    );
 }
 
 /// Test that game.set_actor works correctly with permissions

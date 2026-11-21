@@ -59,24 +59,27 @@ impl PlayerManager {
     }
 
     /// Get the spawn location for a player on connect.
-    /// Priority: last_safe_location > universe portal
+    /// Priority: last_safe_location > current safe room > universe portal.
+    /// The player object is shared by every universe the account visits, so
+    /// remembered rooms count only if they belong to `universe_id`.
     pub async fn get_spawn_location(
         &self,
         player: &Object,
         universe_id: &str,
     ) -> Result<Option<String>> {
-        // Check last safe location
+        // Check last safe location (still exists, in this universe)
         if let Some(last_safe) = player.get_string("last_safe_location") {
-            // Verify room still exists
-            if self.object_store.get(last_safe).await?.is_some() {
-                return Ok(Some(last_safe.to_string()));
+            if let Some(room) = self.object_store.get(last_safe).await? {
+                if room.universe_id == universe_id {
+                    return Ok(Some(last_safe.to_string()));
+                }
             }
         }
 
         // Check if player has a current location (parent_id) that's a valid room
         if let Some(ref parent_id) = player.parent_id {
             if let Some(room) = self.object_store.get(parent_id).await? {
-                if room.class == "room" {
+                if room.class == "room" && room.universe_id == universe_id {
                     // Check if it's a safe zone
                     if self.is_safe_zone(parent_id, player).await? {
                         return Ok(Some(parent_id.clone()));

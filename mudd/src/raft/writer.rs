@@ -37,11 +37,16 @@ impl RaftWriter {
 
         let (raft, _read_pool) = create_raft_node(node_id, pool, network_config).await?;
 
-        // Initialize as single-node cluster
-        let mut members = std::collections::BTreeMap::new();
-        members.insert(node_id, BasicNode::default());
-
-        raft.initialize(members).await?;
+        // Initialize as a single-node cluster the first time only: on a
+        // database this node has served before, the Raft state (vote, log)
+        // is already persisted and initialize() is refused.
+        if raft.is_initialized().await? {
+            info!("Raft state found; resuming existing single-node cluster");
+        } else {
+            let mut members = std::collections::BTreeMap::new();
+            members.insert(node_id, BasicNode::default());
+            raft.initialize(members).await?;
+        }
 
         Ok(Self {
             raft,

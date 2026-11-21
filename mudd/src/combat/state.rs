@@ -407,12 +407,13 @@ impl CombatManager {
         Ok(())
     }
 
-    /// Perform an attack
+    /// Perform an attack: roll to hit, and on a hit deal `damage` (already
+    /// rolled by the caller; doubled on a critical) of `damage_type`
     pub async fn attack(
         &self,
         attacker_id: &str,
         defender_id: &str,
-        damage_dice: i32,
+        damage: i32,
         damage_type: DamageType,
     ) -> Result<AttackResult, String> {
         let result = {
@@ -429,7 +430,7 @@ impl CombatManager {
                 // Calculate and apply damage
                 let is_crit = result.critical;
                 let defender_mut = states.get_mut(defender_id).unwrap();
-                let damage_result = defender_mut.take_damage(damage_dice, damage_type, is_crit);
+                let damage_result = defender_mut.take_damage(damage, damage_type, is_crit);
                 result = result.with_damage(damage_result);
             }
 

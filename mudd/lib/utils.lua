@@ -1,4 +1,4 @@
--- Utility functions for HemiMUD
+-- Utility functions for Mudcroft
 -- Helper functions and wrappers for common operations
 
 Utils = {}
