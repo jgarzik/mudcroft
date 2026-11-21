@@ -12,6 +12,10 @@ export default tseslint.config(
       ecmaVersion: 2022,
       globals: { ...globals.browser, ...globals.node },
     },
+  },
+  {
+    // React rules apply to the app only (Playwright fixtures also call `use`)
+    files: ['src/**/*.{ts,tsx}'],
     plugins: { 'react-hooks': reactHooks },
     rules: {
       'react-hooks/rules-of-hooks': 'error',
