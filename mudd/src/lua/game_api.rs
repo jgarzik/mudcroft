@@ -17,6 +17,31 @@ use crate::permissions::{AccessLevel, Action as PermAction, ObjectContext, Permi
 use crate::timers::{HeartBeat, Timer, TimerManager};
 use crate::venice::{ChatMessage, ImageSize, ImageStyle, ModelTier, VeniceClient};
 
+/// Actor override set by `game.set_actor`. Kept in Lua app data (Rust-side
+/// state) rather than a Lua global so sandboxed code cannot forge it.
+struct ActorOverride(Option<String>);
+
+/// The actor override for this Lua state, if `game.set_actor` set one
+fn actor_override(lua: &Lua) -> Option<String> {
+    lua.app_data_ref::<ActorOverride>()
+        .and_then(|a| a.0.clone())
+}
+
+/// Block on an async permission lookup from a synchronous Lua callback
+fn block_on_perm<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(fut)
+    })
+    .join()
+    .expect("permission lookup thread panicked")
+}
+
 /// Game API context shared with Lua
 #[allow(dead_code)]
 pub struct GameApi {
@@ -227,8 +252,7 @@ impl GameApi {
                 let universe_id = universe_clone.clone();
 
                 // Get current user for ownership
-                let globals = lua.globals();
-                let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+                let actor_override: Option<String> = actor_override(lua);
                 let owner_id = actor_override;
 
                 // Create object with path validation
@@ -843,25 +867,39 @@ impl GameApi {
         let universe_id = self.universe_id.clone();
 
         // game.set_actor(actor_id)
-        // Sets the current actor for permission checks in this Lua context
-        // Used by tests to simulate different users
-        let set_actor = lua.create_function(|lua, actor_id: Option<String>| {
-            let globals = lua.globals();
-            match actor_id {
-                Some(id) => globals.set("_current_actor_id", id)?,
-                None => globals.set("_current_actor_id", Value::Nil)?,
+        // Sets the current actor for permission checks in this Lua context.
+        // Callers may only act as accounts strictly below their own level
+        // (see AccessLevel::can_act_as); nil clears the override.
+        let permissions_clone = permissions.clone();
+        let current_user_clone = current_user.clone();
+        let set_actor = lua.create_function(move |lua, actor_id: Option<String>| {
+            let Some(id) = actor_id else {
+                lua.set_app_data(ActorOverride(None));
+                return Ok(true);
+            };
+            // With no real user (trusted server-side context) anything goes
+            if let Some(real) = current_user_clone.clone() {
+                if id != real {
+                    let permissions = permissions_clone.clone();
+                    let target = id.clone();
+                    let allowed = block_on_perm(async move {
+                        let real_level = permissions.get_access_level(&real).await;
+                        let target_level = permissions.get_access_level(&target).await;
+                        real_level.can_act_as(target_level)
+                    });
+                    if !allowed {
+                        return Ok(false);
+                    }
+                }
             }
+            lua.set_app_data(ActorOverride(Some(id)));
             Ok(true)
         })?;
         game.set("set_actor", set_actor)?;
 
         // game.get_actor()
         // Gets the current actor ID for permission checks
-        let get_actor = lua.create_function(|lua, ()| {
-            let globals = lua.globals();
-            let actor: Option<String> = globals.get("_current_actor_id").ok();
-            Ok(actor)
-        })?;
+        let get_actor = lua.create_function(|lua, ()| Ok(actor_override(lua)))?;
         game.set("get_actor", get_actor)?;
 
         // game.check_permission(action, target_id, is_fixed, owner_id)
@@ -900,9 +938,8 @@ impl GameApi {
                     }
                 };
 
-                // Get user context - prefer _current_actor_id from Lua globals if set
-                let globals = lua.globals();
-                let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+                // Get user context - prefer the game.set_actor override if set
+                let actor_override: Option<String> = actor_override(lua);
                 let user_id = actor_override
                     .or(current_user)
                     .unwrap_or_else(|| "anonymous".to_string());
@@ -948,8 +985,7 @@ impl GameApi {
             let current_user = current_user_clone.clone();
             let universe_id = universe_clone.clone();
 
-            let globals = lua.globals();
-            let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+            let actor_override: Option<String> = actor_override(lua);
             let user_id = actor_override
                 .or(current_user)
                 .unwrap_or_else(|| "anonymous".to_string());
@@ -994,10 +1030,12 @@ impl GameApi {
         game.set("get_access_level", get_access_level)?;
 
         // game.set_access_level(account_id, level_str)
-        // Sets a user's access level (requires admin)
+        // Sets a user's access level. Rules: AccessLevel::can_set_access_level
+        // (admin+, target below caller, admin/owner grants need owner).
         let permissions_clone = permissions.clone();
+        let current_user_clone = current_user.clone();
         let set_access_level =
-            lua.create_function(move |_, (account_id, level_str): (String, String)| {
+            lua.create_function(move |lua, (account_id, level_str): (String, String)| {
                 let permissions = permissions_clone.clone();
 
                 let level = match level_str.as_str() {
@@ -1009,16 +1047,21 @@ impl GameApi {
                     _ => return Ok(false),
                 };
 
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        permissions.set_access_level(&account_id, level).await;
-                    });
-                })
-                .join()
-                .ok();
+                let Some(caller) = actor_override(lua).or(current_user_clone.clone()) else {
+                    return Ok(false);
+                };
 
-                Ok(true)
+                let changed = block_on_perm(async move {
+                    let caller_level = permissions.get_access_level(&caller).await;
+                    let target_level = permissions.get_access_level(&account_id).await;
+                    if !caller_level.can_set_access_level(target_level, level) {
+                        return false;
+                    }
+                    permissions.set_access_level(&account_id, level).await;
+                    true
+                });
+
+                Ok(changed)
             })?;
         game.set("set_access_level", set_access_level)?;
 
@@ -1033,8 +1076,7 @@ impl GameApi {
                 let current_user = current_user_clone.clone();
                 let universe_id = universe_clone.clone();
 
-                let globals = lua.globals();
-                let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+                let actor_override: Option<String> = actor_override(lua);
                 let user_id = actor_override
                     .or(current_user)
                     .unwrap_or_else(|| "anonymous".to_string());
@@ -1091,8 +1133,7 @@ impl GameApi {
             let current_user = current_user_clone.clone();
             let universe_id = universe_clone.clone();
 
-            let globals = lua.globals();
-            let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+            let actor_override: Option<String> = actor_override(lua);
             let user_id = actor_override
                 .or(current_user)
                 .unwrap_or_else(|| "anonymous".to_string());
@@ -1324,38 +1365,38 @@ impl GameApi {
         game.set("deduct_credits", deduct_credits)?;
 
         // game.admin_grant_credits(account_id, amount)
-        // Grant credits to a player (wizard+ only)
+        // Grant credits to a player (admin+, via PermAction::GrantCredits)
         let credits_clone = credits;
         let universe_clone = universe_id;
         let user_clone = current_user;
         let admin_grant_credits =
-            lua.create_function(move |_, (account_id, amount): (String, i64)| {
+            lua.create_function(move |lua, (account_id, amount): (String, i64)| {
                 let credits = credits_clone.clone();
                 let universe_id = universe_clone.clone();
-                let user_id = user_clone.clone();
                 let permissions = permissions.clone();
+                let Some(user_id) = actor_override(lua).or(user_clone.clone()) else {
+                    return Ok(false);
+                };
 
-                let result = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        // Check if current user is wizard+
-                        if let Some(ref uid) = user_id {
-                            let level = permissions.get_access_level(uid).await;
-                            if level < AccessLevel::Wizard {
-                                return false;
-                            }
-                        } else {
-                            return false;
-                        }
+                let result = block_on_perm(async move {
+                    let ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                    let target = ObjectContext {
+                        object_id: format!("/universe/{}", universe_id),
+                        owner_id: None,
+                        is_fixed: false,
+                    };
+                    if !permissions
+                        .check_permission(&ctx, PermAction::GrantCredits, &target)
+                        .is_allowed()
+                    {
+                        return false;
+                    }
 
-                        credits
-                            .grant(&universe_id, &account_id, amount, "admin_grant")
-                            .await;
-                        true
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
+                    credits
+                        .grant(&universe_id, &account_id, amount, "admin_grant")
+                        .await;
+                    true
+                });
 
                 Ok(result)
             })?;
@@ -1513,8 +1554,7 @@ impl GameApi {
             let time_override = time_override_clone.clone();
 
             // Check for actor override from game.set_actor()
-            let globals = lua.globals();
-            let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+            let actor_override: Option<String> = actor_override(lua);
             let effective_user = actor_override.or(user_id);
 
             // Check wizard+ permission
@@ -1552,8 +1592,7 @@ impl GameApi {
             let rng = rng_clone.clone();
 
             // Check for actor override from game.set_actor()
-            let globals = lua.globals();
-            let actor_override: Option<String> = globals.get("_current_actor_id").ok();
+            let actor_override: Option<String> = actor_override(lua);
             let effective_user = actor_override.or(user_id);
 
             // Check wizard+ permission
@@ -1711,31 +1750,35 @@ impl GameApi {
         game.set("get_universe", get_universe)?;
 
         // game.update_universe(config)
-        // Update universe config (wizard+ only)
+        // Update universe config (admin+, via PermAction::AdminConfig)
         // Merges config into existing universe config
         let store_clone = store;
         let universe_clone = universe_id;
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
-        let update_universe = lua.create_function(move |_, config: Table| {
+        let update_universe = lua.create_function(move |lua, config: Table| {
             let store = store_clone.clone();
             let universe_id = universe_clone.clone();
             let permissions = permissions_clone.clone();
-            let user_id = user_clone.clone();
+            let Some(user_id) = actor_override(lua).or(user_clone.clone()) else {
+                return Ok(false);
+            };
 
             // Convert Lua table to JSON
             let config_json = lua_to_json(Value::Table(config))?;
 
-            // Check wizard+ permission and update
             let result: Result<bool, anyhow::Error> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    // Check permission
-                    if let Some(ref uid) = user_id {
-                        let level = permissions.get_access_level(uid).await;
-                        if level < AccessLevel::Wizard {
-                            return Ok(false);
-                        }
-                    } else {
+                    let ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                    let target = ObjectContext {
+                        object_id: format!("/universe/{}", universe_id),
+                        owner_id: None,
+                        is_fixed: false,
+                    };
+                    if !permissions
+                        .check_permission(&ctx, PermAction::AdminConfig, &target)
+                        .is_allowed()
+                    {
                         return Ok(false);
                     }
 

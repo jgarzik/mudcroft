@@ -7,6 +7,7 @@
 //! - Chat: Say command and messaging
 //! - Multiuser: Builder permissions, path grants, multi-user interactions
 //! - Player lifecycle: Persistent objects, safe zones, disconnect, reconnect
+//! - Security: Access-level enforcement in privileged Lua functions
 
 pub mod chat;
 pub mod combat;
@@ -14,3 +15,4 @@ pub mod inventory;
 pub mod movement;
 pub mod multiuser;
 pub mod player_lifecycle;
+pub mod security;
