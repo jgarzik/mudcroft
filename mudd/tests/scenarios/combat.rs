@@ -13,6 +13,10 @@ async fn player_in_passage(server: &TestServer, name: &str) -> TestClient {
         })
         .await
         .expect("connect");
+    // The spawn room arrives after the welcome; consume it before moving so
+    // it cannot be mistaken for the reply to "north"
+    let spawn = c.expect("room").await.expect("spawn room");
+    assert_eq!(spawn["name"], "Cave Entrance");
     c.drain().await;
     c.command("north").await.expect("north");
     let room = c.expect("room").await.expect("moved north");

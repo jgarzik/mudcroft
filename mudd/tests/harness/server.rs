@@ -58,11 +58,6 @@ impl TestServer {
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("test.db");
 
-        // Find a random available port
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-
         // Find the binary paths
         let mudd_path = find_binary_path("mudd")?;
         let init_path = find_binary_path("mudd_init")?;
@@ -99,7 +94,22 @@ impl TestServer {
         let extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
         let log_path = temp_dir.path().join("mudd.log");
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
-        let child = spawn_mudd(&client, &mudd_path, addr, &db_path, &extra_args, &log_path).await?;
+        // Pick a free port and start; if another process took the port in the
+        // meantime, the server exits and we try again with a new one
+        let mut attempt = 0;
+        let (addr, child) = loop {
+            attempt += 1;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let addr = listener.local_addr()?;
+            drop(listener);
+            match spawn_mudd(&client, &mudd_path, addr, &db_path, &extra_args, &log_path).await {
+                Ok(child) => break (addr, child),
+                Err(e) if attempt < 3 && e.to_string().contains("exited during startup") => {
+                    continue
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         // Open a separate database connection for test setup
         // Configure with foreign keys enabled to match server behavior
@@ -450,12 +460,19 @@ async fn spawn_mudd(
     // election (up to 10s), which is slow when many test servers start at
     // once, so allow generous time but stop early if it exits.
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    // Ports are picked by bind-and-release, so another test's server can
+    // grab ours first. Answering /health is not enough: our own log must
+    // show that *this* process is listening on the address.
+    let listening = format!("mudd listening on {}", addr);
     loop {
         if client
             .get(format!("http://{}/health", addr))
             .send()
             .await
             .is_ok()
+            && std::fs::read_to_string(log_path)
+                .map(|log| log.contains(&listening))
+                .unwrap_or(false)
         {
             return Ok(child);
         }

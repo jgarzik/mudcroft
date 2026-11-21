@@ -78,6 +78,8 @@ pub struct TestClient {
     account_id: Option<String>,
     auth_token: Option<String>,
     player_id: Option<String>,
+    /// Messages already read from the socket but not yet returned
+    pending: std::collections::VecDeque<Value>,
 }
 
 impl TestClient {
@@ -169,12 +171,20 @@ impl TestClient {
             account_id,
             auth_token,
             player_id: None,
+            pending: std::collections::VecDeque::new(),
         };
 
         // Receive and process welcome message
         let welcome = client.recv_json_timeout(Duration::from_secs(5)).await?;
         if welcome["type"] == "welcome" {
             client.player_id = welcome["player_id"].as_str().map(|s| s.to_string());
+
+            // The server always follows the welcome with the spawn room (or
+            // a "not initialized" notice). Wait for it here and queue it, so
+            // a later drain() or expect() sees it deterministically instead
+            // of racing its arrival.
+            let spawn = client.recv_json_timeout(Duration::from_secs(5)).await?;
+            client.pending.push_back(spawn);
         }
 
         Ok(client)
@@ -230,6 +240,9 @@ impl TestClient {
 
     /// Receive the next message as JSON
     pub async fn recv_json(&mut self) -> Result<Value> {
+        if let Some(msg) = self.pending.pop_front() {
+            return Ok(msg);
+        }
         loop {
             match self.read.next().await {
                 Some(Ok(Message::Text(text))) => {
