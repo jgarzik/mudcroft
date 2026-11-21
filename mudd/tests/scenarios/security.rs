@@ -630,3 +630,43 @@ async fn test_script_messages_stay_in_universe() {
     .unwrap_or(false);
     assert!(!leaked, "message crossed universes");
 }
+
+/// use_object cannot fan out without bound, and cannot reach private
+/// (underscore) handlers or engine hooks of another owner's object
+#[tokio::test]
+async fn test_use_object_limits() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = connect(&server, wizard("fanout_wiz")).await;
+
+    // An object whose on_use uses itself repeatedly: without a shared
+    // budget this is exponential
+    let out = eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_use = function(a)
+               -- pcall swallows nested errors, so only a shared budget stops this
+               for i = 1, 10 do pcall(game.use_object, a.object_id, a.actor_id, "use") end
+               return "done"
+             end,
+             _secret = function(a) return "leaked" end,
+             on_death = function(a) return "fake death" end,
+           }]])
+           game.create_object("/items/hydra", "item", nil, {name = "hydra", code_hash = h})
+           return tostring(game.use_object("/items/hydra", "me", "use"))"#,
+    )
+    .await;
+    // Returning at all (instead of ~10^8 sandbox runs) shows the cap works
+    assert_eq!(out, "done");
+
+    for verb in ["_secret", "on_death"] {
+        let out = eval(
+            &mut wiz,
+            &format!(
+                r#"return tostring(game.use_object("/items/hydra", "me", "{}"))"#,
+                verb
+            ),
+        )
+        .await;
+        assert_eq!(out, "nil", "{} must not be callable via use_object", verb);
+    }
+}

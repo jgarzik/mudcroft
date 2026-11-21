@@ -119,10 +119,28 @@ pub struct GameApi {
     rng: Arc<Mutex<StdRng>>,
     /// How many game.use_object calls deep this API's script is nested
     use_depth: usize,
+    /// game.use_object calls made so far by this top-level execution,
+    /// shared with every nested sandbox it spawns
+    use_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Deepest allowed game.use_object nesting (object code using objects...)
 const MAX_USE_DEPTH: usize = 8;
+
+/// Most game.use_object calls one top-level execution may make in total,
+/// across all nesting levels (each call runs a whole new sandbox)
+const MAX_USE_CALLS: usize = 32;
+
+/// Engine hooks: run by the server on events, never via game.use_object
+const ENGINE_HOOKS: &[&str] = &[
+    "on_enter",
+    "on_leave",
+    "on_damage",
+    "on_death",
+    "heart_beat",
+    "on_create",
+    "on_destroy",
+];
 
 impl GameApi {
     /// Create a new game API for a universe
@@ -156,6 +174,7 @@ impl GameApi {
             time_override: Arc::new(AtomicU64::new(0)),
             rng: Arc::new(Mutex::new(StdRng::from_rng(&mut rand::rng()))),
             use_depth: 0,
+            use_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -179,6 +198,7 @@ impl GameApi {
             time_override: self.time_override.clone(),
             rng: self.rng.clone(),
             use_depth: self.use_depth + 1,
+            use_calls: self.use_calls.clone(),
         }
     }
 
@@ -2062,6 +2082,15 @@ impl GameApi {
                             MAX_USE_DEPTH
                         )));
                     }
+                    let calls = nested_api
+                        .use_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if calls >= MAX_USE_CALLS {
+                        return Err(mlua::Error::runtime(format!(
+                            "use_object: more than {} calls in one execution",
+                            MAX_USE_CALLS
+                        )));
+                    }
                     let store = nested_api.store.clone();
                     let universe_id = nested_api.universe_id.clone();
 
@@ -2104,6 +2133,11 @@ impl GameApi {
                         "init" => "on_init",
                         other => other, // Use verb directly if no mapping
                     };
+                    // `_name` handlers are private to the object's own code, and
+                    // engine hooks only run on real events
+                    if handler_name.starts_with('_') || ENGINE_HOOKS.contains(&handler_name) {
+                        return Ok(Value::Nil);
+                    }
 
                     let mut args = serde_json::json!({
                         "object_id": obj_id,
