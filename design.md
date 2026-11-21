@@ -88,8 +88,7 @@ mudcroft/
 │   │   │   ├── websocket.rs
 │   │   │   └── protocol.rs     # Message types
 │   │   ├── auth/
-│   │   │   ├── mod.rs
-│   │   │   └── jwt.rs
+│   │   │   └── mod.rs
 │   │   ├── venice/
 │   │   │   ├── mod.rs
 │   │   │   ├── client.rs       # OpenAI-compatible API
@@ -266,8 +265,7 @@ CREATE TABLE accounts (
     username TEXT UNIQUE,
     created_at INTEGER NOT NULL,
     last_login INTEGER,
-    is_banned BOOLEAN DEFAULT FALSE,
-    platform_tier TEXT DEFAULT 'free'
+    is_banned BOOLEAN DEFAULT FALSE
 );
 
 CREATE TABLE universes (
@@ -302,7 +300,6 @@ CREATE TABLE universe_config (
 CREATE TABLE credits (
     account_id TEXT PRIMARY KEY,
     balance INTEGER NOT NULL DEFAULT 0,
-    lifetime_deposited INTEGER DEFAULT 0,
     lifetime_spent INTEGER DEFAULT 0
 );
 
@@ -310,7 +307,7 @@ CREATE TABLE credit_transactions (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
     amount INTEGER NOT NULL,
-    type TEXT NOT NULL,  -- 'deposit', 'spend', 'refund', 'grant'
+    type TEXT NOT NULL,  -- 'spend', 'refund', 'grant'
     spend_category TEXT,  -- 'object_creation', 'llm_fast', 'llm_image', etc.
     created_at INTEGER NOT NULL
 );
@@ -877,8 +874,9 @@ interface RoomState {
 
 ## 10. Pricing & Economics
 
-
 ### Default Costs
+
+Costs are drafted in US cents; the USD-to-credits conversion belongs to the parked payment design in `docs/blockchain.md`.
 
 | Action | Cost |
 |--------|------|
@@ -1903,7 +1901,8 @@ These tests validate that player-facing game mechanics work as expected before a
 ### REST Endpoints
 
 ```
-POST /api/auth/login         -> { token, account }
+POST /auth/register          -> { token, account_id, username, access_level }
+POST /auth/login             -> { token, account_id, username, access_level }
 GET  /api/universes          -> universe[]
 POST /api/universes          -> universe (create)
 GET  /api/universes/:id      -> universe details
@@ -1911,7 +1910,7 @@ GET  /api/universes/:id      -> universe details
 
 ### WebSocket
 
-`wss://play.mudcroft.com/ws` — Auth via JWT in first message.
+`wss://<host>/ws?universe=<id>&token=<token>` — session token in the query string.
 
 ## 14. Deployment & Operations
 

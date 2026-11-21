@@ -101,8 +101,8 @@ Columns and records the original spec proposed:
 | `accounts` | `wallet_address TEXT UNIQUE NOT NULL`, `platform_tier TEXT DEFAULT 'free'` |
 | `universes` | `vendor_wallet TEXT NOT NULL` |
 | player object | `wallet_address` property |
-| credits | `lifetime_deposited`, `lifetime_spent` |
-| `credit_transactions` | ledger rows with `type` in `deposit`, `spend`, `refund`, `grant` |
+| credits | `lifetime_deposited` |
+| `credit_transactions` | a `deposit` ledger row type (the general spend/refund/grant ledger is a non-blockchain roadmap item) |
 
 Typed Raft log entries proposed:
 
