@@ -192,6 +192,7 @@ mod tests {
             "CREATE TABLE raft_log (
                 log_index INTEGER PRIMARY KEY,
                 term INTEGER NOT NULL,
+                leader_node INTEGER NOT NULL DEFAULT 0,
                 entry_type TEXT NOT NULL,
                 payload TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
