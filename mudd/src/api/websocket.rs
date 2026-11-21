@@ -107,25 +107,20 @@ impl ConnectionManager {
             .map(|s| s.sender.clone())
     }
 
-    /// Send a message to a specific player
+    /// Send a message to a specific player.
+    ///
+    /// Never blocks: if the player's queue is full (a client that stopped
+    /// reading) the message is dropped, so one slow client cannot stall
+    /// other players or the player's own command handler.
     pub async fn send_to_player(&self, player_id: &str, msg: ServerMessage) {
         if let Some(sender) = self.get_sender(player_id).await {
-            if sender.send(msg).await.is_err() {
-                warn!("Failed to send message to player {}", player_id);
-            }
+            try_deliver(player_id, &sender, msg);
         }
     }
 
     /// Broadcast a message to all players in a room
     pub async fn broadcast_room(&self, room_id: &str, msg: ServerMessage) {
-        let sessions = self.sessions.read().await;
-        for session in sessions.values() {
-            if session.room_id.as_deref() == Some(room_id)
-                && session.sender.send(msg.clone()).await.is_err()
-            {
-                warn!("Failed to broadcast to player {}", session.player_id);
-            }
-        }
+        self.broadcast_room_except(room_id, None, msg).await;
     }
 
     /// Broadcast to all players in a room except `exclude_id` (if given)
@@ -135,14 +130,19 @@ impl ConnectionManager {
         exclude_id: Option<&str>,
         msg: ServerMessage,
     ) {
-        let sessions = self.sessions.read().await;
-        for session in sessions.values() {
-            if session.room_id.as_deref() == Some(room_id)
-                && Some(session.player_id.as_str()) != exclude_id
-                && session.sender.send(msg.clone()).await.is_err()
-            {
-                warn!("Failed to broadcast to player {}", session.player_id);
-            }
+        // Copy the recipients out so the lock is not held while sending
+        let recipients: Vec<(String, mpsc::Sender<ServerMessage>)> = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .filter(|s| {
+                s.room_id.as_deref() == Some(room_id) && Some(s.player_id.as_str()) != exclude_id
+            })
+            .map(|s| (s.player_id.clone(), s.sender.clone()))
+            .collect();
+        for (player_id, sender) in recipients {
+            try_deliver(&player_id, &sender, msg.clone());
         }
     }
 
@@ -181,6 +181,27 @@ impl ConnectionManager {
             .map(|s| s.universe_id.clone())
     }
 }
+
+/// Queue a message for one client without waiting; drop it if the client's
+/// queue is full or closed
+fn try_deliver(player_id: &str, sender: &mpsc::Sender<ServerMessage>, msg: ServerMessage) {
+    match sender.try_send(msg) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("Dropping message for player {}: queue full", player_id)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(
+                "Failed to send message to player {}: disconnected",
+                player_id
+            )
+        }
+    }
+}
+
+/// Per-connection outgoing queue size. Generous so a burst of script output
+/// fits; a client that stops reading only loses its own messages.
+const CLIENT_QUEUE_SIZE: usize = 256;
 
 /// Messages sent from server to client
 #[derive(Debug, Clone, Serialize)]
@@ -295,7 +316,7 @@ async fn handle_socket(
     universe_id: String,
 ) {
     // Create message channel for this connection
-    let (tx, mut rx) = mpsc::channel::<ServerMessage>(32);
+    let (tx, mut rx) = mpsc::channel::<ServerMessage>(CLIENT_QUEUE_SIZE);
 
     let (account_id, username, access_level) = match &account {
         Some(acc) => {
@@ -1423,4 +1444,61 @@ fn parse_create_args(args: &str) -> Result<CreateParams, String> {
         parent_id,
         properties,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(
+        player_id: &str,
+        room: &str,
+        cap: usize,
+    ) -> (PlayerSession, mpsc::Receiver<ServerMessage>) {
+        let (tx, rx) = mpsc::channel(cap);
+        (
+            PlayerSession {
+                player_id: player_id.to_string(),
+                account_id: String::new(),
+                universe_id: "u".to_string(),
+                room_id: Some(room.to_string()),
+                access_level: AccessLevel::Player,
+                sender: tx,
+            },
+            rx,
+        )
+    }
+
+    fn out(text: &str) -> ServerMessage {
+        ServerMessage::Output {
+            text: text.to_string(),
+        }
+    }
+
+    /// A client that stops reading must not block senders or the session
+    /// lock: messages to a full queue are dropped.
+    #[tokio::test]
+    async fn test_full_client_queue_does_not_block() {
+        let conns = ConnectionManager::new();
+        let (stuck, _stuck_rx) = session("stuck", "r", 1);
+        let (ok, mut ok_rx) = session("ok", "r", 8);
+        conns.register(stuck).await;
+        conns.register(ok).await;
+
+        let deliver = async {
+            for i in 0..5 {
+                conns
+                    .broadcast_room_except("r", None, out(&format!("b{i}")))
+                    .await;
+                conns.send_to_player("stuck", out("direct")).await;
+            }
+            // Writers still get the lock
+            conns.update_room("ok", Some("r2".to_string())).await;
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), deliver)
+            .await
+            .expect("delivery must not block on a full client queue");
+
+        assert!(matches!(ok_rx.recv().await, Some(ServerMessage::Output { text }) if text == "b0"));
+    }
 }
