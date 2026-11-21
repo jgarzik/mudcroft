@@ -98,6 +98,54 @@ pub async fn invoke_handler(
     result
 }
 
+/// How often the timer loop checks for due call_outs and heartbeats
+const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Fire due call_out timers and heartbeats forever.
+///
+/// Each callback runs the named handler on the object's code, as the
+/// object's owner, with {object_id, room_id, args}.
+pub async fn run_timer_loop(state: AppState) {
+    let mut interval = tokio::time::interval(TIMER_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        for fired in state.timers.tick().await {
+            let room_id = match state.object_store.get(&fired.object_id).await {
+                Ok(Some(obj)) => obj.parent_id,
+                Ok(None) => {
+                    // Object is gone: stop its heartbeat too
+                    state.timers.remove_heartbeat(&fired.object_id).await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("Timer object {} lookup failed: {}", fired.object_id, e);
+                    continue;
+                }
+            };
+            let ctx = ScriptContext {
+                universe_id: fired.universe_id.clone(),
+                user_id: None,
+                room_id: room_id.clone(),
+                object_id: Some(fired.object_id.clone()),
+            };
+            let args = serde_json::json!({
+                "object_id": fired.object_id,
+                "room_id": room_id,
+                "args": fired.args,
+            });
+            if let Err(e) = invoke_handler(&state, &ctx, &fired.method, args).await {
+                tracing::warn!(
+                    "Timer {} on {} failed: {}",
+                    fired.method,
+                    fired.object_id,
+                    e
+                );
+            }
+        }
+    }
+}
+
 /// Source of an object's attached code, if any. Objects from another
 /// universe never run in this one.
 async fn object_code(

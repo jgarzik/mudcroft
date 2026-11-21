@@ -105,6 +105,9 @@ pub async fn router(db: Arc<Database>, raft_writer: Arc<RaftWriter>) -> Router {
         combat,
     };
 
+    // Fire call_out timers and heartbeats in the background
+    tokio::spawn(scripting::run_timer_loop(state.clone()));
+
     Router::new()
         .route("/health", get(health_check))
         .route("/", get(root))

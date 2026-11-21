@@ -244,3 +244,74 @@ async fn test_custom_verbs_dispatch_to_object_handlers() {
         .await
         .unwrap();
 }
+
+/// call_out and heart_beat callbacks fire on the object's code
+#[tokio::test]
+async fn test_call_out_and_heart_beat_fire() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "timer_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local bell = game.store_code([[return {{
+                 ring = function(a)
+                   game.call_out(0.3, "chime", a.actor_id)
+                   return "You pull the bell rope."
+                 end,
+                 chime = function(a) game.send(a.args, "The bell chimes.") end,
+                 wind = function(a) game.set_heart_beat(200); return "You wind the clock." end,
+                 halt = function(a) game.remove_heart_beat(); return "The clock stops." end,
+                 heart_beat = function(a) game.broadcast(a.room_id, "Tick.") end,
+               }}]])
+               game.create_object("/items/bell", "item", "{room}", {{name = "bell", fixed = true, code_hash = bell}})
+               game.add_action("ring", "/items/bell", "ring")
+               game.add_action("wind", "/items/bell", "wind")
+               game.add_action("halt", "/items/bell", "halt")
+               return true"#,
+            room = entrance
+        ),
+    )
+    .await;
+
+    let mut alice = player(&server, "timer_alice").await;
+
+    alice.command("ring bell").await.unwrap();
+    alice
+        .expect_output_containing("You pull the bell rope.")
+        .await
+        .unwrap();
+    alice
+        .expect_output_containing("The bell chimes.")
+        .await
+        .expect("call_out fired");
+
+    alice.command("wind bell").await.unwrap();
+    alice
+        .expect_output_containing("You wind the clock.")
+        .await
+        .unwrap();
+    alice
+        .expect_output_containing("Tick.")
+        .await
+        .expect("first beat");
+    alice
+        .expect_output_containing("Tick.")
+        .await
+        .expect("second beat");
+
+    alice.command("halt bell").await.unwrap();
+    alice
+        .expect_output_containing("The clock stops.")
+        .await
+        .unwrap();
+    // Allow an in-flight beat to land, then expect silence
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    alice.drain().await;
+    let after = alice.outputs_within(Duration::from_millis(600)).await;
+    assert!(
+        !after.iter().any(|t| t.contains("Tick.")),
+        "heart_beat stopped: {:?}",
+        after
+    );
+}
