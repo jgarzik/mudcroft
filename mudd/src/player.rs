@@ -143,6 +143,42 @@ impl PlayerManager {
 
     /// Handle player disconnect.
     /// If not in a safe zone, drops all inventory to the current room.
+    /// Record that a player has a game session
+    pub async fn mark_online(&self, universe_id: &str, player_id: &str) -> Result<()> {
+        self.object_store
+            .execute_batch(vec![(
+                "INSERT OR REPLACE INTO online_players (universe_id, player_id, since)
+                 VALUES (?, ?, ?)"
+                    .to_string(),
+                vec![
+                    serde_json::json!(universe_id),
+                    serde_json::json!(player_id),
+                    serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                ],
+            )])
+            .await
+    }
+
+    /// Handle a disconnect, then record the player as offline
+    pub async fn finish_disconnect(&self, universe_id: &str, player_id: &str) -> Result<()> {
+        self.handle_disconnect(universe_id, player_id).await?;
+        self.object_store
+            .execute_batch(vec![(
+                "DELETE FROM online_players WHERE universe_id = ? AND player_id = ?".to_string(),
+                vec![serde_json::json!(universe_id), serde_json::json!(player_id)],
+            )])
+            .await
+    }
+
+    /// Players recorded as online: (universe, player)
+    pub async fn online_players(&self) -> Result<Vec<(String, String)>> {
+        Ok(
+            sqlx::query_as("SELECT universe_id, player_id FROM online_players")
+                .fetch_all(self.object_store.pool())
+                .await?,
+        )
+    }
+
     pub async fn handle_disconnect(&self, universe_id: &str, player_id: &str) -> Result<()> {
         let player = match self.object_store.get(universe_id, player_id).await? {
             Some(p) => p,

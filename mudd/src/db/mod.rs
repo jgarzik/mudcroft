@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -42,6 +42,20 @@ const CLUSTER_NODES_TABLE: &str = r#"
         node_id INTEGER PRIMARY KEY,
         addr TEXT NOT NULL,
         added_at TEXT NOT NULL
+    )
+"#;
+
+/// Players with a game session (written on connect, removed when their
+/// disconnect is handled): a new primary handles the disconnect of anyone
+/// listed who does not reconnect, even if the server they were on died
+const ONLINE_PLAYERS_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS online_players (
+        universe_id TEXT NOT NULL,
+        player_id TEXT NOT NULL,
+        since TEXT NOT NULL,
+        PRIMARY KEY (universe_id, player_id),
+        FOREIGN KEY (universe_id, player_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE
     )
 "#;
 
@@ -125,6 +139,7 @@ impl Database {
     /// - 6 -> 7 (credits_holder_exists trigger): upgraded in place.
     /// - 7 -> 8 (actions table: custom verbs persisted): upgraded in place.
     /// - 8 -> 9 (cluster_nodes table: node ids never reused): in place.
+    /// - 9 -> 10 (online_players table): in place.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -153,6 +168,14 @@ impl Database {
             sqlx::query(CLUSTER_NODES_TABLE).execute(&self.pool).await?;
             self.set_schema_version(9).await?;
             info!("Upgraded database schema 8 -> 9");
+            version = 9;
+        }
+        if version == 9 {
+            sqlx::query(ONLINE_PLAYERS_TABLE)
+                .execute(&self.pool)
+                .await?;
+            self.set_schema_version(10).await?;
+            info!("Upgraded database schema 9 -> 10");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -268,6 +291,7 @@ impl Database {
             "universe_members",
             "actions",
             "cluster_nodes",
+            "online_players",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -484,6 +508,9 @@ impl Database {
 
         sqlx::query(ACTIONS_TABLE).execute(&self.pool).await?;
         sqlx::query(CLUSTER_NODES_TABLE).execute(&self.pool).await?;
+        sqlx::query(ONLINE_PLAYERS_TABLE)
+            .execute(&self.pool)
+            .await?;
 
         // Path grants table (for path-based permission delegation)
         sqlx::query(

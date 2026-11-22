@@ -109,8 +109,11 @@ upgrades live (`Database::upgrade`), and there are none yet.
    both loops;
    on losing leadership it stops them and drops its caches of custom verbs.
    Deadlines are absolute, so whatever fell due during
-   a failover runs at once, and only once. A node that is leader at startup
-   (always, for a single node) waits for this before serving. Elsewhere,
+   a failover runs at once, and only once. After the reconnect grace
+   period it also handles the disconnect of every player recorded in
+   `online_players` who has not reconnected (their server crashed or
+   stepped down). A node that is leader at startup (always, for a single
+   node) waits for this before serving. Elsewhere,
    writes fail with "not the primary".
 8. Bind the TCP listener and serve the Axum router with graceful shutdown.
 

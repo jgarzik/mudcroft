@@ -44,6 +44,7 @@ pub async fn run(state: AppState, active: watch::Sender<bool>) {
             continue;
         }
         let timer_loop = tokio::spawn(scripting::run_timer_loop(state.clone()));
+        let recovery = tokio::spawn(handle_orphaned_sessions(state.clone()));
         let effect_loop = tokio::spawn(effect_scheduler::run_effect_scheduler(state.clone()));
         // The term this activation belongs to: a later term means another
         // node may have led meanwhile (watch notifications can merge a lost
@@ -72,6 +73,7 @@ pub async fn run(state: AppState, active: watch::Sender<bool>) {
         active.send_replace(false);
         timer_loop.abort();
         effect_loop.abort();
+        recovery.abort();
         // The next primary has the verbs (they are in the table)
         state.actions.clear_all().await;
         // Sessions move to the new primary (directly connected players
@@ -80,6 +82,41 @@ pub async fn run(state: AppState, active: watch::Sender<bool>) {
         info!("primary: node {} stepped down (schedulers stopped)", me);
         if stopped {
             return;
+        }
+    }
+}
+
+/// Players recorded as online but not connected here, once the reconnect
+/// grace period has passed, lost their server (a crash, or a primary that
+/// stepped down): handle their disconnects as the old server would have
+async fn handle_orphaned_sessions(state: AppState) {
+    tokio::time::sleep(super::websocket::RECONNECT_GRACE_PERIOD).await;
+    let online = match state.player_manager.online_players().await {
+        Ok(online) => online,
+        Err(e) => {
+            warn!("primary: reading online players failed: {}", e);
+            return;
+        }
+    };
+    for (universe, player) in online {
+        if state
+            .connections
+            .get_sender(&universe, &player)
+            .await
+            .is_some()
+        {
+            continue;
+        }
+        info!(
+            "primary: {} lost its server; handling the disconnect",
+            player
+        );
+        if let Err(e) = state
+            .player_manager
+            .finish_disconnect(&universe, &player)
+            .await
+        {
+            warn!("primary: disconnect of {} failed: {}", player, e);
         }
     }
 }

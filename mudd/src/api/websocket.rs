@@ -45,7 +45,7 @@ fn key(universe_id: &str, player_id: &str) -> SessionKey {
 }
 
 /// Grace period for reconnection (prevents inventory drop on brief disconnects)
-const RECONNECT_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const RECONNECT_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Connection manager for all active WebSocket connections
 #[derive(Default)]
@@ -561,6 +561,15 @@ async fn handle_socket(
     };
 
     state.connections.register(session).await;
+    // Recorded, so the next primary can handle this player's disconnect if
+    // the server this session is on dies
+    if let Err(e) = state
+        .player_manager
+        .mark_online(&universe_id, &player_id)
+        .await
+    {
+        warn!("recording {} as online failed: {}", player_id, e);
+    }
 
     // Send welcome message with theme
     // TODO: Get theme_id from universe config
@@ -684,7 +693,7 @@ async fn handle_socket(
                         info!("Disconnect handling skipped for {} (connected again)", player_id_for_task);
                         return;
                     }
-                    if let Err(e) = state_clone.player_manager.handle_disconnect(&universe_for_task, &player_id_for_task).await {
+                    if let Err(e) = state_clone.player_manager.finish_disconnect(&universe_for_task, &player_id_for_task).await {
                         warn!("Error handling player disconnect: {}", e);
                     }
                     info!("Disconnect handling completed for {} (grace period expired)", player_id_for_task);

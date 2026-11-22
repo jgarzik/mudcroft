@@ -58,7 +58,7 @@ mudd_init --version
 Creates a new database, or upgrades an existing one in place. Running it again
 on the same database is safe. Schema upgrades live here, never in `mudd`:
 the database records its schema version, `mudd` refuses a mismatch, and
-`mudd_init` upgrades older versions where a step exists (today 6 -> 7 -> 8 -> 9);
+`mudd_init` upgrades older versions where a step exists (today 6 through 10);
 anything older, such as a database from before versioning, is refused
 (create a new one); otherwise a
 re-run creates any missing tables and refreshes the core mudlib.

@@ -17,6 +17,11 @@ pub struct ObjectStore {
 
 impl ObjectStore {
     /// Create a new object store with the given connection pool
+    /// The database pool (reads)
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub fn new(pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self { pool, raft_writer }
     }

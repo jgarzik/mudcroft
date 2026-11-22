@@ -3,12 +3,12 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 9):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 10):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). The upgrade steps are
 6 -> 7 (adds the `credits_holder_exists` trigger), 7 -> 8 (adds the
-`actions` table) and 8 -> 9 (adds `cluster_nodes`); an older database is
-refused with a "create a new database" error (from
+`actions` table), 8 -> 9 (adds `cluster_nodes`) and 9 -> 10 (adds
+`online_players`); an older database is refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
@@ -364,6 +364,23 @@ never reused, so it cannot come back as a newer member.
 | node_id | INTEGER PRIMARY KEY | |
 | addr | TEXT NOT NULL | The cluster address it joined with |
 | added_at | TEXT NOT NULL | RFC 3339 |
+
+### online_players
+
+Players with a game session: written when a session starts, removed when
+the player's disconnect is handled (after the reconnect grace period). When
+a node becomes primary it waits out that grace period and handles the
+disconnect of everyone listed who has not reconnected, so a player whose
+server crashed or stepped down is still cleaned up.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| player_id | TEXT NOT NULL | The player object |
+| since | TEXT NOT NULL | RFC 3339 |
+
+Primary key `(universe_id, player_id)`; foreign key to `objects` ON DELETE
+CASCADE.
 ## Startup Validation
 
 `mudd` opens an existing database only. It does not create the database or

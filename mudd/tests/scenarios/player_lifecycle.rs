@@ -433,3 +433,46 @@ async fn test_safe_zone_tracking() {
 
     wizard.close().await.ok();
 }
+
+/// Who is online is recorded, so a player whose server died (a crash, or a
+/// primary that stepped down) is still handled as disconnected once the
+/// next primary has waited out the reconnect grace period
+#[tokio::test]
+async fn test_disconnect_handled_after_crash() {
+    let mut server = TestServer::start().await.expect("server");
+    let pl = server
+        .connect_as(Role::Player {
+            username: "crash_victim".into(),
+        })
+        .await
+        .unwrap();
+    let player_id = pl.player_id().unwrap().to_string();
+    let pool = server.pool().clone();
+    let universe = server.universe_id().to_string();
+    let online = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM online_players WHERE universe_id = ? AND player_id = ?",
+        )
+        .bind(&universe)
+        .bind(&player_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(-1)
+    };
+    assert_eq!(online().await, 1, "recorded as online");
+
+    server.stop(); // SIGKILL: no disconnect handling
+    drop(pl);
+    server.start_again().await.expect("restart");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline && online().await != 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        online().await,
+        0,
+        "handled as disconnected after the restart"
+    );
+    let log = std::fs::read_to_string(&server.log_path).unwrap();
+    assert!(log.contains("disconnected"), "{}", log);
+}
