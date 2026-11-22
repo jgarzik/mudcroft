@@ -1269,3 +1269,28 @@ async fn test_auth_rate_limits() {
     assert_eq!(login("third_person").await.status(), 401);
     assert_eq!(login("fourth_person").await.status(), 429, "per-IP limit");
 }
+
+/// Only failed logins count: the owner logging in again and again is never
+/// limited (by the per-username limits)
+#[tokio::test]
+async fn test_successful_logins_do_not_count() {
+    let server = TestServer::start_with_args(false, &["--auth-limit", "3"])
+        .await
+        .expect("server");
+    let creds = serde_json::json!({"username": "regular", "password": "testpass123"});
+    assert_eq!(
+        server
+            .post("/auth/register", &creds)
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    // 1 registration + 5 logins stays within the client's limit (6)
+    for _ in 0..5 {
+        assert_eq!(
+            server.post("/auth/login", &creds).await.unwrap().status(),
+            200
+        );
+    }
+}

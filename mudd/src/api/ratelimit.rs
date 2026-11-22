@@ -53,6 +53,18 @@ impl RateLimiter {
         let _ = self.take(key, true);
     }
 
+    /// Give back a request taken with `check` (e.g. the login succeeded)
+    pub fn refund(&self, key: &str) {
+        if self.per_minute == 0 {
+            return;
+        }
+        let capacity = f64::from(self.per_minute);
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((tokens, _)) = buckets.get_mut(key) {
+            *tokens = (*tokens + 1.0).min(capacity);
+        }
+    }
+
     fn take(&self, key: &str, consume: bool) -> Result<(), Duration> {
         if self.per_minute == 0 {
             return Ok(());
@@ -95,13 +107,23 @@ pub struct KeyedLocks {
 }
 
 impl KeyedLocks {
-    /// The lock for `key`
-    pub fn get(&self, key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    /// The lock for `key`, or None if `max_waiting` callers already hold
+    /// or wait for it (a queue that long would only delay everyone)
+    pub fn get(
+        &self,
+        key: &str,
+        max_waiting: usize,
+    ) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
         let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         if locks.len() >= MAX_KEYS {
             locks.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
         }
-        locks.entry(key.to_string()).or_default().clone()
+        let lock = locks.entry(key.to_string()).or_default();
+        // The map holds one reference; every caller holding one waits or works
+        if std::sync::Arc::strong_count(lock) > max_waiting {
+            return None;
+        }
+        Some(lock.clone())
     }
 }
 
