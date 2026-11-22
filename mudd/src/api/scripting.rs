@@ -412,6 +412,21 @@ fn deliver_at<'a>(
                         )
                         .await;
                 }
+                GameMessage::Confirm {
+                    target_id,
+                    id,
+                    text,
+                    amount,
+                } => {
+                    state
+                        .connections
+                        .send_to_player(
+                            universe_id,
+                            &target_id,
+                            ServerMessage::Confirm { id, text, amount },
+                        )
+                        .await;
+                }
                 GameMessage::Broadcast {
                     room_id,
                     message,

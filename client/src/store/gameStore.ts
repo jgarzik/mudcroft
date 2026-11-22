@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { RoomData, TerminalMessage } from '../types/messages'
+import type { PaymentRequest, RoomData, TerminalMessage } from '../types/messages'
 import { DEFAULT_THEME_ID } from '../theme/themeRegistry'
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
@@ -18,6 +18,8 @@ interface GameState {
   connectionStatus: ConnectionStatus
   playerId: string | null
   themeId: string
+  // The payment prompt on screen (not persisted)
+  pendingPayment: PaymentRequest | null
 }
 
 interface GameActions {
@@ -32,6 +34,7 @@ interface GameActions {
   setConnectionStatus: (status: ConnectionStatus) => void
   setPlayerId: (id: string) => void
   setThemeId: (id: string) => void
+  setPendingPayment: (payment: PaymentRequest | null) => void
   clearMessages: () => void
 }
 
@@ -54,6 +57,7 @@ export const useGameStore = create<GameStore>()(
       connectionStatus: 'disconnected',
       playerId: null,
       themeId: DEFAULT_THEME_ID,
+      pendingPayment: null,
 
       // Auth actions
       login: (token, username) =>
@@ -100,6 +104,9 @@ export const useGameStore = create<GameStore>()(
 
       setThemeId: (id) =>
         set({ themeId: id }),
+
+      setPendingPayment: (payment) =>
+        set({ pendingPayment: payment }),
 
       clearMessages: () =>
         set({ messages: [] }),

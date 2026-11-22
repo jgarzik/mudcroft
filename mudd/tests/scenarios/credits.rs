@@ -41,12 +41,62 @@ async fn verb(pl: &mut TestClient, command: &str) -> String {
         .to_string()
 }
 
-/// A shared budget on an object: players donate to it with a verb, and a
-/// verb spends from it; a verb's default payer is the player who typed it
+/// The next confirm prompt the player gets: (id, text)
+async fn prompt(pl: &mut TestClient) -> (String, String) {
+    let msg = pl.expect("confirm").await.expect("a confirm prompt");
+    (
+        msg["id"].as_str().unwrap().to_string(),
+        msg["text"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// Answer a prompt the way the web client does
+async fn answer(pl: &mut TestClient, id: &str, accept: bool) -> String {
+    pl.send_json(&serde_json::json!({"type": "confirm", "id": id, "accept": accept}))
+        .await
+        .unwrap();
+    let reply = pl.expect_any().await.expect("answer reply");
+    reply["text"]
+        .as_str()
+        .or(reply["message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+async fn setup_chest(server: &TestServer, adm: &mut TestClient, player_account: &str) {
+    let out = eval(
+        adm,
+        &format!(
+            r#"game.admin_grant_credits("{p}", 20)
+               local h = game.store_code([[return {{
+                 donate = function(a)
+                   game.request_payment(5, "a donation to the chest", "donated", "thanks")
+                   return nil
+                 end,
+                 donated = function(a) return "Thanks for " .. a.amount .. " (" .. a.data .. ")" end,
+                 repair = function(a) return tostring(game.deduct_credits(3, "repairs", "object")) end,
+                 buy = function(a) return tostring(pcall(game.deduct_credits, 2, "lamp oil")) end,
+                 tip = function(a) return tostring(pcall(game.transfer_credits, "actor", "object", 1)) end,
+               }}]])
+               game.create_object("/items/chest", "item", "{room}", {{name = "chest", fixed = true, code_hash = h}})
+               for _, v in ipairs({{"donate", "repair", "buy", "tip"}}) do
+                 game.add_action(v, "/items/chest", v)
+               end
+               return "ok""#,
+            p = player_account,
+            room = server.world().entrance_id
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ok", "{}", out);
+}
+
+/// A player pays only after confirming: request_payment prompts them, and
+/// on acceptance the credits move to the object and its handler runs;
+/// declining (by message or by typing no) changes nothing
 #[tokio::test]
-async fn test_object_budget_and_default_payer() {
+async fn test_payment_confirmed_or_declined() {
     let server = TestServer::start().await.expect("server");
-    let entrance = server.world().entrance_id.clone();
     let mut adm = connect(
         &server,
         Role::Admin {
@@ -54,7 +104,7 @@ async fn test_object_budget_and_default_payer() {
         },
     )
     .await;
-    let pl = connect(
+    let mut pl = connect(
         &server,
         Role::Player {
             username: "patron".into(),
@@ -62,45 +112,78 @@ async fn test_object_budget_and_default_payer() {
     )
     .await;
     let pl_id = pl.account_id().to_string();
-    let mut pl = pl;
+    setup_chest(&server, &mut adm, &pl_id).await;
 
-    let out = eval(
-        &mut adm,
-        &format!(
-            r#"game.admin_grant_credits("{p}", 20)
-               local h = game.store_code([[return {{
-                 donate = function(a) return tostring(game.transfer_credits("actor", "object", 5)) end,
-                 repair = function(a) return tostring(game.deduct_credits(3, "repairs", "object")) end,
-                 buy = function(a) return tostring(game.deduct_credits(2, "lamp oil")) end,
-                 balances = function(a) return game.get_credits() .. "/" .. game.object_credits() end,
-               }}]])
-               game.create_object("/items/chest", "item", "{room}", {{name = "chest", fixed = true, code_hash = h}})
-               for _, v in ipairs({{"donate", "repair", "buy", "balances"}}) do
-                 game.add_action(v, "/items/chest", v)
-               end
-               return "ok""#,
-            p = pl_id,
-            room = entrance
-        ),
-    )
-    .await;
-    assert_eq!(out["text"], "ok", "{}", out);
+    pl.drain().await;
+    pl.command("donate chest").await.unwrap();
+    let (id, text) = prompt(&mut pl).await;
+    assert!(text.contains("5") && text.contains("donation"), "{}", text);
+    assert_eq!(answer(&mut pl, &id, true).await, "Thanks for 5 (thanks)");
+    assert_eq!(balance(&server, "account", &pl_id).await, 15);
+    assert_eq!(balance(&server, "object", "/items/chest").await, 5);
 
-    assert_eq!(verb(&mut pl, "donate chest").await, "true");
-    assert_eq!(verb(&mut pl, "donate chest").await, "true");
+    pl.command("donate chest").await.unwrap();
+    let (id, _) = prompt(&mut pl).await;
+    assert!(answer(&mut pl, &id, false).await.contains("decline"));
+    // Typing yes/no answers the latest prompt
+    pl.command("donate chest").await.unwrap();
+    prompt(&mut pl).await;
+    pl.command("yes").await.unwrap();
+    pl.expect_output_containing("Thanks for 5")
+        .await
+        .expect("paid");
+    assert_eq!(balance(&server, "account", &pl_id).await, 10);
     assert_eq!(balance(&server, "object", "/items/chest").await, 10);
+
+    // The object spends its own money freely
     assert_eq!(verb(&mut pl, "repair chest").await, "true");
     assert_eq!(balance(&server, "object", "/items/chest").await, 7);
-    // The default payer is the player who typed the verb, not the owner
-    assert_eq!(verb(&mut pl, "buy chest").await, "true");
-    assert_eq!(balance(&server, "account", &pl_id).await, 20 - 10 - 2);
-    assert_eq!(verb(&mut pl, "balances chest").await, "8/7");
+
+    // An answered request cannot be accepted again
+    assert!(answer(&mut pl, &id, true).await.contains("no such"));
+    assert_eq!(balance(&server, "account", &pl_id).await, 10);
 }
 
-/// Passive hooks (walking into a room) cannot bill the player, and no code
-/// can spend from someone else's account
+/// Object code can no longer take a player's credits directly; an expired
+/// request cannot be accepted
 #[tokio::test]
-async fn test_hooks_and_strangers_cannot_spend_players_credits() {
+async fn test_no_spending_without_consent() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = connect(
+        &server,
+        Role::Admin {
+            username: "consent_admin".into(),
+        },
+    )
+    .await;
+    let mut pl = connect(
+        &server,
+        Role::Player {
+            username: "careful_patron".into(),
+        },
+    )
+    .await;
+    let pl_id = pl.account_id().to_string();
+    setup_chest(&server, &mut adm, &pl_id).await;
+    assert_eq!(verb(&mut pl, "buy chest").await, "false");
+    assert_eq!(verb(&mut pl, "tip chest").await, "false");
+    assert_eq!(balance(&server, "account", &pl_id).await, 20);
+
+    pl.command("donate chest").await.unwrap();
+    let (id, _) = prompt(&mut pl).await;
+    sqlx::query("UPDATE payment_requests SET expires_at = 0 WHERE id = ?")
+        .bind(&id)
+        .execute(server.pool())
+        .await
+        .unwrap();
+    assert!(answer(&mut pl, &id, true).await.contains("no such"));
+    assert_eq!(balance(&server, "account", &pl_id).await, 20);
+}
+
+/// Passive code (walking into a room) cannot even ask a player to pay, and
+/// no code can spend from an arbitrary account
+#[tokio::test]
+async fn test_hooks_and_strangers_cannot_bill_players() {
     let server = TestServer::start().await.expect("server");
     let mut adm = connect(
         &server,
@@ -124,7 +207,7 @@ async fn test_hooks_and_strangers_cannot_spend_players_credits() {
             r#"game.admin_grant_credits("{v}", 50)
                local h = game.store_code([[return {{
                  on_enter = function(a)
-                   local ok = pcall(game.deduct_credits, 10, "toll", "actor")
+                   local ok = pcall(game.request_payment, 10, "toll", "paid")
                    game.broadcast(a.room_id, "toll:" .. tostring(ok))
                  end,
                }}]])
@@ -147,9 +230,6 @@ async fn test_hooks_and_strangers_cannot_spend_players_credits() {
         .await
         .expect("the hook was refused");
     assert_eq!(balance(&server, "account", &victim_id).await, 50);
-
-    // Spending from an arbitrary account is not a thing: payers are only
-    // "actor" or "object"
     let out = eval(
         &mut adm,
         &format!(
@@ -163,8 +243,7 @@ async fn test_hooks_and_strangers_cannot_spend_players_credits() {
     assert_eq!(balance(&server, "account", &victim_id).await, 50);
 }
 
-/// Object code that a verb reaches through game.use_object does not inherit
-/// the player's wallet: only the verb's own handler may bill them
+/// Object code reached through game.use_object cannot ask the player to pay
 #[tokio::test]
 async fn test_nested_use_object_cannot_bill_the_player() {
     let server = TestServer::start().await.expect("server");
@@ -190,7 +269,7 @@ async fn test_nested_use_object_cannot_bill_the_player() {
         &format!(
             r#"game.admin_grant_credits("{p}", 30)
                local thief = game.store_code([[return {{
-                 on_use = function(a) return tostring(pcall(game.deduct_credits, 30, "skim")) end,
+                 on_use = function(a) return tostring(pcall(game.request_payment, 30, "skim", "x")) end,
                }}]])
                game.create_object("/items/skimmer", "item", "{room}", {{name = "skimmer", fixed = true, code_hash = thief}})
                local front = game.store_code([[return {{
@@ -209,10 +288,11 @@ async fn test_nested_use_object_cannot_bill_the_player() {
     assert_eq!(balance(&server, "account", &pl_id).await, 30);
 }
 
-/// Venice calls cost what the universe config says, charged to the payer
-/// before the call and refunded when it fails (here: no API key in tests)
+/// Venice calls cost what the universe config says, paid by the object
+/// (players pay objects through confirmed payments); refunded on failure
+/// (here: no API key in tests)
 #[tokio::test]
-async fn test_venice_calls_charge_the_payer() {
+async fn test_venice_calls_charge_the_object() {
     let server = TestServer::start().await.expect("server");
     let entrance = server.world().entrance_id.clone();
     let mut adm = connect(
@@ -241,11 +321,11 @@ async fn test_venice_calls_charge_the_payer() {
                  local msgs = {{{{role = "user", content = "hi"}}}}
                  return {{
                    ask = function(a) return show(game.llm_chat(msgs)) end,
-                   paint = function(a) return show(game.llm_image("a cave")) end,
                    ask_house = function(a) return show(game.llm_chat(msgs, nil, {{payer = "object"}})) end,
+                   paint_house = function(a) return show(game.llm_image("a cave", nil, nil, {{payer = "object"}})) end,
                  }}]])
                game.create_object("/items/oracle", "item", "{room}", {{name = "oracle", fixed = true, code_hash = h}})
-               for _, v in ipairs({{"ask", "paint", "ask_house"}}) do
+               for _, v in ipairs({{"ask", "ask_house", "paint_house"}}) do
                  game.add_action(v, "/items/oracle", v)
                end
                return "ok""#,
@@ -256,25 +336,31 @@ async fn test_venice_calls_charge_the_payer() {
     .await;
     assert_eq!(out["text"], "ok", "{}", out);
 
-    // Affordable: charged, then refunded because the call failed
+    // A paid call never bills the player directly
     let reply = verb(&mut pl, "ask oracle").await;
-    assert!(reply.contains("not configured"), "{}", reply);
+    assert!(reply.contains("request_payment"), "{}", reply);
     assert_eq!(balance(&server, "account", &pl_id).await, 7);
-    // Too dear: refused before calling
-    let reply = verb(&mut pl, "paint oracle").await;
-    assert!(reply.contains("not enough credits"), "{}", reply);
-    assert_eq!(balance(&server, "account", &pl_id).await, 7);
-    // The object pays when asked to, and it has nothing
+    // The object pays: refused while it has nothing
     let reply = verb(&mut pl, "ask_house oracle").await;
+    assert!(reply.contains("not enough credits"), "{}", reply);
+    eval(
+        &mut adm,
+        r#"return tostring(game.admin_grant_credits("/items/oracle", 6))"#,
+    )
+    .await;
+    // Affordable: charged, then refunded because the call failed
+    let reply = verb(&mut pl, "ask_house oracle").await;
+    assert!(reply.contains("not configured"), "{}", reply);
+    assert_eq!(balance(&server, "object", "/items/oracle").await, 6);
+    // Too dear
+    let reply = verb(&mut pl, "paint_house oracle").await;
     assert!(reply.contains("not enough credits"), "{}", reply);
 }
 
-/// A verb bills the player only when they clearly picked the object: the
-/// only one offering the verb, or named exactly / unambiguously. Another
-/// builder's look-alike object cannot capture the verb and the player's
-/// wallet.
+/// A verb bills (prompts) the player only when they clearly picked the
+/// object: a look-alike object cannot capture the verb and ask for money
 #[tokio::test]
-async fn test_ambiguous_verb_target_gets_no_wallet() {
+async fn test_ambiguous_verb_target_cannot_ask_for_payment() {
     let server = TestServer::start().await.expect("server");
     let entrance = server.world().entrance_id.clone();
     let mut adm = connect(
@@ -299,11 +385,12 @@ async fn test_ambiguous_verb_target_gets_no_wallet() {
             r#"game.admin_grant_credits("{p}", 50)
                local h = game.store_code([[return {{
                  donate = function(a)
-                   local ok, r = pcall(game.transfer_credits, "actor", "object", 5)
-                   return ok and tostring(r) or "no wallet"
+                   local ok = pcall(game.request_payment, 5, "a donation", "thanks")
+                   if ok then return nil end
+                   return "no wallet"
                  end,
+                 thanks = function(a) return "thanked" end,
                }}]])
-               -- The planted one is listed first and its name is in almost anything
                game.create_object("/items/c", "item", "{room}", {{name = "c", fixed = true, code_hash = h}})
                game.create_object("/items/chest", "item", "{room}", {{name = "chest", fixed = true, code_hash = h}})
                game.add_action("donate", "/items/c", "donate")
@@ -315,11 +402,12 @@ async fn test_ambiguous_verb_target_gets_no_wallet() {
     )
     .await;
     assert_eq!(out["text"], "ok", "{}", out);
-
-    assert_eq!(verb(&mut pl, "donate chest").await, "true");
     assert_eq!(verb(&mut pl, "donate ches").await, "no wallet");
     assert_eq!(verb(&mut pl, "donate").await, "no wallet");
+    pl.drain().await;
+    pl.command("donate chest").await.unwrap();
+    let (id, _) = prompt(&mut pl).await;
+    assert_eq!(answer(&mut pl, &id, true).await, "thanked");
     assert_eq!(balance(&server, "object", "/items/chest").await, 5);
     assert_eq!(balance(&server, "object", "/items/c").await, 0);
-    assert_eq!(balance(&server, "account", &pl_id).await, 45);
 }

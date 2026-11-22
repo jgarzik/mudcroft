@@ -240,6 +240,14 @@ impl TestClient {
         Ok(())
     }
 
+    /// Send any client message
+    pub async fn send_json(&mut self, msg: &serde_json::Value) -> Result<()> {
+        self.write
+            .send(Message::Text(msg.to_string().into()))
+            .await?;
+        Ok(())
+    }
+
     /// Send a ping message
     pub async fn send_ping(&mut self) -> Result<()> {
         let msg = serde_json::json!({

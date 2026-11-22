@@ -185,7 +185,8 @@ for object code, or the `game.set_actor` override if one is set.
 | [`get_path_grants(account_id)`](#gameget_path_grantsaccount_id) | array | — |
 | [`get_credits()`](#gameget_credits) | integer | — |
 | [`object_credits()`](#gameobject_credits) | integer | — |
-| [`deduct_credits(amount, reason, payer?)`](#gamededuct_creditsamount-reason-payer) | boolean | — |
+| [`request_payment(amount, reason, handler, data)`](#gamerequest_paymentamount-reason-handler-data) | request id | a paying player |
+| [`deduct_credits(amount, reason, payer)`](#gamededuct_creditsamount-reason-payer) | boolean | — |
 | [`transfer_credits(from, to, amount)`](#gametransfer_creditsfrom-to-amount) | boolean | — |
 | [`admin_grant_credits(holder, amount)`](#gameadmin_grant_creditsholder-amount) | boolean | admin+ |
 | [`llm_chat(messages, tier, opts)`](#gamellm_chatmessages-tier-opts) | string or `{error}` | Venice configured |
@@ -872,18 +873,48 @@ same shape as `grant_path`'s result.
 ## Credits
 
 Balances are per universe and held by an **account** or an **object** (a
-room's repair fund, a shop's till). Code can spend from two places only:
+room's repair fund, a shop's till).
 
-- `"actor"`: the **paying player**, the one who chose to run this code by
-  typing the verb (or who ran `eval` or a script). Passive code has no
-  paying player: hooks such as `on_enter`, timers, heartbeats, and object
-  code reached through `game.use_object`. Spending as `"actor"` there raises
-  an error. `game.set_actor` does not change the payer.
-- `"object"`: the object whose code is running.
+- **An object** spends its own balance freely (`"object"`).
+- **A player's** credits move only with their consent: object code asks
+  with `game.request_payment`, the player sees a prompt, and only if they
+  accept does anything move (to the asking object). Code can never take a
+  player's credits directly (`"actor"` is refused as a payer), and only code
+  the player chose to run (a verb they typed, clearly naming the object)
+  can ask: hooks such as `on_enter`, timers, heartbeats and code reached
+  through `game.use_object` cannot.
 
 Nothing can spend from any other account. Amounts are whole numbers from 1
 to 10^12; others raise an error. A spend never overdraws: it either happens
 in full or returns `false` with nothing changed.
+
+#### `game.request_payment(amount, reason, handler, data)`
+
+Asks the player who typed this verb to pay `amount` credits to this object.
+They are shown `Pay <amount> credits for <reason>?` (a dialog in the web
+client; text clients type `yes` or `no`) and have a minute to answer. If they
+accept and can afford it, the credits move to this object and its `handler`
+runs (as the object's owner) with `{payment_id, amount, reason, data,
+actor_id}`; its return value is the player's reply. If the handler is
+missing or fails, the payment is refunded. Declining, or not answering,
+changes nothing. `data` is an optional string (up to 4096 bytes); `reason`
+is cut to 200 characters; `handler` cannot be private or an engine hook.
+
+**Returns** the request's id at once (the answer comes later). Raises an
+error without a paying player, outside object code, or when the player
+already has 5 unanswered requests.
+
+```lua
+-- A shop: "buy lamp" asks for 3 credits, and hands over a lamp once paid
+buy = function(args)
+  game.request_payment(3, "an oil lamp", "sold", args.actor_id)
+  return nil  -- the prompt is the reply
+end,
+sold = function(args)
+  game.clone_object("/proto/lamp", args.data)
+  return "The shopkeeper hands you a lamp."
+end,
+```
 
 #### `game.get_credits()`
 
@@ -894,26 +925,17 @@ in full or returns `false` with nothing changed.
 **Returns** the running object's balance. Raises an error outside object
 code.
 
-#### `game.deduct_credits(amount, reason, payer?)`
+#### `game.deduct_credits(amount, reason, payer)`
 
-Spends `amount` from `payer`, `"actor"` (default) or `"object"`. `reason` is
-logged. **Returns** `true`, or `false` if the payer has too little.
+Spends `amount` from the object's own balance (`payer` must be
+`"object"`; `"actor"` raises an error: use `request_payment`). `reason` is
+logged. **Returns** `true`, or `false` if the object has too little.
 
 #### `game.transfer_credits(from, to, amount)`
 
-Moves `amount` from `from` (`"actor"` or `"object"`) to `to`: `"actor"`,
-`"object"`, an account id, or an object path in this universe (which must
-exist). Atomic. **Returns** `true`, or `false` if the payer has too little.
-
-```lua
--- A donation box: the player who types "donate box" pays into it
-donate = function(args)
-  if game.transfer_credits("actor", "object", 5) then
-    return "Thank you!"
-  end
-  return "You can't afford that."
-end
-```
+Moves `amount` from this object (`from` must be `"object"`) to `to`: an
+account id, or an object path in this universe (which must exist). Atomic.
+**Returns** `true`, or `false` if the object has too little.
 
 #### `game.admin_grant_credits(holder, amount)`
 
@@ -929,9 +951,10 @@ and count against the Venice limit of 5 calls per execution.
 
 Each call costs the universe config's `venice_chat_cost` or
 `venice_image_cost` credits (default 0; an admin sets them with
-`game.update_universe`). `opts.payer` names who pays: `"actor"` (the paying
-player, the default) or `"object"` (see [Credits](#credits)). The price is
-charged before the call and refunded if the call fails. A paid call with no
+`game.update_universe`). A priced call is paid by the object
+(`opts.payer = "object"`); a player cannot be billed directly (charge them
+first with `game.request_payment`). The price is charged before the call and
+refunded if the call fails. A paid call with no
 one to pay, or a payer short of credits, returns `{error = ...}` without
 calling Venice. The rate limit (60 calls a minute) is kept per universe and
 code owner, whoever pays.
@@ -940,7 +963,7 @@ code owner, whoever pays.
 
 - `messages`: an array of `{role = "system"|"user"|"assistant", content = "..."}`.
 - `tier` (optional): `"fast"`, `"balanced"` (the default) or `"quality"`.
-- `opts` (optional): `{payer = "actor"|"object"}`.
+- `opts` (optional): `{payer = "object"}` for a priced call.
 
 **Returns** the reply text, or `{error = "..."}`.
 
@@ -957,7 +980,7 @@ return "The smith says: " .. reply
 
 - `style`: `"realistic"` (the default), `"anime"`, `"digital"` or `"painterly"`.
 - `size`: `"small"`, `"medium"` (the default) or `"large"`.
-- `opts` (optional): `{payer = "actor"|"object"}`.
+- `opts` (optional): `{payer = "object"}` for a priced call.
 
 **Returns** an image **hash** string, or `{error = "..."}`. The image is
 served at `/images/{hash}`.

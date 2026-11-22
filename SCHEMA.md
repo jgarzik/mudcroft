@@ -3,12 +3,12 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 10):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 11):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). The upgrade steps are
 6 -> 7 (adds the `credits_holder_exists` trigger), 7 -> 8 (adds the
-`actions` table), 8 -> 9 (adds `cluster_nodes`) and 9 -> 10 (adds
-`online_players`); an older database is refused with a "create a new database" error (from
+`actions` table), 8 -> 9 (adds `cluster_nodes`), 9 -> 10 (adds `online_players`) and
+10 -> 11 (adds `payment_requests`); an older database is refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
@@ -381,6 +381,27 @@ server crashed or stepped down is still cleaned up.
 
 Primary key `(universe_id, player_id)`; foreign key to `objects` ON DELETE
 CASCADE.
+
+### payment_requests
+
+Payments a player has been asked to confirm (`game.request_payment`). A row
+is deleted when it is answered (through Raft, so only one answer counts) or
+found expired; the payment itself is a credits transfer from the player to
+the object.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | TEXT PRIMARY KEY | UUID |
+| universe_id | TEXT NOT NULL | |
+| account_id | TEXT NOT NULL | The player asked to pay |
+| object_id | TEXT NOT NULL | The object asking (and paid) |
+| handler | TEXT NOT NULL | Its handler to run once paid |
+| amount | INTEGER NOT NULL | `CHECK (amount > 0)` |
+| reason | TEXT NOT NULL | Shown to the player |
+| data | TEXT NOT NULL | Passed to the handler |
+| expires_at | INTEGER NOT NULL | ms since epoch (a minute after the request) |
+
+Foreign key `(universe_id, object_id)` to `objects` ON DELETE CASCADE.
 ## Startup Validation
 
 `mudd` opens an existing database only. It does not create the database or

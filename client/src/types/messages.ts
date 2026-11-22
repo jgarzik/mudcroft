@@ -6,11 +6,20 @@ export type ServerMessage =
   | { type: 'error'; message: string }
   | { type: 'echo'; command: string }
   | { type: 'replaced'; message: string }
+  | { type: 'confirm'; id: string; text: string; amount: number }
 
 // Client → Server messages
 export type ClientMessage =
   | { type: 'command'; text: string }
   | { type: 'ping' }
+  | { type: 'confirm'; id: string; accept: boolean }
+
+// A payment the player is asked to confirm
+export interface PaymentRequest {
+  id: string
+  text: string
+  amount: number
+}
 
 // Room data structure for state
 export interface RoomData {

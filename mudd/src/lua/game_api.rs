@@ -97,6 +97,11 @@ impl VeniceBilling {
                 .ok_or_else(|| format!("universe config {} is not a valid price", price_key))?,
         };
         if price > 0 {
+            if let Some(crate::credits::Holder::Account(_)) = holder {
+                return Err("a player pays only through game.request_payment; bill the \
+                            object ({payer = \"object\"}) instead"
+                    .to_string());
+            }
             let Some(ref holder) = holder else {
                 return Err("no paying player here (only a verb, eval or script has one)".into());
             };
@@ -2168,15 +2173,15 @@ impl GameApi {
         let object = self.current_object_id.clone();
 
         // "actor" (the paying player) or "object" (the running object)
+        // A player pays only through game.request_payment (they confirm)
         let spender = {
-            let (payer, object) = (payer.clone(), object.clone());
+            let object = object.clone();
             move |which: &str| -> LuaResult<Holder> {
                 match which {
-                    "actor" => payer.clone().map(Holder::Account).ok_or_else(|| {
-                        mlua::Error::runtime(
-                            "no paying player here (only a verb, eval or script has one)",
-                        )
-                    }),
+                    "actor" => Err(mlua::Error::runtime(
+                        "a player's credits are spent only with their consent: use \
+                         game.request_payment",
+                    )),
                     "object" => object
                         .clone()
                         .map(Holder::Object)
@@ -2246,6 +2251,103 @@ impl GameApi {
                 .map_err(mlua::Error::external)
             })?;
         game.set("transfer_credits", transfer_credits)?;
+
+        // game.request_payment(amount, reason, handler, data?): ask the
+        // paying player (the one who typed this verb) to pay `amount` to
+        // this object. They get a prompt; if they accept within a minute the
+        // credits move and `handler` runs with {payment_id, amount, reason,
+        // data, actor_id}. Returns the request id at once.
+        let (u, p, o) = (universe_id.clone(), payer.clone(), object.clone());
+        let store = self.store.clone();
+        let messages = self.messages.clone();
+        let request_payment = lua.create_function(
+            move |lua, (amount, reason, handler, data): (i64, String, String, Option<String>)| {
+                charge_db(lua)?;
+                let Some(account) = p.clone() else {
+                    return Err(mlua::Error::runtime(
+                        "no paying player here (only code a player chose to run, such as a \
+                         verb, can ask them to pay)",
+                    ));
+                };
+                let Some(object_id) = o.clone() else {
+                    return Err(mlua::Error::runtime("request_payment needs an object"));
+                };
+                if !(1..=crate::credits::MAX_AMOUNT).contains(&amount) {
+                    return Err(mlua::Error::runtime("amount out of range"));
+                }
+                if is_private_handler(&handler) || handler.is_empty() {
+                    return Err(mlua::Error::runtime(
+                        "handler cannot be private or an engine hook",
+                    ));
+                }
+                let reason: String = reason.chars().take(200).collect();
+                let data = data.unwrap_or_default();
+                if data.len() > 4096 {
+                    return Err(mlua::Error::runtime("data is limited to 4096 bytes"));
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let now = crate::combat::now_ms() as i64;
+                let expires = now + crate::api::payments::PAYMENT_DEADLINE_MS as i64;
+                let universe_id = u.clone();
+                let store = store.clone();
+                let pending: i64 = block_now(async {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM payment_requests
+                         WHERE universe_id = ? AND account_id = ? AND expires_at > ?",
+                    )
+                    .bind(&universe_id)
+                    .bind(&account)
+                    .bind(now)
+                    .fetch_one(store.pool())
+                    .await
+                })
+                .map_err(mlua::Error::external)?;
+                if pending >= crate::api::payments::MAX_PENDING_PER_PLAYER {
+                    return Err(mlua::Error::runtime(
+                        "this player already has too many unanswered payment requests",
+                    ));
+                }
+                block_now(store.execute_batch(vec![
+                        (
+                            "DELETE FROM payment_requests WHERE universe_id = ? AND account_id = ?
+                         AND expires_at <= ?"
+                                .to_string(),
+                            vec![
+                                serde_json::json!(universe_id),
+                                serde_json::json!(account),
+                                serde_json::json!(now),
+                            ],
+                        ),
+                        (
+                            "INSERT INTO payment_requests (id, universe_id, account_id, object_id,
+                         handler, amount, reason, data, expires_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                                .to_string(),
+                            vec![
+                                serde_json::json!(id),
+                                serde_json::json!(universe_id),
+                                serde_json::json!(account),
+                                serde_json::json!(object_id),
+                                serde_json::json!(handler),
+                                serde_json::json!(amount),
+                                serde_json::json!(reason),
+                                serde_json::json!(data),
+                                serde_json::json!(expires),
+                            ],
+                        ),
+                    ]))
+                .map_err(mlua::Error::external)?;
+                let player = crate::player::PlayerManager::player_path(&account);
+                messages.confirm(
+                    &player,
+                    &id,
+                    &format!("Pay {} credits for {}?", amount, reason),
+                    amount,
+                );
+                Ok(id)
+            },
+        )?;
+        game.set("request_payment", request_payment)?;
 
         // game.admin_grant_credits(holder, amount): an account id or object
         // path (admin+, via PermAction::GrantCredits)

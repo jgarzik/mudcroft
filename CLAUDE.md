@@ -87,7 +87,7 @@ scripts/testsrv.py start             # manual play-test server with a seeded wor
 ### Security Model (must respect)
 
 - Object code (hooks, verbs, timers, `game.use_object`) runs as the **object's owner**, never as the triggering player; the player is only data (`actor_id`). Don't pass a player's identity into object code execution. `actor_id` given to `use_object` is caller-supplied and untrusted.
-- The one exception is credits: a verb handler gets the typing player's account as **payer** (`ScriptContext.payer`, Lua `"actor"`), and only when the player clearly picked that object; eval/run_script pay as their caller. Hooks, timers and nested `use_object` never get a payer. The payer can only be spent from (credits, Venice prices), never used for permissions.
+- The one exception is credits, and only with consent: a verb handler gets the typing player's account as **payer** (`ScriptContext.payer`) when the player clearly picked that object, and may only *ask* them to pay (`game.request_payment`: a `confirm` prompt; nothing moves unless they accept). Code never spends a player's credits directly. Hooks, timers and nested `use_object` never get a payer; the payer is never used for permissions.
 - Anything that makes code run as an owner needs owner authority: attaching `code_hash` and `add_action`/`remove_action` require being the owner or outranking them (`can_act_as`). Private handlers (`_name`) and engine hooks (`lua::is_private_handler`) are never reachable via `use_object` or verbs. Class `code_hash` defaults are never attached to instances.
 - `use_object` is bounded: 8 levels deep, 32 calls per top-level execution.
 - Lua object writes (`create/update/delete/move/clone_object`) are permission-checked against the acting user; keep new `game.*` writes checked the same way and charge the call budget (`charge_db` / `charge_venice`).
@@ -96,13 +96,13 @@ scripts/testsrv.py start             # manual play-test server with a seeded wor
 
 ### Database
 
-One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, universe_members, credits, timers, heartbeats, actions, cluster_nodes, online_players, path_grants, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
+One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, universe_members, credits, timers, heartbeats, actions, cluster_nodes, online_players, payment_requests, path_grants, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
 
 ### WebSocket Protocol
 
 - Connect: `/ws?universe=<id>&token=...` (token required; 401 without a valid one, no guests)
 - Universe ID required (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens)
-- Client sends `{type:"command", text}` or `{type:"ping"}`; server sends `welcome`, `room`, `output`, `error`, `echo` (every command is echoed first), `replaced` (a newer connection for the same player took over; clients must not auto-reconnect)
+- Client sends `{type:"command", text}` or `{type:"ping"}`; server sends `welcome`, `room`, `output`, `error`, `echo` (every command is echoed first), `confirm` (a payment prompt; client answers `{type:"confirm", id, accept}` or types yes/no), `replaced` (a newer connection for the same player took over; clients must not auto-reconnect)
 - Commands: look, north/south/east/west/up/down (and n/s/e/w/u/d), say, get/take, drop, inventory/i, attack/kill, help; builder+: create; wizard+: eval, goto, setportal; other verbs dispatch to `game.add_action` handlers
 
 ## Test Infrastructure

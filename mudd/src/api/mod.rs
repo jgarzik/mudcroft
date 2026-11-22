@@ -4,6 +4,7 @@ mod auth;
 mod effect_scheduler;
 mod gateway;
 mod images;
+pub mod payments;
 mod primary;
 mod ratelimit;
 pub mod scripting;

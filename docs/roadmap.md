@@ -28,21 +28,6 @@ primary lifecycle, gateways, failover), with these gaps:
   whole game database) on each side (`mudd/src/raft/storage.rs`,
   `transport.rs`).
 
-### Lua runtime
-
-- **A verb may spend all of a player's credits.** Typing a verb on an
-  object is consent to whatever its handler spends as `"actor"`; there is no
-  per-call cap or confirmation prompt (`mudd/src/lua/game_api.rs`). Verb
-  dispatch only hands over the wallet when the player clearly picked the
-  object (`dispatch_custom_verb` in `mudd/src/api/websocket.rs`).
-  Planned (Phase 6): charges to a player only through a confirmed payment:
-  `game.request_payment(amount, reason, handler, data)` returns at once; the
-  server sends `{type:"confirm", id, text, amount}`, the web client shows a
-  dialog (text clients answer `yes`/`no`), and on acceptance before the
-  deadline the server charges and runs the object's handler (as owner,
-  payer = that player). Pending requests are rows with absolute deadlines.
-  `"actor"` stops being a direct payer, including for paid Venice calls.
-
 ## Raft Cluster Operation
 
 Today `mudd` runs a single-node openraft cluster whose log carries plain SQL

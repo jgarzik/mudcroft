@@ -25,6 +25,7 @@ export function useWebSocket() {
     setRoom,
     setPlayerId,
     setThemeId,
+    setPendingPayment,
   } = useGameStore()
 
   const cleanup = useCallback(() => {
@@ -79,11 +80,16 @@ export function useWebSocket() {
           replacedRef.current = true
           addMessage(msg.message, 'system')
           break
+
+        case 'confirm':
+          addMessage(msg.text, 'system')
+          setPendingPayment({ id: msg.id, text: msg.text, amount: msg.amount })
+          break
       }
     } catch (err) {
       console.error('Failed to parse WebSocket message:', err)
     }
-  }, [addMessage, setRoom, setPlayerId, setThemeId])
+  }, [addMessage, setRoom, setPlayerId, setThemeId, setPendingPayment])
 
   const connect = useCallback(() => {
     if (!token || !universe || !isAuthenticated) return
@@ -140,6 +146,15 @@ export function useWebSocket() {
     }
   }, [])
 
+  /** Answer the payment prompt (the dialog's buttons) */
+  const answerPayment = useCallback((id: string, accept: boolean) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const msg: ClientMessage = { type: 'confirm', id, accept }
+      wsRef.current.send(JSON.stringify(msg))
+    }
+    setPendingPayment(null)
+  }, [setPendingPayment])
+
   const disconnect = useCallback(() => {
     cleanup()
     setConnectionStatus('disconnected')
@@ -156,5 +171,5 @@ export function useWebSocket() {
     return cleanup
   }, [isAuthenticated, token, universe, connect, disconnect, cleanup])
 
-  return { sendCommand, disconnect }
+  return { sendCommand, answerPayment, disconnect }
 }

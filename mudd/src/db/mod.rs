@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -55,6 +55,24 @@ const ONLINE_PLAYERS_TABLE: &str = r#"
         since TEXT NOT NULL,
         PRIMARY KEY (universe_id, player_id),
         FOREIGN KEY (universe_id, player_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    )
+"#;
+
+/// Payments a player has been asked to confirm (game.request_payment):
+/// answered or expired rows are deleted. They go with the requesting object.
+const PAYMENT_REQUESTS_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS payment_requests (
+        id TEXT PRIMARY KEY,
+        universe_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        handler TEXT NOT NULL,
+        amount INTEGER NOT NULL CHECK (amount > 0),
+        reason TEXT NOT NULL,
+        data TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        FOREIGN KEY (universe_id, object_id)
             REFERENCES objects(universe_id, id) ON DELETE CASCADE
     )
 "#;
@@ -140,6 +158,7 @@ impl Database {
     /// - 7 -> 8 (actions table: custom verbs persisted): upgraded in place.
     /// - 8 -> 9 (cluster_nodes table: node ids never reused): in place.
     /// - 9 -> 10 (online_players table): in place.
+    /// - 10 -> 11 (payment_requests table): in place.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -176,6 +195,14 @@ impl Database {
                 .await?;
             self.set_schema_version(10).await?;
             info!("Upgraded database schema 9 -> 10");
+            version = 10;
+        }
+        if version == 10 {
+            sqlx::query(PAYMENT_REQUESTS_TABLE)
+                .execute(&self.pool)
+                .await?;
+            self.set_schema_version(11).await?;
+            info!("Upgraded database schema 10 -> 11");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -292,6 +319,7 @@ impl Database {
             "actions",
             "cluster_nodes",
             "online_players",
+            "payment_requests",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -509,6 +537,9 @@ impl Database {
         sqlx::query(ACTIONS_TABLE).execute(&self.pool).await?;
         sqlx::query(CLUSTER_NODES_TABLE).execute(&self.pool).await?;
         sqlx::query(ONLINE_PLAYERS_TABLE)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(PAYMENT_REQUESTS_TABLE)
             .execute(&self.pool)
             .await?;
 

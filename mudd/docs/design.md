@@ -420,7 +420,7 @@ The full reference is [langref.md](langref.md). The functions that exist:
 | Permissions | `set_actor`, `get_actor`, `check_permission`, `can_access_path`, `get_access_level`, `set_access_level`, `grant_path`, `revoke_path`, `get_path_grants` |
 | Timers | `call_out`, `remove_call_out`, `set_heart_beat`, `remove_heart_beat` |
 | Status effects | `apply_effect`, `remove_effect`, `get_effects` |
-| Credits | `get_credits`, `object_credits`, `deduct_credits`, `transfer_credits`, `admin_grant_credits` |
+| Credits | `get_credits`, `object_credits`, `request_payment`, `deduct_credits`, `transfer_credits`, `admin_grant_credits` |
 | AI | `llm_chat`, `llm_image` |
 | Universe | `get_universe`, `update_universe` |
 | Utility | `time`, `set_time`, `set_rng_seed`, `roll_dice` |
@@ -508,8 +508,13 @@ overdraft, so `deduct` and `transfer` (debit and credit in one batch) are
 atomic and report "not enough" instead of overdrawing; no read-modify-write,
 so concurrent writers (or nodes) cannot lose updates. A failed read is an
 error, never a zero balance. Lua spends from the
-**paying player** (`"actor"`: whoever typed the verb, or ran eval or a
-script; `ScriptContext.payer`) or the running object (`"object"`). Passive
+running object (`"object"`) freely; a player's credits move only with
+consent: `game.request_payment` (allowed only with a paying player, i.e. a
+verb the player typed: `ScriptContext.payer`) records a `payment_requests`
+row with a one-minute deadline and sends a `confirm` prompt; accepting
+claims the row through Raft (one answer counts), transfers the credits to
+the object and runs its handler (refunding if it fails), in
+`api/payments.rs`. Passive
 code (hooks, timers, nested `use_object`) has no payer, so walking into a
 room can never cost a player anything. Lua exposes `get_credits`,
 `object_credits`, `deduct_credits`, `transfer_credits` and

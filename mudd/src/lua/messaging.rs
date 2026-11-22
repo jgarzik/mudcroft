@@ -22,6 +22,13 @@ pub enum GameMessage {
     },
     /// Broadcast to all players in a region
     BroadcastRegion { region_id: String, message: String },
+    /// Ask a player to confirm a payment (game.request_payment)
+    Confirm {
+        target_id: String,
+        id: String,
+        text: String,
+        amount: i64,
+    },
     /// An object was moved by game.move_object: update a connected player's
     /// session and run the containers' on_leave/on_enter hooks
     Moved {
@@ -64,6 +71,16 @@ impl MessageQueue {
             room_id: room_id.to_string(),
             message: message.to_string(),
             exclude_id: exclude_id.map(str::to_string),
+        });
+    }
+
+    /// Queue a payment prompt for a player
+    pub fn confirm(&self, target_id: &str, id: &str, text: &str, amount: i64) {
+        self.messages.lock().push(GameMessage::Confirm {
+            target_id: target_id.to_string(),
+            id: id.to_string(),
+            text: text.to_string(),
+            amount,
         });
     }
 

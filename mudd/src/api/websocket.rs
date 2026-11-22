@@ -294,6 +294,14 @@ pub enum ServerMessage {
     /// Text output to display
     #[serde(rename = "output")]
     Output { text: String },
+    /// Ask the player to confirm a payment; answered with a `confirm`
+    /// client message (or by typing yes / no)
+    #[serde(rename = "confirm")]
+    Confirm {
+        id: String,
+        text: String,
+        amount: i64,
+    },
     /// Room description
     #[serde(rename = "room")]
     Room {
@@ -330,6 +338,9 @@ pub enum ClientMessage {
     /// Ping to keep connection alive
     #[serde(rename = "ping")]
     Ping,
+    /// Answer to a payment prompt
+    #[serde(rename = "confirm")]
+    Confirm { id: String, accept: bool },
 }
 
 /// WebSocket query parameters
@@ -773,6 +784,24 @@ async fn handle_client_message(
         }
         ClientMessage::Ping => {
             // Just keep the connection alive, no response needed
+        }
+        ClientMessage::Confirm { id, accept } => {
+            let reply = super::payments::answer(
+                state,
+                universe_id,
+                account_id,
+                player_id,
+                Some(&id),
+                accept,
+            )
+            .await
+            .unwrap_or_else(|| ServerMessage::Error {
+                message: "There is no such payment request (it may have expired).".to_string(),
+            });
+            state
+                .connections
+                .send_to_player(universe_id, player_id, reply)
+                .await;
         }
     }
 }
@@ -1624,6 +1653,38 @@ async fn execute_command(
 
             // Execute create command
             execute_create_command(state, universe_id, account_id, access_level, args).await
+        }
+        // Typed answers to the latest payment prompt (text clients); with
+        // none pending they are ordinary words for custom verbs
+        "yes" | "no" if parts.len() == 1 => {
+            match super::payments::answer(
+                state,
+                universe_id,
+                account_id,
+                player_id,
+                None,
+                verb == "yes",
+            )
+            .await
+            {
+                Some(reply) => reply,
+                None => match dispatch_custom_verb(
+                    state,
+                    universe_id,
+                    player_id,
+                    account_id,
+                    access_level,
+                    &verb,
+                    "",
+                )
+                .await
+                {
+                    Some(reply) => reply,
+                    None => ServerMessage::Output {
+                        text: format!("Unknown command: {}", verb),
+                    },
+                },
+            }
         }
         _ => {
             let args = parts[1..].join(" ");

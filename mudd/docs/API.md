@@ -298,6 +298,13 @@ Every message is JSON with a `type` field.
 {"type": "ping"}
 ```
 
+```json
+{"type": "confirm", "id": "<payment id>", "accept": true}
+```
+
+`confirm` answers a payment prompt (see `confirm` below); typing the command
+`yes` or `no` answers the latest one.
+
 `ping` gets no reply. Messages that are not valid JSON, or have an unknown
 `type`, are ignored.
 
@@ -356,6 +363,16 @@ keep evicting each other.
 
 ```json
 {"type": "replaced", "message": "You connected from another window; this one is now disconnected."}
+```
+
+**confirm**: object code asks the player to pay (`game.request_payment`).
+Nothing is charged unless the client answers with `{"type": "confirm", "id",
+"accept": true}` (or the player types `yes`) within a minute; the reply is an
+`output` (the object's answer, or a decline/expiry message) or an `error`
+(no such request).
+
+```json
+{"type": "confirm", "id": "<payment id>", "text": "Pay 3 credits for an oil lamp?", "amount": 3}
 ```
 
 If no spawn room exists, the server sends this right after `welcome`:
