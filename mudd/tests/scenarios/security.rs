@@ -1077,3 +1077,48 @@ async fn test_access_levels_are_per_universe() {
     let _ = owner_away.expect("echo").await;
     assert!(owner_away.expect("error").await.is_ok());
 }
+
+/// A universe's owner (an ordinary account) is owner inside it, but must not
+/// gain a global admin's identity: no set_actor to them, no run_script as them
+#[tokio::test]
+async fn test_universe_owner_cannot_act_as_global_admin() {
+    let server = TestServer::start().await.expect("server");
+    let owner = connect(&server, player("realm_lord")).await;
+    let owner_id = owner.account_id().to_string();
+    server
+        .create_universe("lord-realm", &owner_id)
+        .await
+        .expect("universe");
+    let adm = connect(&server, admin("realm_visitor_admin")).await;
+    let admin_id = adm.account_id().to_string();
+
+    let mut lord = server
+        .connect_in(player("realm_lord"), "lord-realm")
+        .await
+        .expect("connect");
+    let out = eval(
+        &mut lord,
+        &format!(r#"return game.set_actor("{}")"#, admin_id),
+    )
+    .await;
+    assert_eq!(out, "false", "owner must not impersonate a global admin");
+
+    let resp = server
+        .post_auth(
+            "/universe/lord-realm/run_script",
+            &serde_json::json!({"script": "no-such-script.lua", "account_id": admin_id}),
+            lord.auth_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "{}", resp.text().await.unwrap());
+
+    // Acting as an ordinary player in their own universe still works
+    let pl = connect(&server, player("realm_serf")).await;
+    let out = eval(
+        &mut lord,
+        &format!(r#"return game.set_actor("{}")"#, pl.account_id()),
+    )
+    .await;
+    assert_eq!(out, "true");
+}

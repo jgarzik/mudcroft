@@ -688,7 +688,9 @@ can change objects under their path grants.
 
 Makes later calls in this script act as `account_id`.
 
-- Only **wizards+** may switch, and only to accounts **strictly below** their own level.
+- Only **wizards+** may switch, and only to accounts they **outrank** in this
+  universe; a global admin or owner can be the target only of a higher global
+  level (see [permissions.md](permissions.md#access-levels)).
 - Switching to yourself is always allowed.
 - `nil` clears the override.
 - Ownerless object code can't switch.

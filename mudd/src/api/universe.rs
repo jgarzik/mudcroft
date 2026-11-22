@@ -464,15 +464,15 @@ async fn run_script(
     }
 
     // Run as the authenticated caller. An admin+ may run as another account,
-    // but only one strictly below their own level (no impersonating peers or
-    // superiors).
+    // but only one it outranks (no impersonating peers or superiors, and a
+    // universe owner never runs as a global admin).
     let run_as = match request.account_id {
         Some(other) if other != account.id => {
-            let target_level = state
+            if !state
                 .permissions
-                .get_access_level(&universe.id, &other)
-                .await;
-            if !(level.can_admin() && target_level < level) {
+                .outranks(&universe.id, &account.id, &other)
+                .await
+            {
                 return (
                     StatusCode::FORBIDDEN,
                     Json(ErrorResponse {

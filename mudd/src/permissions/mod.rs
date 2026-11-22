@@ -491,6 +491,29 @@ impl PermissionManager {
         Some(owner)
     }
 
+    /// Whether `actor` outranks `target` in a universe: a strictly higher
+    /// effective level there, and, when the target is a global admin or
+    /// owner, a strictly higher global level too. A universe's owner is
+    /// owner inside it but never gains a global admin's identity.
+    pub async fn outranks(&self, universe_id: &str, actor: &str, target: &str) -> bool {
+        let actor_level = self.get_access_level(universe_id, actor).await;
+        let target_level = self.get_access_level(universe_id, target).await;
+        if target_level >= actor_level {
+            return false;
+        }
+        let target_global = self.get_global_level(target).await;
+        target_global < AccessLevel::Admin || self.get_global_level(actor).await > target_global
+    }
+
+    /// Whether `actor` may act as `target` (impersonate it, or run code as
+    /// it): wizard+ in the universe and outranking it (see `outranks`)
+    pub async fn can_act_as(&self, universe_id: &str, actor: &str, target: &str) -> bool {
+        self.get_access_level(universe_id, actor)
+            .await
+            .can_bypass_fixed()
+            && self.outranks(universe_id, actor, target).await
+    }
+
     /// An account's effective access level in a universe (see the struct
     /// docs for the rule)
     pub async fn get_access_level(&self, universe_id: &str, account_id: &str) -> AccessLevel {
@@ -1049,6 +1072,11 @@ mod tests {
             AccessLevel::Admin
         );
         assert_eq!(pm.get_access_level("ua", "gwiz").await, AccessLevel::Player);
+
+        // alice owns ua, but never outranks a global admin there
+        assert!(!pm.outranks("ua", "alice", "gadmin").await);
+        assert!(!pm.can_act_as("ua", "alice", "gadmin").await);
+        assert!(pm.can_act_as("ua", "alice", "gwiz").await);
 
         // Looking up a universe before it exists does not lock out its owner
         assert_eq!(pm.get_access_level("uc", "gwiz").await, AccessLevel::Player);

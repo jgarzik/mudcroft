@@ -569,19 +569,15 @@ impl GameApi {
                                     // so only the owner or a superior may set it
                                     if let Some(ref owner) = obj.owner_id {
                                         let actor = user.as_deref().unwrap_or_default();
-                                        if actor != owner {
-                                            let actor_level = permissions
-                                                .get_access_level(&universe_id, actor)
-                                                .await;
-                                            let owner_level = permissions
-                                                .get_access_level(&universe_id, owner)
-                                                .await;
-                                            if !actor_level.can_act_as(owner_level) {
-                                                return Ok(Err(
-                                                    "only the owner or a superior may attach code"
-                                                        .to_string(),
-                                                ));
-                                            }
+                                        if actor != owner
+                                            && !permissions
+                                                .can_act_as(&universe_id, actor, owner)
+                                                .await
+                                        {
+                                            return Ok(Err(
+                                                "only the owner or a superior may attach code"
+                                                    .to_string(),
+                                            ));
                                         }
                                     }
                                     match v {
@@ -1259,9 +1255,7 @@ impl GameApi {
                     (None, _) => true,
                     (Some(owner), Some(actor)) if owner == actor => true,
                     (Some(owner), Some(actor)) => {
-                        let actor_level = permissions.get_access_level(&universe_id, actor).await;
-                        let owner_level = permissions.get_access_level(&universe_id, owner).await;
-                        actor_level.can_act_as(owner_level)
+                        permissions.can_act_as(&universe_id, actor, owner).await
                     }
                     (Some(_), None) => false,
                 }
@@ -1397,7 +1391,7 @@ impl GameApi {
         // game.set_actor(actor_id)
         // Sets the current actor for permission checks in this Lua context.
         // Callers may only act as accounts strictly below their own level
-        // (see AccessLevel::can_act_as); nil clears the override.
+        // (see PermissionManager::can_act_as); nil clears the override.
         let permissions_clone = permissions.clone();
         let current_user_clone = current_user.clone();
         let actor_universe = self.universe_id.clone();
@@ -1416,9 +1410,7 @@ impl GameApi {
                 let target = id.clone();
                 let universe_id = actor_universe.clone();
                 let allowed = block_on_perm(async move {
-                    let real_level = permissions.get_access_level(&universe_id, &real).await;
-                    let target_level = permissions.get_access_level(&universe_id, &target).await;
-                    real_level.can_act_as(target_level)
+                    permissions.can_act_as(&universe_id, &real, &target).await
                 });
                 if !allowed {
                     return Ok(false);

@@ -176,8 +176,9 @@ Runs a Lua file from the server's `scripts/` directory inside a universe.
 - **Who may call:** an account that is admin+ in universe `{id}`: a global
   admin or owner, an admin member, or the universe's owner.
 - **Runs as:** the authenticated caller. If `account_id` names another account,
-  the caller must be admin+ **and** strictly outrank that account (levels in
-  universe `{id}`). Otherwise
+  the caller must be admin+ **and** outrank that account in universe `{id}`
+  (a global admin or owner only by a higher global level; see
+  [permissions.md](permissions.md#access-levels)). Otherwise
   the response is 403. Objects the script creates are owned by the account it
   runs as.
 - **Script path:** read from `scripts/<script>`, relative to `mudd`'s working

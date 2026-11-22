@@ -26,6 +26,13 @@ the highest of:
 So a wizard of one universe is a plain player in another, and a universe's
 owner has owner power inside that universe only.
 
+Acting as another account (`game.set_actor`, `run_script` with
+`account_id`, attaching code to or wiring verbs on objects it owns) requires
+outranking it: a strictly higher effective level in the universe, and, if the
+target is a global admin or owner, a strictly higher global level as well
+(`PermissionManager::outranks`). A universe's owner therefore never gains a
+global admin's identity.
+
 | Level | Rank | Adds |
 |-------|------|------|
 | `player` | 0 | The default for new accounts. Play: look, move, `say`, take and drop objects that are neither `fixed` nor living, attack NPCs. Can read objects and modify objects it owns. |
