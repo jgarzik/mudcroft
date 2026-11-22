@@ -2128,3 +2128,119 @@ async fn test_ai_hooks_are_bounded() {
     .unwrap();
     assert!((1..=40).contains(&n), "bounded bounces: {}", n);
 }
+
+/// Phase 1 review: AI handlers are engine hooks (no script reaches them);
+/// game.damage needs control of its source to credit it; a dead NPC waiting
+/// to respawn cannot be damaged or healed; aggro only for creatures (so the
+/// player can always fight back); a player fleeing into an aggressive NPC
+/// fights back at once
+#[tokio::test]
+async fn test_engine_binding_rules() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "auditor".into(),
+        })
+        .await
+        .unwrap();
+    let pl = server
+        .connect_as(Role::Player {
+            username: "bystander".into(),
+        })
+        .await
+        .unwrap();
+    let other = pl.player_id().unwrap().to_string();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"local h = game.store_code([[return {{ ai_combat_tick = function(a) return "ran" end }}]])
+               game.create_object("/npcs/scripted", "npc", "{e}", {{name = "scripted", hp = 50, code_hash = h}})
+               local via_use = game.use_object("/npcs/scripted", "/npcs/scripted", "ai_combat_tick")
+               game.create_object("/npcs/prize", "npc", "{e}", {{name = "prize", hp = 5, max_hp = 5, xp_value = 999}})
+               local forged, why = game.damage("/npcs/prize", 100, "physical", "{o}")
+               game.create_object("/npcs/ghost", "npc", "{e}", {{name = "ghost", hp = 5, max_hp = 5, respawn_seconds = 60}})
+               game.damage("/npcs/ghost", 100)
+               local again, why2 = game.damage("/npcs/ghost", 100)
+               return tostring(via_use) .. "|" .. tostring(forged) .. "|" .. tostring(why) .. "|" .. tostring(again) .. "|" .. tostring(why2)"#,
+            e = entrance,
+            o = other
+        ),
+    )
+    .await;
+    let text = out["text"].as_str().unwrap_or_default().to_string();
+    let parts: Vec<&str> = text.split('|').collect();
+    assert_eq!(parts.len(), 5, "{}", out);
+    assert_eq!(
+        parts[0], "nil",
+        "ai_combat_tick is not reachable via use_object: {}",
+        text
+    );
+    assert_eq!(
+        parts[1], "nil",
+        "a source the caller does not control is refused: {}",
+        text
+    );
+    assert_eq!(
+        parts[3], "nil",
+        "a dead NPC waiting to respawn takes no damage: {}",
+        text
+    );
+    assert!(parts[4].contains("not in the world"), "{}", text);
+    let xp: Option<i64> = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.xp') FROM objects WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&other)
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(xp, None, "no XP forged for the bystander");
+
+    // Aggro only for creatures: a non-npc class with aggro does not attack
+    let out = eval_as(
+        &mut adm,
+        r#"game.define_class("statue_class", {parent = "item"})
+           game.create_object("/rooms/gallery", "room", nil, {name = "Gallery", exits = {east = "/rooms/hallway"}})
+           game.create_object("/rooms/hallway", "room", nil, {name = "Hallway", exits = {west = "/rooms/gallery"}})
+           game.create_object("/rooms/hallway/statue", "statue_class", "/rooms/hallway", {name = "statue", hp = 50, aggro = true})
+           game.create_object("/rooms/hallway/troll", "npc", "/rooms/hallway", {name = "troll", hp = 500, max_hp = 500, aggro = true})
+           game.create_object("/rooms/gallery/orc", "npc", "/rooms/gallery", {name = "orc", hp = 500, max_hp = 500})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out["text"], "ok", "{}", out);
+    adm.drain().await;
+    adm.command("goto /rooms/gallery").await.unwrap();
+    adm.expect("room").await.unwrap();
+    adm.drain().await;
+    adm.command("attack orc").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    adm.drain().await;
+    adm.command("flee").await.unwrap();
+    adm.expect_output_containing("You flee east").await.unwrap();
+    // Fleeing into the troll's room: the troll attacks, and the player
+    // fights back at once (a row targeting the troll)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let me = adm.player_id().unwrap().to_string();
+    let target: Option<String> =
+        sqlx::query_scalar("SELECT target_id FROM combat WHERE universe_id = ? AND entity_id = ?")
+            .bind(server.universe_id())
+            .bind(&me)
+            .fetch_optional(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        target.as_deref(),
+        Some("/rooms/hallway/troll"),
+        "fights back at once"
+    );
+    let statue_fights: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM combat WHERE universe_id = ? AND entity_id = '/rooms/hallway/statue'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(statue_fights, 0, "an aggro non-creature does not attack");
+}

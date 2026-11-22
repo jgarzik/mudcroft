@@ -282,6 +282,8 @@ const ENGINE_HOOKS: &[&str] = &[
     "heart_beat",
     "on_create",
     "on_destroy",
+    "ai_idle_tick",
+    "ai_combat_tick",
 ];
 
 impl GameApi {
@@ -3179,6 +3181,7 @@ impl GameApi {
             self.store.clone(),
             self.current_user_id.clone(),
         );
+        let object_code = self.current_object_id.is_some();
         game.set(
             "damage",
             lua.create_function(
@@ -3196,6 +3199,24 @@ impl GameApi {
                             .ok_or_else(|| format!("no such object: {}", t))?;
                         object_permission(&perms, user.as_deref(), &universe, &target, PermAction::Modify)
                             .await?;
+                        // The source is credited (a kill's XP): the caller
+                        // must control it, like an attacker
+                        if let Some(ref src) = source {
+                            let src_obj = store
+                                .get(&universe, src)
+                                .await
+                                .map_err(|e| e.to_string())?
+                                .ok_or_else(|| format!("no such object: {}", src))?;
+                            may_act_for(
+                                &perms,
+                                user.as_deref(),
+                                object_code,
+                                &universe,
+                                &src_obj,
+                                PermAction::Modify,
+                            )
+                            .await?;
+                        }
                         engine
                             .damage(&universe, &t, amount, &dtype, source.as_deref())
                             .await

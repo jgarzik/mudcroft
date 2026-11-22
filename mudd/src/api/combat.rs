@@ -167,6 +167,16 @@ pub fn weapon_dice(notation: &str) -> Option<crate::combat::DiceRoll> {
     })
 }
 
+/// A creature: an npc, a class derived from it, or a monster
+pub async fn is_creature(state: &AppState, universe_id: &str, obj: &Object) -> bool {
+    obj.class == "monster"
+        || state
+            .classes
+            .read()
+            .await
+            .is_a(universe_id, &obj.class, "npc")
+}
+
 /// Whether `attacker` may fight `target` now: the universe allows fighting
 /// (`combat` not "off"), the target is a creature (an npc, a subclass, a
 /// monster) or a player the PvP rules allow, both are alive and together.
@@ -190,12 +200,12 @@ pub async fn fight_allowed(
     if !alive(target) {
         return Err(format!("{} is already dead.", tn));
     }
-    let creature = target.class == "monster"
-        || state
-            .classes
-            .read()
-            .await
-            .is_a(universe_id, &target.class, "npc");
+    // Only fighters fight: players and creatures, alive
+    if !alive(attacker) || !(is_player(attacker) || is_creature(state, universe_id, attacker).await)
+    {
+        return Err(format!("{} can't fight.", name_of(attacker)));
+    }
+    let creature = is_creature(state, universe_id, target).await;
     let allowed =
         creature || (is_player(target) && pvp_allowed(state, universe_id, attacker, target).await);
     if !allowed {
@@ -223,6 +233,8 @@ pub async fn ready_to_strike(
 /// What one blow did, and what each party is told
 pub struct Blow {
     pub killed: bool,
+    pub critical: bool,
+    pub fumble: bool,
     /// Total damage dealt on a hit (all parts, after resistances)
     pub damage: Option<i32>,
     /// Each damage part: type, as rolled, as applied
@@ -386,6 +398,8 @@ pub async fn strike(
     }
     Ok(Blow {
         killed: outcome.killed,
+        critical: result.critical,
+        fumble: result.fumble,
         damage: if result.hit { damage } else { None },
         parts,
         attacker_text: mine.join("\n"),
@@ -552,7 +566,7 @@ pub async fn assist(
 /// walked in, and an aggressive NPC that walked in attacks a player there
 /// (at once; the player fights back a round later)
 pub async fn arrival(state: &AppState, universe_id: &str, mover: &str, room: &str) {
-    if let Err(e) = arrival_inner(state, universe_id, mover, room).await {
+    if let Err(e) = with_ai_budget(arrival_inner(state, universe_id, mover, room)).await {
         warn!("combat: arrival of {} in {}: {}", mover, room, e);
     }
 }
@@ -573,6 +587,7 @@ async fn arrival_inner(
     let now = now_ms();
     let next = now + settings(state, universe_id).await.round_ms;
     let aggressive = |o: &Object| !is_player(o) && o.get_bool("aggro").unwrap_or(false) && alive(o);
+    // (fight_allowed below also requires the aggressor to be a creature)
     let here = store.get_contents(universe_id, room).await?;
     if is_player(&mover) {
         // Each NPC there not fighting may react with its own ai_idle_tick
@@ -596,12 +611,23 @@ async fn arrival_inner(
                 handled.insert(npc.id.clone());
             }
         }
-        for npc in here
+        // Read again: the AI handlers may have moved or killed anyone
+        let Some(mover) = store.get(universe_id, &mover.id).await? else {
+            return Ok(());
+        };
+        for id in here
             .iter()
             .filter(|o| aggressive(o) && !handled.contains(&o.id))
+            .map(|o| o.id.clone())
         {
-            if !in_combat(state, universe_id, &npc.id).await?
-                && fight_allowed(state, universe_id, npc, &mover).await.is_ok()
+            let Some(npc) = store.get(universe_id, &id).await? else {
+                continue;
+            };
+            if aggressive(&npc)
+                && !in_combat(state, universe_id, &npc.id).await?
+                && fight_allowed(state, universe_id, &npc, &mover)
+                    .await
+                    .is_ok()
             {
                 engage_at(state, universe_id, &npc.id, &mover.id, now, next).await?;
             }
@@ -628,6 +654,16 @@ tokio::task_local! {
     /// The AI handler budget of the action being processed: (depth, calls
     /// left). Task-scoped, so it follows nested scripts and their moves.
     static AI_BUDGET: (u32, std::sync::Arc<std::sync::atomic::AtomicU32>);
+}
+
+/// Run `f` as one action for the AI handler budget: inside an action
+/// already, it shares that action's budget; else it starts a fresh one
+async fn with_ai_budget<F: std::future::Future>(f: F) -> F::Output {
+    if AI_BUDGET.try_with(|_| ()).is_ok() {
+        return f.await;
+    }
+    let fresh = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(MAX_AI_CALLS));
+    AI_BUDGET.scope((0, fresh), f).await
 }
 
 /// Run an NPC's AI handler (as its owner): true if it handled the moment
@@ -1202,7 +1238,8 @@ enum Note {
 
 /// Run every round and deadline due at `now`, as one run
 pub async fn process(state: &AppState, now: u64) {
-    let notes = super::scripting::in_run(state, async {
+    // One AI handler budget for the whole pass
+    let notes = with_ai_budget(super::scripting::in_run(state, async {
         // HP and effects are read then written: serialized with every writer
         let _writes = state.effects.write_guard().await;
         let mut notes = Vec::new();
@@ -1213,7 +1250,7 @@ pub async fn process(state: &AppState, now: u64) {
             .await
             .map_err(|e| e.to_string())?;
         Ok::<_, String>(notes)
-    })
+    }))
     .await;
     let notes = match notes {
         Ok(notes) => notes,
@@ -1762,8 +1799,8 @@ impl CombatEngine {
         self.after(notes, death).await;
         Ok(BlowReport {
             hit: blow.damage.is_some(),
-            critical: blow.attacker_text.starts_with("CRITICAL"),
-            fumble: blow.attacker_text.starts_with("You fumble"),
+            critical: blow.critical,
+            fumble: blow.fumble,
             damage: blow.damage.unwrap_or(0) as i64,
             killed: blow.killed,
             parts: blow
@@ -1786,6 +1823,10 @@ impl CombatEngine {
         let state = &self.state;
         let _writes = state.effects.write_guard().await;
         let target = self.object(u, target_id).await?;
+        // A dead NPC waiting to respawn is out of the world: not again
+        if target.parent_id.is_none() {
+            return Err(format!("{} is not in the world", name_of(&target)));
+        }
         let dtype = damage_type
             .parse::<DamageType>()
             .map_err(|_| format!("unknown damage type: {}", damage_type))?;
@@ -1842,13 +1883,8 @@ impl CombatEngine {
         if fail > 0 && rand::rng().random_range(0..100) < fail {
             return Err("You try to flee but fail to get away!".to_string());
         }
-        let mut notes = Vec::new();
-        let dir = leave_randomly(state, u, &who, false, "flees", &mut notes)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "There is nowhere to run.".to_string())?;
-        // Its own fight ends; its attackers' end on their next round (no
-        // longer together)
+        // Its own fight ends first (so a fight it walks into can start);
+        // its attackers' end on their next round (no longer together)
         state
             .object_store
             .execute_batch(vec![statement(
@@ -1857,6 +1893,11 @@ impl CombatEngine {
             )])
             .await
             .map_err(|e| e.to_string())?;
+        let mut notes = Vec::new();
+        let dir = leave_randomly(state, u, &who, false, "flees", &mut notes)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "There is nowhere to run.".to_string())?;
         self.after(notes, None).await;
         Ok(dir)
     }
@@ -1937,6 +1978,9 @@ impl Engine for CombatEngine {
         Box::pin(async move {
             let _writes = self.state.effects.write_guard().await;
             let t = self.object(universe_id, target).await?;
+            if t.parent_id.is_none() {
+                return Err(format!("{} is not in the world", name_of(&t)));
+            }
             let who = Combatant::from_object(&t, if is_player(&t) { 100 } else { 10 });
             let hp = (who.hp as i64)
                 .saturating_add(amount.clamp(0, 1_000_000))

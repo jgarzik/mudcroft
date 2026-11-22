@@ -316,7 +316,7 @@ another object.
 - `"use"` maps to `on_use`, `"look"` to `on_look`, `"hit"` to `on_hit` and `"init"` to `on_init`. Any other verb names the handler directly.
 - The handler runs in its own sandbox **as that object's owner** and gets `{object_id, actor_id, verb, target_id, code_hash}`.
 - It returns plain data: tables, strings, numbers and booleans.
-- Handlers whose names start with `_` are private, and engine hooks (`on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`) can't be called this way; such calls return `nil`.
+- Handlers whose names start with `_` are private, and engine hooks (`on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`, `ai_idle_tick`, `ai_combat_tick`) can't be called this way; such calls return `nil`.
 - `actor_id` is whatever the caller passed, so don't trust it as proof of who acted.
 - One top-level execution may make at most 32 `use_object` calls, across all nesting levels (at most 8 deep).
 

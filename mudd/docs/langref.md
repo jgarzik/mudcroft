@@ -788,8 +788,10 @@ fights, damage and deaths are part of its one change.
 #### `game.can_attack(attacker_id, target_id)`
 
 **Returns** `true` if `attacker_id` may fight `target_id` now (combat
-setting, a creature or a player the PvP rules allow, both alive and in the
-same room), else `false` and the reason.
+setting; the attacker a player or a creature, the target a creature or a
+player the PvP rules allow; both alive and in the same room), else `false`
+and the reason. A creature is an `npc`, a class derived from it, or a
+`monster`; `aggro` only makes creatures attack.
 
 #### `game.attack(attacker_id, target_id)`
 
@@ -815,8 +817,10 @@ epoch).
 
 Deals `amount` (0 to 1,000,000) damage of `type` (default `physical`) after
 the target's resistances. Reaching 0 HP is a death (the universe's policy),
-with `source_id` (optional) as the killer. Needs Modify permission on the
-target.
+with `source_id` (optional) as the killer, who is credited (XP): the caller
+must control the source as for an attacker. Needs Modify permission on the
+target, which must be in the world (not a dead NPC waiting to respawn; the
+same for `game.heal`).
 
 **Returns** `{damage, hp, killed}` (`damage` as applied), or `nil` and the
 reason.
@@ -1106,7 +1110,7 @@ Calls a handler on another object's code.
 - It runs in a **fresh sandbox, as that object's owner**, with object-code limits. Its object context is that object, and its room context is the object's `parent_id`.
 - The caller's identity is never passed on.
 - `actor_id` is whatever the caller passed. Handlers must treat it as untrusted: it need not be the player who acted.
-- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create` and `on_destroy`. Such calls return `nil`.
+- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`, `ai_idle_tick` and `ai_combat_tick`. Such calls return `nil`.
 - Nesting is limited to 8 levels, and one top-level execution may make at most 32 `use_object` calls in total, across all levels. Call 33 raises an error.
 
 **Returns** the handler's result as plain data: tables, strings, numbers
@@ -1169,7 +1173,8 @@ that are `fixed` or living (`game.is_a(id, "living")`: NPCs, players and
 their subclasses).
 
 `Commands.flee` wraps [`game.flee`](#gamefleeid) (the built-in `flee`
-command uses the same engine call). The library also defines
+command uses the same engine call); like it, it moves a player only when
+that player is the one acting (an `eval` of theirs), never from object code. The library also defines
 `Commands.give`, `Commands.look`, `Commands.say` and `Commands.use`, but no
 player command calls them.
 
