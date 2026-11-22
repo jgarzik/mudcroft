@@ -4,6 +4,7 @@
 //! - Movement: Room navigation via cardinal directions
 //! - Inventory: Item pickup, drop, and listing
 //! - Combat: NPC attacks and damage
+//! - Credits: payers, object budgets, refusals
 //! - Chat: Say command and messaging
 //! - Messaging: Lua send/broadcast delivery, single action reports
 //! - Multiuser: Builder permissions, path grants, multi-user interactions
@@ -15,6 +16,7 @@
 
 pub mod chat;
 pub mod combat;
+pub mod credits;
 pub mod inventory;
 pub mod messaging;
 pub mod movement;

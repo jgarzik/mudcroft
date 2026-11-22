@@ -46,10 +46,9 @@ affected feature.
 
 ### Lua runtime
 
-- **Credits and Venice bill the object's owner.** In object code the credit
-  functions and Venice usage act on the real user, the owner, and ignore
-  `set_actor` (`mudd/src/lua/game_api.rs`). A player triggering a verb spends
-  the owner's credits.
+- **Venice bills the object's owner.** In object code Venice usage is
+  rate-limited against the real user, the owner, not the paying player, and
+  costs no credits (`mudd/src/lua/game_api.rs`).
 
 ### Accounts and permissions
 

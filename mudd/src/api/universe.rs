@@ -523,6 +523,8 @@ async fn run_script(
         user_id: Some(run_as),
         room_id: None,
         object_id: None,
+        // The caller pays, even when running as an account it outranks
+        payer: Some(account.id.clone()),
     };
     let result = scripting::run_lua(
         &state,

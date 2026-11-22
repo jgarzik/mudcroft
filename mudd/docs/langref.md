@@ -184,8 +184,10 @@ for object code, or the `game.set_actor` override if one is set.
 | [`revoke_path(grant_id)`](#gamerevoke_pathgrant_id) | boolean or `{error}` | wizard+, the grantor, or a delegable grant |
 | [`get_path_grants(account_id)`](#gameget_path_grantsaccount_id) | array | — |
 | [`get_credits()`](#gameget_credits) | integer | — |
-| [`deduct_credits(amount, reason)`](#gamededuct_creditsamount-reason) | boolean | — |
-| [`admin_grant_credits(account_id, amount)`](#gameadmin_grant_creditsaccount_id-amount) | boolean | admin+ |
+| [`object_credits()`](#gameobject_credits) | integer | — |
+| [`deduct_credits(amount, reason, payer?)`](#gamededuct_creditsamount-reason-payer) | boolean | — |
+| [`transfer_credits(from, to, amount)`](#gametransfer_creditsfrom-to-amount) | boolean | — |
+| [`admin_grant_credits(holder, amount)`](#gameadmin_grant_creditsholder-amount) | boolean | admin+ |
 | [`llm_chat(messages, tier)`](#gamellm_chatmessages-tier) | string or `{error}` | Venice configured |
 | [`llm_image(prompt, style, size)`](#gamellm_imageprompt-style-size) | image hash or `{error}` | Venice configured |
 | [`time()`](#gametime) | milliseconds | — |
@@ -861,24 +863,54 @@ same shape as `grant_path`'s result.
 
 ## Credits
 
-The credit functions act on the script's **real user**, which for object
-code is the object's **owner**, not the player. `game.set_actor` doesn't
-change this. Object code can't charge the player who triggered it.
+Balances are per universe and held by an **account** or an **object** (a
+room's repair fund, a shop's till). Code can spend from two places only:
+
+- `"actor"`: the **paying player**, the one who chose to run this code by
+  typing the verb (or who ran `eval` or a script). Passive code has no
+  paying player: hooks such as `on_enter`, timers, heartbeats, and object
+  code reached through `game.use_object`. Spending as `"actor"` there raises
+  an error. `game.set_actor` does not change the payer.
+- `"object"`: the object whose code is running.
+
+Nothing can spend from any other account. Amounts are whole numbers from 1
+to 10^12; others raise an error. A spend never overdraws: it either happens
+in full or returns `false` with nothing changed.
 
 #### `game.get_credits()`
 
-**Returns** the real user's balance in this universe, or `0` if there is
-no user.
+**Returns** the paying player's balance, or `0` if there is none.
 
-#### `game.deduct_credits(amount, reason)`
+#### `game.object_credits()`
 
-Deducts from the real user. **Returns** `true` on success, or `false` if
-funds are insufficient or there is no user.
+**Returns** the running object's balance. Raises an error outside object
+code.
 
-#### `game.admin_grant_credits(account_id, amount)`
+#### `game.deduct_credits(amount, reason, payer?)`
 
-Adds credits to `account_id`. Requires **admin+**. **Returns** `true` on
-success, `false` if refused.
+Spends `amount` from `payer`, `"actor"` (default) or `"object"`. `reason` is
+logged. **Returns** `true`, or `false` if the payer has too little.
+
+#### `game.transfer_credits(from, to, amount)`
+
+Moves `amount` from `from` (`"actor"` or `"object"`) to `to`: `"actor"`,
+`"object"`, an account id, or an object path in this universe (which must
+exist). Atomic. **Returns** `true`, or `false` if the payer has too little.
+
+```lua
+-- A donation box: the player who types "donate box" pays into it
+donate = function(args)
+  if game.transfer_credits("actor", "object", 5) then
+    return "Thank you!"
+  end
+  return "You can't afford that."
+end
+```
+
+#### `game.admin_grant_credits(holder, amount)`
+
+Adds credits to `holder`, an account id or an object path that exists.
+Requires **admin+**. **Returns** `true` on success, `false` if refused.
 
 ---
 

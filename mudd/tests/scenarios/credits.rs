@@ -47,8 +47,20 @@ async fn verb(pl: &mut TestClient, command: &str) -> String {
 async fn test_object_budget_and_default_payer() {
     let server = TestServer::start().await.expect("server");
     let entrance = server.world().entrance_id.clone();
-    let mut adm = connect(&server, Role::Admin { username: "bank_admin".into() }).await;
-    let pl = connect(&server, Role::Player { username: "patron".into() }).await;
+    let mut adm = connect(
+        &server,
+        Role::Admin {
+            username: "bank_admin".into(),
+        },
+    )
+    .await;
+    let pl = connect(
+        &server,
+        Role::Player {
+            username: "patron".into(),
+        },
+    )
+    .await;
     let pl_id = pl.account_id().to_string();
     let mut pl = pl;
 
@@ -90,8 +102,20 @@ async fn test_object_budget_and_default_payer() {
 #[tokio::test]
 async fn test_hooks_and_strangers_cannot_spend_players_credits() {
     let server = TestServer::start().await.expect("server");
-    let mut adm = connect(&server, Role::Admin { username: "toll_admin".into() }).await;
-    let victim = connect(&server, Role::Player { username: "traveller".into() }).await;
+    let mut adm = connect(
+        &server,
+        Role::Admin {
+            username: "toll_admin".into(),
+        },
+    )
+    .await;
+    let victim = connect(
+        &server,
+        Role::Player {
+            username: "traveller".into(),
+        },
+    )
+    .await;
     let victim_id = victim.account_id().to_string();
     let mut victim = victim;
     eval(
@@ -137,4 +161,50 @@ async fn test_hooks_and_strangers_cannot_spend_players_credits() {
     .await;
     assert_eq!(out["text"], "false", "{}", out);
     assert_eq!(balance(&server, "account", &victim_id).await, 50);
+}
+
+/// Object code that a verb reaches through game.use_object does not inherit
+/// the player's wallet: only the verb's own handler may bill them
+#[tokio::test]
+async fn test_nested_use_object_cannot_bill_the_player() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = connect(
+        &server,
+        Role::Admin {
+            username: "nest_admin".into(),
+        },
+    )
+    .await;
+    let pl = connect(
+        &server,
+        Role::Player {
+            username: "nest_patron".into(),
+        },
+    )
+    .await;
+    let pl_id = pl.account_id().to_string();
+    let mut pl = pl;
+    let out = eval(
+        &mut adm,
+        &format!(
+            r#"game.admin_grant_credits("{p}", 30)
+               local thief = game.store_code([[return {{
+                 on_use = function(a) return tostring(pcall(game.deduct_credits, 30, "skim")) end,
+               }}]])
+               game.create_object("/items/skimmer", "item", "{room}", {{name = "skimmer", fixed = true, code_hash = thief}})
+               local front = game.store_code([[return {{
+                 press = function(a) return game.use_object("/items/skimmer", a.actor_id, "use") end,
+               }}]])
+               game.create_object("/items/button", "item", "{room}", {{name = "button", fixed = true, code_hash = front}})
+               game.add_action("press", "/items/button", "press")
+               return "ok""#,
+            p = pl_id,
+            room = entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ok", "{}", out);
+    assert_eq!(verb(&mut pl, "press button").await, "false");
+    assert_eq!(balance(&server, "account", &pl_id).await, 30);
 }

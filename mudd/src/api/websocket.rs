@@ -1478,8 +1478,16 @@ async fn execute_command(
         }
         _ => {
             let args = parts[1..].join(" ");
-            match dispatch_custom_verb(state, universe_id, player_id, access_level, &verb, &args)
-                .await
+            match dispatch_custom_verb(
+                state,
+                universe_id,
+                player_id,
+                account_id,
+                access_level,
+                &verb,
+                &args,
+            )
+            .await
             {
                 Some(reply) => reply,
                 None => ServerMessage::Output {
@@ -1502,6 +1510,7 @@ async fn dispatch_custom_verb(
     state: &AppState,
     universe_id: &str,
     player_id: &str,
+    player_account: &str,
     access_level: AccessLevel,
     verb: &str,
     args: &str,
@@ -1576,13 +1585,15 @@ async fn dispatch_custom_verb(
         "object_id": chosen.object_id,
         "room_id": room_id,
     });
-    let result = scripting::invoke_handler(
+    // The player chose to run this verb: they pay for what it spends
+    let result = scripting::invoke_verb_handler(
         state,
         universe_id,
         &chosen.object_id,
         room_id,
         &chosen.method,
         handler_args,
+        player_account,
     )
     .await;
     Some(match result {
@@ -1630,6 +1641,7 @@ async fn execute_lua_with_args(
         user_id: Some(account_id.to_string()),
         room_id: None,
         object_id: None,
+        payer: Some(account_id.to_string()),
     };
     match scripting::run_lua(state, &ctx, code, args, scripting::eval_config()).await {
         Ok(text) => ServerMessage::Output { text },

@@ -31,6 +31,10 @@ pub struct ScriptContext {
     pub room_id: Option<String>,
     /// Object context (timers, object-scoped actions)
     pub object_id: Option<String>,
+    /// The account that pays for credit spending (`"actor"`): the player
+    /// who typed the verb, or whoever ran eval / a script. None for hooks
+    /// and timers, which nobody chose to run.
+    pub payer: Option<String>,
 }
 
 /// Sandbox limits for interactive wizard `eval` and admin scripts, which
@@ -101,7 +105,36 @@ pub async fn invoke_handler(
         room_id,
         method,
         args,
-        HookBudget::new(),
+        Origin {
+            payer: None,
+            hooks: HookBudget::new(),
+        },
+    )
+    .await
+}
+
+/// invoke_handler for a verb the player `payer` typed: that player's
+/// account pays for the handler's credit spending (`"actor"`)
+pub async fn invoke_verb_handler(
+    state: &AppState,
+    universe_id: &str,
+    object_id: &str,
+    room_id: Option<String>,
+    method: &str,
+    args: serde_json::Value,
+    payer: &str,
+) -> Result<Option<String>, String> {
+    invoke_handler_at(
+        state,
+        universe_id,
+        object_id,
+        room_id,
+        method,
+        args,
+        Origin {
+            payer: Some(payer.to_string()),
+            hooks: HookBudget::new(),
+        },
     )
     .await
 }
@@ -148,6 +181,14 @@ impl HookBudget {
     }
 }
 
+/// What a handler run inherits from the run that caused it
+struct Origin {
+    /// Who pays for its credit spending (see ScriptContext::payer)
+    payer: Option<String>,
+    /// The move-hook allowance it may use
+    hooks: HookBudget,
+}
+
 /// invoke_handler at a hook nesting depth (move hooks run handlers that can
 /// move things and so run more hooks; see MAX_MOVE_HOOK_DEPTH)
 fn invoke_handler_at<'a>(
@@ -157,8 +198,12 @@ fn invoke_handler_at<'a>(
     room_id: Option<String>,
     method: &'a str,
     args: serde_json::Value,
-    budget: HookBudget,
+    origin: Origin,
 ) -> BoxFuture<'a, Result<Option<String>, String>> {
+    let Origin {
+        payer,
+        hooks: budget,
+    } = origin;
     Box::pin(async move {
         let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
             return Ok(None);
@@ -168,6 +213,7 @@ fn invoke_handler_at<'a>(
             user_id: owner_id,
             room_id,
             object_id: Some(object_id.to_string()),
+            payer,
         };
         let libs = load_universe_lib_codes(state, universe_id).await?;
         let queue = MessageQueue::shared();
@@ -324,6 +370,7 @@ fn prepare(
     game_api.set_user_context(ctx.user_id.clone());
     game_api.set_room_context(ctx.room_id.clone());
     game_api.set_object_context(ctx.object_id.clone());
+    game_api.set_payer(ctx.payer.clone());
 
     let mut sandbox =
         Sandbox::new(config).map_err(|e| format!("Failed to create sandbox: {}", e))?;
@@ -496,7 +543,11 @@ async fn handle_moved(
             Some(container.clone()),
             method,
             args,
-            budget.deeper(),
+            Origin {
+                // A move hook is passive: nobody chose to run it, nobody pays
+                payer: None,
+                hooks: budget.deeper(),
+            },
         )
         .await
         {

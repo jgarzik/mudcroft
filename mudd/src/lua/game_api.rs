@@ -137,6 +137,8 @@ pub struct GameApi {
     current_room_id: Option<String>,
     current_user_id: Option<String>,
     current_object_id: Option<String>,
+    /// Account paying for credit spending as `"actor"` (see ScriptContext)
+    payer: Option<String>,
     /// Time override for testing (milliseconds since epoch, 0 = use real time)
     time_override: Arc<AtomicU64>,
     /// RNG for dice rolls - seeded for reproducibility in tests
@@ -204,6 +206,7 @@ impl GameApi {
             current_room_id: None,
             current_user_id: None,
             current_object_id: None,
+            payer: None,
             time_override: Arc::new(AtomicU64::new(0)),
             rng: Arc::new(Mutex::new(StdRng::from_rng(&mut rand::rng()))),
             use_depth: 0,
@@ -229,11 +232,18 @@ impl GameApi {
             current_room_id: None,
             current_user_id: None,
             current_object_id: None,
+            // Nested object code never spends the caller's credits
+            payer: None,
             time_override: self.time_override.clone(),
             rng: self.rng.clone(),
             use_depth: self.use_depth + 1,
             use_calls: self.use_calls.clone(),
         }
+    }
+
+    /// Set the account paying for credit spending as `"actor"`
+    pub fn set_payer(&mut self, payer: Option<String>) {
+        self.payer = payer;
     }
 
     /// Set the current user context for permission checks
@@ -2044,73 +2054,107 @@ impl GameApi {
     }
 
     fn register_credit_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        use crate::credits::Holder;
         let credits = self.credits.clone();
         let universe_id = self.universe_id.clone();
         let current_user = self.current_user_id.clone();
         let permissions = self.permissions.clone();
+        let payer = self.payer.clone();
+        let object = self.current_object_id.clone();
 
-        // game.get_credits()
-        // Get the current player's credit balance
-        let credits_clone = credits.clone();
-        let universe_clone = universe_id.clone();
-        let user_clone = current_user.clone();
+        // "actor" (the paying player) or "object" (the running object)
+        let spender = {
+            let (payer, object) = (payer.clone(), object.clone());
+            move |which: &str| -> LuaResult<Holder> {
+                match which {
+                    "actor" => payer.clone().map(Holder::Account).ok_or_else(|| {
+                        mlua::Error::runtime(
+                            "no paying player here (only a verb, eval or script has one)",
+                        )
+                    }),
+                    "object" => object
+                        .clone()
+                        .map(Holder::Object)
+                        .ok_or_else(|| mlua::Error::runtime("no object here")),
+                    _ => Err(mlua::Error::runtime(
+                        "payer must be \"actor\" or \"object\"",
+                    )),
+                }
+            }
+        };
+
+        // game.get_credits(): the paying player's balance (0 if none)
+        let (c, u, p) = (credits.clone(), universe_id.clone(), payer.clone());
         let get_credits = lua.create_function(move |lua, ()| {
             charge_db(lua)?;
-            let credits = credits_clone.clone();
-            let universe_id = universe_clone.clone();
-            let user_id = user_clone.clone();
-
-            let Some(uid) = user_id else {
+            let Some(account) = p.clone() else {
                 return Ok(0);
             };
-            block_now(async {
-                credits
-                    .balance(&universe_id, &crate::credits::Holder::Account(uid))
-                    .await
-            })
-            .map_err(mlua::Error::external)
+            block_now(c.balance(&u, &Holder::Account(account))).map_err(mlua::Error::external)
         })?;
         game.set("get_credits", get_credits)?;
 
-        // game.deduct_credits(amount, reason)
-        // Deduct credits from the current player
-        // Returns true if successful, false if insufficient funds
-        let credits_clone = credits.clone();
-        let universe_clone = universe_id.clone();
-        let user_clone = current_user.clone();
-        let deduct_credits = lua.create_function(move |lua, (amount, reason): (i64, String)| {
+        // game.object_credits(): the running object's balance
+        let (c, u, s) = (credits.clone(), universe_id.clone(), spender.clone());
+        let object_credits = lua.create_function(move |lua, ()| {
             charge_db(lua)?;
-            let credits = credits_clone.clone();
-            let universe_id = universe_clone.clone();
-            let user_id = user_clone.clone();
-
-            let _ = reason;
-            let Some(uid) = user_id else {
-                return Ok(false);
-            };
-            block_now(async {
-                credits
-                    .deduct(&universe_id, &crate::credits::Holder::Account(uid), amount)
-                    .await
-            })
-            .map_err(mlua::Error::external)
+            let holder = s("object")?;
+            block_now(c.balance(&u, &holder)).map_err(mlua::Error::external)
         })?;
+        game.set("object_credits", object_credits)?;
+
+        // game.deduct_credits(amount, reason, payer?): spend from "actor"
+        // (default) or "object"; false if it has too little
+        let (c, u, s) = (credits.clone(), universe_id.clone(), spender.clone());
+        let deduct_credits = lua.create_function(
+            move |lua, (amount, reason, which): (i64, String, Option<String>)| {
+                charge_db(lua)?;
+                let holder = s(which.as_deref().unwrap_or("actor"))?;
+                let paid =
+                    block_now(c.deduct(&u, &holder, amount)).map_err(mlua::Error::external)?;
+                if paid {
+                    tracing::debug!("credits: {:?} spent {} on {:?}", holder, amount, reason);
+                }
+                Ok(paid)
+            },
+        )?;
         game.set("deduct_credits", deduct_credits)?;
 
-        // game.admin_grant_credits(account_id, amount)
-        // Grant credits to a player (admin+, via PermAction::GrantCredits)
-        let credits_clone = credits;
-        let universe_clone = universe_id;
-        let user_clone = current_user;
-        let admin_grant_credits =
-            lua.create_function(move |lua, (account_id, amount): (String, i64)| {
+        // game.transfer_credits(from, to, amount): from "actor" or "object";
+        // to "actor", "object", an account id or an object path. Atomic;
+        // false if the payer has too little.
+        let (c, u, s) = (credits.clone(), universe_id.clone(), spender);
+        let transfer_credits =
+            lua.create_function(move |lua, (from, to, amount): (String, String, i64)| {
                 charge_db(lua)?;
-                let credits = credits_clone.clone();
-                let universe_id = universe_clone.clone();
+                let from = s(&from)?;
+                let to = match to.as_str() {
+                    "actor" | "object" => s(&to)?,
+                    other => Holder::parse(other),
+                };
+                block_now(async {
+                    if !c.holder_exists(&u, &to).await? {
+                        anyhow::bail!("no such holder {:?}", to);
+                    }
+                    c.transfer(&u, &from, &to, amount).await
+                })
+                .map_err(mlua::Error::external)
+            })?;
+        game.set("transfer_credits", transfer_credits)?;
+
+        // game.admin_grant_credits(holder, amount): an account id or object
+        // path (admin+, via PermAction::GrantCredits)
+        let (c, u) = (credits, universe_id);
+        let admin_grant_credits =
+            lua.create_function(move |lua, (holder, amount): (String, i64)| {
+                charge_db(lua)?;
+                let credits = c.clone();
+                let universe_id = u.clone();
                 let permissions = permissions.clone();
-                let Some(user_id) = actor_override(lua).or(user_clone.clone()) else {
+                let Some(user_id) = actor_override(lua).or(current_user.clone()) else {
                     return Ok(false);
                 };
+                let holder = Holder::parse(&holder);
 
                 let result = block_on_perm(async move {
                     let ctx = permissions.get_user_context(&user_id, &universe_id).await;
@@ -2125,15 +2169,8 @@ impl GameApi {
                     {
                         return false;
                     }
-
-                    credits
-                        .grant(
-                            &universe_id,
-                            &crate::credits::Holder::parse(&account_id),
-                            amount,
-                        )
-                        .await
-                        .is_ok()
+                    matches!(credits.holder_exists(&universe_id, &holder).await, Ok(true))
+                        && credits.grant(&universe_id, &holder, amount).await.is_ok()
                 });
 
                 Ok(result)

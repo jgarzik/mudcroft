@@ -167,6 +167,30 @@ impl CreditManager {
         Ok(())
     }
 
+    /// Whether a holder exists: an account, or an object in the universe
+    /// (credits sent to a typo would be lost)
+    pub async fn holder_exists(&self, universe_id: &str, holder: &Holder) -> anyhow::Result<bool> {
+        let Some(ref pool) = self.pool else {
+            anyhow::bail!("credits: no database");
+        };
+        let found: Option<i64> = match holder {
+            Holder::Account(id) => {
+                sqlx::query_scalar("SELECT 1 FROM accounts WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Holder::Object(id) => {
+                sqlx::query_scalar("SELECT 1 FROM objects WHERE universe_id = ? AND id = ?")
+                    .bind(universe_id)
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        Ok(found.is_some())
+    }
+
     /// A holder's balance (0 if it has none). A failed read is an error,
     /// never a silent zero.
     pub async fn balance(&self, universe_id: &str, holder: &Holder) -> anyhow::Result<i64> {
