@@ -29,30 +29,53 @@ async fn player_in_passage(server: &TestServer, name: &str) -> TestClient {
 /// first blow of a fight, or, when already fighting (retyping attack adds
 /// no blow), the next round's
 async fn attack(c: &mut TestClient, cmd: &str) -> String {
-    c.command(cmd).await.expect("send attack");
-    let _ = c.expect("echo").await;
-    let reply = c.expect_any().await.expect("attack reply");
-    assert_eq!(reply["type"], "output", "attack failed: {}", reply);
-    let text = reply["text"].as_str().unwrap().to_string();
-    if !(text.contains("already fighting") || text.contains("turn to fight")) {
-        return text;
-    }
+    try_attack(c, cmd)
+        .await
+        .unwrap_or_else(|e| panic!("attack failed: {}", e))
+}
+
+/// Like `attack`, but an error reply (e.g. the target died meanwhile) is
+/// returned instead of failing the test
+async fn try_attack(c: &mut TestClient, cmd: &str) -> Result<String, String> {
     let ours = |t: &str| {
         t.starts_with("You hit")
             || t.starts_with("You miss")
             || t.starts_with("CRITICAL")
             || t.starts_with("You fumble")
     };
+    c.command(cmd).await.expect("send attack");
+    let _ = c.expect("echo").await;
+    // Skip unrelated messages (an NPC's blows, effect ticks) until the
+    // attack's own reply
+    let text = loop {
+        let reply = c.expect_any().await.expect("attack reply");
+        if reply["type"] == "error" {
+            return Err(reply.to_string());
+        }
+        let text = reply["text"].as_str().unwrap_or_default().to_string();
+        if reply["type"] == "output"
+            && (ours(&text) || text.contains("already fighting") || text.contains("turn to fight"))
+        {
+            break text;
+        }
+    };
+    if ours(&text) {
+        return Ok(text);
+    }
     for _ in 0..20 {
         let m = c
             .expect_any_timeout(Duration::from_secs(3))
             .await
             .expect("the next round's blow");
-        if m["type"] == "output" && ours(m["text"].as_str().unwrap_or_default()) {
-            return m["text"].as_str().unwrap().to_string();
+        let t = m["text"].as_str().unwrap_or_default();
+        // The next blow, or the fight's end (the target died meanwhile)
+        if m["type"] == "output"
+            && (ours(t) || t.contains(" dies.") || t.contains("You stop fighting"))
+        {
+            return Ok(t.to_string());
         }
     }
-    panic!("no round blow after {}", cmd);
+    Err(format!("no round blow after {}", cmd))
 }
 
 /// Attacking an NPC reports a hit, miss or fumble against it
@@ -92,7 +115,7 @@ async fn test_combat_hp_update() {
             .and_then(|r| r.split_whitespace().next())
             .and_then(|n| n.parse().ok())
             .expect("damage amount");
-        if text.contains("slain") {
+        if text.contains("slain") || text.contains(" dies.") {
             return; // one-shot kill: nothing left to compare
         }
         let remaining: i64 = text
@@ -115,17 +138,21 @@ async fn test_kill_npc() {
     let mut alice = player_in_passage(&server, "bat_killer").await;
 
     // One attack starts the fight; rounds finish it
-    let mut slain = attack(&mut alice, "attack bat")
-        .await
-        .contains("Giant Bat is slain!");
+    let first = attack(&mut alice, "attack bat").await;
+    let mut slain = first.contains("Giant Bat is slain!") || first.contains("Giant Bat dies");
+    let mut all = vec![first];
     for _ in 0..30 {
         if slain {
             break;
         }
         let heard = alice.outputs_within(Duration::from_millis(1000)).await;
-        slain = heard.iter().any(|t| t.contains("Giant Bat is slain!"));
+        // Slain by a blow, or dead of bleeding
+        slain = heard
+            .iter()
+            .any(|t| t.contains("Giant Bat is slain!") || t.contains("Giant Bat dies"));
+        all.extend(heard);
     }
-    assert!(slain, "bat should die within 30 rounds");
+    assert!(slain, "bat should die within 30 rounds: {:?}", all);
 
     alice.command("look").await.expect("look");
     let room = alice.expect("room").await.expect("room");
@@ -187,7 +214,11 @@ async fn test_attack_damage_is_rolled() {
         let rat = format!("Rat{}", round);
         server.world().create_npc(&rat, &entrance).await.unwrap();
         for _ in 0..20 {
-            let text = attack(&mut alice, &format!("attack {}", rat.to_lowercase())).await;
+            // The rat may bleed to death between attacks
+            let Ok(text) = try_attack(&mut alice, &format!("attack {}", rat.to_lowercase())).await
+            else {
+                break;
+            };
             if let Some(line) = text.lines().find(|l| l.contains(" damage")) {
                 let d: i64 = line
                     .split(" for ")
@@ -198,7 +229,7 @@ async fn test_attack_damage_is_rolled() {
                 assert!((1..=12).contains(&d), "damage out of range: {}", text);
                 damages.insert(d);
             }
-            if text.contains("slain") {
+            if text.contains("slain") || text.contains(" dies.") {
                 break;
             }
         }
@@ -242,7 +273,7 @@ async fn test_attack_writes_hp_to_the_object() {
     let bat = server.world().bat_id.clone();
     for _ in 0..30 {
         let text = attack(&mut alice, "attack bat").await;
-        if text.contains("slain") {
+        if text.contains("slain") || text.contains(" dies.") {
             return;
         }
         let Some(remaining) = text
@@ -872,15 +903,20 @@ async fn test_combat_rounds_and_retaliation() {
     let ours = heard
         .iter()
         .filter(|t| {
-            t.contains("You hit the ogre")
-                || t.contains("You miss the ogre")
-                || t.contains("You hit ogre")
-                || t.contains("You miss ogre")
+            t.starts_with("You hit")
+                || t.starts_with("You miss")
+                || t.starts_with("CRITICAL")
+                || t.starts_with("You fumble")
         })
         .count();
     let theirs = heard
         .iter()
-        .filter(|t| t.contains("ogre hits you") || t.contains("ogre misses you"))
+        .filter(|t| {
+            t.contains("ogre hits you")
+                || t.contains("ogre misses you")
+                || t.contains("ogre critically hits you")
+                || t.contains("ogre fumbles")
+        })
         .count();
     assert!(ours >= 2, "our rounds went on: {:?}", heard);
     assert!(theirs >= 2, "the ogre fought back: {:?}", heard);
@@ -902,23 +938,23 @@ async fn test_combat_rounds_and_retaliation() {
     assert_eq!(fighting, 0, "the fight ended");
 }
 
-/// Attack until the target dies (a blow can miss)
+/// Attack, then let the rounds go on until the target dies (by a blow or
+/// by bleeding)
 async fn attack_until_slain(c: &mut TestClient, cmd: &str, name: &str) {
-    for _ in 0..40 {
-        c.drain().await;
-        c.command(cmd).await.unwrap();
-        let texts = c.outputs_within(Duration::from_millis(300)).await;
-        if texts
-            .iter()
-            .any(|t| t.contains(&format!("{} is slain", name)))
-        {
+    let dead = |t: &str| {
+        t.contains(&format!("{} is slain", name)) || t.contains(&format!("{} dies", name))
+    };
+    c.drain().await;
+    c.command(cmd).await.unwrap();
+    let mut heard = Vec::new();
+    for _ in 0..30 {
+        let texts = c.outputs_within(Duration::from_millis(500)).await;
+        if texts.iter().any(|t| dead(t)) {
             return;
         }
-        if texts.iter().any(|t| t.contains("You don't see")) {
-            panic!("target gone without being slain: {:?}", texts);
-        }
+        heard.extend(texts);
     }
-    panic!("{} never slain", name);
+    panic!("{} never slain: {:?}", name, heard);
 }
 
 /// An NPC's death by the default policy: its belongings in a corpse (which
