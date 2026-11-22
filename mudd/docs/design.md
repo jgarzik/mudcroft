@@ -494,7 +494,10 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   SQLite transaction (each request in its own savepoint, so requests stay
   independent), writing `last_applied` in that transaction, and answers
   the clients after it commits. An entry is therefore applied exactly once,
-  even across a crash.
+  even across a crash. A request whose SQL fails gets an error response;
+  a storage failure while applying (the transaction itself failing, e.g. a
+  full disk) is fatal to the Raft core, and `mudd` then stops serving and
+  exits non-zero (`RaftWriter::stopped`) so a supervisor can restart it.
 - **Every server write goes through Raft**, including accounts and combat
   state. Only `mudd_init` (and `AccountService::offline`) writes directly,
   because it runs before any Raft node exists.

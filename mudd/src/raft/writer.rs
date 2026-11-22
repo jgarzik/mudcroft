@@ -149,6 +149,21 @@ impl RaftWriter {
         }
     }
 
+    /// Resolves when the Raft core stops: a fatal error (e.g. the state
+    /// machine could not apply a committed entry) or a shutdown. Returns
+    /// the reason. After this every write fails, so the server must stop.
+    pub async fn stopped(&self) -> String {
+        let mut metrics = self.raft.metrics();
+        loop {
+            if let Err(fatal) = &metrics.borrow_watched().running_state {
+                return fatal.to_string();
+            }
+            if metrics.changed().await.is_err() {
+                return "Raft core exited".to_string();
+            }
+        }
+    }
+
     /// Get the Raft instance (for advanced operations)
     pub fn raft(&self) -> &GameRaft {
         &self.raft
@@ -324,5 +339,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 50);
+    }
+
+    /// stopped() resolves once the Raft core is gone
+    #[tokio::test]
+    async fn test_stopped_resolves_when_core_stops() {
+        let pool = test_pool_with_raft_tables().await;
+        let writer = RaftWriter::single_node(pool, 1, 19004, "/tmp/test.db")
+            .await
+            .unwrap();
+        writer
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .unwrap();
+        writer.raft().shutdown().await.unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(5), writer.stopped())
+            .await
+            .expect("stopped() should resolve after shutdown");
+        assert!(!reason.is_empty());
     }
 }

@@ -148,11 +148,21 @@ impl Server {
         let router = self.router().await;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                shutdown_rx.changed().await.ok();
-            })
-            .await?;
+        let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+            shutdown_rx.changed().await.ok();
+        });
+
+        // A stopped Raft core (e.g. a storage failure while applying) means
+        // every write fails from then on: stop serving and exit with an
+        // error so a supervisor restarts mudd, rather than limp along
+        let raft_writer = self.raft_writer.clone();
+        tokio::select! {
+            result = server => result?,
+            reason = raft_writer.stopped() => {
+                tracing::error!("Raft stopped ({}); shutting down", reason);
+                anyhow::bail!("Raft stopped: {}", reason);
+            }
+        }
 
         info!("mudd shutdown complete");
         Ok(())
