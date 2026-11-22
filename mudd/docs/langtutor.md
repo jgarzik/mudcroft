@@ -202,7 +202,7 @@ return p.metadata.heal_dice   -- "2d4+2", inherited from the class
 
 Things to know:
 
-- **Restarts.** Custom classes are currently kept **in memory only** and are lost when the server restarts. Objects keep the properties they were created with, so you only need to define the class again before creating more objects from it.
+- **Persistence.** Custom classes are stored in the database and survive restarts.
 - **Inheritance.** A new object gets the defaults of its class and every ancestor (`potion` → `item` → `thing`), and your props override them. Empty-string defaults and a class's `code_hash` default are not copied; attach code by passing `code_hash` in the props.
 - **Reading properties.** Custom properties appear under `obj.metadata`. `name` and `description` are also copied to `obj.name` and `obj.description`.
 - **Checking class.** `game.is_a(id, "item")` checks inheritance, and so do the `attack` and `take` commands. `game.get_living_in` and the `get_children` class filter match class names exactly, so a monster of a custom `npc` subclass is missing from `get_living_in`; use `all_inventory` with `game.is_a` to find it.
@@ -304,7 +304,7 @@ How verbs behave:
 - **Built-in commands win.** You can't override `look`, `get`, `say` and the other built-ins.
 - **Choosing an object.** If several nearby objects register the same verb, the one whose name matches what the player typed is chosen.
 - **Replies.** Return `nil` to send no reply; that's useful when the handler already used `game.send`. If the handler raises an error, players see `Something went wrong.` and wizards see the real error.
-- **Restarts.** Actions are kept **in memory only** and are lost when the server restarts. Keep the `add_action` calls in a function you can run again (Part B's `crypt_verbs()`), or register them from a room's `on_enter` hook.
+- **Persistence.** Actions are stored in the database: they survive restarts (and, in a cluster, failovers), and are removed with their object or room.
 
 #### Calling another object's code
 
@@ -330,7 +330,7 @@ only work **inside that object's code**. In `eval`, `call_out` returns
 |---|---|
 | `game.call_out(delay_secs, method, args)` | Run `method` on this object once, after `delay_secs` (fractions allowed). `args` is an optional **string**. Returns a timer ID, or `""`. Up to 32 pending per object. Saved across restarts. |
 | `game.remove_call_out(timer_id)` | Cancel a pending call_out. |
-| `game.set_heart_beat(interval_ms)` | Run this object's `heart_beat` handler every `interval_ms` (at least 100). Memory only: stops on restart. |
+| `game.set_heart_beat(interval_ms)` | Run this object's `heart_beat` handler every `interval_ms` (at least 100). Survives restarts. |
 | `game.remove_heart_beat()` | Stop this object's heartbeat. |
 
 Timer callbacks run as the object's owner and receive
@@ -485,7 +485,7 @@ A library runs before *every* script in the universe, so it only
 **defines** things:
 
 - `build_crypt()` builds the area once.
-- `crypt_verbs()` registers the custom verbs. Run it after building and again after every server restart, because verbs aren't saved.
+- `crypt_verbs()` registers the custom verbs (once: they are saved).
 - `crypt_strike()` is a shared attack helper. Object code can call it because libraries are loaded into object code too.
 
 To play it, connect as a wizard and run:
@@ -870,7 +870,6 @@ Don't build on them yet:
 - **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
 - **NPC behaviour:** `aggro` and `respawn_time` do nothing, and NPCs don't fight back in the built-in combat. Script it as in Part B.
 - **Commands and combat:** there are no `use`, `give` or `flee` player commands (add verbs instead), no PvP, and no Lua access to the combat engine's damage types and effects.
-- **Persistence:** custom verbs don't survive a restart.
 - **Universe config:** keys like `pvp_mode` or `spawn_room` have no effect. Use `setportal` for the spawn room.
 
 ---

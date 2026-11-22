@@ -19,8 +19,6 @@ affected feature.
 Clusters work as described in `docs/cluster-design.md` (joining, the
 primary lifecycle, gateways, failover), with these gaps:
 
-- **Custom verbs are lost on failover.** They live only in the primary's
-  memory (`ActionRegistry`) until Phase 6 persists them.
 - **Commands are not exactly-once across a failover.** A command in flight
   when the primary dies may or may not have taken effect; the player is told
   and nothing is retried (one batch per command and command ids would fix

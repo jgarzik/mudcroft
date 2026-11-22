@@ -429,6 +429,31 @@ impl TestCluster {
         Ok(())
     }
 
+    /// Run a script (put there with add_script) in `universe` through node
+    /// `i`, as the cluster admin; its result
+    pub async fn run_script(&self, i: usize, universe: &str, script: &str) -> Result<String> {
+        let base = self.nodes[i].base_url();
+        let login: serde_json::Value = self
+            .client
+            .post(format!("{}/auth/login", base))
+            .json(&serde_json::json!({"username": "cluster_admin", "password": "testpass123"}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let token = login["token"].as_str().unwrap_or_default().to_string();
+        let resp: serde_json::Value = self
+            .client
+            .post(format!("{}/universe/{}/run_script", base, universe))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"script": script}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(resp["result"].as_str().unwrap_or_default().to_string())
+    }
+
     /// The nodes whose log says they became primary
     pub fn primaries(&self) -> Vec<usize> {
         self.nodes

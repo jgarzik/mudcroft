@@ -615,3 +615,70 @@ async fn test_heartbeat_survives_restart() {
         .await
         .expect("the heartbeat came back after the restart");
 }
+
+/// Custom verbs are stored in the database: they survive a restart (and a
+/// failover), and go with their object
+#[tokio::test]
+async fn test_custom_verbs_survive_restart() {
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "verb_keeper".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local h = game.store_code([[return {{ ring = function(a) return "Ding!" end }}]])
+           game.create_object("/items/gong", "item", "{}", {{name = "gong", fixed = true, code_hash = h}})
+           return tostring(game.add_action("ring", "/items/gong", "ring"))"#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("true")
+        .await
+        .expect("verb added");
+    drop(wiz);
+
+    server.restart().await.expect("restart");
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "gong_ringer".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    pl.command("ring gong").await.unwrap();
+    pl.expect_output_containing("Ding!")
+        .await
+        .expect("the verb survived the restart");
+
+    // Deleting the object takes its verb with it
+    let pool = server.pool().clone();
+    let rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM actions WHERE object_id = '/items/gong'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(rows().await, 1);
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "verb_keeper".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(r#"eval return tostring(game.delete_object("/items/gong"))"#)
+        .await
+        .unwrap();
+    wiz.expect_output_containing("true").await.expect("deleted");
+    assert_eq!(rows().await, 0);
+    pl.drain().await;
+    pl.command("ring gong").await.unwrap();
+    pl.expect_output_containing("Unknown command")
+        .await
+        .expect("the verb went with its object");
+}

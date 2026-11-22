@@ -795,7 +795,9 @@ impl GameApi {
                     timers.remove_timers_for_object(&universe_id, &id).await;
                     timers.remove_heartbeat(&universe_id, &id).await;
                     effects.cache_clear(&universe_id, &id).await;
+                    // Its verb rows (and a room's) went with it (cascade)
                     actions.clear_by_object(&universe_id, &id).await;
+                    actions.clear_room(&universe_id, &id).await;
                     Ok(Ok(true))
                 })
             });
@@ -1453,18 +1455,23 @@ impl GameApi {
 
                 // Store action - for now we'll use the object_id as the scope
                 // The caller should set up proper room context before execution
-                block_now(async {
+                let stored = block_now(async {
                     if let Some(rid) = room_id {
-                        actions.add_room_action(&universe_id, &rid, action).await;
+                        actions.add_room_action(&universe_id, &rid, action).await
                     } else {
                         // If no room context, add as object action
                         actions
                             .add_object_action(&universe_id, &action.object_id, action.clone())
-                            .await;
+                            .await
                     }
                 });
-
-                Ok(true)
+                match stored {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        tracing::warn!("add_action not stored: {}", e);
+                        Ok(false)
+                    }
+                }
             },
         )?;
         game.set("add_action", add_action)?;
@@ -1483,19 +1490,24 @@ impl GameApi {
                     return Ok(false);
                 }
 
-                block_now(async {
+                let removed = block_now(async {
                     if let Some(rid) = room_id {
                         actions
                             .remove_room_action(&universe_id, &rid, &verb, &object_id)
-                            .await;
+                            .await
                     } else {
                         actions
                             .remove_object_action(&universe_id, &object_id, &verb)
-                            .await;
+                            .await
                     }
                 });
-
-                Ok(true)
+                match removed {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        tracing::warn!("remove_action not stored: {}", e);
+                        Ok(false)
+                    }
+                }
             })?;
         game.set("remove_action", remove_action)?;
 

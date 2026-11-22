@@ -56,9 +56,8 @@ reconnect to the new primary), drop the caches. An old primary that has not
 noticed yet cannot do damage: its writes fail at `client_write`. It may at
 most send a few stale messages to players for up to one election timeout.
 
-**Known limitation until Phase 6:** custom verbs (`ActionRegistry`) live
-only in memory, so a failover loses them (the new primary has none until
-object code re-registers them). Persisting them stays in Phase 6.
+Custom verbs are in the `actions` table (Phase 6), so a new primary has
+them too.
 
 ## Gateways
 

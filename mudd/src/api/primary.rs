@@ -57,6 +57,7 @@ pub async fn run(state: AppState, activations: watch::Sender<u64>) {
         }
         timer_loop.abort();
         effect_loop.abort();
+        // The next primary has the verbs (they are in the table)
         state.actions.clear_all().await;
         // Sessions move to the new primary (directly connected players
         // reconnect; gateways relaying sessions follow)
@@ -81,5 +82,6 @@ async fn rebuild_caches(state: &AppState) -> anyhow::Result<()> {
     state.permissions.reset().await?;
     state.classes.write().await.load_from_db().await?;
     state.effects.load_from_db(state.db.pool()).await?;
+    state.actions.load_from_db().await?;
     Ok(())
 }

@@ -10,7 +10,7 @@ Mudcroft is a multi-user dungeon (MUD) game server in Rust (`mudd/`) with a Reac
 - WebSocket-based multiplayer gameplay
 - Raft (openraft) log over SQLite; single node by default; clusters join over a TLS cluster port, the leader (primary) runs the game and other nodes are gateways (`docs/cluster-design.md`)
 
-Design it as what it is: a specialized database server. The tables (written only through Raft) are the source of truth; in-memory maps are caches derived from them, never a second copy of state. One logical change (a combat round, an effect tick) is one atomic batch. State that lives only in memory (custom verbs today) is a flaw to fix. Prefer absolute deadlines and event-driven work to periodic sweeps: write only when something happens.
+Design it as what it is: a specialized database server. The tables (written only through Raft) are the source of truth; in-memory maps are caches derived from them, never a second copy of state. One logical change (a combat round, an effect tick) is one atomic batch. State that lives only in memory is a flaw to fix. Prefer absolute deadlines and event-driven work to periodic sweeps: write only when something happens.
 
 ## Build & Test Commands
 
@@ -70,7 +70,7 @@ scripts/testsrv.py start             # manual play-test server with a seeded wor
   - `sandbox.rs` - Execution with instruction/memory limits and per-execution call budgets
   - `game_api.rs` - Exposed game.* functions
   - `libs.rs` - universe library loading (config `lib_hashes`)
-  - `actions.rs` - ActionRegistry for custom verbs
+  - `actions.rs` - ActionRegistry: cache of the `actions` table (custom verbs)
   - `messaging.rs` - MessageQueue
 - **combat/** - dice, damage types, status effects, `engine` (attack resolution over object rows: HP lives in the object's `hp` property), PvP policies
 - **raft/** - openraft storage/state machine (log entries are SQL requests; snapshots are game-table copies), `transport` (TLS cluster port: RPCs, join), RaftWriter
@@ -96,7 +96,7 @@ scripts/testsrv.py start             # manual play-test server with a seeded wor
 
 ### Database
 
-One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, universe_members, credits, timers, heartbeats, path_grants, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
+One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, universe_members, credits, timers, heartbeats, actions, path_grants, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
 
 ### WebSocket Protocol
 

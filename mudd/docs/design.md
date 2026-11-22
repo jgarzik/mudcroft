@@ -105,9 +105,10 @@ upgrades live (`Database::upgrade`), and there are none yet.
    primary a node confirms leadership with a quorum and applies everything
    committed before its term (`ensure_linearizable(ReadIndex)`), rebuilds
    its caches from the tables (timers and heartbeats, access levels and
-   path grants, custom classes, status effects), then starts both loops;
-   on losing leadership it stops them and forgets its custom verbs (memory
-   only until Phase 6). Deadlines are absolute, so whatever fell due during
+   path grants, custom classes, status effects, custom verbs), then starts
+   both loops;
+   on losing leadership it stops them and drops its caches of custom verbs.
+   Deadlines are absolute, so whatever fell due during
    a failover runs at once, and only once. A node that is leader at startup
    (always, for a single node) waits for this before serving. Elsewhere,
    writes fail with "not the primary".
@@ -278,8 +279,9 @@ is built without an account, so it never starts image generation.
 
 ### Custom Verbs
 
-`game.add_action` registers a verb for a room or an object in the in-memory
-`ActionRegistry`. Because the handler runs as the object's owner,
+`game.add_action` registers a verb for a room or an object in the `actions`
+table (through Raft); `ActionRegistry` caches it for dispatch. Rows cascade
+with their object and their room. Because the handler runs as the object's owner,
 `add_action` and `remove_action` require Modify access to the object and
 being its owner or outranking the owner (`can_act_as`; ownerless objects need
 only Modify), and `add_action` refuses private methods (`_name` and engine

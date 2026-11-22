@@ -3,10 +3,18 @@
 //! Objects can register actions (verbs) that players can use when in context.
 //! For example, a lever might add a "pull" action when a player enters the room.
 //! Object ids are scoped per universe, so every key includes the universe.
+//!
+//! The `actions` table is the truth (written through Raft); the maps here
+//! are a cache of it for dispatch, rebuilt when the node becomes primary.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use serde_json::json;
+use sqlx::SqlitePool;
 use tokio::sync::RwLock;
+
+use crate::raft::RaftWriter;
 
 /// An action registered by an object
 #[derive(Debug, Clone)]
@@ -26,19 +34,99 @@ fn key(universe_id: &str, id: &str) -> Key {
     (universe_id.to_string(), id.to_string())
 }
 
+type Statement = (String, Vec<serde_json::Value>);
+
 /// Registry for contextual actions
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ActionRegistry {
     /// Room-scoped actions: (universe, room) -> verb -> list of actions
     room_actions: RwLock<BTreeMap<Key, BTreeMap<String, Vec<Action>>>>,
     /// Object-scoped actions: (universe, object) -> verb -> action
     object_actions: RwLock<BTreeMap<Key, BTreeMap<String, Action>>>,
+    /// The table (none in unit tests: memory only)
+    pool: Option<SqlitePool>,
+    raft_writer: Option<Arc<RaftWriter>>,
+}
+
+impl std::fmt::Debug for ActionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ActionRegistry { .. }")
+    }
 }
 
 impl ActionRegistry {
-    /// Create a new action registry
+    /// A memory-only registry (tests)
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry stored in the `actions` table, written through Raft
+    pub fn with_db(pool: SqlitePool, raft_writer: Arc<RaftWriter>) -> Self {
+        Self {
+            pool: Some(pool),
+            raft_writer: Some(raft_writer),
+            ..Self::default()
+        }
+    }
+
+    async fn persist(&self, statement: Statement) -> anyhow::Result<()> {
+        match self.raft_writer {
+            Some(ref raft) => raft.execute_batch(vec![statement]).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Rebuild the cache from the table (on becoming primary)
+    pub async fn load_from_db(&self) -> anyhow::Result<()> {
+        let Some(ref pool) = self.pool else {
+            return Ok(());
+        };
+        let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT universe_id, scope, scope_id, verb, object_id, method FROM actions",
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut rooms: BTreeMap<Key, BTreeMap<String, Vec<Action>>> = BTreeMap::new();
+        let mut objects: BTreeMap<Key, BTreeMap<String, Action>> = BTreeMap::new();
+        for (universe, scope, scope_id, verb, object_id, method) in rows {
+            let action = Action {
+                verb: verb.clone(),
+                object_id,
+                method,
+            };
+            if scope == "room" {
+                rooms
+                    .entry((universe, scope_id))
+                    .or_default()
+                    .entry(verb)
+                    .or_default()
+                    .push(action);
+            } else {
+                objects
+                    .entry((universe, scope_id))
+                    .or_default()
+                    .insert(verb, action);
+            }
+        }
+        *self.room_actions.write().await = rooms;
+        *self.object_actions.write().await = objects;
+        Ok(())
+    }
+
+    fn upsert(universe_id: &str, scope: &str, scope_id: &str, action: &Action) -> Statement {
+        (
+            "INSERT OR REPLACE INTO actions (universe_id, scope, scope_id, verb, object_id, method)
+             VALUES (?, ?, ?, ?, ?, ?)"
+                .to_string(),
+            vec![
+                json!(universe_id),
+                json!(scope),
+                json!(scope_id),
+                json!(action.verb),
+                json!(action.object_id),
+                json!(action.method),
+            ],
+        )
     }
 
     /// Wrap in Arc for sharing
@@ -47,15 +135,20 @@ impl ActionRegistry {
     }
 
     /// Add an action for a room context
-    pub async fn add_room_action(&self, universe_id: &str, room_id: &str, action: Action) {
+    pub async fn add_room_action(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        action: Action,
+    ) -> anyhow::Result<()> {
+        self.persist(Self::upsert(universe_id, "room", room_id, &action))
+            .await?;
         let mut actions = self.room_actions.write().await;
         let room_entry = actions.entry(key(universe_id, room_id)).or_default();
         let verb_entry = room_entry.entry(action.verb.clone()).or_default();
-
-        // Don't add duplicate
-        if !verb_entry.iter().any(|a| a.object_id == action.object_id) {
-            verb_entry.push(action);
-        }
+        verb_entry.retain(|a| a.object_id != action.object_id);
+        verb_entry.push(action);
+        Ok(())
     }
 
     /// Remove an action from a room context
@@ -65,13 +158,26 @@ impl ActionRegistry {
         room_id: &str,
         verb: &str,
         object_id: &str,
-    ) {
+    ) -> anyhow::Result<()> {
+        self.persist((
+            "DELETE FROM actions WHERE universe_id = ? AND scope = 'room' AND scope_id = ?
+             AND verb = ? AND object_id = ?"
+                .to_string(),
+            vec![
+                json!(universe_id),
+                json!(room_id),
+                json!(verb),
+                json!(object_id),
+            ],
+        ))
+        .await?;
         let mut actions = self.room_actions.write().await;
         if let Some(room_entry) = actions.get_mut(&key(universe_id, room_id)) {
             if let Some(verb_entry) = room_entry.get_mut(verb) {
                 verb_entry.retain(|a| a.object_id != object_id);
             }
         }
+        Ok(())
     }
 
     /// Get actions for a verb in a room
@@ -89,19 +195,40 @@ impl ActionRegistry {
             .unwrap_or_default()
     }
 
-    /// Add an action for an object (inventory item)
-    pub async fn add_object_action(&self, universe_id: &str, object_id: &str, action: Action) {
+    /// Add (or update) an action for an object (inventory item)
+    pub async fn add_object_action(
+        &self,
+        universe_id: &str,
+        object_id: &str,
+        action: Action,
+    ) -> anyhow::Result<()> {
+        self.persist(Self::upsert(universe_id, "object", object_id, &action))
+            .await?;
         let mut actions = self.object_actions.write().await;
         let obj_entry = actions.entry(key(universe_id, object_id)).or_default();
         obj_entry.insert(action.verb.clone(), action);
+        Ok(())
     }
 
     /// Remove an action from an object
-    pub async fn remove_object_action(&self, universe_id: &str, object_id: &str, verb: &str) {
+    pub async fn remove_object_action(
+        &self,
+        universe_id: &str,
+        object_id: &str,
+        verb: &str,
+    ) -> anyhow::Result<()> {
+        self.persist((
+            "DELETE FROM actions WHERE universe_id = ? AND scope = 'object' AND scope_id = ?
+             AND verb = ?"
+                .to_string(),
+            vec![json!(universe_id), json!(object_id), json!(verb)],
+        ))
+        .await?;
         let mut actions = self.object_actions.write().await;
         if let Some(obj_entry) = actions.get_mut(&key(universe_id, object_id)) {
             obj_entry.remove(verb);
         }
+        Ok(())
     }
 
     /// Get action for a verb on an object
@@ -118,15 +245,15 @@ impl ActionRegistry {
             .cloned()
     }
 
-    /// Clear all actions for a room (e.g., when room is destroyed)
-    /// Forget every custom verb (a node that stops being primary: verbs live
-    /// only in memory until they are persisted, so another primary's
-    /// registrations are not here)
+    /// Drop the cache (a node that stops being primary; rebuilt from the
+    /// table when it becomes primary again)
     pub async fn clear_all(&self) {
         self.room_actions.write().await.clear();
         self.object_actions.write().await.clear();
     }
 
+    /// Drop a room's actions from the cache (the room was deleted; its rows
+    /// cascaded)
     pub async fn clear_room(&self, universe_id: &str, room_id: &str) {
         self.room_actions
             .write()
@@ -134,7 +261,8 @@ impl ActionRegistry {
             .remove(&key(universe_id, room_id));
     }
 
-    /// Clear all actions by an object in a universe (e.g., when it is destroyed)
+    /// Drop an object's actions from the cache (it was deleted; its rows
+    /// cascaded)
     pub async fn clear_by_object(&self, universe_id: &str, object_id: &str) {
         // Remove from the universe's room actions
         let mut room_actions = self.room_actions.write().await;
@@ -173,7 +301,8 @@ mod tests {
         let registry = ActionRegistry::new();
         registry
             .add_room_action("u", "room_1", action("pull", "lever_1", "on_pull"))
-            .await;
+            .await
+            .unwrap();
 
         let actions = registry.get_room_actions("u", "room_1", "pull").await;
         assert_eq!(actions.len(), 1);
@@ -181,7 +310,8 @@ mod tests {
 
         registry
             .remove_room_action("u", "room_1", "pull", "lever_1")
-            .await;
+            .await
+            .unwrap();
         assert!(registry
             .get_room_actions("u", "room_1", "pull")
             .await
@@ -193,7 +323,8 @@ mod tests {
         let registry = ActionRegistry::new();
         registry
             .add_object_action("u", "potion_1", action("drink", "potion_1", "on_drink"))
-            .await;
+            .await
+            .unwrap();
 
         let found = registry.get_object_action("u", "potion_1", "drink").await;
         assert_eq!(found.unwrap().method, "on_drink");
@@ -204,10 +335,12 @@ mod tests {
         let registry = ActionRegistry::new();
         registry
             .add_room_action("u", "room_1", action("pull", "lever_1", "on_pull"))
-            .await;
+            .await
+            .unwrap();
         registry
             .add_room_action("u", "room_1", action("push", "lever_1", "on_push"))
-            .await;
+            .await
+            .unwrap();
 
         registry.clear_by_object("u", "lever_1").await;
         assert!(registry
@@ -222,10 +355,12 @@ mod tests {
         let registry = ActionRegistry::new();
         registry
             .add_object_action("a", "/items/x", action("rub", "/items/x", "rub"))
-            .await;
+            .await
+            .unwrap();
         registry
             .add_room_action("a", "/rooms/r", action("pull", "/items/x", "pull"))
-            .await;
+            .await
+            .unwrap();
 
         assert!(registry
             .get_object_action("b", "/items/x", "rub")

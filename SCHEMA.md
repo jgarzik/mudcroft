@@ -3,10 +3,11 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 7):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 8):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
-older one step by step (`Database::upgrade`). The only upgrade step is
-6 -> 7 (adds the `credits_holder_exists` trigger); an older database is refused with a "create a new database" error (from
+older one step by step (`Database::upgrade`). The upgrade steps are
+6 -> 7 (adds the `credits_holder_exists` trigger) and 7 -> 8 (adds the
+`actions` table); an older database is refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
@@ -292,6 +293,24 @@ CASCADE.
 Used by the OpenRaft log store. Game writes go through Raft and are applied to
 the tables above.
 
+
+### actions
+
+Custom verbs (`game.add_action`). The dispatch cache (`ActionRegistry`) is
+rebuilt from this table when a node becomes primary.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| scope | TEXT NOT NULL | `room` (the verb works in that room) or `object` (it follows the object) |
+| scope_id | TEXT NOT NULL | The room, or the object itself |
+| verb | TEXT NOT NULL | |
+| object_id | TEXT NOT NULL | The object whose code handles it |
+| method | TEXT NOT NULL | The handler's name |
+
+Primary key: `(universe_id, scope, scope_id, verb, object_id)`. Foreign keys
+`(universe_id, object_id)` and `(universe_id, scope_id)` to `objects` ON
+DELETE CASCADE: a verb goes with its object and with its room.
 ### raft_log
 
 | Column | Type | Notes |

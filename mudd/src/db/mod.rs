@@ -13,7 +13,26 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
+
+/// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
+/// in a room) or object-scoped (follows the object). They go with their
+/// object and with their room.
+const ACTIONS_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS actions (
+        universe_id TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('room', 'object')),
+        scope_id TEXT NOT NULL,
+        verb TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        method TEXT NOT NULL,
+        PRIMARY KEY (universe_id, scope, scope_id, verb, object_id),
+        FOREIGN KEY (universe_id, object_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE,
+        FOREIGN KEY (universe_id, scope_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    )
+"#;
 
 /// A credits balance needs a holder that exists (credits has no foreign
 /// key, as holders are accounts or objects): checked in the same write, so
@@ -93,6 +112,7 @@ impl Database {
     /// - 4 -> 5 (heartbeats table; timers cascade with their object).
     /// - 5 -> 6 (credits held by accounts or objects, CHECK balance >= 0).
     /// - 6 -> 7 (credits_holder_exists trigger): upgraded in place.
+    /// - 7 -> 8 (actions table: custom verbs persisted): upgraded in place.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -102,12 +122,19 @@ impl Database {
                 SCHEMA_VERSION
             );
         }
+        let mut version = version;
         if version == 6 {
             sqlx::query(CREDITS_HOLDER_TRIGGER)
                 .execute(&self.pool)
                 .await?;
             self.set_schema_version(7).await?;
             info!("Upgraded database schema 6 -> 7");
+            version = 7;
+        }
+        if version == 7 {
+            sqlx::query(ACTIONS_TABLE).execute(&self.pool).await?;
+            self.set_schema_version(8).await?;
+            info!("Upgraded database schema 7 -> 8");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -221,6 +248,7 @@ impl Database {
             "class_handlers",
             "timers",
             "universe_members",
+            "actions",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -434,6 +462,8 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        sqlx::query(ACTIONS_TABLE).execute(&self.pool).await?;
 
         // Path grants table (for path-based permission delegation)
         sqlx::query(

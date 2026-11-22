@@ -74,7 +74,10 @@ pub async fn router(
         Some(raft_writer.clone()),
     ));
     let class_registry = ClassRegistry::with_db(db.pool().clone(), raft_writer.clone());
-    let actions = Arc::new(ActionRegistry::new());
+    let actions = Arc::new(ActionRegistry::with_db(
+        db.pool().clone(),
+        raft_writer.clone(),
+    ));
     let permissions = Arc::new(PermissionManager::with_db(
         db.pool().clone(),
         Some(raft_writer.clone()),

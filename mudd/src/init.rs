@@ -329,10 +329,10 @@ mod tests {
         assert_eq!(count.0, 1);
     }
 
-    /// The first real upgrade step: a version 6 database gets the credits
-    /// holder trigger and becomes version 7
+    /// Upgrades chain: a version 6 database gets the credits holder trigger
+    /// (7) and the actions table (8)
     #[tokio::test]
-    async fn test_upgrade_6_to_7_adds_credits_trigger() {
+    async fn test_upgrade_6_to_8() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         init_database(
@@ -350,6 +350,10 @@ mod tests {
                 .execute(db.pool())
                 .await
                 .unwrap();
+            sqlx::query("DROP TABLE actions")
+                .execute(db.pool())
+                .await
+                .unwrap();
             sqlx::query("PRAGMA user_version = 6")
                 .execute(db.pool())
                 .await
@@ -358,9 +362,16 @@ mod tests {
         }
         init_database(&db_path, None, None, HashMap::new(), None)
             .await
-            .expect("mudd_init upgrades 6 -> 7");
+            .expect("mudd_init upgrades 6 -> 8");
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 7);
+        assert_eq!(db.schema_version().await.unwrap(), 8);
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(tables, 1);
         let triggers: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'credits_holder_exists'",
         )

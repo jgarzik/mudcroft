@@ -616,10 +616,9 @@ this context. It needs the same permission as `add_action`. **Returns**
 7. If nothing matches, the player sees `Unknown command: <verb>`.
 8. If the handler raises an error, players see `Something went wrong.` and wizards+ see the error text.
 
-Actions live **in memory only** and are lost when the server restarts.
-Register them again after a restart, for example from a setup function you
-run with `eval`, or from a room's `on_enter` hook. Registering the same
-room action twice has no effect.
+Actions are stored in the database: they survive restarts (and failovers)
+and are removed with their object, or their room. Registering the same
+action again replaces its method.
 
 ---
 
@@ -1165,7 +1164,6 @@ These are not built yet. See the [roadmap](../../docs/roadmap.md).
 - **Unused NPC properties:** `aggro` and `respawn_time` do nothing.
 - **Missing player commands:** there is no `use`, `give` or `flee` command. Add verbs with `game.add_action`.
 - **Combat gaps:** the server has no NPC counter-attacks and no PvP. Lua has no bindings to the combat engine.
-- **Persistence:** custom verbs don't survive a restart.
 - **Universe config:** keys such as `pvp_mode` or `spawn_room` are not read by the server.
 
 ---

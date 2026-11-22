@@ -334,6 +334,21 @@ async fn test_gateway_follows_failover() {
     cluster.seed_world(0, "fo-world").await.expect("seed");
     let (_, token) = cluster.register(1, "survivor").await.expect("register");
     let limit = Duration::from_secs(10);
+    // A custom verb registered before the failover
+    cluster
+        .add_script(
+            "gong.lua",
+            r#"
+local h = game.store_code([[return { ring = function(a) return "Ding!" end }]])
+game.create_object("/items/gong", "item", "/rooms/cave-entrance", {name = "gong", fixed = true, code_hash = h})
+return tostring(game.add_action("ring", "/items/gong", "ring"))
+"#,
+        )
+        .unwrap();
+    assert_eq!(
+        cluster.run_script(0, "fo-world", "gong.lua").await.unwrap(),
+        "true"
+    );
     let mut player = ClusterPlayer::connect(&cluster.nodes[1], "fo-world", &token)
         .await
         .expect("connect to gateway");
@@ -356,6 +371,12 @@ async fn test_gateway_follows_failover() {
         .wait_for("Cave Entrance", limit)
         .await
         .expect("commands work after the failover");
+    // ... including the custom verb, which the new primary loaded
+    player.command("ring gong").await.unwrap();
+    player
+        .wait_for("Ding!", limit)
+        .await
+        .expect("the verb survived the failover");
 }
 
 /// A primary that steps down while still running (here: removed from the
