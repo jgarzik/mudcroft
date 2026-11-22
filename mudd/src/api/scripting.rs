@@ -90,13 +90,14 @@ where
     F: Future<Output = Result<T, String>>,
 {
     // A failed run's cache changes are undone by rebuilding from the tables
-    let rebuild = || async {
-        if let Err(e) = super::primary::rebuild_caches(state).await {
+    let rebuilder = state.clone();
+    let rebuild = move || async move {
+        if let Err(e) = super::primary::rebuild_caches(&rebuilder).await {
             tracing::error!("rebuilding caches after a failed run: {}", e);
         }
     };
-    match crate::db::run::scope(state.db.pool(), &*state.raft_writer, Vec::new(), f, rebuild).await
-    {
+    let committer: std::sync::Arc<dyn crate::db::run::Committer> = state.raft_writer.clone();
+    match crate::db::run::scope(state.db.pool(), committer, Vec::new(), f, rebuild).await {
         Ok(result) => result,
         Err(e) => Err(format!("not saved: {}", e)),
     }

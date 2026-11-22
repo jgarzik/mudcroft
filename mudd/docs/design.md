@@ -570,12 +570,16 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   SQLite transaction (so its reads, through `db::run::reader`, see them)
   and are captured; when the run succeeds the local transaction is rolled
   back and the captured statements are proposed as one entry. A failed run
-  proposes nothing (except `execute_kept` statements, e.g. a paid Venice
-  call's charge) and rebuilds the caches from the tables
+  proposes nothing (except `execute_kept` statements, e.g. a payment's
+  claim) and rebuilds the caches from the tables
   (`primary::rebuild_caches`), since managers update their caches as writes
-  happen. A process-wide write gate, held from a run's first write until
-  its outcome is settled, makes writing runs take turns, so that rebuild
-  cannot race another run's pending change.
+  happen. A process-wide write gate, held (with SQLite's write lock) from a
+  run's first write until its outcome is settled, makes writing runs take
+  turns, so that rebuild cannot race another run's pending change; runs are
+  short (sandbox time limits), and a Venice call is a commit point
+  (`Run::checkpoint`: save so far, release the lock, then charge and call),
+  so nothing slow happens under the lock. Settling happens in a task of its
+  own, so a cancelled caller cannot leave the transaction open.
 - **Batching**: openraft merges concurrent client writes into one log
   append, and the state machine applies each batch it is handed as one
   SQLite transaction (each request in its own savepoint, so requests stay

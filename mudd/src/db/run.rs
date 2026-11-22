@@ -11,20 +11,29 @@
 //! statement, no cache change.
 //!
 //! From its first write until it has committed (or been undone), a run holds
-//! the process-wide write gate: runs that write take turns (the primary is
-//! the single writer anyway), so a failed run can rebuild the caches from
-//! the tables without racing another run's pending change. Caches are
-//! updated as writes happen (so the run sees its own changes); a run that
-//! fails after writing has its `on_abort` rebuild them.
+//! SQLite's write lock and the process-wide write gate: runs that write take
+//! turns (the primary is the single writer anyway), so a failed run can
+//! rebuild the caches from the tables without racing another run's pending
+//! change. Caches are updated as writes happen (so the run sees its own
+//! changes); a run that fails after writing has its `on_abort` rebuild them.
+//!
+//! Something slow outside the database (a Venice call) must not happen while
+//! the lock is held: [`Run::checkpoint`] commits the run's writes so far and
+//! releases it; the run then continues as a new change.
+//!
+//! Settling a run (commit or undo) happens in its own task, so a caller that
+//! is cancelled part way (a client disconnecting) cannot leave the local
+//! transaction open or the caches out of step.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
 use sqlx::pool::PoolConnection;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 
 /// A SQL statement with its bound parameters
 pub type Statement = (String, Vec<serde_json::Value>);
@@ -39,16 +48,35 @@ tokio::task_local! {
 /// Held by the run that is writing (see the module docs)
 static WRITE_GATE: Mutex<()> = Mutex::const_new(());
 
+/// How a run's writes are committed
+pub trait Committer: Send + Sync {
+    fn commit<'a>(
+        &'a self,
+        statements: Vec<Statement>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
 /// One logical change in progress
 pub struct Run {
     conn: Arc<Mutex<PoolConnection<Sqlite>>>,
-    gate: Mutex<Option<tokio::sync::MutexGuard<'static, ()>>>,
-    began: std::sync::atomic::AtomicBool,
+    committer: Arc<dyn Committer>,
+    gate: Mutex<Option<MutexGuard<'static, ()>>>,
+    /// A local transaction is open (since the last checkpoint)
+    began: AtomicBool,
+    /// Caches may hold changes not in the tables (written since the last
+    /// successful checkpoint): undoing the run must rebuild them
+    dirty: AtomicBool,
+    /// Leads the first batch committed (e.g. a command id marker)
+    prefix: std::sync::Mutex<Vec<Statement>>,
     statements: std::sync::Mutex<Vec<Statement>>,
-    /// Statements that stand even if the run fails (e.g. paying for an
-    /// external call already made): committed on their own then
+    /// Statements that stand even if the run fails: committed on their own
+    /// then
     kept: std::sync::Mutex<Vec<Statement>>,
     after: std::sync::Mutex<Vec<AfterCommit>>,
+}
+
+fn take<T>(m: &std::sync::Mutex<Vec<T>>) -> Vec<T> {
+    std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The run this task is in, if any
@@ -68,9 +96,11 @@ impl Run {
             }
         }
         let mut conn = self.conn.lock().await;
-        if !self.began.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if !self.began.load(Ordering::SeqCst) {
             sqlx::query("BEGIN IMMEDIATE").execute(&mut **conn).await?;
+            self.began.store(true, Ordering::SeqCst);
         }
+        self.dirty.store(true, Ordering::SeqCst);
         sqlx::query("SAVEPOINT run_call")
             .execute(&mut **conn)
             .await?;
@@ -110,6 +140,88 @@ impl Run {
             .unwrap_or_else(|e| e.into_inner())
             .extend(statements.iter().cloned());
         Ok(rows)
+    }
+
+    /// End the local transaction (its writes come back through Raft)
+    async fn end_local(&self) -> Result<()> {
+        if self.began.swap(false, Ordering::SeqCst) {
+            let mut conn = self.conn.lock().await;
+            sqlx::query("ROLLBACK").execute(&mut **conn).await?;
+        }
+        Ok(())
+    }
+
+    /// The batch to commit: the prefix (first time only) and the captured
+    /// statements, or nothing if there were none
+    fn batch(&self) -> Vec<Statement> {
+        let statements = take(&self.statements);
+        if statements.is_empty() {
+            return statements;
+        }
+        let mut batch = take(&self.prefix);
+        batch.extend(statements);
+        batch
+    }
+
+    /// Commit the run's writes so far as one change and release the write
+    /// lock and gate; the run continues as a new change. For before
+    /// something slow outside the database.
+    pub async fn checkpoint(&self) -> Result<()> {
+        self.end_local().await?;
+        let batch = self.batch();
+        take(&self.kept);
+        if !batch.is_empty() {
+            // On failure `dirty` stays set: undoing the run rebuilds caches
+            self.committer.commit(batch).await?;
+        }
+        self.dirty.store(false, Ordering::SeqCst);
+        for f in take(&self.after) {
+            f().await;
+        }
+        self.gate.lock().await.take();
+        Ok(())
+    }
+
+    /// Commit (or, `failed`, undo) the run, then release the gate. Returns
+    /// a commit error (nothing but kept statements was saved then).
+    async fn settle<A, AFut>(self: Arc<Self>, failed: bool, on_abort: A) -> Result<()>
+    where
+        A: FnOnce() -> AFut,
+        AFut: Future<Output = ()>,
+    {
+        let ended = self.end_local().await;
+        let batch = self.batch();
+        let kept = take(&self.kept);
+        let after = take(&self.after);
+        let undo = |kept: Vec<Statement>| async {
+            if !kept.is_empty() {
+                if let Err(e) = self.committer.commit(kept).await {
+                    tracing::error!("committing a failed run's kept writes: {}", e);
+                }
+            }
+            if self.dirty.load(Ordering::SeqCst) {
+                on_abort().await;
+            }
+        };
+        let outcome = if let Err(e) = ended {
+            undo(kept).await;
+            Err(e)
+        } else if failed {
+            undo(kept).await;
+            Ok(())
+        } else if batch.is_empty() {
+            Ok(())
+        } else if let Err(e) = self.committer.commit(batch).await {
+            undo(kept).await;
+            Err(e)
+        } else {
+            for f in after {
+                f().await;
+            }
+            Ok(())
+        };
+        self.gate.lock().await.take();
+        outcome
     }
 }
 
@@ -164,12 +276,31 @@ where
     }
 }
 
-/// How a run's writes are committed
-pub trait Committer: Send + Sync {
-    fn commit<'a>(
-        &'a self,
-        statements: Vec<Statement>,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+/// Settles a run whose caller was cancelled before it finished: undone, in
+/// a task of its own
+struct Unsettled<A>
+where
+    A: FnOnce() -> BoxFuture + Send + 'static,
+{
+    run: Option<Arc<Run>>,
+    on_abort: Option<A>,
+}
+
+impl<A> Drop for Unsettled<A>
+where
+    A: FnOnce() -> BoxFuture + Send + 'static,
+{
+    fn drop(&mut self) {
+        if let (Some(run), Some(on_abort)) = (self.run.take(), self.on_abort.take()) {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = run.settle(true, on_abort).await {
+                        tracing::error!("undoing a cancelled run: {}", e);
+                    }
+                });
+            }
+        }
+    }
 }
 
 /// Run `f` as one change: its writes are proposed as one batch when it
@@ -178,73 +309,50 @@ pub trait Committer: Send + Sync {
 /// When writes are discarded (`f` failed, or committing did), `on_abort`
 /// runs before the write gate is released: it rebuilds the caches.
 ///
-/// Returns `f`'s result, or an error if committing failed (then nothing was
-/// kept either).
+/// Returns `f`'s result, or an error if committing failed (then nothing but
+/// kept statements was saved).
 pub async fn scope<T, E, Fut, A, AFut>(
     pool: &SqlitePool,
-    committer: &dyn Committer,
+    committer: Arc<dyn Committer>,
     prefix: Vec<Statement>,
     f: Fut,
     on_abort: A,
 ) -> Result<std::result::Result<T, E>>
 where
     Fut: Future<Output = std::result::Result<T, E>>,
-    A: FnOnce() -> AFut,
-    AFut: Future<Output = ()>,
+    A: FnOnce() -> AFut + Send + 'static,
+    AFut: Future<Output = ()> + Send + 'static,
 {
     if current().is_some() {
         return Ok(f.await);
     }
     let run = Arc::new(Run {
         conn: Arc::new(Mutex::new(pool.acquire().await?)),
+        committer,
         gate: Mutex::new(None),
-        began: std::sync::atomic::AtomicBool::new(false),
+        began: AtomicBool::new(false),
+        dirty: AtomicBool::new(false),
+        prefix: std::sync::Mutex::new(prefix),
         statements: std::sync::Mutex::new(Vec::new()),
         kept: std::sync::Mutex::new(Vec::new()),
         after: std::sync::Mutex::new(Vec::new()),
     });
-    let result = RUN.scope(run.clone(), f).await;
-
-    // End the local transaction either way: committed writes come back
-    // through Raft
-    if run.began.load(std::sync::atomic::Ordering::SeqCst) {
-        let mut conn = run.conn.lock().await;
-        sqlx::query("ROLLBACK").execute(&mut **conn).await?;
-    }
-    let statements = std::mem::take(&mut *run.statements.lock().unwrap_or_else(|e| e.into_inner()));
-    let after = std::mem::take(&mut *run.after.lock().unwrap_or_else(|e| e.into_inner()));
-    let kept = std::mem::take(&mut *run.kept.lock().unwrap_or_else(|e| e.into_inner()));
-    // Held until the outcome is settled (released when dropped)
-    let _gate = run.gate.lock().await.take();
-    let wrote = run.began.load(std::sync::atomic::Ordering::SeqCst);
-    drop(run);
-    let commit_kept = |kept: Vec<Statement>| async move {
-        if !kept.is_empty() {
-            if let Err(e) = committer.commit(kept).await {
-                tracing::error!("committing a failed run's kept writes: {}", e);
-            }
-        }
+    let boxed = move || -> BoxFuture { Box::pin(on_abort()) };
+    let mut guard = Unsettled {
+        run: Some(run.clone()),
+        on_abort: Some(boxed),
     };
-    if result.is_err() {
-        commit_kept(kept).await;
-        if wrote {
-            on_abort().await;
-        }
-        return Ok(result);
+    let result = RUN.scope(run.clone(), f).await;
+    // Settled in a task of its own: finishes even if this caller is
+    // cancelled while waiting
+    let on_abort = guard.on_abort.take().expect("set above");
+    guard.run = None;
+    let failed = result.is_err();
+    match tokio::spawn(run.settle(failed, on_abort)).await {
+        Ok(Ok(())) => Ok(result),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(anyhow::anyhow!("settling a run: {}", e)),
     }
-    if !statements.is_empty() {
-        let mut batch = prefix;
-        batch.extend(statements);
-        if let Err(e) = committer.commit(batch).await {
-            commit_kept(kept).await;
-            on_abort().await;
-            return Err(e);
-        }
-    }
-    for f in after {
-        f().await;
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -291,14 +399,15 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let direct = Direct(pool.clone());
-        let aborted = std::sync::atomic::AtomicBool::new(false);
-        let on_abort = || async { aborted.store(true, std::sync::atomic::Ordering::SeqCst) };
+        let direct: Arc<dyn Committer> = Arc::new(Direct(pool.clone()));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+        let on_abort = move || async move { flag.store(true, Ordering::SeqCst) };
 
         // Fails: only the kept statement stands, and the caches are rebuilt
         let result: std::result::Result<(), &str> = scope(
             &pool,
-            &direct,
+            direct.clone(),
             Vec::new(),
             async {
                 let run = current().unwrap();
@@ -312,12 +421,12 @@ mod tests {
         .unwrap();
         assert!(result.is_err());
         assert_eq!(rows(&pool).await, vec![2]);
-        assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(aborted.load(Ordering::SeqCst));
 
         // Succeeds: everything stands, and the run read its own write
         let seen: std::result::Result<i64, &str> = scope(
             &pool,
-            &direct,
+            direct.clone(),
             Vec::new(),
             async {
                 let run = current().unwrap();
@@ -344,5 +453,77 @@ mod tests {
             "kept row plus its own write, not the undone one"
         );
         assert_eq!(rows(&pool).await, vec![2, 3]);
+    }
+
+    async fn setup() -> (SqlitePool, Arc<dyn Committer>) {
+        let pool = crate::db::test_utils::test_pool().await;
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let direct: Arc<dyn Committer> = Arc::new(Direct(pool.clone()));
+        (pool, direct)
+    }
+
+    /// A checkpoint saves the writes so far and releases the write lock
+    /// (others can write); a later failure undoes only what came after
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_checkpoint() {
+        let (pool, direct) = setup().await;
+        let result: std::result::Result<(), &str> = scope(
+            &pool,
+            direct.clone(),
+            Vec::new(),
+            async {
+                let run = current().unwrap();
+                run.execute(&[insert(1)]).await.unwrap();
+                run.checkpoint().await.unwrap();
+                // Saved, and the lock is free: a write outside the run works
+                direct.commit(vec![insert(10)]).await.unwrap();
+                run.execute(&[insert(2)]).await.unwrap();
+                Err("failed")
+            },
+            || async {},
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(rows(&pool).await, vec![1, 10]);
+    }
+
+    /// A run whose caller is cancelled part way is undone: nothing saved,
+    /// the caches rebuilt, the write lock released
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cancelled_run_is_undone() {
+        let (pool, direct) = setup().await;
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+        let run = scope(
+            &pool,
+            direct.clone(),
+            Vec::new(),
+            async {
+                current().unwrap().execute(&[insert(1)]).await.unwrap();
+                std::future::pending::<()>().await;
+                std::result::Result::<(), ()>::Ok(())
+            },
+            move || async move { flag.store(true, Ordering::SeqCst) },
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), run)
+                .await
+                .is_err(),
+            "cancelled"
+        );
+        // The undo runs in a task of its own; a later write waits for it
+        direct.commit(vec![insert(2)]).await.unwrap();
+        for _ in 0..50 {
+            if aborted.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(aborted.load(Ordering::SeqCst), "caches rebuilt");
+        assert_eq!(rows(&pool).await, vec![2]);
     }
 }

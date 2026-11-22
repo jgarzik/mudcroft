@@ -96,6 +96,11 @@ impl VeniceBilling {
                 .filter(|p| (0..=crate::credits::MAX_AMOUNT).contains(p))
                 .ok_or_else(|| format!("universe config {} is not a valid price", price_key))?,
         };
+        // A slow call outside the database: the run's writes so far are
+        // saved and the write lock released first (db::run)
+        if let Some(run) = crate::db::run::current() {
+            run.checkpoint().await.map_err(|e| e.to_string())?;
+        }
         if price > 0 {
             if let Some(crate::credits::Holder::Account(_)) = holder {
                 return Err("a player pays only through game.request_payment; bill the \
@@ -107,7 +112,7 @@ impl VeniceBilling {
             };
             if !self
                 .credits
-                .deduct_kept(&self.universe_id, holder, price)
+                .deduct_direct(&self.universe_id, holder, price)
                 .await
                 .map_err(|e| e.to_string())?
             {
@@ -127,7 +132,7 @@ impl VeniceBilling {
             if let Some(ref holder) = holder {
                 if let Err(e) = self
                     .credits
-                    .grant_kept(&self.universe_id, holder, price)
+                    .grant_direct(&self.universe_id, holder, price)
                     .await
                 {
                     tracing::warn!("venice refund of {} to {:?} failed: {}", price, holder, e);

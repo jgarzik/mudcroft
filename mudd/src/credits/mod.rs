@@ -152,14 +152,13 @@ impl CreditManager {
         self.execute_as(statements, false).await
     }
 
-    /// `kept`: inside a run, the statements stand even if the run fails
-    async fn execute_as(&self, statements: Vec<Statement>, kept: bool) -> anyhow::Result<()> {
-        if kept {
-            if let Some(run) = crate::db::run::current() {
-                return run.execute_kept(&statements).await.map(|_| ());
-            }
-        }
+    /// `direct`: committed now, on its own, even inside a run (which must
+    /// not hold the write lock then: see db::run::Run::checkpoint)
+    async fn execute_as(&self, statements: Vec<Statement>, direct: bool) -> anyhow::Result<()> {
         if let Some(ref raft_writer) = self.raft_writer {
+            if direct {
+                return raft_writer.execute_batch_direct(statements).await;
+            }
             return raft_writer.execute_batch(statements).await;
         }
         let Some(ref pool) = self.pool else {
@@ -236,8 +235,10 @@ impl CreditManager {
     }
 
     /// Payment for something outside the database (a Venice call): like
-    /// [`Self::deduct`], but it stands even if the current run fails
-    pub async fn deduct_kept(
+    /// [`Self::deduct`], but committed now against committed balances, so it
+    /// stands whatever the current run does next. The run must have
+    /// checkpointed first.
+    pub async fn deduct_direct(
         &self,
         universe_id: &str,
         holder: &Holder,
@@ -254,8 +255,9 @@ impl CreditManager {
         }
     }
 
-    /// The refund of a [`Self::deduct_kept`] (the call failed): stands too
-    pub async fn grant_kept(
+    /// The refund of a [`Self::deduct_direct`] (the call failed): committed
+    /// now too
+    pub async fn grant_direct(
         &self,
         universe_id: &str,
         holder: &Holder,
