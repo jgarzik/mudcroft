@@ -26,9 +26,11 @@ affected feature.
   the persisted call_outs (`mudd/src/api/mod.rs`, `run_timer_loop` in
   `mudd/src/api/scripting.rs`), so in a cluster each call_out and heartbeat
   would run on every node.
-- **Status effect persistence bypasses Raft.** `EffectRegistry`
-  (`mudd/src/combat/effects.rs`) writes straight to SQLite; it is not wired
-  into the server yet.
+- **Status effects are not universe-scoped or replicated.** `EffectRegistry`
+  (`mudd/src/combat/effects.rs`) keys effects by entity id alone, never
+  writes `active_effects.universe_id`, writes straight to SQLite, and
+  `CombatManager::remove_entity` does not clear an entity's effects. It is
+  not wired into the server yet; wiring it in must fix all four.
 - **Per-node caches are never invalidated.** Access levels
   (`PermissionManager`, `mudd/src/permissions/mod.rs`) and credit balances
   (`CreditManager`, `mudd/src/credits/mod.rs`) are cached per node and not
