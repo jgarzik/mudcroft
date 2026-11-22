@@ -138,8 +138,8 @@ Client -> /ws?universe=<id>&token=<token>
     1. Create a bounded outgoing queue (256 messages)
     2. Player id /players/p-<account_id>: get or create the player object
        in this universe, spawn at last safe location or the universe portal
-    3. Register the PlayerSession (player, account, universe, room, access
-       level fixed at connect, sender)
+    3. Register the PlayerSession (player, account, universe, room, sender);
+       the access level is read per command, not stored
     4. Send welcome, then the room description, then run on_enter on the
        spawn room (or tell wizards to use setportal if there is no portal)
     5. Loop: client commands in, queued server messages out
@@ -416,8 +416,8 @@ ownership rules are described in [permissions.md](permissions.md).
 Levels are per universe: `PermissionManager::get_access_level(universe,
 account)` combines the member level (`universe_members`), a global admin or
 owner level, and universe ownership. It caches them and loads path grants at
-startup. Each WebSocket session records the account's effective level at
-connect time.
+startup. WebSocket commands look the level up for every command, so a change
+applies to open sessions at once.
 
 ## Combat
 

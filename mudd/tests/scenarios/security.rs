@@ -1122,3 +1122,43 @@ async fn test_universe_owner_cannot_act_as_global_admin() {
     .await;
     assert_eq!(out, "true");
 }
+
+/// A level change applies to an open session at once, without reconnecting
+#[tokio::test]
+async fn test_level_change_applies_to_open_session() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = connect(&server, player("live_promo")).await;
+    let pl_id = pl.account_id().to_string();
+    let mut adm = connect(&server, admin("live_promoter")).await;
+
+    pl.drain().await;
+    pl.command("eval return 1").await.unwrap();
+    let _ = pl.expect("echo").await;
+    assert!(pl.expect("error").await.is_ok(), "a player cannot eval");
+
+    let out = eval(
+        &mut adm,
+        &format!(r#"return game.set_access_level("{}", "wizard")"#, pl_id),
+    )
+    .await;
+    assert_eq!(out, "true");
+    assert_eq!(
+        eval(&mut pl, "return 6 * 7").await,
+        "42",
+        "promoted session evals"
+    );
+
+    let out = eval(
+        &mut adm,
+        &format!(r#"return game.set_access_level("{}", "player")"#, pl_id),
+    )
+    .await;
+    assert_eq!(out, "true");
+    pl.drain().await;
+    pl.command("eval return 1").await.unwrap();
+    let _ = pl.expect("echo").await;
+    assert!(
+        pl.expect("error").await.is_ok(),
+        "demoted session cannot eval"
+    );
+}

@@ -268,8 +268,8 @@ Different checks read the level at different times:
 - **HTTP endpoints**: `create` and `upload` read the global level from the
   database on every request; `run_script` uses `PermissionManager`.
 - **WebSocket commands** (`eval`, `goto`, `setportal`, `create`, role-aware
-  `help`) use the level read when the connection opened. A promoted player
-  must reconnect.
+  `help`) read the level from `PermissionManager` for every command, so a
+  promotion or demotion applies to open sessions at once.
 - **Lua permission checks** go through `PermissionManager`. It caches global
   levels, member levels and universe owners in memory after the first
   lookup, and only `game.set_access_level` updates that cache. SQL run by

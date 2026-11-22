@@ -71,8 +71,6 @@ affected feature.
 
 ### Accounts and permissions
 
-- A session's access level is fixed at connect (`mudd/src/api/websocket.rs`);
-  promotions and demotions apply after the player reconnects.
 
 ### Docker
 

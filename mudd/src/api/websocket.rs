@@ -29,7 +29,6 @@ pub struct PlayerSession {
     pub account_id: String,
     pub universe_id: String,
     pub room_id: Option<String>,
-    pub access_level: AccessLevel,
     pub sender: mpsc::Sender<ServerMessage>,
     /// Unique per WebSocket connection, so a replaced connection's cleanup
     /// never removes its replacement
@@ -440,7 +439,6 @@ async fn handle_socket(
         account_id: account_id.clone(),
         universe_id: universe_id.clone(),
         room_id: spawn_room_id.clone(),
-        access_level,
         sender: tx,
         conn_id,
     };
@@ -519,6 +517,9 @@ async fn handle_socket(
                 match result {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                            // Read the level per command: a promotion or
+                            // demotion applies to this open session at once
+                            let access_level = state.permissions.get_access_level(&universe_id, &account_id).await;
                             handle_client_message(&state, &universe_id, &player_id, &account_id, access_level, client_msg).await;
                         }
                     }
@@ -1860,7 +1861,6 @@ mod tests {
                 account_id: String::new(),
                 universe_id: "u".to_string(),
                 room_id: Some(room.to_string()),
-                access_level: AccessLevel::Player,
                 sender: tx,
                 conn_id: 0,
             },
