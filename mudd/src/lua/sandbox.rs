@@ -107,6 +107,9 @@ pub struct Sandbox {
     limits: Arc<Limits>,
 }
 
+/// Lua app data giving native functions the running execution's limits
+struct SharedLimits(Arc<Limits>);
+
 /// The per-execution budget, shared with the instruction hook and the
 /// sandbox's pcall/xpcall
 struct Limits {
@@ -129,6 +132,10 @@ impl Limits {
         let deadline = self.origin.elapsed() + self.timeout;
         self.deadline_ns
             .store(deadline.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn deadline(&self) -> Instant {
+        self.origin + Duration::from_nanos(self.deadline_ns.load(Ordering::Relaxed))
     }
 
     /// Whether the execution must stop (either limit hit)
@@ -190,6 +197,9 @@ impl Sandbox {
             ..Default::default()
         });
 
+        // Nested sandboxes (use_object) find the live deadline here
+        lua.set_app_data(SharedLimits(limits.clone()));
+
         // Remove dangerous globals
         Self::remove_dangerous_globals(&lua)?;
 
@@ -203,6 +213,24 @@ impl Sandbox {
             metering: Metering::new(),
             limits,
         })
+    }
+
+    /// When the current execution's time runs out
+    pub fn deadline(&self) -> Instant {
+        self.limits.deadline()
+    }
+
+    /// Never run past `at`: a nested sandbox (use_object) takes its caller's
+    /// deadline, so nesting cannot extend a run's time
+    pub fn cap_deadline(&mut self, at: Instant) {
+        let cap = at.saturating_duration_since(self.limits.origin).as_nanos() as u64;
+        self.limits.deadline_ns.fetch_min(cap, Ordering::Relaxed);
+    }
+
+    /// The deadline of the sandbox `lua` belongs to (for game.* functions
+    /// that start a nested sandbox)
+    pub fn deadline_of(lua: &Lua) -> Option<Instant> {
+        lua.app_data_ref::<SharedLimits>().map(|l| l.0.deadline())
     }
 
     /// Start a fresh budget (instructions, deadline, call counts). A new
@@ -355,7 +383,11 @@ impl Sandbox {
                 self.config.max_instructions,
             ));
         }
-        if self.limits.timed_out.load(Ordering::Relaxed) {
+        // Also past the deadline without the hook noticing: time spent in a
+        // native call (a slow game.* function) with little Lua after it
+        if self.limits.timed_out.load(Ordering::Relaxed) || Instant::now() > self.limits.deadline()
+        {
+            self.limits.timed_out.store(true, Ordering::Relaxed);
             return Err(SandboxError::Timeout(self.config.timeout));
         }
         result.map_err(SandboxError::from)
@@ -527,6 +559,52 @@ mod tests {
             let result = run_timed(code).expect("the timeout did not stop it");
             assert!(result.contains("Timeout"), "{}: {}", code, result);
         }
+    }
+
+    /// Time spent inside one native call (a slow game.* function) counts
+    /// too, even if few Lua instructions run afterwards
+    #[test]
+    fn test_timeout_counts_time_in_native_calls() {
+        let config = SandboxConfig {
+            timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let mut sandbox = Sandbox::new(config).unwrap();
+        let slow = sandbox
+            .lua()
+            .create_function(|_, ()| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            })
+            .unwrap();
+        sandbox.lua().globals().set("slow", slow).unwrap();
+        let result = sandbox.execute::<i64>("slow() return 1");
+        assert!(
+            matches!(result, Err(SandboxError::Timeout(_))),
+            "{:?}",
+            result
+        );
+    }
+
+    /// A nested sandbox (use_object) never gets more time than the run it
+    /// is part of: it inherits the outer deadline
+    #[test]
+    fn test_nested_sandbox_inherits_deadline() {
+        let outer = Sandbox::new(SandboxConfig {
+            timeout: Duration::from_millis(100),
+            ..Default::default()
+        })
+        .unwrap();
+        let deadline = outer.deadline();
+        let mut inner = Sandbox::new(SandboxConfig::default()).unwrap();
+        inner.cap_deadline(deadline);
+        std::thread::sleep(Duration::from_millis(150));
+        let result = inner.execute::<i64>("local s = 0 for i = 1, 5000 do s = s + i end return s");
+        assert!(
+            matches!(result, Err(SandboxError::Timeout(_))),
+            "{:?}",
+            result
+        );
     }
 
     /// One budget covers a whole execution: chunks run one after another in

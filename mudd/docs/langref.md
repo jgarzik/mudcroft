@@ -113,8 +113,10 @@ Every limit stops a script as soon as it is exceeded, while it runs: the
 instruction count and the wall-clock timeout are both checked every 1,000
 instructions. They hold even for `while true do end`, and `pcall`/`xpcall`
 cannot catch them (once a limit is hit they re-raise instead of returning
-`false`). Time spent inside a single `game.*` call is not interrupted; it
-is counted when control returns to Lua.
+`false`). Time spent inside a single `game.*` call is not interrupted, but
+it counts: the deadline is checked again when control returns to Lua and
+when the run ends. A `game.use_object` call runs within its caller's
+deadline, so nesting never adds time.
 
 Every `game.*` function counts as a database call except these:
 `add_action`, `remove_action`, `send`, `broadcast`, `broadcast_region`,

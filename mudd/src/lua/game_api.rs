@@ -31,16 +31,17 @@ fn actor_override(lua: &Lua) -> Option<String> {
 /// Block on an async permission lookup from a synchronous Lua callback
 fn block_on_perm<F, T>(fut: F) -> T
 where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
+    F: std::future::Future<Output = T>,
 {
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(fut)
-    })
-    .join()
-    .expect("permission lookup thread panicked")
+    block_now(fut)
+}
+
+/// Run a future to completion from synchronous Lua callback code, on the
+/// current (multi-threaded) runtime. Cheap, unlike spawning a thread with
+/// its own runtime per call, which made a few dozen game.* calls blow the
+/// execution's time budget.
+fn block_now<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
 }
 
 /// Check that `parent_id` (if any) exists in `universe_id` (object ids are
@@ -1308,21 +1309,16 @@ impl GameApi {
 
                 // Store action - for now we'll use the object_id as the scope
                 // The caller should set up proper room context before execution
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        if let Some(rid) = room_id {
-                            actions.add_room_action(&universe_id, &rid, action).await;
-                        } else {
-                            // If no room context, add as object action
-                            actions
-                                .add_object_action(&universe_id, &action.object_id, action.clone())
-                                .await;
-                        }
-                    });
-                })
-                .join()
-                .ok();
+                block_now(async {
+                    if let Some(rid) = room_id {
+                        actions.add_room_action(&universe_id, &rid, action).await;
+                    } else {
+                        // If no room context, add as object action
+                        actions
+                            .add_object_action(&universe_id, &action.object_id, action.clone())
+                            .await;
+                    }
+                });
 
                 Ok(true)
             },
@@ -1343,22 +1339,17 @@ impl GameApi {
                     return Ok(false);
                 }
 
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        if let Some(rid) = room_id {
-                            actions
-                                .remove_room_action(&universe_id, &rid, &verb, &object_id)
-                                .await;
-                        } else {
-                            actions
-                                .remove_object_action(&universe_id, &object_id, &verb)
-                                .await;
-                        }
-                    });
-                })
-                .join()
-                .ok();
+                block_now(async {
+                    if let Some(rid) = room_id {
+                        actions
+                            .remove_room_action(&universe_id, &rid, &verb, &object_id)
+                            .await;
+                    } else {
+                        actions
+                            .remove_object_action(&universe_id, &object_id, &verb)
+                            .await;
+                    }
+                });
 
                 Ok(true)
             })?;
@@ -1491,20 +1482,15 @@ impl GameApi {
                     .unwrap_or_else(|| "anonymous".to_string());
 
                 // Build contexts synchronously using thread spawn
-                let result_data = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let user_ctx = permissions.get_user_context(&user_id, &universe_id).await;
-                        let obj_ctx = ObjectContext {
-                            object_id: target_id,
-                            owner_id,
-                            is_fixed: is_fixed.unwrap_or(false),
-                        };
-                        permissions.check_permission(&user_ctx, action, &obj_ctx)
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
+                let result_data = block_now(async {
+                    let user_ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                    let obj_ctx = ObjectContext {
+                        object_id: target_id,
+                        owner_id,
+                        is_fixed: is_fixed.unwrap_or(false),
+                    };
+                    permissions.check_permission(&user_ctx, action, &obj_ctx)
+                });
 
                 let result = lua.create_table()?;
                 match result_data {
@@ -1536,16 +1522,11 @@ impl GameApi {
                 .or(current_user)
                 .unwrap_or_else(|| "anonymous".to_string());
 
-            let result = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    permissions
-                        .can_access_path(&user_id, &universe_id, &path)
-                        .await
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let result = block_now(async {
+                permissions
+                    .can_access_path(&user_id, &universe_id, &path)
+                    .await
+            });
 
             Ok(result)
         })?;
@@ -1631,26 +1612,19 @@ impl GameApi {
                     .or(current_user)
                     .unwrap_or_else(|| "anonymous".to_string());
 
-                let result: Result<crate::permissions::PathGrant, String> =
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            let grantor_ctx =
-                                permissions.get_user_context(&user_id, &universe_id).await;
-                            permissions
-                                .grant_path(
-                                    &grantor_ctx,
-                                    &grantee_id,
-                                    &universe_id,
-                                    &path_prefix,
-                                    can_delegate.unwrap_or(false),
-                                )
-                                .await
-                                .map_err(|e| e.to_string())
-                        })
-                    })
-                    .join()
-                    .expect("Thread panicked");
+                let result: Result<crate::permissions::PathGrant, String> = block_now(async {
+                    let grantor_ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                    permissions
+                        .grant_path(
+                            &grantor_ctx,
+                            &grantee_id,
+                            &universe_id,
+                            &path_prefix,
+                            can_delegate.unwrap_or(false),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                });
 
                 match result {
                     Ok(grant) => {
@@ -1689,18 +1663,13 @@ impl GameApi {
                 .or(current_user)
                 .unwrap_or_else(|| "anonymous".to_string());
 
-            let result: Result<bool, String> = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let revoker_ctx = permissions.get_user_context(&user_id, &universe_id).await;
-                    permissions
-                        .revoke_path(&revoker_ctx, &grant_id, &universe_id)
-                        .await
-                        .map_err(|e| e.to_string())
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let result: Result<bool, String> = block_now(async {
+                let revoker_ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                permissions
+                    .revoke_path(&revoker_ctx, &grant_id, &universe_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
 
             match result {
                 Ok(revoked) => Ok(Value::Boolean(revoked)),
@@ -1722,12 +1691,8 @@ impl GameApi {
             let permissions = permissions_clone.clone();
             let universe_id = universe_clone.clone();
 
-            let grants = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async { permissions.get_path_grants(&account_id, &universe_id).await })
-            })
-            .join()
-            .expect("Thread panicked");
+            let grants =
+                block_now(async { permissions.get_path_grants(&account_id, &universe_id).await });
 
             let table = lua.create_table()?;
             for (i, grant) in grants.iter().enumerate() {
@@ -1768,23 +1733,17 @@ impl GameApi {
                 // Negative/NaN delays fire on the next tick
                 let delay_ms = (delay_secs.max(0.0) * 1000.0) as u64;
 
-                let timer_id = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        // "" when there is no object context or the object is
-                        // at its pending-timer limit
-                        match object_id {
-                            Some(obj_id) => {
-                                let timer =
-                                    Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
-                                timers.try_add_timer(timer).await.unwrap_or_default()
-                            }
-                            None => String::new(),
+                let timer_id = block_now(async {
+                    // "" when there is no object context or the object is
+                    // at its pending-timer limit
+                    match object_id {
+                        Some(obj_id) => {
+                            let timer = Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
+                            timers.try_add_timer(timer).await.unwrap_or_default()
                         }
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
+                        None => String::new(),
+                    }
+                });
 
                 Ok(timer_id)
             },
@@ -1805,16 +1764,11 @@ impl GameApi {
                 return Ok(false);
             };
 
-            let removed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    timers
-                        .remove_timer_owned(&timer_id, &universe_id, &object_id)
-                        .await
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let removed = block_now(async {
+                timers
+                    .remove_timer_owned(&timer_id, &universe_id, &object_id)
+                    .await
+            });
 
             Ok(removed)
         })?;
@@ -1834,15 +1788,10 @@ impl GameApi {
                 return Ok(false);
             };
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
-                    timers.set_heartbeat(hb).await;
-                });
-            })
-            .join()
-            .ok();
+            block_now(async {
+                let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
+                timers.set_heartbeat(hb).await;
+            });
 
             Ok(true)
         })?;
@@ -1857,18 +1806,13 @@ impl GameApi {
             let object_id = object_clone.clone();
             let universe_id = universe_id.clone();
 
-            let removed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(obj_id) = object_id {
-                        timers.remove_heartbeat(&universe_id, &obj_id).await
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let removed = block_now(async {
+                if let Some(obj_id) = object_id {
+                    timers.remove_heartbeat(&universe_id, &obj_id).await
+                } else {
+                    false
+                }
+            });
 
             Ok(removed)
         })?;
@@ -1894,18 +1838,13 @@ impl GameApi {
             let universe_id = universe_clone.clone();
             let user_id = user_clone.clone();
 
-            let balance = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(uid) = user_id {
-                        credits.get_balance(&universe_id, &uid).await
-                    } else {
-                        0
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let balance = block_now(async {
+                if let Some(uid) = user_id {
+                    credits.get_balance(&universe_id, &uid).await
+                } else {
+                    0
+                }
+            });
 
             Ok(balance)
         })?;
@@ -1923,18 +1862,13 @@ impl GameApi {
             let universe_id = universe_clone.clone();
             let user_id = user_clone.clone();
 
-            let result = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(uid) = user_id {
-                        credits.deduct(&universe_id, &uid, amount, &reason).await
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let result = block_now(async {
+                if let Some(uid) = user_id {
+                    credits.deduct(&universe_id, &uid, amount, &reason).await
+                } else {
+                    false
+                }
+            });
 
             Ok(result)
         })?;
@@ -2014,15 +1948,10 @@ impl GameApi {
                     .and_then(ModelTier::parse)
                     .unwrap_or(ModelTier::Balanced);
 
-                let result = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let account_id = user_id.as_deref().unwrap_or("anonymous");
-                        venice.chat(account_id, messages, tier).await
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
+                let result = block_now(async {
+                    let account_id = user_id.as_deref().unwrap_or("anonymous");
+                    venice.chat(account_id, messages, tier).await
+                });
 
                 match result {
                     Ok(response) => Ok(Value::String(lua.create_string(&response)?)),
@@ -2061,22 +1990,17 @@ impl GameApi {
                     .and_then(ImageSize::parse)
                     .unwrap_or(ImageSize::Medium);
 
-                let result = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let account_id = user_id.as_deref().unwrap_or("anonymous");
-                        // Generate image (returns raw binary bytes)
-                        let image_bytes = venice
-                            .generate_image(account_id, &prompt, style, size)
-                            .await?;
-                        // Store binary data and get hash
-                        image_store
-                            .store(&image_bytes, "image/png", "llm_image")
-                            .await
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
+                let result = block_now(async {
+                    let account_id = user_id.as_deref().unwrap_or("anonymous");
+                    // Generate image (returns raw binary bytes)
+                    let image_bytes = venice
+                        .generate_image(account_id, &prompt, style, size)
+                        .await?;
+                    // Store binary data and get hash
+                    image_store
+                        .store(&image_bytes, "image/png", "llm_image")
+                        .await
+                });
 
                 match result {
                     Ok(hash) => Ok(Value::String(lua.create_string(&hash)?)),
@@ -2139,19 +2063,14 @@ impl GameApi {
             let effective_user = actor_override.or(user_id);
 
             // Check wizard+ permission
-            let allowed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(ref uid) = effective_user {
-                        let level = permissions.get_access_level(&universe_id, uid).await;
-                        level >= AccessLevel::Wizard
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let allowed = block_now(async {
+                if let Some(ref uid) = effective_user {
+                    let level = permissions.get_access_level(&universe_id, uid).await;
+                    level >= AccessLevel::Wizard
+                } else {
+                    false
+                }
+            });
 
             if allowed {
                 time_override.store(time_ms, Ordering::Relaxed);
@@ -2180,19 +2099,14 @@ impl GameApi {
             let effective_user = actor_override.or(user_id);
 
             // Check wizard+ permission
-            let allowed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(ref uid) = effective_user {
-                        let level = permissions.get_access_level(&universe_id, uid).await;
-                        level >= AccessLevel::Wizard
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let allowed = block_now(async {
+                if let Some(ref uid) = effective_user {
+                    let level = permissions.get_access_level(&universe_id, uid).await;
+                    level >= AccessLevel::Wizard
+                } else {
+                    false
+                }
+            });
 
             if allowed {
                 *rng.lock() = StdRng::seed_from_u64(seed);
@@ -2311,8 +2225,10 @@ impl GameApi {
                     // Fresh sandbox, contexts set before registration
                     let mut api = nested_api.nested_for(&obj);
                     api.use_depth = nested_api.use_depth;
-                    let result = run_handler_sandboxed(&api, &libs, &code, handler_name, &args)
-                        .map_err(mlua::Error::runtime)?;
+                    let deadline = super::Sandbox::deadline_of(lua);
+                    let result =
+                        run_handler_sandboxed(&api, &libs, &code, handler_name, &args, deadline)
+                            .map_err(mlua::Error::runtime)?;
                     match result {
                         Some(json) => json_to_lua(lua, &json),
                         None => Ok(Value::Nil),
@@ -2420,9 +2336,14 @@ fn run_handler_sandboxed(
     code: &str,
     handler: &str,
     args: &serde_json::Value,
+    caller_deadline: Option<std::time::Instant>,
 ) -> Result<Option<serde_json::Value>, String> {
     let mut sandbox = super::Sandbox::new(super::SandboxConfig::default())
         .map_err(|e| format!("use_object: {}", e))?;
+    // Nesting must not extend the calling run's time
+    if let Some(deadline) = caller_deadline {
+        sandbox.cap_deadline(deadline);
+    }
     api.register(sandbox.lua())
         .map_err(|e| format!("use_object: {}", e))?;
     for (name, lib) in libs {
