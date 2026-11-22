@@ -1306,7 +1306,12 @@ async fn execute_command(
                 .get("hp")
                 .and_then(|v| v.as_i64())
                 .is_none_or(|hp| hp > 0);
-            if target.parent_id.as_deref() != Some(room_id.as_str()) || !alive {
+            if target.parent_id.as_deref() != Some(room_id.as_str()) {
+                return ServerMessage::Error {
+                    message: format!("You don't see {} here.", target_display_name),
+                };
+            }
+            if !alive {
                 return ServerMessage::Error {
                     message: format!("{} is already dead.", target_display_name),
                 };

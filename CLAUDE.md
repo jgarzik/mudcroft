@@ -85,6 +85,7 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
 ### Security Model (must respect)
 
 - Object code (hooks, verbs, timers, `game.use_object`) runs as the **object's owner**, never as the triggering player; the player is only data (`actor_id`). Don't pass a player's identity into object code execution. `actor_id` given to `use_object` is caller-supplied and untrusted.
+- The one exception is credits: a verb handler gets the typing player's account as **payer** (`ScriptContext.payer`, Lua `"actor"`), and only when the player clearly picked that object; eval/run_script pay as their caller. Hooks, timers and nested `use_object` never get a payer. The payer can only be spent from (credits, Venice prices), never used for permissions.
 - Anything that makes code run as an owner needs owner authority: attaching `code_hash` and `add_action`/`remove_action` require being the owner or outranking them (`can_act_as`). Private handlers (`_name`) and engine hooks (`lua::is_private_handler`) are never reachable via `use_object` or verbs. Class `code_hash` defaults are never attached to instances.
 - `use_object` is bounded: 8 levels deep, 32 calls per top-level execution.
 - Lua object writes (`create/update/delete/move/clone_object`) are permission-checked against the acting user; keep new `game.*` writes checked the same way and charge the call budget (`charge_db` / `charge_venice`).
