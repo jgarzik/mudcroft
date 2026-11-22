@@ -240,9 +240,13 @@ pub struct TickOutcome {
 /// not one by one), then any effect that has ended. Pure: the caller
 /// commits the result.
 pub fn process_due(target: &Combatant, effects: &EntityEffects, now: u64) -> TickOutcome {
-    let mut hp = target.hp;
-    let mut kept = EntityEffects::new();
-    let mut events = Vec::new();
+    // First count every effect's due pulses (advancing its clock), then
+    // apply all damage before any healing: the outcome must not depend on
+    // the order effects happen to be stored in, and healing cannot revive
+    // a target that the damage killed
+    let mut advanced = Vec::new();
+    let mut damage = Vec::new();
+    let mut heals = Vec::new();
     for effect in effects.all() {
         let mut effect = effect.clone();
         if let (Some(first), Some(period)) = (effect.pending_pulse(), effect.period_ms) {
@@ -257,27 +261,41 @@ pub fn process_due(target: &Combatant, effects: &EntityEffects, now: u64) -> Tic
                             .profile
                             .calculate_damage(amount, dtype, false)
                             .final_damage;
-                        let dealt = each.saturating_mul(pulses);
-                        hp = hp.saturating_sub(dealt).max(0);
-                        events.push(TickEvent::Damage {
-                            effect: effect.effect_type,
-                            amount: dealt,
-                            dtype,
-                        });
+                        damage.push((effect.effect_type, each.saturating_mul(pulses), dtype));
                     }
-                    Some((amount, _)) => {
-                        let healed = amount
-                            .saturating_neg()
-                            .saturating_mul(pulses)
-                            .min(target.max_hp.saturating_sub(hp))
-                            .max(0);
-                        hp += healed;
-                        events.push(TickEvent::Heal { amount: healed });
-                    }
+                    Some((amount, _)) => heals.push(amount.saturating_neg().saturating_mul(pulses)),
                     None => {}
                 }
             }
         }
+        advanced.push(effect);
+    }
+
+    let mut hp = target.hp;
+    let mut events = Vec::new();
+    for (effect, dealt, dtype) in damage {
+        if dealt > 0 {
+            hp = hp.saturating_sub(dealt).max(0);
+            events.push(TickEvent::Damage {
+                effect,
+                amount: dealt,
+                dtype,
+            });
+        }
+    }
+    let killed = hp <= 0 && target.hp > 0;
+    if !killed {
+        for amount in heals {
+            let healed = amount.min(target.max_hp.saturating_sub(hp)).max(0);
+            if healed > 0 {
+                hp += healed;
+                events.push(TickEvent::Heal { amount: healed });
+            }
+        }
+    }
+
+    let mut kept = EntityEffects::new();
+    for effect in advanced {
         if now >= effect.expires_at && effect.pending_pulse().is_none() {
             events.push(TickEvent::Expired(effect.effect_type));
         } else {
@@ -287,7 +305,7 @@ pub fn process_due(target: &Combatant, effects: &EntityEffects, now: u64) -> Tic
     TickOutcome {
         effects: kept,
         hp_changed: hp != target.hp,
-        killed: hp <= 0 && target.hp > 0,
+        killed,
         hp,
         events,
     }
@@ -607,5 +625,58 @@ mod tests {
         assert!(statements
             .iter()
             .any(|(sql, _)| sql.contains("INSERT INTO active_effects")));
+    }
+
+    /// Review fixes: no zero-damage events; regenerating always heals;
+    /// death is decided when HP first reaches 0, whatever the effect order
+    #[test]
+    fn test_process_due_edge_cases() {
+        use crate::combat::StatusEffect;
+        let immune = combatant(serde_json::json!({"hp": 10, "resistances": {"poison": "immune"}}));
+        let mut poison = EntityEffects::new();
+        poison.add(StatusEffect::periodic(
+            EffectType::Poisoned,
+            0,
+            5_000,
+            1_000,
+            3,
+            Some(DamageType::Poison),
+        ));
+        let out = process_due(&immune, &poison, 1_000);
+        assert!(out.events.is_empty(), "{:?}", out.events);
+
+        let regen = StatusEffect::periodic(
+            EffectType::Regenerating,
+            0,
+            5_000,
+            1_000,
+            5,
+            Some(DamageType::Radiant),
+        );
+        assert_eq!(regen.pulse_amount(), Some((-5, DamageType::Physical)));
+
+        let weak = combatant(serde_json::json!({"hp": 5, "max_hp": 30}));
+        for heal_first in [false, true] {
+            let mut e = EntityEffects::new();
+            let bleed = StatusEffect::periodic(
+                EffectType::Bleeding,
+                0,
+                5_000,
+                1_000,
+                9,
+                Some(DamageType::Physical),
+            );
+            let heal = StatusEffect::periodic(EffectType::Regenerating, 0, 5_000, 1_000, 20, None);
+            if heal_first {
+                e.add(heal.clone());
+                e.add(bleed.clone());
+            } else {
+                e.add(bleed);
+                e.add(heal);
+            }
+            let out = process_due(&weak, &e, 1_000);
+            assert!(out.killed, "order {} must not decide death", heal_first);
+            assert_eq!(out.hp, 0);
+        }
     }
 }

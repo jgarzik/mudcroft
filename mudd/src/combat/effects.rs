@@ -210,11 +210,12 @@ impl StatusEffect {
     /// (negative). None for effects that do not pulse.
     pub fn pulse_amount(&self) -> Option<(i32, DamageType)> {
         self.period_ms?;
-        if let Some(dtype) = self.damage_type {
-            return (self.magnitude > 0).then_some((self.magnitude, dtype));
+        // Regenerating always heals, whatever damage type it was given
+        if self.effect_type == EffectType::Regenerating {
+            return (self.magnitude > 0).then_some((-self.magnitude, DamageType::Physical));
         }
-        (self.effect_type == EffectType::Regenerating && self.magnitude > 0)
-            .then_some((-self.magnitude, DamageType::Physical))
+        let dtype = self.damage_type?;
+        (self.magnitude > 0).then_some((self.magnitude, dtype))
     }
 
     /// The next pulse still to come, if any (pulses run up to the end)
