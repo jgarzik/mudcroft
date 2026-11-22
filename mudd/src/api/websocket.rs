@@ -563,13 +563,17 @@ async fn handle_socket(
     state.connections.register(session).await;
     // Recorded, so the next primary can handle this player's disconnect if
     // the server this session is on dies
-    if let Err(e) = state
+    let online_since = match state
         .player_manager
         .mark_online(&universe_id, &player_id)
         .await
     {
-        warn!("recording {} as online failed: {}", player_id, e);
-    }
+        Ok(since) => since,
+        Err(e) => {
+            warn!("recording {} as online failed: {}", player_id, e);
+            String::new()
+        }
+    };
 
     // Send welcome message with theme
     // TODO: Get theme_id from universe config
@@ -682,6 +686,7 @@ async fn handle_socket(
         let state_clone = state.clone();
         let player_id_for_task = player_id_clone.clone();
         let universe_for_task = universe_id.clone();
+        let since_for_task = online_since.clone();
 
         tokio::spawn(async move {
             // Wait for grace period or cancellation
@@ -693,7 +698,7 @@ async fn handle_socket(
                         info!("Disconnect handling skipped for {} (connected again)", player_id_for_task);
                         return;
                     }
-                    if let Err(e) = state_clone.player_manager.finish_disconnect(&universe_for_task, &player_id_for_task).await {
+                    if let Err(e) = state_clone.player_manager.finish_disconnect(&universe_for_task, &player_id_for_task, &since_for_task).await {
                         warn!("Error handling player disconnect: {}", e);
                     }
                     info!("Disconnect handling completed for {} (grace period expired)", player_id_for_task);

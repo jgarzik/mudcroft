@@ -143,8 +143,10 @@ impl PlayerManager {
 
     /// Handle player disconnect.
     /// If not in a safe zone, drops all inventory to the current room.
-    /// Record that a player has a game session
-    pub async fn mark_online(&self, universe_id: &str, player_id: &str) -> Result<()> {
+    /// Record that a player has a game session; the `since` value written
+    /// (which identifies this session's row)
+    pub async fn mark_online(&self, universe_id: &str, player_id: &str) -> Result<String> {
+        let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         self.object_store
             .execute_batch(vec![(
                 "INSERT OR REPLACE INTO online_players (universe_id, player_id, since)
@@ -153,27 +155,40 @@ impl PlayerManager {
                 vec![
                     serde_json::json!(universe_id),
                     serde_json::json!(player_id),
-                    serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                    serde_json::json!(since),
+                ],
+            )])
+            .await?;
+        Ok(since)
+    }
+
+    /// Handle a disconnect, then record the player as offline: removes the
+    /// row only if it is still the one written at `since` (a newer session
+    /// for the player writes its own)
+    pub async fn finish_disconnect(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        since: &str,
+    ) -> Result<()> {
+        self.handle_disconnect(universe_id, player_id).await?;
+        self.object_store
+            .execute_batch(vec![(
+                "DELETE FROM online_players WHERE universe_id = ? AND player_id = ? AND since = ?"
+                    .to_string(),
+                vec![
+                    serde_json::json!(universe_id),
+                    serde_json::json!(player_id),
+                    serde_json::json!(since),
                 ],
             )])
             .await
     }
 
-    /// Handle a disconnect, then record the player as offline
-    pub async fn finish_disconnect(&self, universe_id: &str, player_id: &str) -> Result<()> {
-        self.handle_disconnect(universe_id, player_id).await?;
-        self.object_store
-            .execute_batch(vec![(
-                "DELETE FROM online_players WHERE universe_id = ? AND player_id = ?".to_string(),
-                vec![serde_json::json!(universe_id), serde_json::json!(player_id)],
-            )])
-            .await
-    }
-
-    /// Players recorded as online: (universe, player)
-    pub async fn online_players(&self) -> Result<Vec<(String, String)>> {
+    /// Players recorded as online: (universe, player, since)
+    pub async fn online_players(&self) -> Result<Vec<(String, String, String)>> {
         Ok(
-            sqlx::query_as("SELECT universe_id, player_id FROM online_players")
+            sqlx::query_as("SELECT universe_id, player_id, since FROM online_players")
                 .fetch_all(self.object_store.pool())
                 .await?,
         )

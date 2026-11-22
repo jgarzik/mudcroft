@@ -98,12 +98,17 @@ async fn handle_orphaned_sessions(state: AppState) {
             return;
         }
     };
-    for (universe, player) in online {
-        if state
+    for (universe, player, since) in online {
+        // The same claim as a normal disconnect: a player who reconnects
+        // meanwhile cancels it, and a live session is never handled
+        let (_cancel, gen) = state
             .connections
-            .get_sender(&universe, &player)
+            .schedule_disconnect(&universe, &player)
+            .await;
+        if !state
+            .connections
+            .claim_expired_disconnect(&universe, &player, gen)
             .await
-            .is_some()
         {
             continue;
         }
@@ -113,7 +118,7 @@ async fn handle_orphaned_sessions(state: AppState) {
         );
         if let Err(e) = state
             .player_manager
-            .finish_disconnect(&universe, &player)
+            .finish_disconnect(&universe, &player, &since)
             .await
         {
             warn!("primary: disconnect of {} failed: {}", player, e);
