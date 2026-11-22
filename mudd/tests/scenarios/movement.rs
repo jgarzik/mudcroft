@@ -497,3 +497,125 @@ async fn test_move_hooks_fan_out_is_bounded() {
     .unwrap_or(-1);
     assert!((1..=40).contains(&n), "on_enter ran {} times", n);
 }
+
+/// Moves between containers without code do not use up the run's hook
+/// budget: a later real hook still runs
+#[tokio::test]
+async fn test_codeless_moves_do_not_spend_hook_budget() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "budget_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_enter = function(a) game.broadcast(a.room_id, "hub-entered:" .. a.moved_id) end,
+           }]])
+           game.create_object("/rooms/hub", "room", nil, {name = "Hub", code_hash = h})
+           game.create_object("/rooms/bare-a", "room", nil, {name = "Bare A"})
+           game.create_object("/rooms/bare-b", "room", nil, {name = "Bare B"})
+           game.create_object("/items/token", "item", "/rooms/bare-a", {name = "token"})
+           return "ok""#,
+    )
+    .await;
+    let mut watcher = wizard(&server, "hub_watcher").await;
+    watcher.command("goto /rooms/hub").await.unwrap();
+    watcher.expect("room").await.unwrap();
+    watcher.drain().await;
+    eval(
+        &mut wiz,
+        r#"for i = 1, 20 do
+             game.move_object("/items/token", "/rooms/bare-b")
+             game.move_object("/items/token", "/rooms/bare-a")
+           end
+           game.move_object("/items/token", "/rooms/hub")
+           return "moved""#,
+    )
+    .await;
+    watcher
+        .expect_output_containing("hub-entered:/items/token")
+        .await
+        .expect("the hub's on_enter still ran");
+}
+
+/// A room's on_leave that moves the player elsewhere (a trapdoor) wins over
+/// the walk that triggered it
+#[tokio::test]
+async fn test_on_leave_teleport_is_not_undone_by_the_walk() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "trap_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_leave = function(a) game.move_object(a.actor_id, "/rooms/dungeon") end,
+           }]])
+           game.create_object("/rooms/beyond", "room", nil, {name = "Beyond"})
+           game.create_object("/rooms/dungeon", "room", nil, {name = "Dungeon"})
+           game.create_object("/rooms/trap", "room", nil,
+             {name = "Trap", exits = {north = "/rooms/beyond"}, code_hash = h})
+           return "ok""#,
+    )
+    .await;
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "trapped".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.move_object("{}", "/rooms/trap"))"#,
+            pl.player_id().unwrap()
+        ),
+    )
+    .await;
+    pl.expect("room").await.unwrap();
+    pl.drain().await;
+
+    pl.command("north").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    pl.drain().await;
+    pl.command("look").await.unwrap();
+    let _ = pl.expect("echo").await;
+    let room = pl.expect("room").await.unwrap();
+    assert_eq!(room["name"], "Dungeon", "the trapdoor wins");
+}
+
+/// A player moved by Lua into a safe room respawns there later
+#[tokio::test]
+async fn test_lua_move_records_safe_location() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "safe_wiz").await;
+    eval(
+        &mut wiz,
+        r#"game.create_object("/rooms/hub", "room", nil, {name = "Hub", is_portal = true})
+           return "ok""#,
+    )
+    .await;
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "hub_bound".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    let player_id = pl.player_id().unwrap().to_string();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.move_object("{}", "/rooms/hub"))"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect("room").await.unwrap();
+    let safe = eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.get_object("{}").metadata.last_safe_location)"#,
+            player_id
+        ),
+    )
+    .await;
+    assert_eq!(safe, "/rooms/hub");
+}

@@ -416,6 +416,27 @@ async fn handle_moved(
         }
     }
 
+    // A player moved into a safe room respawns there (as for a walk)
+    if let Some(ref room) = to {
+        if object_id.starts_with("/players/") {
+            if let Ok(Some(player)) = state.object_store.get(universe_id, object_id).await {
+                if let Ok(true) = state
+                    .player_manager
+                    .is_safe_zone(universe_id, room, &player)
+                    .await
+                {
+                    if let Err(e) = state
+                        .player_manager
+                        .update_safe_location(universe_id, object_id, room)
+                        .await
+                    {
+                        tracing::warn!("safe location for {} not saved: {}", object_id, e);
+                    }
+                }
+            }
+        }
+    }
+
     if budget.depth >= MAX_MOVE_HOOK_DEPTH {
         tracing::warn!(
             "move hooks for {} not run: nested {} deep",
@@ -430,6 +451,13 @@ async fn handle_moved(
     ];
     for (container, method, mut args) in hooks {
         let Some(container) = container else { continue };
+        // Only containers with code use up the budget (most have none)
+        if !matches!(
+            object_code(state, &container, universe_id).await,
+            Ok(Some(_))
+        ) {
+            continue;
+        }
         if !budget.take() {
             tracing::warn!(
                 "{} hook on {} not run: the run's move-hook budget is spent",

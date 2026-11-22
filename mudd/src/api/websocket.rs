@@ -916,6 +916,14 @@ async fn execute_command(
             )
             .await;
 
+            // The hook may have moved the player (a trapdoor): its move
+            // stands, and this walk is over (the player was shown the room)
+            if state.connections.get_room_id(universe_id, player_id).await
+                != Some(current_room_id.clone())
+            {
+                return ServerMessage::Silent;
+            }
+
             // Update player's room in memory
             state
                 .connections
@@ -1079,6 +1087,12 @@ async fn execute_command(
                             ),
                         )
                         .await;
+                        // A hook that moved the player wins over the goto
+                        if state.connections.get_room_id(universe_id, player_id).await
+                            != Some(from_id.clone())
+                        {
+                            return ServerMessage::Silent;
+                        }
                     }
 
                     // Update player's room, in the session and the player
