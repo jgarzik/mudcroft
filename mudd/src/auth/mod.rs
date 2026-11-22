@@ -4,7 +4,7 @@
 
 pub mod accounts;
 
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 /// Generate a secure random token

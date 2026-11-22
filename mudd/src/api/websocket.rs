@@ -1323,7 +1323,7 @@ async fn execute_command(
             // Perform attack (basic 1d6 physical damage; the combat manager
             // takes the rolled amount and doubles it on a critical)
             let damage_roll = {
-                use rand::Rng;
+                use rand::RngExt;
                 rand::rng().random_range(1..=6)
             };
             let attack_result = match state

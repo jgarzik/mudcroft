@@ -6,7 +6,7 @@ use std::sync::Arc;
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 use parking_lot::Mutex;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::sync::RwLock;
 
 use super::actions::{Action, ActionRegistry};
