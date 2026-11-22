@@ -41,8 +41,8 @@ global admin's identity.
 | `admin` | 3 | `run_script` on the universe. `game.admin_grant_credits` and `game.update_universe`. `game.set_access_level` on accounts below admin, to levels below admin. A **global** admin can also `POST /universe/create` and `/universe/upload`. |
 | `owner` | 4 | `game.set_access_level` on any account, including granting or revoking `admin` membership. |
 
-`mudd_init` creates the first account as a global `admin`. No tool creates a
-global `owner`; use SQL (see [Changing access levels](#changing-access-levels)).
+`mudd_init` creates the first account as a global `admin`. Other global
+levels are set with `mudd_admin` (see [Changing access levels](#changing-access-levels)).
 
 ## Who a Script Runs As
 
@@ -252,14 +252,14 @@ eval return game.set_access_level("<account_id>", "wizard")
 ```
 
 Global levels have no Lua or HTTP path. To make an account a global admin or
-owner, stop the server and use SQL:
+owner, or remove its global level, stop the server and use `mudd_admin`:
 
-```sql
-UPDATE accounts SET access_level = 'owner' WHERE username = 'alice';
+```
+mudd_admin --database /var/lib/mudd/game.db set-level alice owner   # or admin, none
 ```
 
-Keep at least one account at `admin` or `owner`. The server refuses to start
-without one (see [admin.md](admin.md#troubleshooting)).
+It refuses to remove the last global admin or owner: the server will not
+start without one (see [admin.md](admin.md#troubleshooting)).
 
 ### Caching
 

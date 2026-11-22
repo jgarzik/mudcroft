@@ -150,7 +150,18 @@ impl TestServer {
     /// Stop the server process and start it again on the same database,
     /// port and arguments (simulates a server restart)
     pub async fn restart(&mut self) -> Result<()> {
+        self.stop();
+        self.start_again().await
+    }
+
+    /// Stop the server process (the database stays; see start_again)
+    pub fn stop(&mut self) {
         self.child.kill();
+    }
+
+    /// Start the server again after stop(), on the same database, port and
+    /// arguments
+    pub async fn start_again(&mut self) -> Result<()> {
         self.child = spawn_mudd(
             &self.client,
             &self.mudd_path,

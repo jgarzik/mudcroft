@@ -15,7 +15,7 @@ Mudcroft is a multi-user dungeon (MUD) game server in Rust (`mudd/`) with a Reac
 Server commands run from the `mudd/` directory:
 
 ```bash
-cargo build --release                # Build mudd and mudd_init
+cargo build --release                # Build mudd, mudd_init and mudd_admin
 cargo test --lib                     # Unit tests only (fast)
 cargo test --release                 # All tests including integration and Lua suite
 cargo test --release test_name       # Run single test
@@ -46,6 +46,7 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
 
 - `main.rs` - mudd CLI; `lib.rs` - Config, Server (DB open, Raft setup, 10s leader wait, serve)
 - `bin/init.rs` - mudd_init CLI; `init.rs` - database creation/upgrade, admin account, mudlib load
+- `bin/admin.rs` - mudd_admin CLI (offline, server stopped); `admin.rs` - global access levels
 - `player.rs` - PlayerManager: persistent player objects, spawn, disconnect grace period
 - **api/** - HTTP/WebSocket endpoints via Axum
   - `mod.rs` - AppState, router, startup loading, `--static-dir` serving
@@ -102,7 +103,7 @@ One SQLite file with tables: accounts, universes, universe_settings, objects, co
 ## Test Infrastructure
 
 `mudd/tests/harness/` provides:
-- **TestServer** - spawns the real mudd binary in a temp dir (fresh DB via mudd_init); the child is killed on drop; logs go to the temp dir (`log_path`); `start_with_args` passes extra flags; `restart()` stops and restarts mudd on the same DB; readiness waits for the server's own "listening" log line, and startup retries on a new port if the server exits
+- **TestServer** - spawns the real mudd binary in a temp dir (fresh DB via mudd_init); the child is killed on drop; logs go to the temp dir (`log_path`); `start_with_args` passes extra flags; `restart()` stops and restarts mudd on the same DB (`stop()`/`start_again()` to act on the DB in between); readiness waits for the server's own "listening" log line, and startup retries on a new port if the server exits
 - **TestClient** - Role-based authenticated WebSocket client; `connect` waits for and queues the spawn room message
 - **TestWorld** - Pre-configured universe with regions/rooms
 

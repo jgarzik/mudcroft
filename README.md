@@ -30,7 +30,7 @@ it. The server, `mudd`, is written in Rust; the client is React.
 
 | Path | Contents |
 |------|----------|
-| [mudd/](mudd/) | Rust server: `mudd` daemon, `mudd_init` database tool, core mudlib (`mudd/lib/*.lua`), tests |
+| [mudd/](mudd/) | Rust server: `mudd` daemon, `mudd_init` database tool, `mudd_admin` offline admin tool, core mudlib (`mudd/lib/*.lua`), tests |
 | [client/](client/) | React + TypeScript + Vite web client and Playwright end-to-end tests |
 | [scripts/](scripts/) | Play-test server scripts, e2e runner, sample world (`cave_adventure.lua`) |
 | [docs/](docs/) | Roadmap, known issues and parked designs |

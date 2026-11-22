@@ -490,3 +490,45 @@ async fn test_universe_upload_zip() {
     let libs = body["libs_loaded"].as_array().unwrap();
     assert!(libs.contains(&serde_json::json!("greet")), "{}", body);
 }
+
+/// mudd_admin (run while mudd is stopped) grants a global level that applies
+/// in every universe, and reports unknown accounts with a failing exit
+#[tokio::test]
+async fn test_mudd_admin_set_level() {
+    let mut server = TestServer::start().await.expect("server");
+    let pl = server
+        .connect_as(Role::Player {
+            username: "made_admin".into(),
+        })
+        .await
+        .unwrap();
+    drop(pl);
+    server.stop();
+
+    let admin_bin = env!("CARGO_BIN_EXE_mudd_admin");
+    let run = |user: &str, level: &str| {
+        std::process::Command::new(admin_bin)
+            .arg("--database")
+            .arg(&server.db_path)
+            .args(["set-level", user, level])
+            .output()
+            .expect("run mudd_admin")
+    };
+    let out = run("made_admin", "admin");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run("no_such_user", "admin");
+    assert!(!out.status.success(), "unknown account must fail");
+
+    server.start_again().await.expect("restart");
+    let mut adm = server
+        .connect_as(Role::Player {
+            username: "made_admin".into(),
+        })
+        .await
+        .unwrap();
+    adm.drain().await;
+    adm.command("eval return 'admin here'").await.unwrap();
+    let _ = adm.expect("echo").await;
+    let out = adm.expect_any().await.unwrap();
+    assert_eq!(out["text"], "admin here", "{}", out);
+}

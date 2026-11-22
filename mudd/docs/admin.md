@@ -20,10 +20,11 @@ cd mudcroft/mudd
 cargo build --release
 ```
 
-This builds two binaries:
+This builds three binaries:
 
 - `target/release/mudd`: the server
 - `target/release/mudd_init`: creates and upgrades the database
+- `target/release/mudd_admin`: offline administration (global access levels)
 
 To serve the web client from `mudd`, also build it:
 
@@ -37,7 +38,7 @@ To install system-wide, copy the binaries and also the core Lua library
 (`mudd/lib/*.lua`), because `mudd_init` must be able to read it:
 
 ```bash
-sudo install -m 755 target/release/mudd target/release/mudd_init /usr/local/bin/
+sudo install -m 755 target/release/mudd target/release/mudd_init target/release/mudd_admin /usr/local/bin/
 sudo mkdir -p /usr/local/share/mudcroft
 sudo cp -r lib /usr/local/share/mudcroft/lib
 sudo cp -r ../client/dist /usr/local/share/mudcroft/www    # optional
@@ -94,6 +95,20 @@ mudd_init --database <PATH> [--lib-dir <DIR>] [--lib <FILE.lua>]... [--force]
 Each universe records the library hashes current **when it is created**, in
 `universes.config.lib_hashes`. Re-running `mudd_init` with newer library files
 affects only universes created after that.
+
+### mudd_admin
+
+Offline administration. Like `mudd_init` it writes the database directly
+(outside Raft and the server's caches), so **stop `mudd` first**.
+
+```
+mudd_admin --database <PATH> set-level <USERNAME> <admin|owner|none>
+```
+
+`set-level` sets an account's global level: `admin` or `owner` apply in
+every universe; `none` removes the global level (per-universe levels, set
+with `game.set_access_level`, are unaffected). It refuses to remove the last
+global admin or owner, and exits non-zero on an unknown account.
 
 ### mudd
 
@@ -436,7 +451,7 @@ versions (see [mudd_init](#mudd_init)).
 | `Database is missing required table '<name>'` | Run `mudd_init` on the database to migrate it. |
 | `Database schema version N does not match this mudd (M). Run mudd_init to upgrade it.` | The database was made by a different version. Run `mudd_init` on it. |
 | `Database schema version N predates version M and there is no upgrade from it; create a new database` | (from `mudd_init`) No upgrade path exists from that version. Create a new database. |
-| `Database has no admin account. Run mudd_init to create a valid database.` | No account has `access_level` `admin` or `owner`. `mudd_init` will not add one to an existing database. Fix it with SQL: `UPDATE accounts SET access_level='admin' WHERE username='...'`. |
+| `Database has no admin account. Run mudd_init to create a valid database.` | No account has `access_level` `admin` or `owner`. `mudd_init` will not add one to an existing database. Run `mudd_admin --database <PATH> set-level <USERNAME> admin`. |
 | `--static-dir <dir> has no index.html (build the client first)` | Run `npm run build` in `client/`, or fix the path. |
 | `Address already in use` | Another process holds the `--bind` port. Pick another address or stop that process. |
 | `get`/`drop`/`inventory` reply with a Lua error about `Commands` | The universe has no core library. It was created after a `mudd_init` that did not find `lib/`. Re-run `mudd_init` with `--lib-dir`, then create a new universe. |

@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "mudd_init"
 path = "src/bin/init.rs"
 
+[[bin]]
+name = "mudd_admin"
+path = "src/bin/admin.rs"
+
 [lib]
 name = "mudd"
 path = "src/lib.rs"
