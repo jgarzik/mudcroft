@@ -33,6 +33,10 @@ const MIN_ROUND_MS: u64 = 1000;
 const MAX_ROUND_MS: u64 = 10_000;
 const DEFAULT_CORPSE_DECAY_S: u64 = 300;
 const DEFAULT_RESPAWN_S: u64 = 300;
+/// Longest respawn or corpse decay (builder-set values are clamped)
+const MAX_DELAY_S: u64 = 30 * 24 * 60 * 60;
+/// Longest pause between wanders
+const MAX_WANDER_S: f64 = 24.0 * 60.0 * 60.0;
 
 /// Longest sleep with nothing due (changes wake the scheduler sooner)
 const IDLE_WAIT: Duration = Duration::from_secs(60);
@@ -80,7 +84,8 @@ pub async fn settings(state: &AppState, universe_id: &str) -> Settings {
             .get("corpse_decay_s")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_CORPSE_DECAY_S)
-            .saturating_mul(1000),
+            .min(MAX_DELAY_S)
+            * 1000,
     }
 }
 
@@ -155,14 +160,40 @@ pub async fn strike(
     target: &Object,
     now: u64,
 ) -> anyhow::Result<Blow> {
-    let a = Combatant::from_object(attacker, if is_player(attacker) { 100 } else { 10 });
-    let d = Combatant::from_object(target, if is_player(target) { 100 } else { 10 });
+    let mut a = Combatant::from_object(attacker, if is_player(attacker) { 100 } else { 10 });
+    let mut d = Combatant::from_object(target, if is_player(target) { 100 } else { 10 });
+    // Gear: a wielded weapon's dice, type and bonus; worn armor class
+    let gear = super::equipment::equipped(state, universe_id, &attacker.id).await;
+    let weapon = super::equipment::weapon(&gear);
+    let dice = weapon
+        .and_then(|w| w.get_string("damage"))
+        .and_then(|n| crate::combat::parse_dice(n).ok())
+        .filter(|roll| roll.count <= 100 && roll.sides <= 1000);
+    let dtype = weapon
+        .and_then(|w| w.get_string("damage_type"))
+        .and_then(|t| t.parse::<DamageType>().ok())
+        .unwrap_or(DamageType::Physical);
+    if let Some(bonus) = weapon
+        .and_then(|w| w.properties.get("attack_bonus"))
+        .and_then(|v| v.as_i64())
+    {
+        a.attack_bonus = a
+            .attack_bonus
+            .saturating_add(bonus.clamp(-1000, 1000) as i32);
+    }
+    let worn = super::equipment::equipped(state, universe_id, &target.id).await;
+    d.armor_class = d
+        .armor_class
+        .saturating_add(super::equipment::armor_bonus(&worn));
     let attacker_effects = state.effects.get(universe_id, &attacker.id).await;
     let target_effects = state.effects.get(universe_id, &target.id).await;
     let mods = attack_mods(&attacker_effects, &target_effects, now);
     let d20 = crate::combat::roll_d20();
-    let damage_roll = rand::rng().random_range(1..=6);
-    let outcome = resolve_attack(&a, &d, &mods, d20, damage_roll, DamageType::Physical, now);
+    let damage_roll = match dice {
+        Some(roll) => roll.roll().max(0),
+        None => rand::rng().random_range(1..=6),
+    };
+    let outcome = resolve_attack(&a, &d, &mods, d20, damage_roll, dtype, now);
     let statements = attack_statements(universe_id, &target.id, &outcome)?;
     if !statements.is_empty() {
         state.object_store.execute_batch(statements).await?;
@@ -645,7 +676,8 @@ pub async fn death(
             .properties
             .get("respawn_seconds")
             .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_RESPAWN_S);
+            .unwrap_or(DEFAULT_RESPAWN_S)
+            .min(MAX_DELAY_S);
         if respawn_s == 0 {
             // For good, with whatever it still holds (fixed things)
             delete_tree(state, universe_id, id, room.as_deref()).await?;
@@ -1168,7 +1200,8 @@ async fn deadline(
                     .properties
                     .get("wander_seconds")
                     .and_then(|v| v.as_f64())
-                    .filter(|s| *s > 0.0)
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .map(|s| s.clamp(1.0, MAX_WANDER_S))
                 else {
                     return Ok(());
                 };

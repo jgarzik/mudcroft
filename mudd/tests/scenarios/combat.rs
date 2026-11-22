@@ -1374,3 +1374,73 @@ async fn test_npc_deletion_spares_players_inside() {
         "the player survives, in the room"
     );
 }
+
+/// Wielding a weapon replaces the bare 1d6 with its damage dice; worn armor
+/// adds to armor class; gear that leaves its wearer is no longer equipped
+#[tokio::test]
+async fn test_equipment() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "knight".into(),
+        })
+        .await
+        .unwrap();
+    let me = adm.player_id().unwrap().to_string();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/items/maul", "item", "{me}", {{name = "maul", slot = "weapon", damage = "1d1+9", damage_type = "bludgeoning", attack_bonus = 40}})
+               game.create_object("/items/helm", "item", "{me}", {{name = "helm", slot = "head", armor_class = 5}})
+               game.create_object("/items/plate", "item", "{me}", {{name = "plate", slot = "body", armor_class = 8}})
+               game.create_object("/npcs/dummy", "npc", "{e}", {{name = "dummy", hp = 1000, max_hp = 1000}})
+               return "ok""#,
+            me = me,
+            e = entrance
+        ),
+    )
+    .await;
+    async fn say(c: &mut TestClient, cmd: &str) -> String {
+        c.drain().await;
+        c.command(cmd).await.unwrap();
+        let _ = c.expect("echo").await;
+        let reply = c.expect_any().await.unwrap();
+        reply["text"]
+            .as_str()
+            .or(reply["message"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+    assert!(say(&mut adm, "wield maul").await.contains("You wield maul"));
+    assert!(say(&mut adm, "wear helm").await.contains("You wear helm"));
+    assert!(say(&mut adm, "wear plate").await.contains("You wear plate"));
+    assert!(say(&mut adm, "wear maul").await.contains("can't wear"));
+    let eq = say(&mut adm, "equipment").await;
+    assert!(
+        eq.contains("maul")
+            && eq.contains("helm")
+            && eq.contains("plate")
+            && eq.contains("Armor class: 23"),
+        "{}",
+        eq
+    );
+    // The maul's fixed 10 damage (20 on a critical), never a d6
+    let hit = say(&mut adm, "attack dummy").await;
+    assert!(
+        hit.contains("for 10 damage") || hit.contains("for 20 damage"),
+        "{}",
+        hit
+    );
+    // Dropped gear is unequipped, and stays so when picked up again
+    say(&mut adm, "remove helm").await;
+    say(&mut adm, "drop plate").await;
+    say(&mut adm, "get plate").await;
+    let eq = say(&mut adm, "equipment").await;
+    assert!(
+        !eq.contains("plate") && !eq.contains("helm") && eq.contains("maul"),
+        "{}",
+        eq
+    );
+    assert!(eq.contains("Armor class: 10"), "{}", eq);
+}

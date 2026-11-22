@@ -118,6 +118,18 @@ pub const DEADLINES_TABLE: &str = r#"
     END
 "#;
 
+/// Equipped gear names its wearer (`equipped_by`); anything that moves it
+/// (drop, give, death, a script) unequips it
+pub const EQUIPMENT_TRIGGER: &str = r#"
+    CREATE TRIGGER IF NOT EXISTS unequip_on_move AFTER UPDATE OF parent_id ON objects
+    WHEN OLD.parent_id IS NOT NEW.parent_id
+     AND json_extract(NEW.properties, '$.equipped_by') IS NOT NULL
+    BEGIN
+        UPDATE objects SET properties = json_remove(properties, '$.equipped_by')
+        WHERE universe_id = NEW.universe_id AND id = NEW.id;
+    END
+"#;
+
 /// Payments a player has been asked to confirm (game.request_payment):
 /// answered or expired rows are deleted. They go with the requesting object.
 const PAYMENT_REQUESTS_TABLE: &str = r#"
@@ -316,6 +328,7 @@ impl Database {
         if version == 12 {
             sqlx::raw_sql(COMBAT_TABLE).execute(&self.pool).await?;
             sqlx::raw_sql(DEADLINES_TABLE).execute(&self.pool).await?;
+            sqlx::raw_sql(EQUIPMENT_TRIGGER).execute(&self.pool).await?;
             self.set_schema_version(13).await?;
             info!("Upgraded database schema 12 -> 13");
             return Ok(());
@@ -668,6 +681,7 @@ impl Database {
             .await?;
         sqlx::raw_sql(COMBAT_TABLE).execute(&self.pool).await?;
         sqlx::raw_sql(DEADLINES_TABLE).execute(&self.pool).await?;
+        sqlx::raw_sql(EQUIPMENT_TRIGGER).execute(&self.pool).await?;
 
         // Path grants table (for path-based permission delegation)
         sqlx::query(

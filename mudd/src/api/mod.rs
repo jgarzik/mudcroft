@@ -4,6 +4,7 @@ mod auth;
 mod combat;
 mod devices;
 mod effect_scheduler;
+mod equipment;
 mod gateway;
 mod images;
 pub mod payments;

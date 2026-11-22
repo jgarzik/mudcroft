@@ -450,6 +450,9 @@ time 0 (the same on every replica); the scheduler reschedules it.
 Primary key `(universe_id, object_id, kind)`; foreign key to `objects` ON
 DELETE CASCADE.
 
+Trigger `unequip_on_move` (schema 13) on `objects`: when an object's
+`parent_id` changes, its `equipped_by` property (equipment) is removed.
+
 ## Startup Validation
 
 `mudd` opens an existing database only. It does not create the database or

@@ -1165,8 +1165,9 @@ Which properties the server reads:
 | `hp`, `max_hp`, `armor_class`, `attack_bonus` (npc, player) | built-in combat |
 | `xp_value`, `respawn_seconds`, `home_room` (npc); `xp` (player) | death and respawn (see [Built-in combat](#built-in-combat)) |
 | `aggro`, `flee_threshold`, `faction`, `wander_seconds` (npc) | NPC behaviour (see [Built-in combat](#built-in-combat)) |
+| `slot`, `damage`, `damage_type`, `attack_bonus`, `armor_class`, `equipped_by` (item) | equipment (see [Built-in combat](#built-in-combat)) |
 
-All other properties, including `weight`, `value`, `lighting`, the weapon and armor fields,
+All other properties, including `weight`, `value`, `lighting`,
 `capacity` and `locked`, are data for your own scripts.
 
 ---
@@ -1182,6 +1183,7 @@ The built-in `attack <name>` (or `kill`) command works like this:
 - A critical hit that does not kill makes the target **bleed**: 2 physical damage per second for 3 seconds.
 - **Rounds.** The first blow lands at once; then each fighter strikes again every `combat_round_ms` (universe config, default 3000, 1000 to 10000) until the fight ends, without further commands. The target fights back. A fight ends when either side dies or they are no longer in the same room (walk away to flee); a fighter whose target is gone turns on someone still fighting it. Attacking someone else switches target. A stunned or paralyzed fighter loses its turn.
 - A hit fires `on_damage`. A kill fires `on_death`.
+- **Equipment**: `wield <item>` / `unwield`, `wear <item>` / `remove <item>`, `equipment` (or `eq`). An item names its slot in `slot`: `weapon` (an item with `damage` and no slot is one), `head`, `body`, `hands`, `feet`, `shield`, `neck` or `ring`; one item per slot. A wielded weapon replaces the bare 1d6 with its `damage` dice (e.g. `"1d8"`, `"2d4+1"`) of its `damage_type` (resistances apply) and adds its `attack_bonus`; each worn item adds its `armor_class` to the wearer's. Equipped items carry `equipped_by` (the wearer); anything that moves an item away (dropping, giving, death, a script) unequips it, and death policies treat gear like other belongings.
 - **NPC behaviour** (NPC properties):
   - `aggro = true`: attacks a player who arrives in its room (walking, `goto`, spawning or moved by Lua), and a player in a room it arrives in, at once (PvP rules don't apply to NPCs).
   - `flee_threshold` (a fraction of `max_hp`, e.g. `0.25`): below it, the NPC runs through a random exit on its turn instead of attacking, ending its fight.

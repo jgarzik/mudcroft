@@ -115,7 +115,6 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **NPC AI in Lua**: aggro, wandering, fleeing and faction assist are
   built in (`mudd/src/api/combat.rs`); class `npc` still names
   `ai_idle_tick`/`ai_combat_tick` handlers that nothing calls.
-- **Equipment**: wield/unwield, wear/remove, armor slots.
 - **Region hooks**: `on_enter`/`on_leave` on the region when a player
   crosses region boundaries.
 - **An LPC-style `init()` cascade on moves.** `game.move_object` already

@@ -191,6 +191,7 @@ after the verb as their argument.
 | `get`/`take <item>`, `drop <item>`, `inventory`/`inv`/`i` | all | Call `Commands.take/drop/inventory` from the mudlib; `take` refuses `fixed` and living objects, and item names match literally (`%`, `_` escaped); `get <item>\|all from <container>` calls `Commands.take_from` |
 | `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`), or a player as `pvp_policy` allows: the first blow, then rounds both ways until the fight ends |
 | `pvp on`/`off` | all | Flag yourself for player combat (counts under `pvp_policy = "flagged"`) |
+| `wield`/`unwield`, `wear`/`remove <item>`, `equipment`/`eq` | all | Equipment (`api/equipment.rs`): weapon dice, type and bonus and worn armor class count in combat |
 | `help` | all | Commands for the caller's access level |
 | `create <class> <path> "<name>" ["<desc>"] [key=value ...]` | builder+ | Create an object, path-permission checked |
 | `eval <lua>` | wizard+ | Run Lua as the caller |
@@ -492,6 +493,9 @@ Two layers exist:
   same row; the scheduler is woken after every committed run) move it to
   a room of the same region and reschedule. Deleting an object for good
   (`delete_tree`) takes its contents, deepest first, but moves players out.
+  Equipment (`api/equipment.rs`): an item marked `equipped_by` its holder
+  counts in `strike` (weapon dice, type, bonus; armor class); the trigger
+  `unequip_on_move` clears the mark whenever the item's parent changes.
 - **Status effects** (`src/combat/effects.rs`, `src/api/effect_scheduler.rs`)
   live in `active_effects`, cached by `EffectRegistry`. They store absolute
   deadlines (`expires_at`; periodic ones also `period_ms`, `next_pulse_at`),

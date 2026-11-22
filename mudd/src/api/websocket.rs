@@ -1282,7 +1282,7 @@ async fn execute_command(
         "help" => {
             let mut text = String::from(
                 "Commands: look, north/south/east/west/up/down, say <message>, \
-                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, pvp on/off, help. \
+                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, wield/wear/remove/equipment, pvp on/off, help. \
                  Objects may offer their own verbs (e.g. 'pull lever').",
             );
             if access_level >= AccessLevel::Builder {
@@ -1728,6 +1728,37 @@ async fn execute_command(
             }
             ServerMessage::Silent
         }
+        "wield" => {
+            super::equipment::equip(
+                state,
+                universe_id,
+                player_id,
+                args_after_verb(command),
+                true,
+            )
+            .await
+        }
+        "wear" => {
+            super::equipment::equip(
+                state,
+                universe_id,
+                player_id,
+                args_after_verb(command),
+                false,
+            )
+            .await
+        }
+        "unwield" => super::equipment::unequip(state, universe_id, player_id, None).await,
+        "remove" => {
+            super::equipment::unequip(
+                state,
+                universe_id,
+                player_id,
+                Some(args_after_verb(command)),
+            )
+            .await
+        }
+        "equipment" | "eq" => super::equipment::list(state, universe_id, player_id).await,
         "pvp" => {
             // Flag yourself for player combat (counts under pvp_policy
             // "flagged")
