@@ -68,3 +68,40 @@ async fn test_static_dir_without_index_is_rejected() {
         err
     );
 }
+
+/// mudd serves the client directly (no proxy in front), so it compresses
+/// text and sets the browser security headers itself
+#[tokio::test]
+async fn test_static_dir_gzip_and_security_headers() {
+    let site = tempfile::TempDir::new().expect("temp dir");
+    let big = format!(
+        "<!doctype html><title>Mudcroft</title>{}",
+        "<p>cave</p>".repeat(200)
+    );
+    std::fs::write(site.path().join("index.html"), &big).unwrap();
+    let dir = site.path().to_str().unwrap();
+    let server = TestServer::start_with_args(false, &["--static-dir", dir])
+        .await
+        .expect("server with static dir");
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/", server.base_url()))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let h = resp.headers();
+    assert_eq!(
+        h.get("content-encoding").map(|v| v.to_str().unwrap()),
+        Some("gzip")
+    );
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(h["x-frame-options"], "SAMEORIGIN");
+    assert_eq!(h["referrer-policy"], "strict-origin-when-cross-origin");
+    assert!(resp.bytes().await.unwrap().len() < big.len());
+
+    // API responses carry the headers too
+    let health = server.get("/health").await.unwrap();
+    assert_eq!(health.headers()["x-content-type-options"], "nosniff");
+}

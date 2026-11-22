@@ -136,14 +136,35 @@ pub async fn router(
         .merge(auth::router())
         .merge(universe::router());
 
-    match static_dir {
+    let app = match static_dir {
         Some(dir) => {
             let index = tower_http::services::ServeFile::new(dir.join("index.html"));
             let files = tower_http::services::ServeDir::new(dir).fallback(index);
             api.fallback_service(files).with_state(state)
         }
         None => api.route("/", get(root)).with_state(state),
-    }
+    };
+    with_web_layers(app)
+}
+
+/// What a front-end proxy would otherwise add: gzip for text (images and
+/// WebSocket upgrades pass through) and browser security headers
+fn with_web_layers(app: Router) -> Router {
+    use axum::http::{header, HeaderValue};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    app.layer(tower_http::compression::CompressionLayer::new())
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("SAMEORIGIN"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
 }
 
 /// Root endpoint
