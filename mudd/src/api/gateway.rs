@@ -121,7 +121,13 @@ pub async fn forward_to_primary(
     {
         Ok(response) => into_response(response),
         Err(e) => {
-            warn!("gateway: forwarding {} failed: {}", forwarded.uri, e);
+            // The path only: a query string can carry a token
+            warn!(
+                "gateway: forwarding {} {} failed: {}",
+                parts.method,
+                parts.uri.path(),
+                e
+            );
             plain(
                 StatusCode::BAD_GATEWAY,
                 "the primary did not answer; try again",
@@ -214,6 +220,15 @@ pub async fn ws_upgrade(ws: WebSocketUpgrade, params: WsParams, state: AppState)
             "Universe and token required: ?universe=<id>&token=<token>",
         );
     };
+    let universe = match crate::universe::validate_universe_id(&universe) {
+        Ok(id) => id,
+        Err(e) => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid universe ID: {}", e),
+            )
+        }
+    };
     let Some((_, security)) = state.raft_writer.cluster().cloned() else {
         return plain(StatusCode::SERVICE_UNAVAILABLE, "not a cluster member");
     };
@@ -229,8 +244,9 @@ pub async fn ws_upgrade(ws: WebSocketUpgrade, params: WsParams, state: AppState)
         headers: Vec::new(),
         body: String::new(),
     };
+    // /auth/validate answers 200 either way: the body says whether it is
     match PeerClient::new(addr, security).http(&check).await {
-        Ok(response) if response.status == 200 => {}
+        Ok(response) if response.status == 200 && token_valid(&response) => {}
         Ok(_) => {
             return plain(
                 StatusCode::UNAUTHORIZED,
@@ -246,6 +262,15 @@ pub async fn ws_upgrade(ws: WebSocketUpgrade, params: WsParams, state: AppState)
     }
     let open = GameOpen { universe, token };
     ws.on_upgrade(move |socket| relay(socket, state, open))
+}
+
+fn token_valid(response: &HttpResponse) -> bool {
+    BASE64
+        .decode(&response.body)
+        .ok()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|v| v["valid"].as_bool())
+        .unwrap_or(false)
 }
 
 /// Percent-encode a token for a query string (tokens are hex; anything else

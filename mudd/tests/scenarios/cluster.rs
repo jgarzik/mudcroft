@@ -419,3 +419,18 @@ async fn test_cluster_other_ca_refused() {
 fn mudd_test_certs(dir: &std::path::Path) -> crate::harness::ClusterCerts {
     crate::harness::make_certs(dir, "cluster-test-secret-0123456789").expect("certs")
 }
+
+/// A gateway refuses a bad token before upgrading, like the primary (401)
+#[tokio::test]
+async fn test_gateway_refuses_bad_token() {
+    let cluster = TestCluster::start(2).await.expect("cluster");
+    cluster.seed_world(0, "tok-world").await.expect("seed");
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        let node_no = i + 1;
+        let err = ClusterPlayer::connect(node, "tok-world", "not-a-real-token")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("node {} accepted a bad token", node_no));
+        assert!(err.to_string().contains("401"), "node {}: {}", node_no, err);
+    }
+}
