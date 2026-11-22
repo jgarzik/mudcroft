@@ -1,6 +1,6 @@
 # Multi-node Mudcroft: cluster design
 
-Status: **proposal for review** (Phase 5a). Nothing here is built yet.
+Status: **reviewed** (Phase 5a; decisions recorded below). Nothing here is built yet.
 
 ## Goals and decisions already made
 
@@ -56,9 +56,9 @@ reconnect to the new primary), drop the caches. An old primary that has not
 noticed yet cannot do damage: its writes fail at `client_write`. It may at
 most send a few stale messages to players for up to one election timeout.
 
-**Prerequisite:** custom verbs (`ActionRegistry`) live only in memory today,
-so a failover would lose them. Persisting them (a Phase 6 item) must move
-**before** this work.
+**Known limitation until Phase 6:** custom verbs (`ActionRegistry`) live
+only in memory, so a failover loses them (the new primary has none until
+object code re-registers them). Persisting them stays in Phase 6.
 
 ## Gateways
 
@@ -119,7 +119,8 @@ production-like tests:
 
 - Every node has a certificate signed by a cluster CA
   (`--cluster-cert`, `--cluster-key`, `--cluster-ca`). Clients verify the
-  server against the CA.
+  server against the CA. Operators supply the CA, certificates and secret;
+  `admin.md` documents the `openssl` commands (mudd generates none).
 - After the TLS handshake, the connecting side sends
   `Hello { node_id, secret }`. The secret comes from `--cluster-secret-file`
   and is compared in constant time; the node id must be a cluster member (or
@@ -214,25 +215,22 @@ certificates generated at test time (`rcgen` as a dev-dependency):
 
 ## Implementation phases (5b)
 
-1. Persist custom verbs (moved up from Phase 6).
-2. Cluster transport: TLS listener, `Hello` with the secret, framed Raft
+1. Cluster transport: TLS listener, `Hello` with the secret, framed Raft
    RPCs, `--join`, learner then voter, `mudd_admin cluster status/remove`.
-3. Snapshots: `VACUUM INTO` build, streaming, ATTACH-and-copy install,
+2. Snapshots: `VACUUM INTO` build, streaming, ATTACH-and-copy install,
    size-triggered snapshot and purge.
-4. Primary lifecycle: `ensure_linearizable`, cache rebuild, primary-only
+3. Primary lifecycle: `ensure_linearizable`, cache rebuild, primary-only
    schedulers, stop on losing leadership, `NotPrimary` writes.
-5. Gateways: session multiplexing, forwarded HTTP, reconnection on failover.
-6. Failover tests and docs (`admin.md` cluster section, `design.md`).
+4. Gateways: session multiplexing, forwarded HTTP, reconnection on failover.
+5. Failover tests and docs (`admin.md` cluster section, `design.md`).
 
-## Open questions
+## Decisions (review, 2026-11-22)
 
-1. **Membership:** `--join` with learner promotion (recommended, as roodb)
-   instead of the static `--peers` bootstrap in the plan?
-2. **Peer authentication:** shared secret over server-verified TLS (as
-   decided), or mutual TLS (roodb's choice, no secret to distribute), or
-   both?
-3. **In-flight commands at failover:** report "interrupted" and never retry
-   (recommended), or invest now in one-batch-per-command so commands can be
-   retried exactly once?
-4. **Order:** persist custom verbs first (recommended), pulling it forward
-   from Phase 6?
+1. **Membership:** `--join` with learner-then-voter promotion; no static
+   `--peers` list.
+2. **Peer authentication:** shared secret over server-verified TLS. The CA,
+   certificates and secret are supplied by the operator.
+3. **In-flight commands at failover:** reported as interrupted, never
+   retried.
+4. **Custom verbs:** persisted in Phase 6, after the cluster work; lost on
+   failover until then.
