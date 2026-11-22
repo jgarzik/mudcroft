@@ -16,10 +16,12 @@ if [ "$(id -u)" = 0 ]; then
 fi
 
 if [ "$(id -u)" = 0 ]; then
-    chown appuser:appuser "$(dirname "$DB_PATH")"
-    # Files a root-run older image may have left behind
+    # Never follow symlinks here: /data is writable by appuser, so a link
+    # planted there must not make root chown some other file
+    chown -h appuser:appuser "$(dirname "$DB_PATH")"
+    # Database files left root-owned (an older image, mudd_admin run as root)
     for f in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
-        if [ -e "$f" ]; then chown appuser:appuser "$f"; fi
+        if [ -f "$f" ] && [ ! -L "$f" ]; then chown -h appuser:appuser "$f"; fi
     done
 fi
 
