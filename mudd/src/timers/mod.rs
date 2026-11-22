@@ -47,7 +47,8 @@ impl Timer {
             universe_id: universe_id.to_string(),
             object_id: object_id.to_string(),
             method: method.to_string(),
-            fire_at: now.saturating_add(delay_ms.min(MAX_TIMER_DELAY_MS) as i64),
+            fire_at: now
+                .saturating_add(delay_ms.clamp(MIN_TIMER_DELAY_MS, MAX_TIMER_DELAY_MS) as i64),
             args,
         }
     }
@@ -131,6 +132,9 @@ pub const MAX_TIMERS_PER_OBJECT: usize = 32;
 pub const MIN_HEARTBEAT_MS: u64 = 100;
 /// Longest heartbeat interval (one day)
 pub const MAX_HEARTBEAT_MS: u64 = 86_400_000;
+/// Shortest call_out delay: with a deadline-driven loop, a handler that
+/// reschedules itself with no delay would otherwise spin
+pub const MIN_TIMER_DELAY_MS: u64 = 100;
 /// Longest call_out delay (30 days)
 pub const MAX_TIMER_DELAY_MS: u64 = 30 * 86_400_000;
 
@@ -645,5 +649,10 @@ mod tests {
         let timer = Timer::new("u", "/o", "m", u64::MAX, None);
         assert!(timer.fire_at > now && timer.fire_at <= now + MAX_TIMER_DELAY_MS as i64 + 1_000);
         assert!(!timer.is_due());
+
+        // A zero delay is at least the minimum: a handler that reschedules
+        // itself cannot spin
+        let soon = Timer::new("u", "/o", "m", 0, None);
+        assert!(soon.fire_at >= now + MIN_TIMER_DELAY_MS as i64);
     }
 }

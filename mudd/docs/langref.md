@@ -650,7 +650,7 @@ callback runs that object's code, as its owner.
 #### `game.call_out(delay_secs, method, args)`
 
 Schedules handler `method` on the current object after `delay_secs`
-seconds (fractions allowed; at most 30 days).
+seconds (fractions allowed; at least 0.1 s, at most 30 days).
 
 - `args` is an optional **string**. It arrives as `args.args` in the callback. To pass structured data, encode it in a string or store it in a property.
 - The callback receives `{object_id, room_id, args}`, where `room_id` is the object's `parent_id` when the timer fires.
