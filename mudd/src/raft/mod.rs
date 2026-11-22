@@ -42,10 +42,11 @@ pub async fn create_raft_node(
     node_id: NodeId,
     pool: SqlitePool,
     network_config: NetworkConfig,
+    single_node: bool,
 ) -> anyhow::Result<(GameRaft, SqlitePool)> {
     info!("Creating Raft node {}", node_id);
 
-    let config = create_openraft_config();
+    let config = create_openraft_config(single_node);
     let read_pool = pool.clone();
     let shared: SharedPool = Arc::new(RwLock::new(pool));
     let log_store = LogStore::new(shared.clone());

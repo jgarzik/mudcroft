@@ -517,7 +517,8 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   carry the database file (after a `PRAGMA wal_checkpoint(TRUNCATE)`) if the
   state machine were given its path, which it is not yet. Installing a
   snapshot without the database file is refused.
-- **Timing**: heartbeat 500 ms, election timeout 1.5-3 s.
+- **Timing**: heartbeat 500 ms, election timeout 1.5-3 s in a cluster. A
+  single node turns its tick, heartbeat and election timers off (no peers).
 - **Network**: `raft/network.rs` (`RaftNetworkV2`) sends RPCs as HTTP POSTs
   to `http://<peer>/raft/<endpoint>` (`append_entries`, `vote`, and
   `snapshot` for a whole snapshot). Nothing serves these endpoints yet.

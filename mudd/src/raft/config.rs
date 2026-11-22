@@ -124,12 +124,19 @@ impl RaftNodeConfig {
     }
 }
 
-/// Create the OpenRaft configuration with our tuning parameters
-pub fn create_openraft_config() -> Arc<Config> {
+/// Create the OpenRaft configuration with our tuning parameters.
+///
+/// A single node has no peers to heartbeat or elect against, so its tick,
+/// heartbeat and election timers are off (as in the sister project roodb);
+/// the timing values apply only once more nodes join.
+pub fn create_openraft_config(single_node: bool) -> Arc<Config> {
     Arc::new(Config {
         heartbeat_interval: HEARTBEAT_INTERVAL,
         election_timeout_min: ELECTION_TIMEOUT_MIN,
         election_timeout_max: ELECTION_TIMEOUT_MAX,
+        enable_tick: !single_node,
+        enable_heartbeat: !single_node,
+        enable_elect: !single_node,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(SNAPSHOT_THRESHOLD),
         ..Default::default()
     })
