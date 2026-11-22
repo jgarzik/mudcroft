@@ -30,52 +30,34 @@ primary lifecycle, gateways, failover), with these gaps:
 
 ## Raft Cluster Operation
 
-Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
-(`Request { sql, params }`). Planned:
+Clusters are built (see [cluster-design.md](cluster-design.md)): `--join`
+membership, a TLS cluster port with a shared secret, a single primary that
+runs the game, gateways that relay to it, and failover. Planned:
 
-- **Leader-only execution.** Only the leader runs Lua. A trigger (player
-  command, timer, scheduled task) runs on the leader, which collects the
-  resulting SQL mutations, proposes them, and broadcasts events to room
-  occupants. Followers apply the SQL and never run Lua. Followers redirect
-  or proxy client writes to the leader.
-- **Typed log entries** instead of raw SQL:
+- **One batch per Lua run.** Each `game.*` write is its own Raft entry
+  today. Collecting a whole execution's writes into one entry would make
+  each command atomic and, with a command id recorded in the batch, let a
+  gateway retry a command interrupted by a failover exactly once. Typed log
+  entries could replace raw SQL at the same time:
 
   ```rust
   pub enum GameLogEntry {
       CreateUniverse { universe_id, name, owner_account_id, initial_config },
       DeleteUniverse { universe_id },
-      Mutations { universe_id, sql_statements: Vec<String> },
+      Mutations { universe_id, command_id, sql_statements: Vec<String> },
       StoreCode { universe_id, hash, code, author_account_id },
   }
   ```
 
-  One `Mutations` entry per execution would also make each Lua run's writes
-  atomic (today each statement is its own entry).
-- **Cold start**: a new node requests a snapshot from the leader (SQLite
-  backup, compressed, streamed), applies it, replays log entries since the
-  snapshot, and joins as a follower.
-- **Failover**: target about 500 ms of disruption; in-flight commands may
-  time out and the client retries; no committed data lost.
-- **Cache coherence**: invalidate or bypass per-node caches when entries are
-  applied (see Known Issues).
-- **Node configuration file** (TOML), in addition to the CLI flags:
-
-  ```toml
-  node_id = 1
-  peers = ["10.0.1.1:9000", "10.0.1.2:9000", "10.0.1.3:9000"]
-  venice_api_key = "venice-..."
-  venice_api_url = "https://api.venice.ai/api/v1"
-  ```
-
-- **Multi-node tests**: a cluster harness that starts several nodes and
-  checks election, replication, snapshot transfer and failover.
+- **Streamed snapshots** built and installed without holding the whole
+  database in memory (see Known Issues).
+- **Node configuration file** (TOML), in addition to the CLI flags.
 
 ## Storage
 
 - **Per-universe databases**: a shared database for accounts and the
   universe registry, plus one database per universe, under a data directory
   (`raft/`, `shared.db`, `universes/*.db`). Today everything is in one file.
-- Universe-scoped object IDs (see Known Issues).
 - **Event log** table (event type, actor, target, room, data) for auditing
   and moderation.
 - **Backups**: Raft replicates but is not an offsite backup; add periodic
@@ -213,6 +195,7 @@ Ideas from the original design, beyond today's `/auth/*` and `/universe/*`:
 Today there is a single-container Docker image (`Dockerfile`, `docker/`):
 one `mudd` serving the client and the API. Planned:
 
-- Docker Compose for a three-node cluster plus the client.
+- Docker Compose for a three-node cluster plus the client (with
+  operator-supplied cluster certificates and secret).
 - A script to start a local three-node cluster.
 - Production deployment and performance work.
