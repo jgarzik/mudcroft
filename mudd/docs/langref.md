@@ -729,7 +729,8 @@ Adds an effect lasting `duration` seconds (0.1 to 86,400; fractions allowed)
 with strength `magnitude` (-10,000 to 10,000). `damage_type` is optional;
 `poisoned`, `burning` and `bleeding` default to poison, fire and physical.
 `period` (seconds between pulses, 0.5 to 3,600, default 1) applies to
-periodic effects. Applying a type the target already has keeps the later end
+periodic effects. `duration` and `period` must be finite numbers (`0/0`
+raises an error). Applying a type the target already has keeps the later end
 and the stronger magnitude, and a periodic effect keeps its pulse timing.
 The acting user needs Modify permission on the target.
 

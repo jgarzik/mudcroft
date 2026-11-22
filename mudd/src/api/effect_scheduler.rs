@@ -55,7 +55,23 @@ pub async fn process(state: &AppState, now: u64) {
 
     let mut statements = Vec::new();
     let mut processed: Vec<(String, String, Object, bool, TickOutcome)> = Vec::new();
-    for ((universe, entity), effects) in due {
+    for ((universe, entity), _) in due {
+        // Work from the table, the source of truth, not the cache: the
+        // object may have been deleted (rows cascaded) and even recreated
+        let effects =
+            match crate::combat::EffectRegistry::load_entity(state.db.pool(), &universe, &entity)
+                .await
+            {
+                Ok(effects) if effects.is_empty() => {
+                    state.effects.cache_clear(&universe, &entity).await;
+                    continue;
+                }
+                Ok(effects) => effects,
+                Err(e) => {
+                    warn!("effects: loading {} failed: {}", entity, e);
+                    continue;
+                }
+            };
         let obj = match state.object_store.get(&universe, &entity).await {
             Ok(Some(obj)) => obj,
             Ok(None) => {

@@ -624,12 +624,16 @@ impl GameApi {
             universe_id.clone(),
             permissions.clone(),
         );
-        let cleanup = (self.timers.clone(), self.actions.clone());
+        let cleanup = (
+            self.timers.clone(),
+            self.actions.clone(),
+            self.effects.clone(),
+        );
         let delete_object = lua.create_function(move |lua, id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
             let (user, universe_id, permissions) = ctx_clone.clone();
-            let (timers, actions) = cleanup.clone();
+            let (timers, actions, effects) = cleanup.clone();
             let user = actor_override(lua).or(user);
 
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
@@ -654,6 +658,9 @@ impl GameApi {
                         // the deleted object, nor for a later object reusing
                         // its path
                         timers.remove_timers_for_object(&universe_id, &id).await;
+                        // Its effect rows went with it (cascade); drop them
+                        // from the cache too
+                        effects.cache_clear(&universe_id, &id).await;
                         timers.remove_heartbeat(&universe_id, &id).await;
                         actions.clear_by_object(&universe_id, &id).await;
                     }
@@ -1756,6 +1763,11 @@ impl GameApi {
                 Option<f64>,
             )| {
                 charge_db(lua)?;
+                if !duration.is_finite() || period.is_some_and(|p| !p.is_finite()) {
+                    return Err(mlua::Error::runtime(
+                        "apply_effect: duration and period must be finite numbers",
+                    ));
+                }
                 let effect_type = effect_type(&kind)?;
                 let damage_type = match dtype {
                     Some(name) => Some(DamageType::from_str(&name).map_err(|_| {

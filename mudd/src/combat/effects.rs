@@ -128,6 +128,9 @@ impl std::fmt::Display for EffectType {
     }
 }
 
+/// Shortest pulse period: each pulse is a replicated write
+pub const MIN_PERIOD_MS: u64 = 500;
+
 /// Current time in milliseconds since the Unix epoch. Effect deadlines are
 /// absolute times computed on the primary before proposing, so replicas
 /// store the same values.
@@ -180,7 +183,7 @@ impl StatusEffect {
         magnitude: i32,
         damage_type: Option<DamageType>,
     ) -> Self {
-        let period_ms = period_ms.max(1);
+        let period_ms = period_ms.max(MIN_PERIOD_MS);
         Self {
             effect_type,
             magnitude,
@@ -330,6 +333,38 @@ pub struct EffectRegistry {
 
 /// (universe_id, entity_id)
 pub type EntityKey = (String, String);
+
+/// An active_effects row, in column order
+type Row = (
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
+fn row_to_effect(row: Row) -> Option<(EntityKey, StatusEffect)> {
+    let (universe_id, entity_id, effect_type, expires, period, next, magnitude, dtype, source) =
+        row;
+    let Ok(effect_type) = EffectType::from_str(&effect_type) else {
+        warn!("Unknown effect type in database: {}", effect_type);
+        return None;
+    };
+    let effect = StatusEffect {
+        effect_type,
+        magnitude: magnitude as i32,
+        source_id: source,
+        damage_type: dtype.and_then(|d| DamageType::from_str(&d).ok()),
+        expires_at: expires.max(0) as u64,
+        period_ms: period.map(|p| (p.max(0) as u64).max(MIN_PERIOD_MS)),
+        next_pulse_at: next.map(|n| n.max(0) as u64),
+    };
+    Some(((universe_id, entity_id), effect))
+}
 
 fn key(universe_id: &str, entity_id: &str) -> EntityKey {
     (universe_id.to_string(), entity_id.to_string())
@@ -549,19 +584,32 @@ impl EffectRegistry {
         self.changed.notified().await
     }
 
+    /// One entity's effects as stored in the table (the source of truth)
+    pub async fn load_entity(
+        pool: &SqlitePool,
+        universe_id: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<EntityEffects> {
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT universe_id, entity_id, effect_type, expires_at, period_ms, next_pulse_at,
+                    magnitude, damage_type, source_id
+             FROM active_effects WHERE universe_id = ? AND entity_id = ?",
+        )
+        .bind(universe_id)
+        .bind(entity_id)
+        .fetch_all(pool)
+        .await?;
+        let mut effects = EntityEffects::new();
+        for row in rows {
+            if let Some((_, effect)) = row_to_effect(row) {
+                effects.add(effect);
+            }
+        }
+        Ok(effects)
+    }
+
     /// Rebuild the cache from the table (at startup)
     pub async fn load_from_db(&self, pool: &SqlitePool) -> anyhow::Result<()> {
-        type Row = (
-            String,
-            String,
-            String,
-            i64,
-            Option<i64>,
-            Option<i64>,
-            i64,
-            Option<String>,
-            Option<String>,
-        );
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT universe_id, entity_id, effect_type, expires_at, period_ms, next_pulse_at,
                     magnitude, damage_type, source_id
@@ -571,35 +619,10 @@ impl EffectRegistry {
         .await?;
 
         let mut cache = HashMap::<EntityKey, EntityEffects>::new();
-        for (
-            universe_id,
-            entity_id,
-            effect_type,
-            expires,
-            period,
-            next,
-            magnitude,
-            dtype,
-            source,
-        ) in rows
-        {
-            let Ok(effect_type) = EffectType::from_str(&effect_type) else {
-                warn!("Unknown effect type in database: {}", effect_type);
-                continue;
-            };
-            let effect = StatusEffect {
-                effect_type,
-                magnitude: magnitude as i32,
-                source_id: source,
-                damage_type: dtype.and_then(|d| DamageType::from_str(&d).ok()),
-                expires_at: expires.max(0) as u64,
-                period_ms: period.map(|p| p.max(1) as u64),
-                next_pulse_at: next.map(|n| n.max(0) as u64),
-            };
-            cache
-                .entry((universe_id, entity_id))
-                .or_default()
-                .add(effect);
+        for row in rows {
+            if let Some((key, effect)) = row_to_effect(row) {
+                cache.entry(key).or_default().add(effect);
+            }
         }
         debug!("Loaded effects for {} entities", cache.len());
         *self.cache.write().await = cache;

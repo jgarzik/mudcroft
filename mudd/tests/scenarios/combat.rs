@@ -472,3 +472,59 @@ async fn test_stunned_player_cannot_attack() {
         reply
     );
 }
+
+/// Durations and periods must be real numbers: NaN would defeat the clamps
+#[tokio::test]
+async fn test_effect_times_must_be_finite() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "nan_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"local a = pcall(game.apply_effect, "{b}", "poisoned", 0/0, 1)
+               local b = pcall(game.apply_effect, "{b}", "poisoned", 5, 1, nil, 0/0)
+               return tostring(a) .. ":" .. tostring(b) .. ":" .. #game.get_effects("{b}")"#,
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "false:false:0", "{}", out);
+}
+
+/// Effects belong to one object: deleting it and creating a new one with
+/// the same id does not hand the old effects to the new object
+#[tokio::test]
+async fn test_effects_do_not_survive_object_recreation() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "recreate_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        r#"game.create_object("/npcs/ghost", "npc", nil, {name = "ghost", hp = 20})
+           game.apply_effect("/npcs/ghost", "poisoned", 3, 5)
+           game.delete_object("/npcs/ghost")
+           game.create_object("/npcs/ghost", "npc", nil, {name = "ghost", hp = 20})
+           return #game.get_effects("/npcs/ghost")"#,
+    )
+    .await;
+    assert_eq!(out["text"], "0", "{}", out);
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let hp: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.hp') FROM objects WHERE universe_id = ? AND id = '/npcs/ghost'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(hp, 20, "the new object takes no poison");
+}
