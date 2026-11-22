@@ -111,7 +111,9 @@ Exceeding a limit raises an error, for example `database query limit exceeded (1
 The instruction, memory and call limits stop a script as soon as it
 exceeds them. The timeout works differently: it is checked only after a
 chunk finishes, and not at all for the handler call in object code. Rely
-on the instruction limit to stop runaway loops.
+on the instruction limit to stop runaway loops: it holds even for
+`while true do end`, and `pcall`/`xpcall` cannot catch it (once the limit
+is exceeded they re-raise instead of returning `false`).
 
 Every `game.*` function counts as a database call except these:
 `add_action`, `remove_action`, `send`, `broadcast`, `broadcast_region`,
@@ -125,7 +127,7 @@ object-code budget. One top-level execution may make at most 32
 
 ### Sandbox globals
 
-- **Available:** `string`, `table`, `math`, `utf8`, the Lua base functions (`pairs`, `ipairs`, `pcall`, `error`, `tostring`, `type`, ...), and `print`, which does nothing.
+- **Available:** `string`, `table`, `math`, `utf8`, the Lua base functions (`pairs`, `ipairs`, `pcall`, `error`, `tostring`, `type`, ...), and `print`, which does nothing. `pcall` and `xpcall` are the sandbox's own: they catch ordinary errors but pass the error to you (or to the `xpcall` handler) as a string, even if `error` was given a table.
 - **Removed:** `os`, `io`, `load`, `loadstring`, `loadfile`, `dofile`, `require`, `package`, `debug`, `collectgarbage`.
 - **Added:** the `game` table, the [`parent`](#parentclass_name-handler_name-args) function, and any globals defined by the universe's libraries (see [Core library](#core-library)).
 

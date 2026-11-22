@@ -134,8 +134,12 @@ impl Sandbox {
             move |_lua, _debug| {
                 let current = count_clone.fetch_add(1000, Ordering::Relaxed) + 1000;
                 if current > max_instructions {
+                    // Raise an error: yielding does nothing on the main
+                    // thread, which is not yieldable. Every later check
+                    // raises again, so even a caught error cannot keep the
+                    // script running; the sandbox's pcall/xpcall re-raise it.
                     exceeded_clone.store(true, Ordering::Relaxed);
-                    Ok(VmState::Yield)
+                    Err(mlua::Error::runtime("instruction limit exceeded"))
                 } else {
                     Ok(VmState::Continue)
                 }
@@ -153,6 +157,7 @@ impl Sandbox {
 
         // Add safe utility functions
         Self::add_safe_globals(&lua)?;
+        Self::add_limit_aware_pcall(&lua, exceeded.clone())?;
 
         Ok(Self {
             lua,
@@ -201,6 +206,53 @@ impl Sandbox {
         })?;
         globals.set("print", safe_print)?;
 
+        Ok(())
+    }
+
+    /// Replace pcall and xpcall with versions that catch ordinary errors but
+    /// re-raise once the instruction limit is exceeded, so a script cannot
+    /// catch the limit and keep running
+    fn add_limit_aware_pcall(lua: &Lua, exceeded: Arc<AtomicBool>) -> LuaResult<()> {
+        use mlua::MultiValue;
+
+        fn error_value(lua: &Lua, e: &mlua::Error) -> LuaResult<Value> {
+            Ok(Value::String(lua.create_string(e.to_string())?))
+        }
+
+        let flag = exceeded.clone();
+        let pcall = lua.create_function(move |lua, (f, args): (Function, MultiValue)| {
+            match f.call::<MultiValue>(args) {
+                Ok(mut values) => {
+                    values.push_front(Value::Boolean(true));
+                    Ok(values)
+                }
+                Err(e) if flag.load(Ordering::Relaxed) => Err(e),
+                Err(e) => Ok(MultiValue::from_vec(vec![
+                    Value::Boolean(false),
+                    error_value(lua, &e)?,
+                ])),
+            }
+        })?;
+        lua.globals().set("pcall", pcall)?;
+
+        let flag = exceeded;
+        let xpcall = lua.create_function(
+            move |lua, (f, handler, args): (Function, Function, MultiValue)| match f
+                .call::<MultiValue>(args)
+            {
+                Ok(mut values) => {
+                    values.push_front(Value::Boolean(true));
+                    Ok(values)
+                }
+                Err(e) if flag.load(Ordering::Relaxed) => Err(e),
+                Err(e) => {
+                    let mut handled = handler.call::<MultiValue>(error_value(lua, &e)?)?;
+                    handled.push_front(Value::Boolean(false));
+                    Ok(handled)
+                }
+            },
+        )?;
+        lua.globals().set("xpcall", xpcall)?;
         Ok(())
     }
 
@@ -387,6 +439,59 @@ mod tests {
             result,
             Err(SandboxError::InstructionLimitExceeded(_, _))
         ));
+    }
+
+    /// Run `code` under a low instruction limit on its own thread; None if
+    /// it is still running after the deadline (the limit failed to stop it)
+    fn run_limited(code: &'static str) -> Option<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let config = SandboxConfig {
+                max_instructions: 10_000,
+                ..Default::default()
+            };
+            let mut sandbox = Sandbox::new(config).unwrap();
+            let _ = tx.send(format!("{:?}", sandbox.execute::<()>(code)));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
+    }
+
+    /// A script that never ends on its own is stopped by the limit
+    #[test]
+    fn test_instruction_limit_stops_infinite_loop() {
+        let result = run_limited("while true do end").expect("the loop was not stopped");
+        assert!(result.contains("InstructionLimitExceeded"), "{}", result);
+    }
+
+    /// pcall/xpcall cannot swallow the limit and keep running
+    #[test]
+    fn test_instruction_limit_not_caught_by_pcall() {
+        for code in [
+            "while true do pcall(function() while true do end end) end",
+            "while true do xpcall(function() while true do end end, function(e) return e end) end",
+        ] {
+            let result = run_limited(code).expect("pcall kept the script alive");
+            assert!(
+                result.contains("InstructionLimitExceeded"),
+                "{}: {}",
+                code,
+                result
+            );
+        }
+    }
+
+    /// pcall still catches ordinary errors
+    #[test]
+    fn test_pcall_catches_ordinary_errors() {
+        let mut sandbox = Sandbox::new(SandboxConfig::default()).unwrap();
+        let result: String = sandbox
+            .execute(
+                r#"local ok, err = pcall(function() error("boom") end)
+                   local ok2, v = pcall(function(a, b) return a + b end, 2, 3)
+                   return tostring(ok) .. ":" .. tostring(err):match("boom") .. ":" .. tostring(ok2) .. v"#,
+            )
+            .unwrap();
+        assert_eq!(result, "false:boom:true5");
     }
 
     #[test]
