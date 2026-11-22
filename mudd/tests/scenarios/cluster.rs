@@ -160,3 +160,110 @@ async fn test_cluster_admin_status_and_remove() {
     let (ok, out) = cluster.admin(0, &["remove", "1"]).unwrap();
     assert!(!ok && out.contains("last voter"), "{}", out);
 }
+
+/// Only the leader runs the schedulers; when it dies, the new primary
+/// rebuilds them from the tables and a call_out armed before the failover
+/// fires exactly once
+#[tokio::test]
+async fn test_cluster_call_out_survives_failover() {
+    let mut cluster = TestCluster::start(3).await.expect("cluster");
+    cluster
+        .wait_for(
+            2,
+            &account_count("cluster_admin"),
+            1,
+            Duration::from_secs(20),
+        )
+        .await;
+    assert_eq!(
+        cluster.primaries(),
+        vec![0],
+        "only node 1 is primary\n{}",
+        cluster.logs()
+    );
+
+    cluster
+        .add_script(
+            "bell.lua",
+            r#"
+local h = game.store_code([[return {
+  arm = function(a) game.call_out(2, "ring") return "armed" end,
+  ring = function(a)
+    local bell = game.get_object(a.object_id)
+    game.update_object(a.object_id, {rang = (bell.metadata.rang or 0) + 1})
+  end,
+}]])
+game.create_object("/items/bell", "item", nil, {name = "bell", code_hash = h})
+return game.use_object("/items/bell", "", "arm")
+"#,
+        )
+        .unwrap();
+    let base = cluster.nodes[0].base_url();
+    let login: serde_json::Value = cluster
+        .client
+        .post(format!("{}/auth/login", base))
+        .json(&serde_json::json!({"username": "cluster_admin", "password": "testpass123"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap().to_string();
+    let created = cluster
+        .client
+        .post(format!("{}/universe/create", base))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"id": "bell-world", "name": "Bells", "owner_id": login["account_id"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "{}",
+        created.text().await.unwrap()
+    );
+    let ran: serde_json::Value = cluster
+        .client
+        .post(format!("{}/universe/bell-world/run_script", base))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"script": "bell.lua"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ran["result"], "armed", "{}", ran);
+
+    // The primary dies before the bell is due
+    cluster.stop(0);
+    let rang = "SELECT COALESCE(json_extract(properties, '$.rang'), 0) FROM objects
+                WHERE universe_id = 'bell-world' AND id = '/items/bell'";
+    for node in 1..3 {
+        assert_eq!(
+            cluster
+                .wait_for(node, rang, 1, Duration::from_secs(20))
+                .await,
+            1,
+            "the bell rang on the new primary\n{}",
+            cluster.logs()
+        );
+    }
+    // ... once
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for node in 1..3 {
+        assert_eq!(
+            cluster
+                .wait_for(node, rang, 1, Duration::from_secs(1))
+                .await,
+            1
+        );
+    }
+    let primaries = cluster.primaries();
+    assert!(
+        primaries.contains(&0) && primaries.len() == 2,
+        "exactly one survivor took over: {:?}",
+        primaries
+    );
+}

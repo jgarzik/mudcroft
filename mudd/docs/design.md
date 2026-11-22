@@ -100,11 +100,18 @@ upgrades live (`Database::upgrade`), and there are none yet.
    `ClassRegistry`, `ActionRegistry`, `PermissionManager`, `PlayerManager`,
    `TimerManager`, `CreditManager`, `VeniceClient`, `ImageStore`,
    `ThemeRegistry`.
-7. Load persisted state: timers, path grants, custom classes.
-   Failures are logged and startup continues. Access levels and credit
-   balances load lazily into in-memory caches.
-8. Spawn the timer loop (`scripting::run_timer_loop`).
-9. Bind the TCP listener and serve the Axum router with graceful shutdown.
+7. Start the primary lifecycle (`api/primary.rs`). Only the Raft leader,
+   the primary, runs the timer loop and the effect scheduler. On becoming
+   primary a node confirms leadership with a quorum and applies everything
+   committed before its term (`ensure_linearizable(ReadIndex)`), rebuilds
+   its caches from the tables (timers and heartbeats, access levels and
+   path grants, custom classes, status effects), then starts both loops;
+   on losing leadership it stops them and forgets its custom verbs (memory
+   only until Phase 6). Deadlines are absolute, so whatever fell due during
+   a failover runs at once, and only once. A node that is leader at startup
+   (always, for a single node) waits for this before serving. Elsewhere,
+   writes fail with "not the primary".
+8. Bind the TCP listener and serve the Axum router with graceful shutdown.
 
 ## HTTP Surface
 
@@ -350,7 +357,8 @@ contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; th
 its method on the object's code (as the owner) with `{object_id, room_id,
 args}`. A heartbeat whose object no longer exists is removed. One-shot timers
 are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
-remove; beats write nothing), both reloaded at startup. The timer loop is
+remove; beats write nothing), both reloaded whenever the node becomes
+primary (it alone runs this loop). The timer loop is
 deadline-driven: it sleeps until the earliest `fire_at` or next beat, and a
 new timer or heartbeat wakes it. An object may have at most 32 pending timers; heartbeat intervals are
 at least 100 ms. `game.delete_object` cancels the object's timers and

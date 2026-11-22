@@ -420,7 +420,9 @@ impl TimerManager {
                 .fetch_all(pool)
                 .await?;
 
+        // Replaces the cache: also used to rebuild it on becoming primary
         let mut timers = self.timers.write().await;
+        timers.clear();
         for (id, universe_id, object_id, method, fire_at, args) in rows {
             let timer = Timer {
                 id: id.clone(),
@@ -442,11 +444,14 @@ impl TimerManager {
                 .fetch_all(pool)
                 .await?;
         let mut heartbeats = self.heartbeats.write().await;
+        heartbeats.clear();
         for (universe_id, object_id, interval_ms) in rows {
             let hb = HeartBeat::new(&universe_id, &object_id, interval_ms.max(0) as u64);
             heartbeats.insert((universe_id, object_id), hb);
         }
         debug!("Loaded {} heartbeats from database", heartbeats.len());
+        drop(heartbeats);
+        self.changed.notify_one();
         Ok(())
     }
 

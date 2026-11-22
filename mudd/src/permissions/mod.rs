@@ -726,6 +726,15 @@ impl PermissionManager {
     }
 
     /// Load all path grants from database on startup
+    /// Drop every cached level and owner and reload the path grants: the
+    /// caches are rebuilt from the tables on becoming primary
+    pub async fn reset(&self) -> anyhow::Result<()> {
+        self.global_levels.write().await.clear();
+        self.member_levels.write().await.clear();
+        self.universe_owners.write().await.clear();
+        self.load_path_grants().await
+    }
+
     pub async fn load_path_grants(&self) -> anyhow::Result<()> {
         let Some(ref pool) = self.db_pool else {
             return Ok(());
@@ -737,7 +746,9 @@ impl PermissionManager {
         .fetch_all(pool)
         .await?;
 
+        // Replaces the cache
         let mut grants = self.path_grants.write().await;
+        grants.clear();
         for row in rows {
             let grant = row.into_grant();
             let key = (grant.universe_id.clone(), grant.grantee_id.clone());

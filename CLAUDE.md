@@ -55,6 +55,7 @@ scripts/testsrv.py start             # manual play-test server with a seeded wor
   - `auth.rs` - /auth/* endpoints (register, login, logout, validate)
   - `universe.rs` - /universe/* endpoints (list, create, upload, run_script)
   - `images.rs` - /images/{hash}
+  - `primary.rs` - primary lifecycle: only the Raft leader runs the timer loop and effect scheduler; caches rebuilt from tables on becoming primary
   - `scripting.rs` - script runner: per-execution sandbox + MessageQueue, hooks, verbs, timer loop, message delivery
   - `websocket.rs` - /ws endpoint, ConnectionManager, PlayerSession, command dispatch
 - **auth/** - AccountService, tokens, password hashing

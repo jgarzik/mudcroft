@@ -171,7 +171,7 @@ impl RaftWriter {
 
         debug!("Submitting write to Raft: {}", sql);
 
-        let response = self.raft.client_write(request).await?;
+        let response = self.raft.client_write(request).await.map_err(not_primary)?;
 
         if !response.data.success {
             if let Some(ref err) = response.data.error {
@@ -191,7 +191,11 @@ impl RaftWriter {
         &self,
         statements: Vec<(String, Vec<serde_json::Value>)>,
     ) -> Result<()> {
-        let response = self.raft.client_write(Request::batch(statements)).await?;
+        let response = self
+            .raft
+            .client_write(Request::batch(statements))
+            .await
+            .map_err(not_primary)?;
         if !response.data.success {
             bail!(
                 "Batch failed: {}",
@@ -260,6 +264,26 @@ impl RaftWriter {
     /// Get the current leader's node ID (if known)
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow_watched().current_leader
+    }
+}
+
+/// A write refused because this node is not the leader says so plainly
+/// (only the primary writes; see docs/cluster-design.md)
+fn not_primary(
+    e: openraft::error::RaftError<
+        super::TypeConfig,
+        openraft::error::ClientWriteError<super::TypeConfig>,
+    >,
+) -> anyhow::Error {
+    use openraft::error::ClientWriteError;
+    match e.api_error() {
+        Some(ClientWriteError::ForwardToLeader(f)) => anyhow::anyhow!(
+            "not the primary (the primary is node {})",
+            f.leader_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        _ => anyhow::Error::new(e),
     }
 }
 

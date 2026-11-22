@@ -3,6 +3,7 @@
 mod auth;
 mod effect_scheduler;
 mod images;
+mod primary;
 pub mod scripting;
 mod universe;
 mod websocket;
@@ -71,7 +72,7 @@ pub async fn router(
         db.pool().clone(),
         Some(raft_writer.clone()),
     ));
-    let mut class_registry = ClassRegistry::with_db(db.pool().clone(), raft_writer.clone());
+    let class_registry = ClassRegistry::with_db(db.pool().clone(), raft_writer.clone());
     let actions = Arc::new(ActionRegistry::new());
     let permissions = Arc::new(PermissionManager::with_db(
         db.pool().clone(),
@@ -90,20 +91,9 @@ pub async fn router(
     let image_store = Arc::new(ImageStore::new(db.pool().clone(), raft_writer.clone()));
     let themes = Arc::new(ThemeRegistry::new());
 
-    // Load persisted data on startup
-    if let Err(e) = timers.load_from_db().await {
-        tracing::warn!("Failed to load timers from database: {}", e);
-    }
-    if let Err(e) = permissions.load_path_grants().await {
-        tracing::warn!("Failed to load path grants from database: {}", e);
-    }
-    if let Err(e) = class_registry.load_from_db().await {
-        tracing::warn!("Failed to load classes from database: {}", e);
-    }
+    // The caches are built from the tables when this node becomes primary
+    // (api/primary.rs)
     let effects = crate::combat::EffectRegistry::shared();
-    if let Err(e) = effects.load_from_db(db.pool()).await {
-        tracing::warn!("Failed to load status effects from database: {}", e);
-    }
 
     let classes = Arc::new(RwLock::new(class_registry));
 
@@ -125,9 +115,22 @@ pub async fn router(
         effects,
     };
 
-    // Fire call_out timers and heartbeats in the background
-    tokio::spawn(scripting::run_timer_loop(state.clone()));
-    tokio::spawn(effect_scheduler::run_effect_scheduler(state.clone()));
+    // Timers, heartbeats and status effects run on the primary only. A node
+    // that is already the leader (always, for a single node) waits for its
+    // caches before serving, so no request races their first load.
+    let (activations, mut activated) = tokio::sync::watch::channel(0u64);
+    let leader_at_start = state.raft_writer.is_leader();
+    tokio::spawn(primary::run(state.clone(), activations));
+    if leader_at_start {
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            activated.wait_for(|n| *n > 0),
+        )
+        .await;
+        if !matches!(ready, Ok(Ok(_))) {
+            tracing::warn!("primary not ready after 30 s; serving anyway");
+        }
+    }
 
     let api = Router::new()
         .route("/health", get(health_check))

@@ -213,7 +213,16 @@ impl TestCluster {
         let db_path = self.dir.path().join(format!("{}.db", name));
         let log_path = self.dir.path().join(format!("{}.log", name));
         let http: SocketAddr = format!("127.0.0.1:{}", free_port()?).parse()?;
-        let child = spawn_mudd(&self.client, &self.mudd, http, &db_path, &args, &log_path).await?;
+        let child = spawn_mudd(
+            &self.client,
+            &self.mudd,
+            http,
+            &db_path,
+            &args,
+            &log_path,
+            Some(self.dir.path()),
+        )
+        .await?;
         self.nodes.push(ClusterNode {
             http,
             cluster_addr,
@@ -271,6 +280,29 @@ impl TestCluster {
         ))
     }
 
+    /// Put a Lua script where run_script finds it (`scripts/<name>` under
+    /// the nodes' working directory)
+    pub fn add_script(&self, name: &str, source: &str) -> Result<()> {
+        let dir = self.dir.path().join("scripts");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(name), source)?;
+        Ok(())
+    }
+
+    /// The nodes whose log says they became primary
+    pub fn primaries(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                std::fs::read_to_string(&n.log_path)
+                    .map(|log| log.contains("is the primary"))
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// The last lines of every node's log (for failure messages)
     pub fn logs(&self) -> String {
         self.nodes
@@ -296,6 +328,7 @@ impl TestCluster {
             &node.db_path,
             &node.args,
             &node.log_path,
+            Some(self.dir.path()),
         )
         .await?;
         self.nodes[i].child = child;

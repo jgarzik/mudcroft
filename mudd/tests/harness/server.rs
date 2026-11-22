@@ -102,7 +102,17 @@ impl TestServer {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let addr = listener.local_addr()?;
             drop(listener);
-            match spawn_mudd(&client, &mudd_path, addr, &db_path, &extra_args, &log_path).await {
+            match spawn_mudd(
+                &client,
+                &mudd_path,
+                addr,
+                &db_path,
+                &extra_args,
+                &log_path,
+                None,
+            )
+            .await
+            {
                 Ok(child) => break (addr, child),
                 Err(e) if attempt < 3 && e.to_string().contains("exited during startup") => {
                     continue
@@ -175,6 +185,7 @@ impl TestServer {
             &self.db_path,
             &self.extra_args,
             &self.log_path,
+            None,
         )
         .await?;
         Ok(())
@@ -487,13 +498,19 @@ pub(super) async fn spawn_mudd(
     db_path: &Path,
     extra_args: &[String],
     log_path: &Path,
+    current_dir: Option<&Path>,
 ) -> Result<ChildGuard> {
     let log_out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
+    let mut command = Command::new(mudd_path);
+    if let Some(dir) = current_dir {
+        // run_script reads scripts/ relative to the working directory
+        command.current_dir(dir);
+    }
     let mut child = ChildGuard::new(
-        die_with_parent(&mut Command::new(mudd_path))
+        die_with_parent(&mut command)
             .arg("--bind")
             .arg(addr.to_string())
             .arg("--database")

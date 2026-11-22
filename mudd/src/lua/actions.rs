@@ -119,6 +119,14 @@ impl ActionRegistry {
     }
 
     /// Clear all actions for a room (e.g., when room is destroyed)
+    /// Forget every custom verb (a node that stops being primary: verbs live
+    /// only in memory until they are persisted, so another primary's
+    /// registrations are not here)
+    pub async fn clear_all(&self) {
+        self.room_actions.write().await.clear();
+        self.object_actions.write().await.clear();
+    }
+
     pub async fn clear_room(&self, universe_id: &str, room_id: &str) {
         self.room_actions
             .write()

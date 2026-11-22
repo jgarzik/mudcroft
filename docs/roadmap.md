@@ -22,13 +22,11 @@ still to be built:
 
 - **No gateways yet.** A command or HTTP write sent to a node that is not
   the leader fails (only the leader can write); play through the leader.
-- **Timers fire once per node.** Every node spawns the timer loop and loads
-  the persisted call_outs (`mudd/src/api/mod.rs`, `run_timer_loop` in
-  `mudd/src/api/scripting.rs`), so in a cluster each call_out and heartbeat
-  would run on every node.
-- **Per-node caches are never invalidated.** Access levels
-  (`PermissionManager`, `mudd/src/permissions/mod.rs`) are cached per node
-  and not updated when Raft applies another node's write.
+- **Custom verbs are lost on failover.** They live only in the primary's
+  memory (`ActionRegistry`) until Phase 6 persists them.
+- **A former primary keeps its game sessions.** After a failover, players
+  still connected to the old primary get "not the primary" errors until they
+  reconnect to the new one (gateways will move them).
 - **Snapshots are held in memory whole.** A snapshot is built and sent as
   one in-memory buffer (the whole game database); streaming it in chunks
   comes with the cluster transport (`docs/cluster-design.md`).

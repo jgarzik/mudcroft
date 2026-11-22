@@ -147,9 +147,10 @@ requests finish, and exits with status 0. Signals are handled from the
 moment `mudd` starts, so one during startup stops it too; a second signal
 exits at once without waiting.
 
-> **Clusters are partly built.** Nodes join and replicate, but every node
-> still runs the timer loop and effect scheduler, and gateways do not yet
-> forward commands to the primary: play through the leader only. See
+> **Clusters are partly built.** Nodes join and replicate, and only the
+> leader (the primary) runs timers and status effects, taking over on
+> failover. Gateways do not yet forward commands to the primary: play
+> through the leader only. See
 > [Clusters](#clusters) and [docs/cluster-design.md](../../docs/cluster-design.md).
 
 | Environment variable | Description |

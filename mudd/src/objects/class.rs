@@ -373,6 +373,9 @@ impl ClassRegistry {
                 .fetch_all(pool)
                 .await?;
 
+        // Replaces the universe classes: also used to rebuild the cache on
+        // becoming primary
+        self.universe_classes.clear();
         let mut props_by_class: HashMap<(String, String), Properties> = HashMap::new();
         for (universe_id, class_name, key, value) in prop_rows {
             match serde_json::from_str(&value) {
