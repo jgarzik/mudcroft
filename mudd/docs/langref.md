@@ -934,8 +934,8 @@ Each call costs the universe config's `venice_chat_cost` or
 player, the default) or `"object"` (see [Credits](#credits)). The price is
 charged before the call and refunded if the call fails. A paid call with no
 one to pay, or a payer short of credits, returns `{error = ...}` without
-calling Venice. The rate limit (60 calls a minute) is kept per payer, or per
-the object's owner when there is none.
+calling Venice. The rate limit (60 calls a minute) is kept per code owner,
+whoever pays.
 
 #### `game.llm_chat(messages, tier, opts)`
 

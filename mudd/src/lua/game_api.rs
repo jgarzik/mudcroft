@@ -71,7 +71,7 @@ impl VeniceBilling {
     }
 
     /// Charge the price under `price_key` to `holder`, run `call` (given the
-    /// rate-limit key: the payer, else the owner), and refund if it fails
+    /// rate-limit key: the code's owner), and refund if it fails
     async fn paid<T, F, Fut>(
         &self,
         holder: Option<crate::credits::Holder>,
@@ -109,11 +109,10 @@ impl VeniceBilling {
                 return Err(format!("not enough credits (costs {})", price));
             }
         }
-        let key = match holder {
-            Some(crate::credits::Holder::Account(ref id))
-            | Some(crate::credits::Holder::Object(ref id)) => id.clone(),
-            None => self.owner.clone().unwrap_or_else(|| "anonymous".into()),
-        };
+        // Rate-limited under the code's owner, whoever pays: the limit
+        // guards the operator's Venice bill, and keyed by payer every
+        // object (or player) would be a fresh bucket
+        let key = self.owner.clone().unwrap_or_else(|| "anonymous".into());
         let result = call(key).await;
         if result.is_err() && price > 0 {
             if let Some(ref holder) = holder {
@@ -2880,6 +2879,45 @@ pub fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Venice calls are rate-limited under the code's owner whoever pays:
+    /// keyed by payer, every object (or player) would be a fresh bucket
+    #[tokio::test]
+    async fn test_venice_rate_key_is_the_owner() {
+        let pool = crate::db::test_utils::test_pool().await;
+        let billing = VeniceBilling {
+            store: Arc::new(ObjectStore::new(pool.clone(), None)),
+            credits: CreditManager::shared(Some(pool), None),
+            universe_id: "u".into(),
+            owner: Some("builder".into()),
+            payer: Some("player".into()),
+            object: Some("/items/oracle".into()),
+        };
+        for holder in [
+            None,
+            Some(crate::credits::Holder::Account("player".into())),
+            Some(crate::credits::Holder::Object("/items/oracle".into())),
+        ] {
+            let key = billing
+                .paid(holder, "venice_chat_cost", |key| async move {
+                    Ok::<_, String>(key)
+                })
+                .await
+                .unwrap();
+            assert_eq!(key, "builder");
+        }
+        let ownerless = VeniceBilling {
+            owner: None,
+            ..billing
+        };
+        let key = ownerless
+            .paid(None, "venice_chat_cost", |key| async move {
+                Ok::<_, String>(key)
+            })
+            .await
+            .unwrap();
+        assert_eq!(key, "anonymous");
+    }
 
     #[test]
     fn test_lua_to_json_primitives() {

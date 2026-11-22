@@ -508,8 +508,8 @@ key, AI features are off. Chat tiers are fast, balanced and quality. A
 token-bucket rate limiter allows 60 requests per minute per key. Lua calls
 cost the universe config's `venice_chat_cost` / `venice_image_cost` credits
 (default 0), charged to the payer (`"actor"` or `"object"`) before the
-call and refunded if it fails; the rate-limit key is the payer, else the
-object's owner. Room images are the operator's cost and charge nothing.
+call and refunded if it fails; the rate limit is kept per code owner,
+whoever pays. Room images are the operator's cost and charge nothing.
 
 Room images (`images/gen.rs`) use two steps:
 
