@@ -331,14 +331,18 @@ see `Universe not initialized. Wizards: use 'setportal' command.`
    `eval return game.create_object("/rooms/hall", "room", nil, {name="Hall"}).id`.
    See [langtutor.md](langtutor.md).
 
-2. **Set the portal.** Connect to the universe as a wizard+ and run:
+2. **Set the portal.** As a universe admin+, over HTTP:
 
-   ```
-   setportal /rooms/cave-entrance
+   ```bash
+   curl -s -X POST $SERVER/universe/my-game/portal \
+        -H "Authorization: Bearer $TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d '{"room_id":"/rooms/cave-entrance"}'
    ```
 
-   With no argument, `setportal` uses the room you are standing in. Use
-   `goto <room_id>` to get there first.
+   Or connect to the universe as a wizard+ and run
+   `setportal /rooms/cave-entrance`. With no argument, `setportal` uses the
+   room you are standing in; use `goto <room_id>` to get there first.
 
 Wizard commands:
 

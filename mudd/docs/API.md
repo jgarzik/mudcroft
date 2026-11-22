@@ -199,6 +199,26 @@ Runs a Lua file from the server's `scripts/` directory inside a universe.
 | 403 | `{"error": "Admin access or universe ownership required"}` or `{"error": "Cannot run a script as that account"}` |
 | 404 | `{"error": "Universe not found: <id>"}` or `{"error": "Script not found: <name> (...)"}` |
 
+### POST /universe/{id}/portal
+
+Sets the universe's portal: the room players spawn in.
+
+```json
+{"room_id": "/rooms/cave-entrance"}
+```
+
+- **Who may call:** admin+ in universe `{id}`, as for `run_script`.
+- The room must be an object of class `room` in universe `{id}`.
+- `{id}` is lowercased before lookup.
+
+| Status | Body |
+|--------|------|
+| 200 | `{"universe_id": "<id>", "room_id": "<room>"}` |
+| 400 | `{"error": "Invalid universe ID: ..."}` or `{"error": "<room> is not a room"}` |
+| 401 | Missing, malformed or invalid token |
+| 403 | `{"error": "Admin access or universe ownership required"}` |
+| 404 | `{"error": "Universe not found: <id>"}` or `{"error": "Room not found: <room>"}` |
+
 ## Images
 
 ### GET /images/{hash}

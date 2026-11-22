@@ -137,6 +137,112 @@ pub fn router() -> Router<AppState> {
         .route("/universe/create", post(create_universe))
         .route("/universe/upload", post(upload_universe))
         .route("/universe/{id}/run_script", post(run_script))
+        .route("/universe/{id}/portal", post(set_portal))
+}
+
+fn error_response(status: StatusCode, error: impl Into<String>) -> axum::response::Response {
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.into(),
+        }),
+    )
+        .into_response()
+}
+
+/// Authenticate the caller and require admin+ in universe `universe_id`
+/// (a global admin, a member admin, or the universe's owner). Returns the
+/// caller and the universe (its id normalized).
+async fn universe_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    universe_id: &str,
+) -> Result<(Account, crate::objects::UniverseInfo), axum::response::Response> {
+    let account = authenticate(headers, state)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    // Normalize like create and /ws (ids are case-insensitive)
+    let universe_id = validate_universe_id(universe_id).map_err(|e| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid universe ID: {}", e),
+        )
+    })?;
+    let universe = match state.object_store.get_universe(&universe_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Universe not found: {}", universe_id),
+            ))
+        }
+        Err(e) => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            ))
+        }
+    };
+    let level = state
+        .permissions
+        .get_access_level(&universe.id, &account.id)
+        .await;
+    if !level.can_admin() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Admin access or universe ownership required",
+        ));
+    }
+    Ok((account, universe))
+}
+
+/// Request body for POST /universe/{id}/portal
+#[derive(Debug, Deserialize)]
+struct SetPortalRequest {
+    /// Room players spawn in (an object of class `room` in the universe)
+    room_id: String,
+}
+
+/// POST /universe/{id}/portal: set the room new players spawn in.
+/// Universe admin+.
+async fn set_portal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(universe_id): Path<String>,
+    Json(request): Json<SetPortalRequest>,
+) -> impl IntoResponse {
+    let (_account, universe) = match universe_admin(&state, &headers, &universe_id).await {
+        Ok(ok) => ok,
+        Err(response) => return response,
+    };
+    let room = match state.object_store.get(&universe.id, &request.room_id).await {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("Room not found: {}", request.room_id),
+            )
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        }
+    };
+    if room.class != "room" {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{} is not a room", request.room_id),
+        );
+    }
+    if let Err(e) = state.object_store.set_portal(&universe.id, &room.id).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to set portal: {}", e),
+        );
+    }
+    Json(serde_json::json!({ "universe_id": universe.id, "room_id": room.id })).into_response()
 }
 
 /// GET /universe/list
@@ -408,64 +514,11 @@ async fn run_script(
     Path(universe_id): Path<String>,
     Json(request): Json<RunScriptRequest>,
 ) -> impl IntoResponse {
-    // Require authentication
-    let account = match authenticate(&headers, &state).await {
-        Ok(acc) => acc,
-        Err(e) => return e.into_response(),
+    let (account, universe) = match universe_admin(&state, &headers, &universe_id).await {
+        Ok(ok) => ok,
+        Err(response) => return response,
     };
-
-    // Normalize like create and /ws (ids are case-insensitive)
-    let universe_id = match validate_universe_id(&universe_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("Invalid universe ID: {}", e),
-                }),
-            )
-                .into_response()
-        }
-    };
-
-    // Validate universe exists and check ownership
-    let universe = match state.object_store.get_universe(&universe_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Universe not found: {}", universe_id),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Database error: {}", e),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // Must be admin+ in this universe (global admin, member admin, or the
-    // universe's owner)
-    let level = state
-        .permissions
-        .get_access_level(&universe.id, &account.id)
-        .await;
-    if !level.can_admin() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "Admin access or universe ownership required".to_string(),
-            }),
-        )
-            .into_response();
-    }
+    let universe_id = universe.id.clone();
 
     // Run as the authenticated caller. An admin+ may run as another account,
     // but only one it outranks (no impersonating peers or superiors, and a

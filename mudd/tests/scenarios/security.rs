@@ -1162,3 +1162,86 @@ async fn test_level_change_applies_to_open_session() {
         "demoted session cannot eval"
     );
 }
+
+/// POST /universe/{id}/portal sets the spawn room: universe admin+ only
+/// (a universe's owner counts), and only to a room in that universe
+#[tokio::test]
+async fn test_portal_endpoint() {
+    let server = TestServer::start().await.expect("server");
+    let uid = server.universe_id().to_string();
+    let mut spawn = mudd::objects::Object::new("/rooms/new-spawn", &uid, "room").unwrap();
+    spawn.set_property("name", serde_json::json!("New Spawn"));
+    server.world().store().create(&spawn).await.unwrap();
+    let path = format!("/universe/{}/portal", uid);
+    let body = serde_json::json!({"room_id": "/rooms/new-spawn"});
+    let portal = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT value FROM universe_settings WHERE universe_id = ? AND key = 'portal_room_id'",
+        )
+        .bind(server.universe_id())
+        .fetch_one(server.pool())
+        .await
+        .unwrap()
+    };
+    let before = portal().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}{}", server.base_url(), path))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let pl = connect(&server, player("portal_peasant")).await;
+    let resp = server
+        .post_auth(&path, &body, pl.auth_token())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(portal().await, before);
+
+    let adm = connect(&server, admin("portal_admin")).await;
+    for (room, status) in [
+        ("/rooms/nowhere", 404),
+        (server.world().bat_id.as_str(), 400),
+    ] {
+        let resp = server
+            .post_auth(
+                &path,
+                &serde_json::json!({"room_id": room}),
+                adm.auth_token(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "{}", room);
+    }
+    let resp = server
+        .post_auth(&path, &body, adm.auth_token())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    assert_eq!(portal().await, "/rooms/new-spawn");
+
+    // A universe's owner is admin+ inside it, and only inside it
+    let lord_id = pl.account_id().to_string();
+    server
+        .create_universe("peasant-realm", &lord_id)
+        .await
+        .unwrap();
+    let resp = server
+        .post_auth(
+            "/universe/peasant-realm/portal",
+            &serde_json::json!({"room_id": "/rooms/hall"}),
+            pl.auth_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    // The test universe's new spawn room does not exist in peasant-realm
+    let resp = server
+        .post_auth("/universe/peasant-realm/portal", &body, pl.auth_token())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
