@@ -115,9 +115,34 @@ pub struct LoginRequest {
 }
 
 /// Login with username and password
-async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
-    // Before any password hashing
-    if let Err(retry) = state.auth_by_user.check(&req.username.to_lowercase()) {
+async fn login(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<LoginRequest>,
+) -> impl IntoResponse {
+    let invalid = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid credentials".to_string(),
+            }),
+        )
+            .into_response()
+    };
+    // Usernames are at most 32 characters (registration checks): refuse
+    // anything long before it reaches a limiter or a hash
+    if req.username.len() > 64 {
+        return invalid();
+    }
+    // Failed logins per username and client, checked before any hashing,
+    // so nobody can lock another person out by failing under their name.
+    // The client is what the receiving node recorded (limit_auth_by_ip).
+    let client = headers
+        .get(super::ratelimit::CLIENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("internal");
+    let user_key = format!("{}|{}", req.username.to_lowercase(), client);
+    if let Err(retry) = state.auth_by_user.peek(&user_key) {
         return super::ratelimit::too_many(retry);
     }
     let service = state.accounts();
@@ -133,13 +158,10 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> 
             }),
         )
             .into_response(),
-        Err(AuthError::InvalidCredentials) => (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "invalid credentials".to_string(),
-            }),
-        )
-            .into_response(),
+        Err(AuthError::InvalidCredentials) => {
+            state.auth_by_user.charge(&user_key);
+            invalid()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

@@ -44,7 +44,12 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 const PRIMARY_WAIT: Duration = Duration::from_secs(30);
 
 /// Headers that travel with a forwarded request or response
-const PASSED_HEADERS: [&str; 2] = ["authorization", "content-type"];
+const PASSED_HEADERS: [&str; 3] = [
+    "authorization",
+    "content-type",
+    // The client as the gateway saw it (login rate limits)
+    super::ratelimit::CLIENT_HEADER,
+];
 
 /// The primary's cluster address (this node's own if it is the primary)
 fn primary_addr(state: &AppState) -> Option<String> {
