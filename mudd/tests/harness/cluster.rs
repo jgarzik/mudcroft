@@ -247,6 +247,30 @@ impl TestCluster {
         Ok(self.nodes.len() - 1)
     }
 
+    /// Run `mudd_admin cluster --node <node i> ... <args>`: (success, stdout
+    /// and stderr)
+    pub fn admin(&self, i: usize, args: &[&str]) -> Result<(bool, String)> {
+        let out = Command::new(find_binary_path("mudd_admin")?)
+            .arg("cluster")
+            .arg("--node")
+            .arg(&self.nodes[i].cluster_addr)
+            .arg("--cluster-ca")
+            .arg(&self.certs.ca)
+            .arg("--cluster-secret-file")
+            .arg(&self.certs.secret)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()?;
+        Ok((
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        ))
+    }
+
     /// The last lines of every node's log (for failure messages)
     pub fn logs(&self) -> String {
         self.nodes

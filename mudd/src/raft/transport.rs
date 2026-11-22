@@ -69,6 +69,8 @@ enum Kind {
     SnapshotHeader = 4,
     SnapshotChunk = 5,
     Join = 6,
+    Status = 7,
+    Remove = 8,
 }
 
 impl Kind {
@@ -80,6 +82,8 @@ impl Kind {
             4 => Kind::SnapshotHeader,
             5 => Kind::SnapshotChunk,
             6 => Kind::Join,
+            7 => Kind::Status,
+            8 => Kind::Remove,
             _ => return None,
         })
     }
@@ -111,6 +115,38 @@ pub enum JoinReply {
     Joined { node_id: NodeId },
     /// Ask the leader instead (its address, if known)
     NotLeader { leader: Option<String> },
+}
+
+/// One member as `status` reports it
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemberStatus {
+    pub node_id: NodeId,
+    pub addr: String,
+    pub voter: bool,
+}
+
+/// A node's view of the cluster (`mudd_admin cluster status`)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClusterStatus {
+    pub node_id: NodeId,
+    pub leader: Option<NodeId>,
+    pub members: Vec<MemberStatus>,
+    pub last_log_index: Option<u64>,
+    pub last_applied_index: Option<u64>,
+}
+
+/// Remove a node from the cluster
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemoveRequest {
+    pub node_id: NodeId,
+}
+
+/// The answer to a remove request
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RemoveReply {
+    Removed,
+    NotLeader { leader: Option<String> },
+    Refused(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -157,38 +193,65 @@ fn read_pem_certs(path: &Path) -> anyhow::Result<Vec<rustls::pki_types::Certific
     Ok(certs)
 }
 
+fn read_secret(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let secret = std::fs::read(path).map_err(|e| anyhow::anyhow!("{}: {}", path.display(), e))?;
+    let secret = secret.trim_ascii().to_vec();
+    if secret.len() < 16 {
+        anyhow::bail!(
+            "{}: the cluster secret must be at least 16 bytes",
+            path.display()
+        );
+    }
+    Ok(secret)
+}
+
+fn client_config(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    ca: &Path,
+) -> anyhow::Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in read_pem_certs(ca)? {
+        roots.add(ca)?;
+    }
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 impl ClusterSecurity {
+    /// For a tool that only connects (mudd_admin): the CA and the secret,
+    /// no certificate of its own; it cannot serve
+    pub fn client_only(ca: &Path, secret: &Path) -> anyhow::Result<Self> {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let client = client_config(provider.clone(), ca)?;
+        // A server config nobody will use (no certificate to serve with)
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        Ok(Self {
+            server: Arc::new(server),
+            client: Arc::new(client),
+            secret: read_secret(secret)?,
+        })
+    }
+
     pub fn load(files: &ClusterFiles) -> anyhow::Result<Self> {
         use rustls::pki_types::pem::PemObject;
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let certs = read_pem_certs(&files.cert)?;
         let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&files.key)
             .map_err(|e| anyhow::anyhow!("{}: {}", files.key.display(), e))?;
-        let mut roots = rustls::RootCertStore::empty();
-        for ca in read_pem_certs(&files.ca)? {
-            roots.add(ca)?;
-        }
         let server = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
             .with_single_cert(certs, key)?;
-        let client = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let secret = std::fs::read(&files.secret)
-            .map_err(|e| anyhow::anyhow!("{}: {}", files.secret.display(), e))?;
-        let secret = secret.trim_ascii().to_vec();
-        if secret.len() < 16 {
-            anyhow::bail!(
-                "{}: the cluster secret must be at least 16 bytes",
-                files.secret.display()
-            );
-        }
+        let client = client_config(provider, &files.ca)?;
         Ok(Self {
             server: Arc::new(server),
             client: Arc::new(client),
-            secret,
+            secret: read_secret(&files.secret)?,
         })
     }
 }
@@ -371,6 +434,17 @@ impl PeerClient {
         .await
     }
 
+    /// This node's view of the cluster
+    pub async fn status(&self) -> Result<ClusterStatus, String> {
+        self.request(Kind::Status, &(), CONTROL_TIMEOUT).await
+    }
+
+    /// Ask to remove a node
+    pub async fn remove(&self, node_id: NodeId) -> Result<RemoveReply, String> {
+        self.request(Kind::Remove, &RemoveRequest { node_id }, CONTROL_TIMEOUT)
+            .await
+    }
+
     /// Stream a snapshot on a dedicated connection
     async fn send_snapshot(
         &self,
@@ -534,6 +608,82 @@ impl ClusterService {
         })
     }
 
+    fn status(&self) -> ClusterStatus {
+        let m = self.raft.metrics().borrow_watched().clone();
+        let membership = m.membership_config.membership();
+        let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+        ClusterStatus {
+            node_id: m.id,
+            leader: m.current_leader,
+            members: membership
+                .nodes()
+                .map(|(id, node)| MemberStatus {
+                    node_id: *id,
+                    addr: node.addr.clone(),
+                    voter: voters.contains(id),
+                })
+                .collect(),
+            last_log_index: m.last_log_index,
+            last_applied_index: m.last_applied.map(|l| l.index),
+        }
+    }
+
+    /// The leader's address if this node is not the leader
+    fn not_leader(&self) -> Option<Option<String>> {
+        let m = self.raft.metrics().borrow_watched().clone();
+        if m.current_leader == Some(m.id) {
+            return None;
+        }
+        Some(m.current_leader.and_then(|id| {
+            m.membership_config
+                .membership()
+                .get_node(&id)
+                .map(|n| n.addr.clone())
+                .filter(|a| !a.is_empty())
+        }))
+    }
+
+    async fn handle_remove(&self, request: RemoveRequest) -> RemoveReply {
+        if let Some(leader) = self.not_leader() {
+            return RemoveReply::NotLeader { leader };
+        }
+        let id = request.node_id;
+        let membership = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .clone();
+        let membership = membership.membership();
+        if membership.get_node(&id).is_none() {
+            return RemoveReply::Refused(format!("node {} is not a member", id));
+        }
+        let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+        if voters.contains(&id) {
+            if voters.len() == 1 {
+                return RemoveReply::Refused("cannot remove the last voter".to_string());
+            }
+            if let Err(e) = self
+                .raft
+                .change_membership(ChangeMembers::RemoveVoters([id].into()), false)
+                .await
+            {
+                return RemoveReply::Refused(e.to_string());
+            }
+        }
+        match self
+            .raft
+            .change_membership(ChangeMembers::RemoveNodes([id].into()), false)
+            .await
+        {
+            Ok(_) => {
+                info!("cluster: node {} removed", id);
+                RemoveReply::Removed
+            }
+            Err(e) => RemoveReply::Refused(e.to_string()),
+        }
+    }
+
     async fn handle_join(self: &Arc<Self>, request: JoinRequest) -> JoinReply {
         let (leader, membership) = {
             let metrics = self.raft.metrics().borrow_watched().clone();
@@ -681,6 +831,13 @@ impl ClusterService {
                 Ok(request) => encode(&self.handle_join(request).await).map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             },
+            Kind::Status => encode(&self.status()).map_err(|e| e.to_string()),
+            Kind::Remove => match decode::<RemoveRequest>(&body) {
+                Ok(request) => {
+                    encode(&self.handle_remove(request).await).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            },
             Kind::Hello | Kind::SnapshotChunk => Err(format!("unexpected {:?}", kind)),
         };
         match reply {
@@ -817,6 +974,26 @@ pub fn enable_cluster_timers(raft: &GameRaft) {
     config.tick(true);
     config.heartbeat(true);
     config.elect(true);
+}
+
+/// Whether a member this node can reach (with a leader) reports a
+/// membership without `node_id`: the node was removed while it was away.
+/// Best effort: unreachable peers say nothing.
+pub async fn removed_by_peers(
+    node_id: NodeId,
+    peers: &[String],
+    security: Arc<ClusterSecurity>,
+) -> bool {
+    for peer in peers {
+        let client = PeerClient::new(peer.clone(), security.clone());
+        let status = tokio::time::timeout(Duration::from_secs(5), client.status()).await;
+        if let Ok(Ok(status)) = status {
+            if status.leader.is_some() {
+                return !status.members.iter().any(|m| m.node_id == node_id);
+            }
+        }
+    }
+    false
 }
 
 /// Join a cluster through any of `seeds`: follows "not the leader" answers

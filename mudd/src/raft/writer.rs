@@ -84,10 +84,50 @@ impl RaftWriter {
         let raft = create_raft_node(
             node_id,
             pool,
-            ClusterNetwork::new(security),
+            ClusterNetwork::new(security.clone()),
             Some(db_path.to_string()),
         )
         .await?;
+
+        // A node removed from the cluster (`mudd_admin cluster remove`) must
+        // not come back with its old id: to return, it starts empty and
+        // joins again
+        if stored.is_some() {
+            // The metrics show the membership loaded from storage only once
+            // the core has started
+            let _ = raft
+                .wait(Some(Duration::from_secs(5)))
+                .metrics(
+                    |m| m.membership_config.membership().nodes().count() > 0,
+                    "membership loaded",
+                )
+                .await;
+            let membership = raft.metrics().borrow_watched().membership_config.clone();
+            let membership = membership.membership();
+            // Its own log may not say so: the leader stops replicating to a
+            // node once it is removed. So also ask the members it knows.
+            let removed_here =
+                membership.nodes().count() > 0 && membership.get_node(&node_id).is_none();
+            let removed_there = match (&security, removed_here) {
+                (Some(security), false) => {
+                    let peers: Vec<String> = membership
+                        .nodes()
+                        .filter(|(id, n)| **id != node_id && !n.addr.is_empty())
+                        .map(|(_, n)| n.addr.clone())
+                        .collect();
+                    transport::removed_by_peers(node_id, &peers, security.clone()).await
+                }
+                _ => false,
+            };
+            if removed_here || removed_there {
+                raft.shutdown().await.ok();
+                bail!(
+                    "node {} was removed from the cluster; to rejoin, start from an empty \
+                     database (mudd_init --empty) with --join",
+                    node_id
+                );
+            }
+        }
 
         let advertise = cluster
             .as_ref()

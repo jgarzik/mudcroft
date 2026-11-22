@@ -95,3 +95,68 @@ async fn test_cluster_wrong_secret_refused() {
     let err = cluster.add_joiner(Some(&wrong)).await.expect_err("refused");
     assert!(err.to_string().contains("authentication"), "{}", err);
 }
+
+/// Members of `mudd_admin cluster status` output: (id, voter)
+fn members(status: &str) -> Vec<(u64, bool)> {
+    let v: serde_json::Value = serde_json::from_str(status).expect(status);
+    v["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["node_id"].as_u64().unwrap(),
+                m["voter"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// mudd_admin inspects the cluster through any member and removes a node
+/// (through the leader); the last voter cannot be removed; a removed node
+/// refuses to start again
+#[tokio::test]
+async fn test_cluster_admin_status_and_remove() {
+    let mut cluster = TestCluster::start(3).await.expect("cluster");
+    // All three become voters
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut status = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let (ok, out) = cluster.admin(1, &["status"]).unwrap();
+        assert!(ok, "{}", out);
+        status = out;
+        if members(&status) == vec![(1, true), (2, true), (3, true)] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        members(&status),
+        vec![(1, true), (2, true), (3, true)],
+        "{}",
+        status
+    );
+
+    // Asked through a follower, the removal reaches the leader
+    let (ok, out) = cluster.admin(1, &["remove", "3"]).unwrap();
+    assert!(ok, "{}\n{}", out, cluster.logs());
+    let (_, status) = cluster.admin(0, &["status"]).unwrap();
+    assert_eq!(members(&status), vec![(1, true), (2, true)], "{}", status);
+    let (ok, out) = cluster.admin(0, &["remove", "99"]).unwrap();
+    assert!(!ok && out.contains("not a member"), "{}", out);
+
+    // The removed node cannot come back with its old id
+    cluster.stop(2);
+    let restarted = cluster.restart(2).await;
+    let err = match restarted {
+        Ok(()) => panic!("removed node restarted\n{}", cluster.logs()),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("was removed"), "{}", err);
+
+    // Down to one voter, which cannot be removed
+    let (ok, out) = cluster.admin(0, &["remove", "2"]).unwrap();
+    assert!(ok, "{}", out);
+    let (ok, out) = cluster.admin(0, &["remove", "1"]).unwrap();
+    assert!(!ok && out.contains("last voter"), "{}", out);
+}

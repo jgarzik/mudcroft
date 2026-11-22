@@ -101,11 +101,14 @@ affects only universes created after that.
 
 ### mudd_admin
 
-Offline administration. Like `mudd_init` it writes the database directly
-(outside Raft and the server's caches), so **stop `mudd` first**.
+Administration. `set-level` is offline: like `mudd_init` it writes the
+database directly (outside Raft and the server's caches), so **stop `mudd`
+first**. `cluster` talks to a running cluster (see [Clusters](#clusters)).
 
 ```
 mudd_admin --database <PATH> set-level <USERNAME> <admin|owner|none>
+mudd_admin cluster --node <HOST:PORT> --cluster-ca <PEM> --cluster-secret-file <FILE> status
+mudd_admin cluster --node <HOST:PORT> --cluster-ca <PEM> --cluster-secret-file <FILE> remove <NODE_ID>
 ```
 
 `set-level` sets an account's global level: `admin` or `owner` apply in
@@ -324,6 +327,23 @@ remembers its id, so a restart needs no `--join` (it is ignored). A node
 with the wrong secret, or a certificate not signed by the cluster CA, is
 refused and exits. Keep an odd number of voters (3 or 5): writes need a
 majority.
+
+**Inspect and remove nodes** through any member's cluster port (the tool
+needs the CA and the secret, no certificate of its own):
+
+```bash
+mudd_admin cluster --node 10.0.0.1:9000 --cluster-ca ca.pem \
+    --cluster-secret-file cluster.secret status       # JSON: members, leader, positions
+mudd_admin cluster --node 10.0.0.1:9000 --cluster-ca ca.pem \
+    --cluster-secret-file cluster.secret remove 3
+```
+
+`remove` goes to the leader (a member that is not the leader names it),
+demotes a voter first, and refuses to remove the last voter. Remove dead
+nodes so they stop counting toward the majority. A removed node refuses to
+start again with its old id, even if it was down during the removal (it
+asks the members it knows); to bring the machine back, start it from an
+empty database (`mudd_init --empty`) with `--join`, as a new node.
 
 Raft timing: heartbeat 100 ms, election timeout 400-800 ms once the cluster
 has more than one member.
