@@ -13,35 +13,26 @@
 
 pub mod config;
 pub mod network;
-pub mod snapshot;
-pub mod state_machine;
 pub mod storage;
 pub mod types;
 pub mod writer;
 
-// Note: log_storage.rs is kept for reference but not compiled
-// It contains the original attempt to implement RaftLogStorage
-// which is a sealed trait in OpenRaft 0.9. Use storage.rs instead.
-
 // Re-exports
 pub use config::{create_openraft_config, RaftNodeConfig};
 pub use network::{NetworkConfig, RaftNetworkFactoryImpl};
-pub use snapshot::SnapshotStore;
-pub use state_machine::SnapshotData;
-pub use storage::CombinedStorage;
+pub use storage::{LogStore, SharedPool, StateMachine};
 pub use types::{NodeId, Request, Response, TypeConfig};
 pub use writer::RaftWriter;
 
-use openraft::storage::Adaptor;
+use std::sync::Arc;
+
 use openraft::Raft;
 use sqlx::sqlite::SqlitePool;
+use tokio::sync::RwLock;
 use tracing::info;
 
-/// Type alias for the storage adaptor
-pub type StorageAdaptor = Adaptor<TypeConfig, CombinedStorage>;
-
 /// Type alias for our Raft instance
-pub type GameRaft = Raft<TypeConfig>;
+pub type GameRaft = Raft<TypeConfig, StateMachine>;
 
 /// Create a new Raft node with all components
 ///
@@ -56,13 +47,11 @@ pub async fn create_raft_node(
 
     let config = create_openraft_config();
     let read_pool = pool.clone();
-    let storage = CombinedStorage::new(pool).await?;
+    let shared: SharedPool = Arc::new(RwLock::new(pool));
+    let log_store = LogStore::new(shared.clone());
+    let state_machine = StateMachine::new(shared, None).await?;
     let network = RaftNetworkFactoryImpl::new(network_config);
 
-    // Wrap storage with Adaptor to satisfy sealed traits
-    let (log_store, state_machine) = Adaptor::new(storage);
-
-    // Create Raft instance
     let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;
 
     info!("Raft node {} created successfully", node_id);
@@ -117,9 +106,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_combined_storage_creation() {
-        let pool = test_pool().await;
-        let storage = CombinedStorage::new(pool).await;
-        assert!(storage.is_ok());
+    async fn test_state_machine_creation() {
+        let pool: SharedPool = Arc::new(RwLock::new(test_pool().await));
+        assert!(StateMachine::new(pool, None).await.is_ok());
     }
 }

@@ -32,7 +32,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
 mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize"] }
 
 # Consensus (Raft)
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.10", features = ["serde", "type-alias"] }
+futures-util = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -67,7 +68,6 @@ regex = "1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
-futures-util = "0.3"
 tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

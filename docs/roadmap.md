@@ -37,11 +37,12 @@ affected feature.
   updated when Raft applies another node's write. Credit writes store an
   absolute balance computed from the local cache, so concurrent writers would
   lose updates.
-- **Snapshots.** Install overwrites the live database file while the pool is
-  open (`mudd/src/raft/storage.rs`). `SnapshotStore`
-  (`mudd/src/raft/snapshot.rs`) is unused by the active storage, and its
-  `cleanup_old_snapshots` orders by mtime, so a file whose mtime cannot be
-  read sorts last and is deleted even if it is the newest.
+- **Snapshots.** The state machine is created without the database path,
+  so snapshots carry no data; and installing one that did would overwrite
+  the live database file while the application's pool is open
+  (`mudd/src/raft/storage.rs`).
+- **No Raft RPC server.** `raft/network.rs` posts to `/raft/*` on peers, but
+  no route serves those endpoints.
 
 ### Universes and objects
 

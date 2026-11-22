@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+use openraft::async_runtime::WatchReceiver;
 use openraft::BasicNode;
 use sqlx::SqlitePool;
 use tracing::{debug, info};
@@ -137,7 +138,7 @@ impl RaftWriter {
                 bail!("Timeout waiting for Raft leader");
             }
 
-            let metrics = self.raft.metrics().borrow().clone();
+            let metrics = self.raft.metrics().borrow_watched().clone();
 
             if let Some(leader) = metrics.current_leader {
                 info!("Raft leader elected: node {}", leader);
@@ -165,13 +166,13 @@ impl RaftWriter {
 
     /// Check if this node is currently the leader
     pub fn is_leader(&self) -> bool {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         metrics.current_leader == Some(self.node_id)
     }
 
     /// Get the current leader's node ID (if known)
     pub fn current_leader(&self) -> Option<NodeId> {
-        self.raft.metrics().borrow().current_leader
+        self.raft.metrics().borrow_watched().current_leader
     }
 }
 
@@ -284,5 +285,44 @@ mod tests {
         // Single-node should always be leader
         assert!(writer.is_leader());
         assert_eq!(writer.current_leader(), Some(1));
+    }
+
+    /// Concurrent writes (which openraft batches into shared appends and
+    /// applies) all commit, each with its own response
+    #[tokio::test]
+    async fn test_concurrent_writes() {
+        let pool = test_pool_with_raft_tables().await;
+        let writer = std::sync::Arc::new(
+            RaftWriter::single_node(pool.clone(), 1, 19003, "/tmp/test.db")
+                .await
+                .unwrap(),
+        );
+        writer
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let tasks: Vec<_> = (0..50)
+            .map(|i| {
+                let writer = writer.clone();
+                tokio::spawn(async move {
+                    writer
+                        .execute(
+                            "INSERT INTO test_data (id, value) VALUES (?, ?)",
+                            vec![serde_json::json!(format!("id-{}", i)), serde_json::json!(i)],
+                        )
+                        .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            let response = task.await.unwrap().unwrap();
+            assert_eq!(response.rows_affected, 1);
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM test_data")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 50);
     }
 }

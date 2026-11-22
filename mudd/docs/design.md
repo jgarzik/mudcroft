@@ -481,13 +481,20 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
 
 ## Raft Replication
 
-`openraft` 0.9 with storage in the same SQLite database (`raft/storage.rs`):
+`openraft` 0.10 with storage in the same SQLite database (`raft/storage.rs`:
+`LogStore` for the log and vote, `StateMachine` for applying entries):
 
 - **Log entries** are SQL requests (`raft/types.rs`: `Request { statements }`,
   each statement SQL plus bound parameters), applied in one transaction: all
   or nothing. Managers write through `RaftWriter::execute` (one statement) or
   `execute_batch` (several, atomically); non-deterministic values (UUIDs,
   timestamps) are computed before proposing. Reads go straight to the pool.
+- **Batching**: openraft merges concurrent client writes into one log
+  append, and the state machine applies each batch it is handed as one
+  SQLite transaction (each request in its own savepoint, so requests stay
+  independent), writing `last_applied` in that transaction, and answers
+  the clients after it commits. An entry is therefore applied exactly once,
+  even across a crash.
 - **Every server write goes through Raft**, including accounts and combat
   state. Only `mudd_init` (and `AccountService::offline`) writes directly,
   because it runs before any Raft node exists.
@@ -495,11 +502,14 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   `raft_vote` (vote and committed index), `raft_meta` (`last_applied`,
   `last_purged`, `last_membership`). Persisting the membership lets a
   restarted single node elect itself again.
-- **Snapshots**: after 1,000 log entries; a snapshot is the whole database
-  file after a `PRAGMA wal_checkpoint(TRUNCATE)`.
+- **Snapshots**: after 1,000 log entries. A snapshot records the applied
+  position and membership; it would also carry the database file (after a
+  `PRAGMA wal_checkpoint(TRUNCATE)`) if the state machine were given its
+  path, which it is not yet.
 - **Timing**: heartbeat 500 ms, election timeout 1.5-3 s.
-- **Network**: `raft/network.rs` sends RPCs as HTTP POSTs to
-  `http://<peer>/raft/<endpoint>`.
+- **Network**: `raft/network.rs` (`RaftNetworkV2`) sends RPCs as HTTP POSTs
+  to `http://<peer>/raft/<endpoint>` (`append_entries`, `vote`, and
+  `snapshot` for a whole snapshot). Nothing serves these endpoints yet.
 - **Modes**: single-node by default. `--peers "1=host1:9000,2=host2:9001"`
   selects cluster mode, where node 1 initializes the membership.
 

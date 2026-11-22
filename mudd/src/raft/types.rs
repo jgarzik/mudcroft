@@ -2,37 +2,24 @@
 //!
 //! Core types for Raft replication: Request, Response, and type configuration.
 
-use std::fmt::Display;
-use std::io::Cursor;
+use std::fmt;
 
-use openraft::{BasicNode, Entry, RaftTypeConfig};
+use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 /// Node ID type for Raft cluster
 pub type NodeId = u64;
 
-/// Type configuration for our Raft instance
-#[derive(
-    Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
-)]
-pub struct TypeConfig;
-
-impl Display for TypeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TypeConfig")
-    }
-}
-
-impl RaftTypeConfig for TypeConfig {
-    type D = Request;
-    type R = Response;
-    type Node = BasicNode;
-    type NodeId = NodeId;
-    type Entry = Entry<TypeConfig>;
-    type SnapshotData = Cursor<Vec<u8>>;
-    type AsyncRuntime = openraft::TokioRuntime;
-    type Responder = openraft::impls::OneshotResponder<TypeConfig>;
-}
+// Everything not named here takes openraft's default (leader_id_adv
+// LeaderId, Tokio runtime). The log store persists a log id as (term,
+// leader node, index), which is the adv committed leader id.
+openraft::declare_raft_types!(
+    pub TypeConfig:
+        D = Request,
+        R = Response,
+        NodeId = NodeId,
+        Node = BasicNode,
+);
 
 /// One SQL statement with its bound parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +39,12 @@ pub struct Statement {
 pub struct Request {
     /// Statements, applied in order inside one transaction
     pub statements: Vec<Statement>,
+}
+
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Request({} statements)", self.statements.len())
+    }
 }
 
 impl Request {

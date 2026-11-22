@@ -4,40 +4,33 @@
 //! using HTTP/JSON for simplicity.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::alias::{SnapshotMetaOf, SnapshotOf, VoteOf};
+use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::network::v2::RaftNetworkV2;
+use openraft::network::{RPCOption, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, AppendResult, SnapshotResponse, VoteRequest,
+    VoteResponse,
 };
-use openraft::BasicNode;
+use openraft::{BasicNode, OptionalSend};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
 use super::types::{NodeId, TypeConfig};
 
-/// Raft RPC request wrapper
+/// A whole snapshot sent in one request (`/raft/snapshot`)
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum RaftRpcRequest {
-    Vote(VoteRequest<NodeId>),
-    AppendEntries(AppendEntriesRequest<TypeConfig>),
-    InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
-}
-
-/// Raft RPC response wrapper
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum RaftRpcResponse {
-    Vote(VoteResponse<NodeId>),
-    AppendEntries(AppendEntriesResponse<NodeId>),
-    InstallSnapshot(InstallSnapshotResponse<NodeId>),
-    Error { message: String },
+pub struct FullSnapshotRequest {
+    pub vote: VoteOf<TypeConfig>,
+    pub meta: SnapshotMetaOf<TypeConfig>,
+    pub data: Vec<u8>,
 }
 
 /// Network configuration for Raft cluster
@@ -135,7 +128,7 @@ impl RaftNetworkImpl {
         &mut self,
         endpoint: &str,
         request: &T,
-    ) -> Result<R, Unreachable> {
+    ) -> Result<R, Unreachable<TypeConfig>> {
         let addr = self.config.get_addr(self.target).ok_or_else(|| {
             Unreachable::new(&io::Error::new(
                 io::ErrorKind::NotFound,
@@ -164,10 +157,10 @@ impl RaftNetworkImpl {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             error!("RPC error from {}: {} - {}", self.target, status, body);
-            return Err(Unreachable::new(&io::Error::other(format!(
+            return Err(Unreachable::from_string(format!(
                 "HTTP {}: {}",
                 status, body
-            ))));
+            )));
         }
 
         response.json().await.map_err(|e| {
@@ -177,38 +170,48 @@ impl RaftNetworkImpl {
     }
 }
 
-impl RaftNetwork<TypeConfig> for RaftNetworkImpl {
+impl RaftNetworkV2<TypeConfig> for RaftNetworkImpl {
+    type SnapshotData = Cursor<Vec<u8>>;
+
     async fn append_entries(
         &mut self,
-        req: AppendEntriesRequest<TypeConfig>,
+        rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send_rpc("append_entries", &req)
+    ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
+        let prev_log_id = rpc.prev_log_id;
+        let last_log_id = rpc.last_log_id();
+        let response: AppendEntriesResponse<TypeConfig> = self
+            .send_rpc("append_entries", &rpc)
             .await
-            .map_err(RPCError::Unreachable)
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        req: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
-    > {
-        self.send_rpc("install_snapshot", &req)
-            .await
-            .map_err(RPCError::Unreachable)
+            .map_err(RPCError::Unreachable)?;
+        Ok(response.into_append_result(prev_log_id, last_log_id))
     }
 
     async fn vote(
         &mut self,
-        req: VoteRequest<NodeId>,
+        rpc: VoteRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send_rpc("vote", &req)
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        self.send_rpc("vote", &rpc)
             .await
             .map_err(RPCError::Unreachable)
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        vote: VoteOf<TypeConfig>,
+        snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
+        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        _option: RPCOption,
+    ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
+        let request = FullSnapshotRequest {
+            vote,
+            meta: snapshot.meta,
+            data: snapshot.snapshot.into_inner(),
+        };
+        self.send_rpc("snapshot", &request)
+            .await
+            .map_err(StreamingError::Unreachable)
     }
 }
 
