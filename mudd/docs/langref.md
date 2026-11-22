@@ -171,6 +171,9 @@ for object code, or the `game.set_actor` override if one is set.
 | [`remove_call_out(timer_id)`](#gameremove_call_outtimer_id) | boolean | object context; own timers only |
 | [`set_heart_beat(interval_ms)`](#gameset_heart_beatinterval_ms) | boolean | object context |
 | [`remove_heart_beat()`](#gameremove_heart_beat) | boolean | object context |
+| [`apply_effect(target_id, type, duration, magnitude, damage_type)`](#gameapply_effecttarget_id-type-duration-magnitude-damage_type) | `true` | Modify on the target |
+| [`remove_effect(target_id, type)`](#gameremove_effecttarget_id-type) | boolean | Modify on the target |
+| [`get_effects(target_id)`](#gameget_effectstarget_id) | list of effects | — |
 | [`set_actor(account_id)`](#gameset_actoraccount_id) | boolean | wizard+, target below caller |
 | [`get_actor()`](#gameget_actor) | account ID or `nil` | — |
 | [`check_permission(action, target_id, is_fixed, owner_id)`](#gamecheck_permissionaction-target_id-is_fixed-owner_id) | `{allowed, error}` | — |
@@ -696,6 +699,38 @@ running.
 Pending call_outs are saved to the database and reloaded at startup. Heartbeats are not.
 
 Deleting an object cancels both its call_outs and its heartbeat.
+
+## Status effects
+
+Status effects (poisoned, stunned, bleeding, ...) are stored in the
+`active_effects` table, one row per effect type on an object, so they
+survive a restart. Deleting an object deletes its effects, and a combatant
+killed by `attack` loses them.
+
+Types: `poisoned`, `stunned`, `blinded`, `burning`, `frozen`, `paralyzed`,
+`slowed`, `hasted`, `strengthened`, `weakened`, `protected`, `exposed`,
+`invisible`, `regenerating`, `silenced`, `bleeding`.
+
+#### `game.apply_effect(target_id, type, duration, magnitude, damage_type)`
+
+Adds an effect lasting `duration` effect ticks (1 to 10,000) with strength
+`magnitude` (-10,000 to 10,000). Applying a type the target already has
+keeps the longer duration and the stronger magnitude. `damage_type` is
+optional; `poisoned`, `burning` and `bleeding` default to poison, fire and
+physical. The acting user needs Modify permission on the target.
+
+**Returns** `true`. **Raises** an error for an unknown type or damage type,
+a missing target, or a denied permission.
+
+#### `game.remove_effect(target_id, type)`
+
+**Returns** `true` if the target had the effect, `false` if not. Needs
+Modify permission on the target.
+
+#### `game.get_effects(target_id)`
+
+**Returns** a list of `{type, remaining, magnitude, damage_type}` tables
+(`damage_type` is `nil` for effects that deal no damage).
 
 ---
 

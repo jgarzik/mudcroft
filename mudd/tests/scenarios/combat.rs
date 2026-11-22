@@ -245,3 +245,77 @@ async fn test_attack_writes_hp_to_the_object() {
     }
     panic!("no hit landed in 30 attacks");
 }
+
+async fn eval_as(c: &mut TestClient, code: &str) -> serde_json::Value {
+    c.drain().await;
+    c.command(&format!("eval {}", code)).await.unwrap();
+    let _ = c.expect("echo").await;
+    c.expect_any().await.expect("eval reply")
+}
+
+/// game.apply_effect / get_effects / remove_effect, stored in the table
+/// (surviving a restart), and checked like other object writes
+#[tokio::test]
+async fn test_lua_effects_api() {
+    let mut server = TestServer::start().await.expect("server");
+    let bat = server.world().bat_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "effect_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"game.apply_effect("{b}", "poisoned", 5, 2)
+               game.apply_effect("{b}", "stunned", 3, 0)
+               local e = game.get_effects("{b}")
+               table.sort(e, function(x, y) return x.type < y.type end)
+               return e[1].type .. ":" .. e[1].remaining .. ":" .. e[1].magnitude .. ":" .. e[1].damage_type .. "," .. e[2].type"#,
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "poisoned:5:2:poison,stunned", "{}", out);
+
+    server.restart().await.expect("restart");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "effect_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"local removed = game.remove_effect("{b}", "stunned")
+               return tostring(removed) .. ":" .. #game.get_effects("{b}")"#,
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "true:1", "survived the restart: {}", out);
+
+    // A builder (no grant covering the bat) may not apply effects to it
+    let bld = server
+        .connect_as(Role::Builder {
+            username: "effect_builder".into(),
+            regions: vec![],
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"game.set_actor("{who}")
+               local ok = pcall(game.apply_effect, "{b}", "stunned", 3, 0)
+               game.set_actor(nil)
+               return tostring(ok)"#,
+            who = bld.account_id(),
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "false", "{}", out);
+}

@@ -301,6 +301,7 @@ fn prepare(
         state.credits.clone(),
         state.venice.clone(),
         state.image_store.clone(),
+        state.effects.clone(),
         &ctx.universe_id,
     );
     // Contexts are captured when functions are registered, so set them first

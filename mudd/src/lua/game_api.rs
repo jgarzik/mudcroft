@@ -132,6 +132,7 @@ pub struct GameApi {
     credits: Arc<CreditManager>,
     venice: Arc<VeniceClient>,
     image_store: Arc<crate::images::ImageStore>,
+    effects: Arc<crate::combat::EffectRegistry>,
     universe_id: String,
     current_room_id: Option<String>,
     current_user_id: Option<String>,
@@ -185,6 +186,7 @@ impl GameApi {
         credits: Arc<CreditManager>,
         venice: Arc<VeniceClient>,
         image_store: Arc<crate::images::ImageStore>,
+        effects: Arc<crate::combat::EffectRegistry>,
         universe_id: &str,
     ) -> Self {
         Self {
@@ -197,6 +199,7 @@ impl GameApi {
             credits,
             venice,
             image_store,
+            effects,
             universe_id: universe_id.to_string(),
             current_room_id: None,
             current_user_id: None,
@@ -221,6 +224,7 @@ impl GameApi {
             credits: self.credits.clone(),
             venice: self.venice.clone(),
             image_store: self.image_store.clone(),
+            effects: self.effects.clone(),
             universe_id: self.universe_id.clone(),
             current_room_id: None,
             current_user_id: None,
@@ -282,6 +286,7 @@ impl GameApi {
         self.register_message_functions(lua, &game)?;
         self.register_permission_functions(lua, &game)?;
         self.register_timer_functions(lua, &game)?;
+        self.register_effect_functions(lua, &game)?;
         self.register_credit_functions(lua, &game)?;
         self.register_venice_functions(lua, &game)?;
         self.register_utility_functions(lua, &game)?;
@@ -1709,6 +1714,158 @@ impl GameApi {
         })?;
         game.set("get_path_grants", get_path_grants)?;
 
+        Ok(())
+    }
+
+    fn register_effect_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        use crate::combat::{DamageType, EffectType, StatusEffect};
+        use std::str::FromStr;
+
+        /// Longest effect, in ticks, and largest magnitude a script may set
+        const MAX_TICKS: u32 = 10_000;
+        const MAX_MAGNITUDE: i64 = 10_000;
+
+        fn effect_type(name: &str) -> LuaResult<EffectType> {
+            EffectType::from_str(name)
+                .map_err(|_| mlua::Error::runtime(format!("unknown effect type {:?}", name)))
+        }
+
+        // game.apply_effect(target_id, type, duration_ticks, magnitude [, damage_type])
+        // Adds (or refreshes) a status effect. Checked like other writes to
+        // the target (Modify); persisted, so it survives a restart.
+        let (store, perms, effects, universe, user) = (
+            self.store.clone(),
+            self.permissions.clone(),
+            self.effects.clone(),
+            self.universe_id.clone(),
+            self.current_user_id.clone(),
+        );
+        let apply_effect = lua.create_function(
+            move |lua,
+                  (target, kind, duration, magnitude, dtype): (
+                String,
+                String,
+                u32,
+                i64,
+                Option<String>,
+            )| {
+                charge_db(lua)?;
+                let effect_type = effect_type(&kind)?;
+                let damage_type = match dtype {
+                    Some(name) => Some(DamageType::from_str(&name).map_err(|_| {
+                        mlua::Error::runtime(format!("unknown damage type {:?}", name))
+                    })?),
+                    // Damage-over-time effects default their damage type
+                    None => match effect_type {
+                        EffectType::Poisoned => Some(DamageType::Poison),
+                        EffectType::Burning => Some(DamageType::Fire),
+                        EffectType::Bleeding => Some(DamageType::Physical),
+                        _ => None,
+                    },
+                };
+                let effect = StatusEffect {
+                    effect_type,
+                    remaining_ticks: duration.clamp(1, MAX_TICKS),
+                    magnitude: magnitude.clamp(-MAX_MAGNITUDE, MAX_MAGNITUDE) as i32,
+                    source_id: None,
+                    damage_type,
+                };
+                let user = actor_override(lua).or(user.clone());
+                let (store, perms, effects, universe) = (
+                    store.clone(),
+                    perms.clone(),
+                    effects.clone(),
+                    universe.clone(),
+                );
+                let result: anyhow::Result<Result<(), String>> = block_now(async move {
+                    let Some(obj) = store.get(&universe, &target).await? else {
+                        anyhow::bail!("Object not found: {}", target);
+                    };
+                    if let Err(reason) = object_permission(
+                        &perms,
+                        user.as_deref(),
+                        &universe,
+                        &obj,
+                        PermAction::Modify,
+                    )
+                    .await
+                    {
+                        return Ok(Err(reason));
+                    }
+                    effects.apply(&store, &universe, &target, effect).await?;
+                    Ok(Ok(()))
+                });
+                match result {
+                    Ok(Ok(())) => Ok(true),
+                    Ok(Err(reason)) => Err(denied("apply_effect", reason)),
+                    Err(e) => Err(mlua::Error::external(e)),
+                }
+            },
+        )?;
+        game.set("apply_effect", apply_effect)?;
+
+        // game.remove_effect(target_id, type) -> true if it was present
+        let (store, perms, effects, universe, user) = (
+            self.store.clone(),
+            self.permissions.clone(),
+            self.effects.clone(),
+            self.universe_id.clone(),
+            self.current_user_id.clone(),
+        );
+        let remove_effect = lua.create_function(move |lua, (target, kind): (String, String)| {
+            charge_db(lua)?;
+            let effect_type = effect_type(&kind)?;
+            let user = actor_override(lua).or(user.clone());
+            let (store, perms, effects, universe) = (
+                store.clone(),
+                perms.clone(),
+                effects.clone(),
+                universe.clone(),
+            );
+            let result: anyhow::Result<Result<bool, String>> = block_now(async move {
+                let Some(obj) = store.get(&universe, &target).await? else {
+                    anyhow::bail!("Object not found: {}", target);
+                };
+                if let Err(reason) =
+                    object_permission(&perms, user.as_deref(), &universe, &obj, PermAction::Modify)
+                        .await
+                {
+                    return Ok(Err(reason));
+                }
+                if !effects.get(&universe, &target).await.has(effect_type) {
+                    return Ok(Ok(false));
+                }
+                effects
+                    .remove(&store, &universe, &target, effect_type)
+                    .await?;
+                Ok(Ok(true))
+            });
+            match result {
+                Ok(Ok(removed)) => Ok(removed),
+                Ok(Err(reason)) => Err(denied("remove_effect", reason)),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
+        })?;
+        game.set("remove_effect", remove_effect)?;
+
+        // game.get_effects(target_id) -> {{type, remaining, magnitude, damage_type}, ...}
+        let (effects, universe) = (self.effects.clone(), self.universe_id.clone());
+        let get_effects = lua.create_function(move |lua, target: String| {
+            charge_db(lua)?;
+            let (effects, universe) = (effects.clone(), universe.clone());
+            let current = block_now(async move { effects.get(&universe, &target).await });
+            let list = lua.create_table()?;
+            for (i, e) in current.active_effects().into_iter().enumerate() {
+                let t = lua.create_table()?;
+                t.set("type", e.effect_type.to_string())?;
+                t.set("remaining", e.remaining_ticks)?;
+                t.set("magnitude", e.magnitude)?;
+                t.set("damage_type", e.damage_type.map(|d| d.to_string()))?;
+                list.set(i + 1, t)?;
+            }
+            Ok(list)
+        })?;
+        game.set("get_effects", get_effects)?;
         Ok(())
     }
 

@@ -164,7 +164,11 @@ pub struct DamageResult {
 impl DamageResult {
     /// Create a new damage result
     pub fn new(base: i32, dtype: DamageType, modifier: DamageModifier, is_crit: bool) -> Self {
-        let crit_damage = if is_crit { base.saturating_mul(2) } else { base };
+        let crit_damage = if is_crit {
+            base.saturating_mul(2)
+        } else {
+            base
+        };
         let final_damage = modifier.apply(crit_damage);
 
         Self {

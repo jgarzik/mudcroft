@@ -401,6 +401,7 @@ The full reference is [langref.md](langref.md). The functions that exist:
 | Messages | `send`, `broadcast`, `broadcast_region` |
 | Permissions | `set_actor`, `get_actor`, `check_permission`, `can_access_path`, `get_access_level`, `set_access_level`, `grant_path`, `revoke_path`, `get_path_grants` |
 | Timers | `call_out`, `remove_call_out`, `set_heart_beat`, `remove_heart_beat` |
+| Status effects | `apply_effect`, `remove_effect`, `get_effects` |
 | Credits | `get_credits`, `deduct_credits`, `admin_grant_credits` |
 | AI | `llm_chat`, `llm_image` |
 | Universe | `get_universe`, `update_universe` |
