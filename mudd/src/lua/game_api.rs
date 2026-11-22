@@ -664,8 +664,10 @@ impl GameApi {
         game.set("delete_object", delete_object)?;
 
         // game.move_object(id, new_parent_id)
-        // Actually moves object in database
+        // Moves the object in the database, then (once the script ends) moves
+        // a connected player's session and runs the containers' hooks
         let store_clone = store.clone();
+        let move_queue = self.messages.clone();
         let ctx_clone = (
             current_user.clone(),
             universe_id.clone(),
@@ -678,7 +680,7 @@ impl GameApi {
                 let (user, universe_id, permissions) = ctx_clone.clone();
                 let user = actor_override(lua).or(user);
 
-                let result: anyhow::Result<Result<(), String>> =
+                let result: anyhow::Result<Result<Option<String>, String>> =
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
                             let Some(obj) = store.get(&universe_id, &id).await? else {
@@ -702,13 +704,16 @@ impl GameApi {
                             }
                             store
                                 .move_object(&universe_id, &id, new_parent_id.as_deref())
-                                .await
-                                .map(Ok)
+                                .await?;
+                            Ok(Ok(obj.parent_id))
                         })
                     });
 
                 match result {
-                    Ok(Ok(())) => Ok(true),
+                    Ok(Ok(from)) => {
+                        move_queue.moved(&id, from.as_deref(), new_parent_id.as_deref());
+                        Ok(true)
+                    }
                     Ok(Err(reason)) => Err(denied("move_object", reason)),
                     Err(e) => Err(mlua::Error::external(e)),
                 }

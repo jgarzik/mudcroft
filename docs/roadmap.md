@@ -48,8 +48,6 @@ affected feature.
 
 ### Universes and objects
 
-- **`game.move_object` on a connected player** changes only the database; the
-  session stays in the old room.
 - **Room image generation** writes back a room snapshot loaded before the
   slow Venice calls, overwriting changes made meanwhile, and can run several
   times for the same room (`mudd/src/images/gen.rs`).
@@ -183,8 +181,8 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Equipment**: wield/unwield, wear/remove, armor slots.
 - **Region hooks**: `on_enter`/`on_leave` on the region when a player
   crosses region boundaries.
-- **`game.move_object` fires hooks**, including an LPC-style `init()`
-  cascade: on any move the destination's `on_enter`, then `on_init` between
+- **An LPC-style `init()` cascade on moves.** `game.move_object` already
+  runs the containers' `on_leave`/`on_enter`; add `on_init` between
   the newcomer and each object present, so objects can offer contextual
   verbs ("get sword", "wield sword") and remove them on `on_move`.
 - **More lifecycle handlers**: `on_create`, `on_destroy`, `on_move`,

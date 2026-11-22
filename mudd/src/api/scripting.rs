@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use mlua::{Function, Table, Value};
 
+use std::future::Future;
+use std::pin::Pin;
+
 use super::{AppState, ServerMessage};
 use crate::lua::{json_to_lua, GameApi, GameMessage, MessageQueue, Sandbox, SandboxConfig};
 
@@ -91,25 +94,43 @@ pub async fn invoke_handler(
     method: &str,
     args: serde_json::Value,
 ) -> Result<Option<String>, String> {
-    let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
-        return Ok(None);
-    };
-    let ctx = ScriptContext {
-        universe_id: universe_id.to_string(),
-        user_id: owner_id,
-        room_id,
-        object_id: Some(object_id.to_string()),
-    };
-    let libs = load_universe_lib_codes(state, universe_id).await?;
-    let queue = MessageQueue::shared();
+    invoke_handler_at(state, universe_id, object_id, room_id, method, args, 0).await
+}
 
-    let result = {
-        let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
-        call_handler(&mut sandbox, &code, method, &args)
-    };
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-    deliver(state, &queue, &ctx.universe_id).await;
-    result
+/// invoke_handler at a hook nesting depth (move hooks run handlers that can
+/// move things and so run more hooks; see MAX_MOVE_HOOK_DEPTH)
+fn invoke_handler_at<'a>(
+    state: &'a AppState,
+    universe_id: &'a str,
+    object_id: &'a str,
+    room_id: Option<String>,
+    method: &'a str,
+    args: serde_json::Value,
+    depth: u32,
+) -> BoxFuture<'a, Result<Option<String>, String>> {
+    Box::pin(async move {
+        let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
+            return Ok(None);
+        };
+        let ctx = ScriptContext {
+            universe_id: universe_id.to_string(),
+            user_id: owner_id,
+            room_id,
+            object_id: Some(object_id.to_string()),
+        };
+        let libs = load_universe_lib_codes(state, universe_id).await?;
+        let queue = MessageQueue::shared();
+
+        let result = {
+            let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
+            call_handler(&mut sandbox, &code, method, &args)
+        };
+
+        deliver_at(state, &queue, &ctx.universe_id, depth).await;
+        result
+    })
 }
 
 /// How often the timer loop checks for due call_outs and heartbeats
@@ -255,36 +276,123 @@ fn prepare(
 /// Deliver queued script messages to connected players in `universe_id`
 /// (sessions are keyed per universe, so nothing reaches other universes)
 pub async fn deliver(state: &AppState, queue: &MessageQueue, universe_id: &str) {
-    for msg in queue.drain() {
-        match msg {
-            GameMessage::Send { target_id, message } => {
+    deliver_at(state, queue, universe_id, 0).await
+}
+
+/// How deeply move hooks may nest: a hook that moves something runs more
+/// hooks, so rooms that pass an object back and forth stop here
+const MAX_MOVE_HOOK_DEPTH: u32 = 4;
+
+fn deliver_at<'a>(
+    state: &'a AppState,
+    queue: &'a MessageQueue,
+    universe_id: &'a str,
+    depth: u32,
+) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        for msg in queue.drain() {
+            match msg {
+                GameMessage::Send { target_id, message } => {
+                    state
+                        .connections
+                        .send_to_player(
+                            universe_id,
+                            &target_id,
+                            ServerMessage::Output { text: message },
+                        )
+                        .await;
+                }
+                GameMessage::Broadcast {
+                    room_id,
+                    message,
+                    exclude_id,
+                } => {
+                    state
+                        .connections
+                        .broadcast_room_except(
+                            universe_id,
+                            &room_id,
+                            exclude_id.as_deref(),
+                            ServerMessage::Output { text: message },
+                        )
+                        .await;
+                }
+                GameMessage::BroadcastRegion { region_id, message } => {
+                    broadcast_region(state, universe_id, &region_id, &message).await;
+                }
+                GameMessage::Moved {
+                    object_id,
+                    from,
+                    to,
+                } => {
+                    handle_moved(state, universe_id, &object_id, from, to, depth).await;
+                }
+            }
+        }
+    })
+}
+
+/// A Lua move_object: move a connected player's session (and show them the
+/// new room), then run on_leave on the old container and on_enter on the
+/// new one, with moved_id naming what moved
+async fn handle_moved(
+    state: &AppState,
+    universe_id: &str,
+    object_id: &str,
+    from: Option<String>,
+    to: Option<String>,
+    depth: u32,
+) {
+    if let Some(account_id) = state.connections.account_id(universe_id, object_id).await {
+        state
+            .connections
+            .update_room(universe_id, object_id, to.clone())
+            .await;
+        if let Some(ref room) = to {
+            if let Some(room_msg) =
+                super::websocket::build_room_message(state, universe_id, room, Some(&account_id))
+                    .await
+            {
                 state
                     .connections
-                    .send_to_player(
-                        universe_id,
-                        &target_id,
-                        ServerMessage::Output { text: message },
-                    )
+                    .send_to_player(universe_id, object_id, room_msg)
                     .await;
             }
-            GameMessage::Broadcast {
-                room_id,
-                message,
-                exclude_id,
-            } => {
-                state
-                    .connections
-                    .broadcast_room_except(
-                        universe_id,
-                        &room_id,
-                        exclude_id.as_deref(),
-                        ServerMessage::Output { text: message },
-                    )
-                    .await;
-            }
-            GameMessage::BroadcastRegion { region_id, message } => {
-                broadcast_region(state, universe_id, &region_id, &message).await;
-            }
+        }
+    }
+
+    if depth >= MAX_MOVE_HOOK_DEPTH {
+        tracing::warn!(
+            "move hooks for {} not run: nested {} deep",
+            object_id,
+            depth
+        );
+        return;
+    }
+    let hooks = [
+        (from.clone(), "on_leave", serde_json::json!({ "to": to })),
+        (to.clone(), "on_enter", serde_json::json!({ "from": from })),
+    ];
+    for (container, method, mut args) in hooks {
+        let Some(container) = container else { continue };
+        if let Some(map) = args.as_object_mut() {
+            map.insert("object_id".into(), container.clone().into());
+            map.insert("room_id".into(), container.clone().into());
+            map.insert("actor_id".into(), object_id.into());
+            map.insert("moved_id".into(), object_id.into());
+        }
+        if let Err(e) = invoke_handler_at(
+            state,
+            universe_id,
+            &container,
+            Some(container.clone()),
+            method,
+            args,
+            depth + 1,
+        )
+        .await
+        {
+            tracing::warn!("{} hook on {} failed: {}", method, container, e);
         }
     }
 }

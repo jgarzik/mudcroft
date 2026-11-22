@@ -261,7 +261,9 @@ These handler names **never fire on their own**: `on_create`,
 `on_destroy`) can't be triggered with `game.use_object` either. Other
 limits:
 
-- `game.move_object` fires no hooks.
+- `game.move_object` runs the old and new rooms' `on_leave`/`on_enter`
+  (with `moved_id`) after your script ends, and moves a connected player's
+  view too.
 - Region objects get no hooks.
 - Hook return values are ignored.
 - By the time `on_death` runs, the NPC is already out of the room, so use `args.room_id`, not `game.environment(...)`.
@@ -844,7 +846,6 @@ The actual numbers depend on the dice.
 | A heartbeat stopped after a restart | Heartbeats are memory-only. Restart them from a hook, as the lair rooms do. |
 | `attack` says "You can't attack ..." | The target's class is neither `npc` (or a class derived from it) nor `monster`. |
 | `game.environment(id)` is `nil` in `on_death` | The dead NPC was already removed from the room. Use `args.room_id`. |
-| A player is moved with `game.move_object` but still sees the old room | Lua moves change only the database, not a connected player's session. Don't teleport players from Lua. |
 
 Limits per run:
 
@@ -868,7 +869,6 @@ Don't build on them yet:
 - **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
 - **NPC behaviour:** `aggro` and `respawn_time` do nothing, and NPCs don't fight back in the built-in combat. Script it as in Part B.
 - **Commands and combat:** there are no `use`, `give` or `flee` player commands (add verbs instead), no PvP, and no Lua access to the combat engine's damage types and effects.
-- **Movement from Lua:** `game.move_object` fires no hooks and can't teleport connected players.
 - **Persistence:** custom verbs, heartbeats and classes defined with `define_class` don't survive a restart.
 - **Universe config:** keys like `pvp_mode` or `spawn_room` have no effect. Use `setportal` for the spawn room.
 

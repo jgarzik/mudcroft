@@ -234,6 +234,15 @@ impl ConnectionManager {
             .get(&key(universe_id, player_id))
             .and_then(|s| s.room_id.clone())
     }
+
+    /// The account of a connected player, or None if not connected
+    pub async fn account_id(&self, universe_id: &str, player_id: &str) -> Option<String> {
+        self.sessions
+            .read()
+            .await
+            .get(&key(universe_id, player_id))
+            .map(|s| s.account_id.clone())
+    }
 }
 
 /// Queue a message for one client without waiting; drop it if the client's
@@ -656,7 +665,7 @@ async fn display_name(state: &AppState, universe_id: &str, player_id: &str) -> S
 
 /// Build a Room message from a room object
 /// Also triggers background image generation if room has no image and Venice is configured
-async fn build_room_message(
+pub(crate) async fn build_room_message(
     state: &AppState,
     universe_id: &str,
     room_id: &str,
@@ -787,6 +796,11 @@ impl Hook {
         if let Some(map) = args.as_object_mut() {
             map.insert("object_id".into(), object_id.into());
             map.insert("actor_id".into(), actor_id.into());
+            // Room hooks name what moved; for a player's own move that is
+            // the player (Lua moves pass it explicitly, see scripting.rs)
+            if matches!(method, "on_enter" | "on_leave") && !map.contains_key("moved_id") {
+                map.insert("moved_id".into(), actor_id.into());
+            }
             if let Some(room) = room_id {
                 map.insert("room_id".into(), room.into());
             }

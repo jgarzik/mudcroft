@@ -22,6 +22,13 @@ pub enum GameMessage {
     },
     /// Broadcast to all players in a region
     BroadcastRegion { region_id: String, message: String },
+    /// An object was moved by game.move_object: update a connected player's
+    /// session and run the containers' on_leave/on_enter hooks
+    Moved {
+        object_id: String,
+        from: Option<String>,
+        to: Option<String>,
+    },
 }
 
 /// Queue for messages generated during Lua execution
@@ -63,6 +70,15 @@ impl MessageQueue {
         self.messages.lock().push(GameMessage::BroadcastRegion {
             region_id: region_id.to_string(),
             message: message.to_string(),
+        });
+    }
+
+    /// Queue a move notification (see GameMessage::Moved)
+    pub fn moved(&self, object_id: &str, from: Option<&str>, to: Option<&str>) {
+        self.messages.lock().push(GameMessage::Moved {
+            object_id: object_id.to_string(),
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
         });
     }
 

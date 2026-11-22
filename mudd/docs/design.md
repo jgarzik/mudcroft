@@ -259,7 +259,11 @@ receives one argument table.
 | `on_use` etc. | `game.use_object(obj, actor, verb, target)` (`use`→`on_use`, `hit`→`on_hit`, `look`→`on_look`, `init`→`on_init`, others as named) | `verb`, `code_hash`, `target_id` |
 
 Every hook also gets `object_id`, `actor_id` and (when known) `room_id`.
-Errors in hooks are logged. Lua `game.move_object` fires no hooks.
+Errors in hooks are logged. Lua `game.move_object` queues a
+`GameMessage::Moved`; delivering it moves a connected player's session
+(sending the new room) and runs the old and new containers' `on_leave` and
+`on_enter` with `moved_id`. Delivery tracks how deeply hooks nest and stops
+running move hooks past 4 levels.
 
 ### Custom Verbs
 

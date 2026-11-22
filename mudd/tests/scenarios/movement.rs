@@ -304,3 +304,156 @@ async fn test_look_shows_contents() {
         room
     );
 }
+
+async fn wizard(server: &TestServer, name: &str) -> crate::harness::TestClient {
+    let mut c = server
+        .connect_as(Role::Wizard {
+            username: name.to_string(),
+        })
+        .await
+        .expect("connect");
+    c.drain().await;
+    c
+}
+
+/// Run `code` with eval and return the output text
+async fn eval(c: &mut crate::harness::TestClient, code: &str) -> String {
+    c.drain().await;
+    c.command(&format!("eval {}", code)).await.unwrap();
+    let _ = c.expect("echo").await;
+    let reply = c.expect_any().await.expect("eval reply");
+    assert_ne!(reply["type"], "error", "eval failed: {}", reply);
+    reply["text"].as_str().unwrap_or_default().to_string()
+}
+
+/// game.move_object on a connected player moves their session too: they get
+/// the new room, and later commands happen there
+#[tokio::test]
+async fn test_lua_move_updates_connected_player() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "moved_player".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    let mut wiz = wizard(&server, "mover_wiz").await;
+    let passage = server.world().passage_id.clone();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.move_object("{}", "{}"))"#,
+            pl.player_id().unwrap(),
+            passage
+        ),
+    )
+    .await;
+
+    let room = pl
+        .expect("room")
+        .await
+        .expect("moved player sees the new room");
+    assert_eq!(room["name"], "Narrow Passage");
+    pl.drain().await;
+    pl.command("look").await.unwrap();
+    let _ = pl.expect("echo").await;
+    let room = pl.expect("room").await.unwrap();
+    assert_eq!(
+        room["name"], "Narrow Passage",
+        "the session is in the new room"
+    );
+}
+
+/// Moving any object fires the rooms' hooks, with moved_id
+#[tokio::test]
+async fn test_lua_move_fires_room_hooks() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "hook_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_enter = function(a) game.broadcast(a.room_id, "arrived:" .. tostring(a.moved_id)) end,
+             on_leave = function(a) game.broadcast(a.to, "left-from-ring:" .. tostring(a.moved_id)) end,
+           }]])
+           game.create_object("/rooms/ring", "room", nil, {name = "Ring", code_hash = h})
+           game.create_object("/rooms/ring/pebble", "item", "/rooms/ring", {name = "pebble"})
+           return "ok""#,
+    )
+    .await;
+    // The wizard stands in the entrance; move the pebble from the ring there
+    // (sent raw: the hooks' broadcasts arrive before eval's own reply)
+    let entrance = server.world().entrance_id.clone();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval return tostring(game.move_object("/rooms/ring/pebble", "{}"))"#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    let heard = wiz
+        .expect_output_containing("left-from-ring:/rooms/ring/pebble")
+        .await
+        .expect("on_leave ran on the old room with moved_id");
+    assert_eq!(heard, "left-from-ring:/rooms/ring/pebble");
+
+    // And into the ring: its on_enter runs (broadcast into the ring, where a
+    // second wizard waits)
+    let mut watcher = wizard(&server, "ring_watcher").await;
+    eval(&mut watcher, r#"return "x""#).await;
+    watcher.command("goto /rooms/ring").await.unwrap();
+    watcher.expect("room").await.unwrap();
+    watcher.drain().await;
+    eval(
+        &mut wiz,
+        r#"return tostring(game.move_object("/rooms/ring/pebble", "/rooms/ring"))"#,
+    )
+    .await;
+    watcher
+        .expect_output_containing("arrived:/rooms/ring/pebble")
+        .await
+        .expect("on_enter ran with moved_id");
+}
+
+/// Hooks that move the object on (rooms bouncing it back and forth) stop at
+/// the nesting limit instead of looping forever
+#[tokio::test]
+async fn test_move_hooks_are_depth_limited() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "bounce_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local function bouncer(other)
+             return game.store_code(string.format([[return {
+               on_enter = function(a)
+                 local o = game.get_object(a.moved_id)
+                 game.update_object(a.moved_id, {bounces = (o.metadata.bounces or 0) + 1})
+                 game.move_object(a.moved_id, %q)
+               end,
+             }]], other))
+           end
+           game.create_object("/rooms/ping", "room", nil, {name = "Ping", code_hash = bouncer("/rooms/pong")})
+           game.create_object("/rooms/pong", "room", nil, {name = "Pong", code_hash = bouncer("/rooms/ping")})
+           game.create_object("/items/ball", "item", nil, {name = "ball"})
+           return "ok""#,
+    )
+    .await;
+    eval(
+        &mut wiz,
+        r#"return tostring(game.move_object("/items/ball", "/rooms/ping"))"#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let bounces: i64 = eval(
+        &mut wiz,
+        r#"return game.get_object("/items/ball").metadata.bounces"#,
+    )
+    .await
+    .parse()
+    .unwrap_or(0);
+    assert!(
+        (1..=8).contains(&bounces),
+        "hooks ran a bounded number of times, got {}",
+        bounces
+    );
+}

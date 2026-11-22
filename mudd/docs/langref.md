@@ -320,9 +320,14 @@ game.move_object("/d/keep/armory/sword", args.actor_id)   -- into a player's inv
 
 Anyone may move an object that isn't `fixed`. Fixed objects can be moved only by wizards+, their owner, or a holder of a path grant covering them.
 
-`move_object` does **not** run `on_enter` or `on_leave` hooks. Moving a
-connected player only changes the database; the player's session stays
-in the old room. Don't use it to teleport players.
+After the script ends, a move:
+
+- moves a connected player's session too: the player is shown the new room
+  and later commands happen there;
+- runs `on_leave` on the old container and `on_enter` on the new one (for
+  any moved object, not only players), with `moved_id` set to the moved
+  object. Hooks that move things run more hooks, nested at most 4 deep;
+  deeper moves happen but run no hooks.
 
 **Returns** `true`. **Raises** an error if the object or destination
 doesn't exist, either belongs to another universe, or the acting user
@@ -394,8 +399,8 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 
 | Handler | Fires when | Runs on | `args` fields (all include `object_id`) |
 |---|---|---|---|
-| `on_enter` | a player walks in, arrives by `goto`, or connects and spawns there | the room | `actor_id`, `room_id`, `from` (`nil` on spawn), `direction` (walking only) |
-| `on_leave` | a player walks out, or leaves by `goto` | the room | `actor_id`, `room_id`, `to`, `direction` (walking only) |
+| `on_enter` | a player walks in, arrives by `goto`, or connects and spawns there; or `game.move_object` moves anything into it | the room (or container) | `actor_id`, `moved_id` (what arrived), `room_id`, `from` (`nil` on spawn), `direction` (walking only) |
+| `on_leave` | a player walks out, or leaves by `goto`; or `game.move_object` moves anything out of it | the room (or container) | `actor_id`, `moved_id` (what left), `room_id`, `to`, `direction` (walking only) |
 | `on_damage` | the `attack` command hits | the target NPC | `actor_id`, `room_id`, `attacker_id`, `damage` |
 | `on_death` | the `attack` command kills | the target NPC | `actor_id`, `room_id`, `killer_id` |
 | `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
@@ -414,7 +419,8 @@ Hook details:
 - **Combat hooks:** `on_damage` and `on_death` run after the attacker's combat report. A killing blow fires both.
   - By the time `on_death` runs, the dead NPC has been removed from the room (`parent_id = nil`). Use `args.room_id`, not `game.environment`.
 - **Return values:** hook return values are ignored. Errors are logged on the server.
-- **Unwired hooks:** region objects get no hooks. `game.move_object` fires no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
+- **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `actor_id` and `moved_id` both naming the moved object.
+- **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
 
 ### `parent(class_name, handler_name, args)`
 
@@ -1040,8 +1046,7 @@ These are not built yet. See the [roadmap](../../docs/roadmap.md).
 - **Unused NPC properties:** `aggro` and `respawn_time` do nothing.
 - **Missing player commands:** there is no `use`, `give` or `flee` command. Add verbs with `game.add_action`.
 - **Combat gaps:** the server has no NPC counter-attacks and no PvP. Lua has no bindings to the combat engine.
-- **Movement from Lua:** `game.move_object` fires no hooks and can't teleport connected players.
-- **Persistence:** custom verbs, heartbeats and classes defined with `define_class` don't survive a restart.
+- **Persistence:** custom verbs and heartbeats don't survive a restart.
 - **Universe config:** keys such as `pvp_mode` or `spawn_room` are not read by the server.
 
 ---
