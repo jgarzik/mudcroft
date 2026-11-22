@@ -488,6 +488,36 @@ pub struct Death {
     pub xp: Option<i64>,
 }
 
+/// Move a player (in the current run) and, once it commits, put their
+/// session there and show them the room
+async fn move_player(
+    state: &AppState,
+    universe_id: &str,
+    player: &str,
+    to: Option<&str>,
+) -> anyhow::Result<()> {
+    state
+        .object_store
+        .move_object(universe_id, player, to)
+        .await?;
+    let (st, u, p, to) = (
+        state.clone(),
+        universe_id.to_string(),
+        player.to_string(),
+        to.map(str::to_string),
+    );
+    crate::db::run::after_commit(move || async move {
+        st.connections.update_room(&u, &p, to.clone()).await;
+        if let Some(room) = to {
+            if let Some(msg) = super::websocket::build_room_message(&st, &u, &room, None).await {
+                st.connections.send_to_player(&u, &p, msg).await;
+            }
+        }
+    })
+    .await;
+    Ok(())
+}
+
 /// Most objects one deletion may take with it
 const MAX_TREE: usize = 10_000;
 
@@ -509,7 +539,7 @@ pub async fn delete_tree(
     while i < order.len() {
         for child in store.get_contents(universe_id, &order[i]).await? {
             if is_player(&child) {
-                store.move_object(universe_id, &child.id, spill_to).await?;
+                move_player(state, universe_id, &child.id, spill_to).await?;
                 continue;
             }
             if seen.insert(child.id.clone()) {
@@ -575,9 +605,7 @@ pub async fn death(
     // Players inside are not belongings: they go to the room
     let contents = store.get_contents(universe_id, id).await?;
     for p in contents.iter().filter(|o| is_player(o)) {
-        store
-            .move_object(universe_id, &p.id, room.as_deref())
-            .await?;
+        move_player(state, universe_id, &p.id, room.as_deref()).await?;
     }
     let items: Vec<Object> = contents
         .into_iter()

@@ -1341,7 +1341,7 @@ async fn test_npc_deletion_spares_players_inside() {
         })
         .await
         .unwrap();
-    let pl = server
+    let mut pl = server
         .connect_as(Role::Player {
             username: "swallowed".into(),
         })
@@ -1360,6 +1360,8 @@ async fn test_npc_deletion_spares_players_inside() {
     )
     .await;
     assert_eq!(out["text"], "ready", "{}", out);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    pl.drain().await;
     attack_until_slain(&mut adm, "attack whale", "whale").await;
     let room: Option<String> =
         sqlx::query_scalar("SELECT parent_id FROM objects WHERE universe_id = ? AND id = ?")
@@ -1373,6 +1375,19 @@ async fn test_npc_deletion_spares_players_inside() {
         Some(entrance.as_str()),
         "the player survives, in the room"
     );
+    // ... and is shown where they are now
+    let mut shown = false;
+    for _ in 0..20 {
+        match pl.expect_any_timeout(Duration::from_millis(250)).await {
+            Ok(m) if m["type"] == "room" && m["name"] == "Cave Entrance" => {
+                shown = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(shown, "the freed player's session follows the move");
 }
 
 /// Wielding a weapon replaces the bare 1d6 with its damage dice; worn armor
