@@ -100,11 +100,13 @@ async fn test_item_names_match_literally() {
 #[tokio::test]
 async fn test_register_validates_credentials() {
     let server = TestServer::start_with_world(false).await.expect("server");
+    let huge = "x".repeat(1025);
     for (user, pass) in [
         ("", ""),
         ("ab", "secret1"),
         ("has space", "secret1"),
         ("fine_user", "12345"),
+        ("fine_user", huge.as_str()),
     ] {
         let resp = server
             .post(

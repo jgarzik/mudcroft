@@ -17,7 +17,8 @@ For access levels, see [permissions.md](permissions.md#access-levels).
   a new login replaces it, and logout clears it.
 - **Passwords** are stored as argon2id hashes (PHC strings with a random
   salt) and verified in constant time; a login for an unknown username takes
-  as long as one with a wrong password.
+  as long as one with a wrong password. At most one argon2 operation per CPU
+  core runs at a time; further logins wait.
 - **Errors** are JSON `{"error": "<message>"}`, with these exceptions, which
   return plain text:
   - `GET /images/{hash}` failures
@@ -52,7 +53,7 @@ This route exists only when `mudd` runs **without** `--static-dir`. With
 ### POST /auth/register
 
 Creates a `player` account and logs it in. Usernames must be 3-32 ASCII
-letters, digits, `_` or `-`; passwords must be at least 6 characters.
+letters, digits, `_` or `-`; passwords must be 6 characters to 1 KiB.
 
 ```json
 {"username": "player1", "password": "secretpassword123"}
@@ -61,7 +62,7 @@ letters, digits, `_` or `-`; passwords must be at least 6 characters.
 | Status | Body |
 |--------|------|
 | 201 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player"}` |
-| 400 | `{"error": "username must be 3-32 characters"}`, `{"error": "username may contain only letters, digits, _ and -"}` or `{"error": "password must be at least 6 characters"}` |
+| 400 | `{"error": "username must be 3-32 characters"}`, `{"error": "username may contain only letters, digits, _ and -"}` `{"error": "password must be at least 6 characters"}` or `{"error": "password must be at most 1024 bytes"}` |
 | 409 | `{"error": "username already exists"}` |
 | 500 | `{"error": "database error: ..."}` |
 

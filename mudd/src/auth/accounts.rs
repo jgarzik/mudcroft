@@ -15,8 +15,28 @@ use crate::raft::RaftWriter;
 
 use super::{generate_token, hash_password, verify_password};
 
+/// Longest password accepted (refused before any hashing)
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+
+/// Bounds concurrent argon2 operations: each takes ~19 MiB and a core, so
+/// a flood of logins queues here instead of exhausting memory
+fn argon2_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        tokio::sync::Semaphore::new(cores)
+    })
+}
+
 /// Hash a password off the async executor (argon2 is CPU-heavy)
 async fn hash_blocking(password: &str) -> Result<String, AuthError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AuthError::Write("password too long".to_string()));
+    }
+    let _permit = argon2_permits()
+        .acquire()
+        .await
+        .map_err(|e| AuthError::Write(e.to_string()))?;
     let password = password.to_string();
     tokio::task::spawn_blocking(move || hash_password(&password))
         .await
@@ -29,6 +49,12 @@ async fn hash_blocking(password: &str) -> Result<String, AuthError> {
 /// taken does not reveal whether the account exists.
 async fn verify_blocking(password: &str, stored: Option<String>) -> bool {
     static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if password.len() > MAX_PASSWORD_BYTES {
+        return false;
+    }
+    let Ok(_permit) = argon2_permits().acquire().await else {
+        return false;
+    };
     let password = password.to_string();
     tokio::task::spawn_blocking(move || {
         let found = stored.is_some();
@@ -367,6 +393,22 @@ mod tests {
 
         let result = service.login("testuser", "wrongpassword").await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    /// Overlong passwords are refused before any hashing
+    #[tokio::test]
+    async fn test_overlong_password_refused() {
+        let service = AccountService::offline(test_pool().await);
+        let huge = "x".repeat(MAX_PASSWORD_BYTES + 1);
+        assert!(service.create_account("longpw", &huge).await.is_err());
+        service
+            .create_account("longpw", "password123")
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.login("longpw", &huge).await,
+            Err(AuthError::InvalidCredentials)
+        ));
     }
 
     #[tokio::test]

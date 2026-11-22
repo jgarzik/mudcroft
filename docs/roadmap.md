@@ -71,6 +71,10 @@ affected feature.
 
 ### Accounts and permissions
 
+- **No rate limiting on login and register.** Concurrent argon2 work is
+  capped at the CPU count (`mudd/src/auth/accounts.rs`), so a flood cannot
+  exhaust memory, but it can still keep every core busy and delay real
+  logins. Needs per-IP and per-username limits.
 
 ### Docker
 

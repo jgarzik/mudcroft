@@ -45,7 +45,7 @@ pub struct ErrorResponse {
 
 /// Register a new account
 /// Rules for new accounts: usernames are 3-32 ASCII letters, digits, `_`
-/// or `-`; passwords at least 6 characters (as the web client requires)
+/// or `-`; passwords 6 characters (as the web client requires) to 1 KiB
 fn validate_credentials(username: &str, password: &str) -> Result<(), String> {
     let len = username.chars().count();
     if !(3..=32).contains(&len) {
@@ -59,6 +59,12 @@ fn validate_credentials(username: &str, password: &str) -> Result<(), String> {
     }
     if password.chars().count() < 6 {
         return Err("password must be at least 6 characters".to_string());
+    }
+    if password.len() > crate::auth::accounts::MAX_PASSWORD_BYTES {
+        return Err(format!(
+            "password must be at most {} bytes",
+            crate::auth::accounts::MAX_PASSWORD_BYTES
+        ));
     }
     Ok(())
 }
