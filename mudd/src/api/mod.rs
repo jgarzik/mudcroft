@@ -43,6 +43,8 @@ pub struct AppState {
     pub venice: Arc<VeniceClient>,
     pub image_store: Arc<ImageStore>,
     pub themes: Arc<ThemeRegistry>,
+    /// Room images being generated (one job per room)
+    pub image_jobs: crate::images::ImageJobs,
     /// Status effects: a cache of the active_effects table
     pub effects: Arc<crate::combat::EffectRegistry>,
 }
@@ -119,6 +121,7 @@ pub async fn router(
         venice,
         image_store,
         themes,
+        image_jobs: crate::images::ImageJobs::new(),
         effects,
     };
 

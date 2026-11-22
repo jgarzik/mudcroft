@@ -724,7 +724,11 @@ pub(crate) async fn build_room_message(
         .map(|s| s.to_string());
 
     // Trigger background image generation if room has no image and Venice is configured
-    if image_hash.is_none() && state.venice.is_configured() {
+    // (at most one job per room: viewers arriving meanwhile start none)
+    let job = (image_hash.is_none() && state.venice.is_configured() && account_id.is_some())
+        .then(|| state.image_jobs.try_start(universe_id, room_id))
+        .flatten();
+    if let Some(job) = job {
         if let Some(acct_id) = account_id {
             let venice = state.venice.clone();
             let image_store = state.image_store.clone();
@@ -736,6 +740,8 @@ pub(crate) async fn build_room_message(
 
             // Spawn background task for image generation
             tokio::spawn(async move {
+                // Held until the job ends, however it ends
+                let _job = job;
                 let theme = themes.get(DEFAULT_THEME_ID);
                 match generate_room_image(
                     &venice,

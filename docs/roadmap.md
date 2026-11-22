@@ -38,12 +38,6 @@ affected feature.
 - **No Raft RPC server.** `raft/network.rs` posts to `/raft/*` on peers, but
   no route serves those endpoints.
 
-### Universes and objects
-
-- **Room image generation** writes back a room snapshot loaded before the
-  slow Venice calls, overwriting changes made meanwhile, and can run several
-  times for the same room (`mudd/src/images/gen.rs`).
-
 ### Lua runtime
 
 - **A verb may spend all of a player's credits.** Typing a verb on an
@@ -221,7 +215,7 @@ list is in [langref.md](../mudd/docs/langref.md)):
 
 - Use the universe's `theme_id` for the welcome message and image prompts
   (today always `sierra-retro`).
-- Charge credits for room images and deduplicate in-flight generations.
+- Charge credits for room images.
 - Creator hints for the prompt step.
 - Layering: background from Venice, object sprites (or Venice), client-side
   entity sprites and UI (names, health bars).

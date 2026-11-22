@@ -521,7 +521,11 @@ Room images (`images/gen.rs`) use two steps:
    set.
 
 `build_room_message` starts this in a background task when a room without
-`image_hash` is shown to an authenticated player and Venice is configured.
+`image_hash` is shown to an authenticated player and Venice is configured. One job
+runs per room at a time (`ImageJobs`; its guard frees the room however the
+job ends). The result is written in place (`image_hash`, `image_generated_at`
+only, so changes made during generation survive) and only if the room still
+has no image.
 The client fetches `/images/{hash}`. The theme is currently always
 `sierra-retro` (`ThemeRegistry` also has `modern`); its style is the Sierra
 adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
