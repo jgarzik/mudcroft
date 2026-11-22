@@ -46,6 +46,15 @@ impl ClusterPlayer {
     /// Read messages until one mentions `needle` (anywhere in its JSON);
     /// that message
     pub async fn wait_for(&mut self, needle: &str, limit: Duration) -> Result<serde_json::Value> {
+        Ok(self.wait_for_seen(needle, limit).await?.0)
+    }
+
+    /// As `wait_for`, also returning the messages read before it
+    pub async fn wait_for_seen(
+        &mut self,
+        needle: &str,
+        limit: Duration,
+    ) -> Result<(serde_json::Value, Vec<String>)> {
         use futures_util::StreamExt;
         let deadline = tokio::time::Instant::now() + limit;
         let mut seen = Vec::new();
@@ -55,7 +64,7 @@ impl ClusterPlayer {
             match next {
                 Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                     if text.contains(needle) {
-                        return Ok(serde_json::from_str(&text)?);
+                        return Ok((serde_json::from_str(&text)?, seen));
                     }
                     seen.push(text.to_string());
                 }

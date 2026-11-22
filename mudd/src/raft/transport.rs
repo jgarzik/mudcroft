@@ -87,6 +87,10 @@ const GAME_TEXT: u8 = 0x20;
 /// replaced, refused, ...); a connection that drops without it is a failover
 const GAME_END: u8 = 0x21;
 
+/// The end reason from a node that is not (yet) the primary: the gateway
+/// retries quietly, without telling the player anything changed
+pub const NOT_PRIMARY: &str = "not primary";
+
 impl Kind {
     fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
@@ -802,7 +806,9 @@ impl ClusterService {
     /// The leader's address if this node is not the leader
     fn not_leader(&self) -> Option<Option<String>> {
         let m = self.raft.metrics().borrow_watched().clone();
-        if m.current_leader == Some(m.id) {
+        // The server state too: a leader that steps down can still name
+        // itself as current_leader
+        if m.current_leader == Some(m.id) && m.state == openraft::ServerState::Leader {
             return None;
         }
         Some(m.current_leader.and_then(|id| {
@@ -856,21 +862,15 @@ impl ClusterService {
     }
 
     async fn handle_join(self: &Arc<Self>, request: JoinRequest) -> JoinReply {
-        let (leader, membership) = {
-            let metrics = self.raft.metrics().borrow_watched().clone();
-            (metrics.current_leader, metrics.membership_config)
-        };
-        let me = self.raft.metrics().borrow_watched().id;
-        if leader != Some(me) {
-            let leader = leader.and_then(|id| {
-                membership
-                    .membership()
-                    .get_node(&id)
-                    .map(|n| n.addr.clone())
-                    .filter(|a| !a.is_empty())
-            });
+        if let Some(leader) = self.not_leader() {
             return JoinReply::NotLeader { leader };
         }
+        let membership = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .clone();
         if request.advertise.is_empty() || request.advertise.starts_with("0.0.0.0") {
             // Peers could not reach it; answer as if not admitted
             return JoinReply::NotLeader { leader: None };

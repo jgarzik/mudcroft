@@ -76,8 +76,17 @@ pub async fn forward_to_primary(
     let Some((_, security)) = state.raft_writer.cluster() else {
         return next.run(request).await;
     };
-    if state.raft_writer.is_leader() {
+    if state.primary_active()
+        || (state.raft_writer.is_leader()
+            && state.wait_primary_active(Duration::from_secs(5)).await)
+    {
         return next.run(request).await;
+    }
+    if state.raft_writer.is_leader() {
+        return plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the primary is starting; try again",
+        );
     }
     if request.headers().contains_key(FORWARDED) {
         return plain(
@@ -294,6 +303,9 @@ enum Outcome {
     Ended,
     /// The connection to the primary dropped: a failover
     Lost,
+    /// The node was not (yet) the primary, or dropped the connection before
+    /// any message: try again quietly
+    NotReady,
 }
 
 async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
@@ -312,6 +324,8 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
     // Until a session is open, try whichever node is primary now: one that
     // died refuses quickly, and an election names the next
     let mut deadline = tokio::time::Instant::now() + PRIMARY_WAIT;
+    // The player was told about the current outage
+    let mut notified = false;
     loop {
         let opened = match primary_addr(&state) {
             Some(addr) => transport::open_game_session(&addr, &security, &open)
@@ -340,6 +354,8 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 return;
             }
         };
+        // Whether this session got anything from the primary yet
+        let mut live = false;
         let outcome = loop {
             tokio::select! {
                 incoming = socket.recv() => match incoming {
@@ -353,12 +369,20 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 },
                 frame = remote.recv() => match frame {
                     Some(GameFrame::Text(text)) => {
+                        if !live {
+                            live = true;
+                            notified = false;
+                        }
                         if socket.send(Message::Text(text.into())).await.is_err() {
                             break Outcome::ClientGone;
                         }
                     }
+                    Some(GameFrame::End(reason)) if reason == transport::NOT_PRIMARY => {
+                        break Outcome::NotReady
+                    }
                     Some(GameFrame::End(_)) => break Outcome::Ended,
-                    None => break Outcome::Lost,
+                    None if live => break Outcome::Lost,
+                    None => break Outcome::NotReady,
                 },
             }
         };
@@ -370,8 +394,18 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 let _ = socket.send(Message::Close(None)).await;
                 return;
             }
+            Outcome::NotReady => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
             Outcome::Lost => {
                 info!("gateway: lost the primary at {}; reconnecting", addr);
+                deadline = tokio::time::Instant::now() + PRIMARY_WAIT;
+                if notified {
+                    // Once per outage
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                notified = true;
                 let still_here = send_json(
                     &mut socket,
                     &ServerMessage::Output {
@@ -384,7 +418,7 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 if !still_here {
                     return;
                 }
-                deadline = tokio::time::Instant::now() + PRIMARY_WAIT;
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }

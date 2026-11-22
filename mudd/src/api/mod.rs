@@ -45,6 +45,10 @@ pub struct AppState {
     pub venice: Arc<VeniceClient>,
     pub image_store: Arc<ImageStore>,
     pub themes: Arc<ThemeRegistry>,
+    /// True while this node is the active primary: leader, caches rebuilt,
+    /// schedulers running (set by api/primary.rs). Game traffic is served
+    /// locally only then.
+    pub primary: tokio::sync::watch::Receiver<bool>,
     /// Room images being generated (one job per room)
     pub image_jobs: crate::images::ImageJobs,
     /// Status effects: a cache of the active_effects table
@@ -52,6 +56,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Whether this node is the active primary
+    pub fn primary_active(&self) -> bool {
+        *self.primary.borrow()
+    }
+
+    /// Wait up to `limit` for this node to be the active primary (a node
+    /// that has just been elected is still rebuilding its caches)
+    pub async fn wait_primary_active(&self, limit: std::time::Duration) -> bool {
+        let mut primary = self.primary.clone();
+        let waited = tokio::time::timeout(limit, primary.wait_for(|active| *active)).await;
+        matches!(waited, Ok(Ok(_)))
+    }
+
     /// The account service, writing through Raft
     pub fn accounts(&self) -> AccountService {
         AccountService::new(self.db.pool().clone(), self.raft_writer.clone())
@@ -101,6 +118,7 @@ pub async fn router(
 
     let classes = Arc::new(RwLock::new(class_registry));
 
+    let (primary_tx, primary_rx) = tokio::sync::watch::channel(false);
     let state = AppState {
         db,
         raft_writer,
@@ -116,24 +134,21 @@ pub async fn router(
         image_store,
         themes,
         image_jobs: crate::images::ImageJobs::new(),
+        primary: primary_rx,
         effects,
     };
 
     // Timers, heartbeats and status effects run on the primary only. A node
     // that is already the leader (always, for a single node) waits for its
     // caches before serving, so no request races their first load.
-    let (activations, mut activated) = tokio::sync::watch::channel(0u64);
     let leader_at_start = state.raft_writer.is_leader();
-    tokio::spawn(primary::run(state.clone(), activations));
-    if leader_at_start {
-        let ready = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            activated.wait_for(|n| *n > 0),
-        )
-        .await;
-        if !matches!(ready, Ok(Ok(_))) {
-            tracing::warn!("primary not ready after 30 s; serving anyway");
-        }
+    tokio::spawn(primary::run(state.clone(), primary_tx));
+    if leader_at_start
+        && !state
+            .wait_primary_active(std::time::Duration::from_secs(30))
+            .await
+    {
+        tracing::warn!("primary not ready after 30 s; serving anyway");
     }
 
     let api = Router::new()

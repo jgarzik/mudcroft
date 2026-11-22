@@ -17,9 +17,10 @@ use tracing::{info, warn};
 
 use super::{effect_scheduler, scripting, AppState};
 
-/// Run the lifecycle forever. `activations` counts the times this node
-/// became primary (the router waits for the first when it starts as leader).
-pub async fn run(state: AppState, activations: watch::Sender<u64>) {
+/// Run the lifecycle forever. `active` is true while this node is the
+/// active primary (caches rebuilt, schedulers running); game traffic is
+/// served locally only then.
+pub async fn run(state: AppState, active: watch::Sender<bool>) {
     let raft = state.raft_writer.raft().clone();
     let me = state.raft_writer.node_id();
     let mut metrics = raft.metrics();
@@ -44,17 +45,31 @@ pub async fn run(state: AppState, activations: watch::Sender<u64>) {
         }
         let timer_loop = tokio::spawn(scripting::run_timer_loop(state.clone()));
         let effect_loop = tokio::spawn(effect_scheduler::run_effect_scheduler(state.clone()));
-        info!("primary: node {} is the primary (schedulers started)", me);
-        activations.send_modify(|n| *n += 1);
+        // The term this activation belongs to: a later term means another
+        // node may have led meanwhile (watch notifications can merge a lost
+        // and regained leadership), so the caches must be rebuilt
+        let term = metrics.borrow_watched().current_term;
+        info!(
+            "primary: node {} is the primary (term {}, schedulers started)",
+            me, term
+        );
+        active.send_replace(true);
 
-        // Serve until another node leads (or the core stops)
+        // Serve until another node leads, the term changes, or the core stops
         let mut stopped = false;
-        while leading(&metrics.borrow_watched(), me) {
+        loop {
+            {
+                let m = metrics.borrow_watched();
+                if !leading(&m, me) || m.current_term != term {
+                    break;
+                }
+            }
             if metrics.changed().await.is_err() {
                 stopped = true;
                 break;
             }
         }
+        active.send_replace(false);
         timer_loop.abort();
         effect_loop.abort();
         // The next primary has the verbs (they are in the table)

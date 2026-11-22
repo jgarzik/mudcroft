@@ -389,8 +389,22 @@ pub async fn ws_handler(
 ) -> impl IntoResponse {
     // A node that is not the primary is a gateway: the session runs on the
     // primary, and this node relays it (and follows a failover)
-    if !state.raft_writer.is_leader() && state.raft_writer.cluster().is_some() {
-        return super::gateway::ws_upgrade(ws, params, state).await;
+    if state.raft_writer.cluster().is_some() && !state.primary_active() {
+        // Just elected: give the node a moment to rebuild its caches
+        let activating = state.raft_writer.is_leader()
+            && state
+                .wait_primary_active(std::time::Duration::from_secs(5))
+                .await;
+        if !activating {
+            if state.raft_writer.is_leader() {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "The primary is starting; try again",
+                )
+                    .into_response();
+            }
+            return super::gateway::ws_upgrade(ws, params, state).await;
+        }
     }
     match admit(&state, params.universe.as_deref(), params.token.as_deref()).await {
         Ok((account, universe_id)) => ws
@@ -414,8 +428,12 @@ pub async fn serve_remote_session(
     open: crate::raft::transport::GameOpen,
     mut stream: crate::raft::transport::GameStream,
 ) {
-    if !state.raft_writer.is_leader() {
-        // The gateway reconnects to the primary
+    if !state
+        .wait_primary_active(std::time::Duration::from_secs(5))
+        .await
+    {
+        // Not (yet) the primary: the gateway retries quietly
+        stream.end(crate::raft::transport::NOT_PRIMARY).await;
         return;
     }
     match admit(&state, Some(&open.universe), Some(&open.token)).await {
@@ -630,7 +648,7 @@ async fn handle_socket(
     }
     // Ended here on purpose, unless this node stepped down: then a gateway
     // relaying the session must take it for a failover and move it on
-    if state.raft_writer.is_leader() {
+    if state.primary_active() {
         socket.finish().await;
     }
 

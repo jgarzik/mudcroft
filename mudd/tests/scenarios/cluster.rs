@@ -411,10 +411,15 @@ async fn test_gateway_follows_live_step_down() {
         .wait_for("change hands", Duration::from_secs(20))
         .await
         .unwrap_or_else(|e| panic!("{}\n{}", e, cluster.logs()));
-    player
-        .wait_for("Cave Entrance", Duration::from_secs(20))
+    let (_, between) = player
+        .wait_for_seen("Cave Entrance", Duration::from_secs(20))
         .await
         .unwrap_or_else(|e| panic!("back in the world: {}\n{}", e, cluster.logs()));
+    let repeats = between
+        .iter()
+        .filter(|m| m.contains("change hands"))
+        .count();
+    assert_eq!(repeats, 0, "told once, not per retry: {:?}", between);
 }
 
 /// A node whose certificates come from another CA cannot join (the cluster
