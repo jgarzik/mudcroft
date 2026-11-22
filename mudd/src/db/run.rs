@@ -69,6 +69,10 @@ pub struct Run {
     /// A checkpoint failed to save: writes made before it are lost, so the
     /// run must fail as a whole (later writes are refused)
     poisoned: AtomicBool,
+    /// A nested part failed and rebuilt the caches mid-run: anything that
+    /// refilled them meanwhile read committed state without this run's
+    /// pending changes, so they are rebuilt again once the run commits
+    rebuilt_mid_run: AtomicBool,
     /// Bumped by each checkpoint (which ends the savepoints of nested runs)
     generation: AtomicU64,
     /// Nesting depth (names nested runs' savepoints)
@@ -289,6 +293,7 @@ impl Run {
         }
         if wrote {
             on_abort().await;
+            self.rebuilt_mid_run.store(true, Ordering::SeqCst);
         }
         self.dirty
             .store(dirty_before || !kept.is_empty(), Ordering::SeqCst);
@@ -306,36 +311,45 @@ impl Run {
         let batch = self.batch();
         let kept = take(&self.kept);
         let after = take(&self.after);
-        let undo = |kept: Vec<Statement>| async {
-            if !kept.is_empty() {
-                if let Err(e) = self.committer.commit(kept).await {
-                    tracing::error!("committing a failed run's kept writes: {}", e);
-                }
-            }
-            if self.dirty.load(Ordering::SeqCst) {
-                on_abort().await;
-            }
-        };
+        // Undone: kept writes are saved on their own, caches rebuilt
+        let mut undone = true;
         let outcome = if let Err(e) = ended {
-            undo(kept).await;
             Err(e)
         } else if self.poisoned.load(Ordering::SeqCst) {
-            undo(kept).await;
             Err(anyhow::anyhow!("a save in this run failed"))
         } else if failed {
-            undo(kept).await;
             Ok(())
-        } else if batch.is_empty() {
-            Ok(())
-        } else if let Err(e) = self.committer.commit(batch).await {
-            undo(kept).await;
-            Err(e)
         } else {
-            for f in after {
-                f().await;
+            let committed = if batch.is_empty() {
+                Ok(())
+            } else {
+                self.committer.commit(batch).await
+            };
+            if committed.is_ok() {
+                undone = false;
+                for f in after {
+                    f().await;
+                }
             }
-            Ok(())
+            committed
         };
+        if undone && !kept.is_empty() {
+            if let Err(e) = self.committer.commit(kept).await {
+                tracing::error!("committing a failed run's kept writes: {}", e);
+            }
+        }
+        // Undone after writing: the caches hold changes the tables don't.
+        // Committed after a nested part rebuilt them mid-run: anything that
+        // refilled them meanwhile missed this run's changes. Either way,
+        // rebuild from the tables while still holding the gate.
+        let rebuild = if undone {
+            self.dirty.load(Ordering::SeqCst)
+        } else {
+            self.rebuilt_mid_run.load(Ordering::SeqCst)
+        };
+        if rebuild {
+            on_abort().await;
+        }
         self.gate.lock().await.take();
         outcome
     }
@@ -449,6 +463,7 @@ where
         began: AtomicBool::new(false),
         dirty: AtomicBool::new(false),
         poisoned: AtomicBool::new(false),
+        rebuilt_mid_run: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         depth: AtomicU64::new(0),
         prefix: std::sync::Mutex::new(prefix),
@@ -653,6 +668,8 @@ mod tests {
         let (pool, direct) = setup().await;
         let aborted = Arc::new(AtomicBool::new(false));
         let flag = aborted.clone();
+        let rebuilds_after = Arc::new(AtomicU64::new(0));
+        let counter = rebuilds_after.clone();
         let inner_pool = pool.clone();
         let inner_direct = direct.clone();
         let result: std::result::Result<(), ()> = scope(
@@ -680,7 +697,9 @@ mod tests {
                 run.execute(&[insert(3)]).await.unwrap();
                 Ok(())
             },
-            || async {},
+            move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
         )
         .await
         .unwrap();
@@ -689,6 +708,9 @@ mod tests {
             aborted.load(Ordering::SeqCst),
             "the inner run rebuilt caches"
         );
+        // Caches refilled mid-run (by anyone) may miss the outer run's
+        // changes: rebuilt once more after it commits
+        assert_eq!(rebuilds_after.load(Ordering::SeqCst), 1);
         assert_eq!(rows(&pool).await, vec![1, 3, 5]);
     }
 
