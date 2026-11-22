@@ -143,15 +143,24 @@ async fn login(
         .unwrap_or("internal");
     let username = req.username.to_lowercase();
     let user_key = format!("{}|{}", username, client);
-    if let Err(retry) = state.auth_by_user.peek(&user_key) {
+    if let Err(retry) = state
+        .auth_by_user
+        .peek(&user_key)
+        .and_then(|()| state.auth_by_user_cap.peek(&username))
+    {
         return super::ratelimit::too_many(retry);
     }
-    // Many failures for this name from many clients: slow every attempt
-    // down rather than refuse, so the owner can still log in (a hard block
-    // here would let anyone lock the account)
-    if state.auth_by_user_global.peek(&username).is_err() {
+    // Many failures for this name from many clients: attempts go one at a
+    // time, a second apart (about one guess a second however many clients
+    // try), rather than being refused, so the owner can still log in
+    let _serialized = if state.auth_by_user_global.peek(&username).is_err() {
+        let lock = state.auth_user_locks.get(&username);
+        let guard = lock.lock_owned().await;
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
+        Some(guard)
+    } else {
+        None
+    };
     let service = state.accounts();
 
     match service.login(&req.username, &req.password).await {
@@ -168,6 +177,7 @@ async fn login(
         Err(AuthError::InvalidCredentials) => {
             state.auth_by_user.charge(&user_key);
             state.auth_by_user_global.charge(&username);
+            state.auth_by_user_cap.charge(&username);
             invalid()
         }
         Err(e) => (

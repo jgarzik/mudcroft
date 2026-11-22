@@ -94,8 +94,9 @@ client (an IPv4 address or an IPv6 /64): beyond that,
 `429 {"error": "too many attempts; try again later"}` with a `Retry-After`
 header (seconds), before the password is checked. A successful login does
 not count, and one client never blocks another. Beyond ten times the rate of
-failures for one username across all clients, attempts for it are slowed by
-a second each rather than refused.
+failures for one username across all clients, attempts for it go one at a
+time, a second apart (so the owner still gets in); beyond a hundred times
+the rate they are refused.
 
 ### POST /auth/logout
 

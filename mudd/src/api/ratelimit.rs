@@ -88,6 +88,23 @@ impl RateLimiter {
     }
 }
 
+/// One lock per key (pruned when unused), to serialize work per key
+#[derive(Default)]
+pub struct KeyedLocks {
+    locks: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl KeyedLocks {
+    /// The lock for `key`
+    pub fn get(&self, key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.len() >= MAX_KEYS {
+            locks.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+        }
+        locks.entry(key.to_string()).or_default().clone()
+    }
+}
+
 /// 429 with Retry-After
 pub fn too_many(retry: Duration) -> Response {
     let mut response = (

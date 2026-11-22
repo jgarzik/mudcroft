@@ -51,9 +51,13 @@ pub struct AppState {
     pub auth_by_ip: Arc<ratelimit::RateLimiter>,
     pub auth_by_user: Arc<ratelimit::RateLimiter>,
     /// Failed logins per username across all clients (ten times the
-    /// configured rate): beyond it every attempt for the name is slowed by a
-    /// second (never refused, so it cannot lock the owner out)
+    /// configured rate): beyond it attempts for the name go one at a time,
+    /// a second apart (the owner still gets in, queued)
     pub auth_by_user_global: Arc<ratelimit::RateLimiter>,
+    /// The hard cap across all clients (a hundred times the rate): refused
+    pub auth_by_user_cap: Arc<ratelimit::RateLimiter>,
+    /// Serializes the slowed attempts per username
+    pub auth_user_locks: Arc<ratelimit::KeyedLocks>,
     /// True while this node is the active primary: leader, caches rebuilt,
     /// schedulers running (set by api/primary.rs). Game traffic is served
     /// locally only then.
@@ -148,6 +152,8 @@ pub async fn router(
         auth_by_ip: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(2))),
         auth_by_user: Arc::new(ratelimit::RateLimiter::new(auth_limit)),
         auth_by_user_global: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(10))),
+        auth_by_user_cap: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(100))),
+        auth_user_locks: Arc::new(ratelimit::KeyedLocks::default()),
         effects,
     };
 
