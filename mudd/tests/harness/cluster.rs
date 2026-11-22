@@ -285,20 +285,55 @@ impl TestCluster {
         Ok(())
     }
 
-    async fn launch(&mut self, name: &str, args: Vec<String>, cluster_addr: String) -> Result<()> {
+    async fn launch(
+        &mut self,
+        name: &str,
+        mut args: Vec<String>,
+        mut cluster_addr: String,
+    ) -> Result<()> {
         let db_path = self.dir.path().join(format!("{}.db", name));
         let log_path = self.dir.path().join(format!("{}.log", name));
-        let http: SocketAddr = format!("127.0.0.1:{}", free_port()?).parse()?;
-        let child = spawn_mudd(
-            &self.client,
-            &self.mudd,
-            http,
-            &db_path,
-            &args,
-            &log_path,
-            Some(self.dir.path()),
-        )
-        .await?;
+        // Ports are picked by bind-and-release, so another test's process
+        // can take one first: then try again. If the cluster port was the
+        // one taken, the node never got as far as joining, so it retries
+        // with a new one; if the HTTP port was, it keeps its cluster port
+        // (peers know that address) and only the HTTP port changes.
+        let mut attempt = 0;
+        let (http, child) = loop {
+            attempt += 1;
+            let http: SocketAddr = format!("127.0.0.1:{}", free_port()?).parse()?;
+            // The log is appended to: look only at what this attempt wrote
+            let log_start = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0) as usize;
+            match spawn_mudd(
+                &self.client,
+                &self.mudd,
+                http,
+                &db_path,
+                &args,
+                &log_path,
+                Some(self.dir.path()),
+            )
+            .await
+            {
+                Ok(child) => break (http, child),
+                Err(e) if attempt < 4 && e.to_string().contains("Address already in use") => {
+                    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    let this_attempt = log.get(log_start..).unwrap_or_default();
+                    if !this_attempt.contains("cluster port listening") {
+                        let port = free_port()?;
+                        let new_addr = format!("127.0.0.1:{}", port);
+                        for arg in args.iter_mut() {
+                            if *arg == cluster_addr {
+                                *arg = new_addr.clone();
+                            }
+                        }
+                        cluster_addr = new_addr;
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         self.nodes.push(ClusterNode {
             http,
             cluster_addr,
