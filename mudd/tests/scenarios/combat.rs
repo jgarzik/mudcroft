@@ -549,7 +549,40 @@ async fn test_dead_target_is_not_killed_twice() {
         pl.command("attack bat").await.unwrap();
         let _ = pl.expect("echo").await;
         let reply = pl.expect_any().await.unwrap();
-        let text = reply["text"].as_str().or(reply["message"].as_str()).unwrap_or_default();
+        let text = reply["text"]
+            .as_str()
+            .or(reply["message"].as_str())
+            .unwrap_or_default();
         assert!(!text.contains("slain"), "killed twice: {}", text);
     }
+}
+
+/// update_object writes only the properties it was given, so it cannot put
+/// back an HP that combat or an effect changed meanwhile
+#[tokio::test]
+async fn test_update_object_writes_only_given_properties() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "partial_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.update_object("{}", {{name = "Old Bat"}})"#,
+            bat
+        ),
+    )
+    .await;
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM raft_log WHERE payload LIKE '%Old Bat%' ORDER BY log_index DESC LIMIT 1",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(payload.contains("json_set"), "{}", payload);
+    assert!(!payload.contains("hp"), "hp was rewritten: {}", payload);
 }

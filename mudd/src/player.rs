@@ -126,11 +126,14 @@ impl PlayerManager {
         player_id: &str,
         room_id: &str,
     ) -> Result<()> {
-        if let Some(mut player) = self.object_store.get(universe_id, player_id).await? {
-            player.set_property("last_safe_location", serde_json::json!(room_id));
-            self.object_store.update(&player).await?;
-        }
-        Ok(())
+        // In place: rewriting the whole row could undo HP changed meanwhile
+        self.object_store
+            .set_properties(
+                universe_id,
+                player_id,
+                &[("last_safe_location", serde_json::json!(room_id))],
+            )
+            .await
     }
 
     /// Handle player disconnect.
@@ -215,13 +218,18 @@ impl PlayerManager {
         // Determine respawn location
         let respawn_room_id = self.get_respawn_location(&player, universe_id).await?;
 
-        // Reset player HP and move to respawn
-        if let Some(mut player) = self.object_store.get(universe_id, player_id).await? {
-            let max_hp = player.get_i64("max_hp").unwrap_or(100);
-            player.set_property("hp", serde_json::json!(max_hp));
-            player.parent_id = Some(respawn_room_id.clone());
-            self.object_store.update(&player).await?;
-        }
+        // Restore HP and move to respawn, in place and atomically
+        let max_hp = player.get_i64("max_hp").unwrap_or(100);
+        self.object_store
+            .execute_batch(vec![
+                ObjectStore::set_properties_statement(
+                    universe_id,
+                    player_id,
+                    &[("hp", serde_json::json!(max_hp))],
+                )?,
+                ObjectStore::set_parent_statement(universe_id, player_id, Some(&respawn_room_id)),
+            ])
+            .await?;
 
         info!(
             "Player {} died and respawned at {}",

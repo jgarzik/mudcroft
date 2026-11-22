@@ -287,7 +287,10 @@ return npc and npc.metadata.hp
 #### `game.update_object(id, changes)`
 
 Merges `changes` into the object's properties. Each top-level key replaces
-the old value: `{exits = {north = ...}}` replaces the whole `exits` table.
+the old value: `{exits = {north = ...}}` replaces the whole `exits` table. Only the
+keys you pass are written (in place, in one atomic change), so a property
+changed by something else meanwhile, such as `hp` in combat, is not put back.
+Property names may not contain `"`, `\` or control characters.
 
 A `code_hash` key attaches stored code, or detaches it if set to `nil`. It
 is never stored as a property. See [Attaching code](#attaching-code).

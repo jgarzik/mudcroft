@@ -143,12 +143,6 @@ impl CreditManager {
         )
     }
 
-    /// Delete a holder's balance (its object was deleted)
-    pub async fn clear(&self, universe_id: &str, holder: &Holder) -> anyhow::Result<()> {
-        self.execute(vec![Self::delete_statement(universe_id, holder)])
-            .await
-    }
-
     async fn execute(&self, statements: Vec<Statement>) -> anyhow::Result<()> {
         if let Some(ref raft_writer) = self.raft_writer {
             return raft_writer.execute_batch(statements).await;

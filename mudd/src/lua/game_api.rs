@@ -555,7 +555,7 @@ impl GameApi {
                     // First get the existing object
                     let obj_result = store.get(&universe_id, &id).await?;
                     match obj_result {
-                        Some(mut obj) => {
+                        Some(obj) => {
                             if let Err(reason) = object_permission(
                                 &permissions,
                                 user.as_deref(),
@@ -567,8 +567,13 @@ impl GameApi {
                             {
                                 return Ok(Err(reason));
                             }
-                            // Apply changes; `code_hash` attaches (or, if nil,
-                            // detaches) stored code instead of setting a property
+                            // Write only what changed, in place and in one
+                            // batch: rewriting the whole row could put back
+                            // a property (hp) changed meanwhile. `code_hash`
+                            // attaches (or, if nil, detaches) stored code
+                            // instead of setting a property.
+                            let mut props = Vec::new();
+                            let mut code_change: Option<Option<String>> = None;
                             for (k, v) in changes_vec {
                                 if k == "code_hash" {
                                     // The code will run as the object's owner,
@@ -591,16 +596,33 @@ impl GameApi {
                                             if store.get_code(&hash).await?.is_none() {
                                                 anyhow::bail!("unknown code_hash {}", hash);
                                             }
-                                            obj.code_hash = Some(hash);
+                                            code_change = Some(Some(hash));
                                         }
-                                        serde_json::Value::Null => obj.code_hash = None,
+                                        serde_json::Value::Null => code_change = Some(None),
                                         _ => anyhow::bail!("code_hash must be a string"),
                                     }
                                 } else {
-                                    obj.properties.insert(k, v);
+                                    props.push((k, v));
                                 }
                             }
-                            store.update(&obj).await?;
+                            let mut statements = Vec::new();
+                            if !props.is_empty() {
+                                statements.push(ObjectStore::set_properties_statement(
+                                    &universe_id,
+                                    &id,
+                                    &props,
+                                )?);
+                            }
+                            if let Some(code) = code_change {
+                                statements.push(ObjectStore::set_code_hash_statement(
+                                    &universe_id,
+                                    &id,
+                                    code.as_deref(),
+                                ));
+                            }
+                            if !statements.is_empty() {
+                                store.execute_batch(statements).await?;
+                            }
                             Ok(Ok(true))
                         }
                         None => Ok(Ok(false)),
@@ -628,13 +650,12 @@ impl GameApi {
             self.timers.clone(),
             self.actions.clone(),
             self.effects.clone(),
-            self.credits.clone(),
         );
         let delete_object = lua.create_function(move |lua, id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
             let (user, universe_id, permissions) = ctx_clone.clone();
-            let (timers, actions, effects, credits) = cleanup.clone();
+            let (timers, actions, effects) = cleanup.clone();
             let user = actor_override(lua).or(user);
 
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
@@ -653,25 +674,26 @@ impl GameApi {
                     {
                         return Ok(Err(reason));
                     }
-                    let deleted = store.delete(&universe_id, &id).await?;
-                    if deleted {
-                        // Nothing may keep running for (or be dispatched to)
-                        // the deleted object, nor for a later object reusing
-                        // its path
-                        timers.remove_timers_for_object(&universe_id, &id).await;
-                        // Its effect rows went with it (cascade); drop them
-                        // from the cache too
-                        effects.cache_clear(&universe_id, &id).await;
-                        // Its balance goes too (credits has no foreign key:
-                        // holders may be accounts)
-                        let holder = crate::credits::Holder::Object(id.clone());
-                        if let Err(e) = credits.clear(&universe_id, &holder).await {
-                            tracing::warn!("credits of deleted {} not cleared: {}", id, e);
-                        }
-                        timers.remove_heartbeat(&universe_id, &id).await;
-                        actions.clear_by_object(&universe_id, &id).await;
-                    }
-                    Ok(Ok(deleted))
+                    // The object and its balance go together, atomically
+                    // (credits has no foreign key: holders may be accounts)
+                    store
+                        .execute_batch(vec![
+                            ObjectStore::delete_statement(&universe_id, &id),
+                            crate::credits::CreditManager::delete_statement(
+                                &universe_id,
+                                &crate::credits::Holder::Object(id.clone()),
+                            ),
+                        ])
+                        .await?;
+                    // Nothing may keep running for (or be dispatched to) the
+                    // deleted object, nor for a later object reusing its
+                    // path. Its timer, heartbeat and effect rows went with
+                    // it (cascade); drop them from the caches too.
+                    timers.remove_timers_for_object(&universe_id, &id).await;
+                    timers.remove_heartbeat(&universe_id, &id).await;
+                    effects.cache_clear(&universe_id, &id).await;
+                    actions.clear_by_object(&universe_id, &id).await;
+                    Ok(Ok(true))
                 })
             });
 

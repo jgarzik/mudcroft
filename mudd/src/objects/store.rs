@@ -123,21 +123,25 @@ impl ObjectStore {
     /// it cannot lose a concurrent change to other properties, and it can
     /// go into an atomic batch with other statements.
     ///
-    /// Property names must be plain identifiers (letters, digits, `_`).
-    pub fn set_properties_statement(
+    /// The JSON path is bound (quoted), so any property name works except
+    /// one containing `"`, `\` or a control character.
+    pub fn set_properties_statement<K: AsRef<str>>(
         universe_id: &str,
         id: &str,
-        props: &[(&str, serde_json::Value)],
+        props: &[(K, serde_json::Value)],
     ) -> Result<(String, Vec<serde_json::Value>)> {
         let mut sql = String::from("UPDATE objects SET properties = json_set(properties");
         let mut params = Vec::with_capacity(props.len() * 2 + 3);
         for (key, value) in props {
-            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            let key = key.as_ref();
+            if key.is_empty()
+                || key.len() > 255
+                || key.chars().any(|c| c == '"' || c == '\\' || c.is_control())
+            {
                 anyhow::bail!("invalid property name {:?}", key);
             }
-            // The path is a literal built from the checked name; the value
-            // is bound, as JSON text decoded by json()
-            sql.push_str(&format!(", '$.{}', json(?)", key));
+            sql.push_str(", ?, json(?)");
+            params.push(serde_json::json!(format!("$.\"{}\"", key)));
             params.push(serde_json::json!(value.to_string()));
         }
         sql.push_str("), updated_at = ? WHERE universe_id = ? AND id = ?");
@@ -147,13 +151,57 @@ impl ObjectStore {
         Ok((sql, params))
     }
 
+    /// Statement setting an object's container (`None`: nowhere)
+    pub fn set_parent_statement(
+        universe_id: &str,
+        id: &str,
+        parent_id: Option<&str>,
+    ) -> (String, Vec<serde_json::Value>) {
+        (
+            "UPDATE objects SET parent_id = ?, updated_at = ? WHERE universe_id = ? AND id = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(parent_id),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                serde_json::json!(universe_id),
+                serde_json::json!(id),
+            ],
+        )
+    }
+
+    /// Statement attaching (or, with `None`, detaching) an object's code
+    pub fn set_code_hash_statement(
+        universe_id: &str,
+        id: &str,
+        code_hash: Option<&str>,
+    ) -> (String, Vec<serde_json::Value>) {
+        (
+            "UPDATE objects SET code_hash = ?, updated_at = ? WHERE universe_id = ? AND id = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(code_hash),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                serde_json::json!(universe_id),
+                serde_json::json!(id),
+            ],
+        )
+    }
+
+    /// Statement deleting an object
+    pub fn delete_statement(universe_id: &str, id: &str) -> (String, Vec<serde_json::Value>) {
+        (
+            "DELETE FROM objects WHERE universe_id = ? AND id = ?".to_string(),
+            vec![serde_json::json!(universe_id), serde_json::json!(id)],
+        )
+    }
+
     /// Set some properties of an object in place (see
     /// set_properties_statement)
-    pub async fn set_properties(
+    pub async fn set_properties<K: AsRef<str>>(
         &self,
         universe_id: &str,
         id: &str,
-        props: &[(&str, serde_json::Value)],
+        props: &[(K, serde_json::Value)],
     ) -> Result<()> {
         let statement = Self::set_properties_statement(universe_id, id, props)?;
         self.execute_batch(vec![statement]).await
@@ -712,8 +760,15 @@ mod tests {
         assert_eq!(rat.properties["angry"], true);
         assert_eq!(rat.properties["name"], "rat", "other properties untouched");
 
-        // Names are spliced into the JSON path, so only identifiers pass
-        for bad in ["", "a.b", "x') --", "q\"r"] {
+        // Any name works (the path is bound, quoted), except ones that
+        // could not be quoted
+        store
+            .set_properties("u", "/npcs/rat", &[("max-hp.v2", serde_json::json!(7))])
+            .await
+            .unwrap();
+        let rat = store.get("u", "/npcs/rat").await.unwrap().unwrap();
+        assert_eq!(rat.properties["max-hp.v2"], 7);
+        for bad in ["", "q\"r", "back\\slash", "nl\n"] {
             assert!(ObjectStore::set_properties_statement(
                 "u",
                 "/npcs/rat",
