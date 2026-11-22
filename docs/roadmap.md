@@ -16,12 +16,12 @@ affected feature.
 
 ### Multi-node coherence
 
-`mudd` works single-node only.
+Nodes join and replicate over the cluster transport
+(`mudd/src/raft/transport.rs`); the rest of `docs/cluster-design.md` is
+still to be built:
 
-- **No Raft RPC server.** `mudd/src/raft/network.rs` POSTs to
-  `http://<peer>/raft/<endpoint>`, but no route serves `/raft/*`
-  (`mudd/src/api/mod.rs`) and nothing binds `--raft-port`. Nodes started with
-  `--peers` cannot reach each other.
+- **No gateways yet.** A command or HTTP write sent to a node that is not
+  the leader fails (only the leader can write); play through the leader.
 - **Timers fire once per node.** Every node spawns the timer loop and loads
   the persisted call_outs (`mudd/src/api/mod.rs`, `run_timer_loop` in
   `mudd/src/api/scripting.rs`), so in a cluster each call_out and heartbeat
@@ -32,8 +32,6 @@ affected feature.
 - **Snapshots are held in memory whole.** A snapshot is built and sent as
   one in-memory buffer (the whole game database); streaming it in chunks
   comes with the cluster transport (`docs/cluster-design.md`).
-- **No Raft RPC server.** `raft/network.rs` posts to `/raft/*` on peers, but
-  no route serves those endpoints.
 
 ### Lua runtime
 
@@ -62,8 +60,6 @@ affected feature.
 Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
 (`Request { sql, params }`). Planned:
 
-- **Raft RPC endpoints** for append-entries, vote and install-snapshot,
-  served on `--raft-port`.
 - **Leader-only execution.** Only the leader runs Lua. A trigger (player
   command, timer, scheduled task) runs on the leader, which collects the
   resulting SQL mutations, proposes them, and broadcasts events to room

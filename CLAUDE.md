@@ -8,7 +8,7 @@ Mudcroft is a multi-user dungeon (MUD) game server in Rust (`mudd/`) with a Reac
 - Sandboxed Lua scripting for programmable game mechanics
 - LPC-style object system with path-based IDs and class inheritance
 - WebSocket-based multiplayer gameplay
-- Raft (openraft) log over SQLite; single-node today, multi-node planned
+- Raft (openraft) log over SQLite; single node by default, clusters join over a TLS cluster port (gateways and primary-only schedulers still to build; `docs/cluster-design.md`)
 
 Design it as what it is: a specialized database server. The tables (written only through Raft) are the source of truth; in-memory maps are caches derived from them, never a second copy of state. One logical change (a combat round, an effect tick) is one atomic batch. State that lives only in memory (custom verbs today) is a flaw to fix. Prefer absolute deadlines and event-driven work to periodic sweeps: write only when something happens.
 
@@ -71,7 +71,7 @@ scripts/testsrv.py start             # manual play-test server with a seeded wor
   - `actions.rs` - ActionRegistry for custom verbs
   - `messaging.rs` - MessageQueue
 - **combat/** - dice, damage types, status effects, `engine` (attack resolution over object rows: HP lives in the object's `hp` property), PvP policies
-- **raft/** - openraft storage/state machine (log entries are SQL requests), network, RaftWriter
+- **raft/** - openraft storage/state machine (log entries are SQL requests; snapshots are game-table copies), `transport` (TLS cluster port: RPCs, join), RaftWriter
 - **timers/** - call_out (one-shot) and heartbeat (recurring), both persisted (`timers`, `heartbeats`)
 - **permissions/** - LPMud-style path-based access control
   - Access levels: player < builder < wizard < admin < owner, per universe (`universe_members`); global admin/owner apply everywhere; a universe's `owner_id` is owner inside it

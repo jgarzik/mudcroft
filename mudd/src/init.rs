@@ -11,6 +11,26 @@ use tracing::info;
 use crate::auth::accounts::AccountService;
 use crate::db::Database;
 
+/// Create an empty database for a node that will join a cluster: the
+/// schema only. Refuses an existing file (a joining node must start empty;
+/// its data arrives in a snapshot from the cluster).
+pub async fn init_empty_database(path: &Path) -> Result<()> {
+    if path.exists() {
+        bail!(
+            "{} already exists; a node joining a cluster starts from an empty database",
+            path.display()
+        );
+    }
+    let db = Database::new(Some(
+        path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("database path is not UTF-8"))?,
+    ))
+    .await?;
+    db.pool().close().await;
+    info!("Created empty database at {}", path.display());
+    Ok(())
+}
+
 /// Initialize or upgrade a game server database (idempotent)
 ///
 /// # Arguments

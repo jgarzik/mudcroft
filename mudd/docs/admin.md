@@ -65,6 +65,7 @@ re-run creates any missing tables and refreshes the core mudlib.
 
 ```
 mudd_init --database <PATH> [--lib-dir <DIR>] [--lib <FILE.lua>]... [--force]
+mudd_init --database <PATH> --empty
 ```
 
 | Flag | Description |
@@ -73,6 +74,7 @@ mudd_init --database <PATH> [--lib-dir <DIR>] [--lib <FILE.lua>]... [--force]
 | `--lib-dir <DIR>` | Core mudlib directory. Every `*.lua` file in it is stored and becomes a default library for new universes. Default: `lib` **relative to the current directory**. |
 | `--lib <FILE>` | Extra Lua file to store in `code_store` (repeatable). It is stored by hash only. It is not attached to any universe. |
 | `-f`, `--force` | Delete the existing database file first, then create a fresh one |
+| `--empty` | Create an empty database (schema only: no admin account, no mudlib) for a node that will join a cluster with `mudd --join`; its data arrives from the cluster. Refuses an existing file. |
 | `-V`, `--version` | Print the version |
 
 | Environment variable | Description |
@@ -117,7 +119,9 @@ Runs the server. The database must already exist (see `mudd_init`).
 
 ```
 mudd --database <PATH> [--bind <ADDR>] [--static-dir <DIR>]
-     [--node-id <N>] [--raft-port <PORT>] [--peers <LIST>]
+     [--advertise <HOST:PORT> --cluster-cert <PEM> --cluster-key <PEM>
+      --cluster-ca <PEM> --cluster-secret-file <FILE>
+      [--cluster-listen <ADDR>] [--join <HOST:PORT,...>]]
 ```
 
 | Flag | Default | Description |
@@ -125,9 +129,13 @@ mudd --database <PATH> [--bind <ADDR>] [--static-dir <DIR>]
 | `-d`, `--database <PATH>` | (required) | Database created by `mudd_init` |
 | `-b`, `--bind <ADDR>` | `127.0.0.1:8080` | HTTP and WebSocket listen address. Use `0.0.0.0:8080` to accept remote connections. |
 | `--static-dir <DIR>` | (none) | Serve the built web client (for example `client/dist`) on the same origin as the API. Requests no API route claims get the matching file, falling back to `index.html` for client-side routes. Startup fails if `DIR/index.html` is missing. Without this flag, `GET /` returns `{"name":"mudd","version":"..."}`. |
-| `--node-id <N>` | `1` | Raft node id |
-| `--raft-port <PORT>` | `9000` | Raft port advertised to peers |
-| `--peers <LIST>` | (none) | Cluster peers, `1=host1:9000,2=host2:9001`. Omit it for single-node mode. |
+| `--advertise <HOST:PORT>` | (none) | Run as a cluster member, reachable by peers at this cluster-port address (not `0.0.0.0`). Requires the four `--cluster-*` files. Omit for a single node. See [Clusters](#clusters). |
+| `--cluster-listen <ADDR>` | `0.0.0.0` and the `--advertise` port | Address the cluster port listens on |
+| `--join <HOST:PORT,...>` | (none) | For a new node (database from `mudd_init --empty`): join through these members' cluster ports. Ignored once the node has joined (it remembers its id). |
+| `--cluster-cert <PEM>` | | This node's certificate, signed by the cluster CA, with subjectAltName `DNS:mudd-cluster` |
+| `--cluster-key <PEM>` | | The certificate's private key |
+| `--cluster-ca <PEM>` | | The cluster CA certificate |
+| `--cluster-secret-file <FILE>` | | The cluster's shared secret (at least 16 bytes) |
 | `-V`, `--version` | | Print the version |
 
 SIGTERM (as sent by `docker stop` or systemd) or SIGINT (Ctrl-C) stops
@@ -136,11 +144,10 @@ requests finish, and exits with status 0. Signals are handled from the
 moment `mudd` starts, so one during startup stops it too; a second signal
 exits at once without waiting.
 
-> **Clustering is not functional yet.** `--node-id`, `--raft-port` and
-> `--peers` are parsed, and a node sends Raft RPCs to
-> `http://<peer>/raft/...`. But no server listens for those RPCs: nothing binds
-> `--raft-port`, and the HTTP router has no `/raft` routes. Run single-node,
-> which is the default. See [docs/roadmap.md](../../docs/roadmap.md).
+> **Clusters are partly built.** Nodes join and replicate, but every node
+> still runs the timer loop and effect scheduler, and gateways do not yet
+> forward commands to the primary: play through the leader only. See
+> [Clusters](#clusters) and [docs/cluster-design.md](../../docs/cluster-design.md).
 
 | Environment variable | Description |
 |----------------------|-------------|
@@ -258,6 +265,68 @@ variables makes the container exit with status 1.
   volume, for example
   `docker run --rm -v mudcroft-data:/data --entrypoint /app/mudd_admin mudcroft --database /data/mudcroft.db set-level alice admin`
   (files it leaves root-owned are handed back to `appuser` on the next start).
+
+## Clusters
+
+Several `mudd` nodes form one Raft cluster (design:
+[docs/cluster-design.md](../../docs/cluster-design.md)). Nodes talk over a
+separate **cluster port** with TLS, after which each connection presents a
+**shared secret**. You supply the CA, the certificates and the secret; for
+example with `openssl`:
+
+```bash
+# Cluster CA (keep ca.key offline)
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout ca.key -out ca.pem -days 3650 -subj /CN=mudcroft-cluster-ca \
+    -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
+
+# A node certificate; every node's must carry the name mudd-cluster
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout node.key -out node.csr -subj /CN=mudd-cluster
+printf 'subjectAltName=DNS:mudd-cluster\nextendedKeyUsage=serverAuth,clientAuth\n' > node.ext
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+    -out node.pem -days 825 -extfile node.ext
+
+# The shared secret
+openssl rand -hex 32 > cluster.secret && chmod 600 cluster.secret
+```
+
+Peers verify a node's certificate against the CA under the name
+`mudd-cluster`, whatever address they reach it at.
+
+**Start the first node** from a normal database:
+
+```bash
+mudd_init --database node1.db --lib-dir lib      # with MUDD_ADMIN_* set
+mudd --database node1.db --bind 0.0.0.0:8080 \
+    --advertise 10.0.0.1:9000 \
+    --cluster-cert node.pem --cluster-key node.key \
+    --cluster-ca ca.pem --cluster-secret-file cluster.secret
+```
+
+An existing single-node database works too: it keeps its data and becomes
+node 1.
+
+**Add a node** from an empty database, joining any member:
+
+```bash
+mudd_init --database node2.db --empty
+mudd --database node2.db --bind 0.0.0.0:8080 \
+    --advertise 10.0.0.2:9000 --join 10.0.0.1:9000 \
+    --cluster-cert node.pem --cluster-key node.key \
+    --cluster-ca ca.pem --cluster-secret-file cluster.secret
+```
+
+The leader assigns it an id, sends it a snapshot of the game data, adds it
+as a learner and promotes it to voter once it has caught up. A member that
+is not the leader points the newcomer at the leader. Once joined, the node
+remembers its id, so a restart needs no `--join` (it is ignored). A node
+with the wrong secret, or a certificate not signed by the cluster CA, is
+refused and exits. Keep an odd number of voters (3 or 5): writes need a
+majority.
+
+Raft timing: heartbeat 100 ms, election timeout 400-800 ms once the cluster
+has more than one member.
 
 ## Creating Universes
 

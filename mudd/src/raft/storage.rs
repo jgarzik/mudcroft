@@ -49,6 +49,21 @@ fn log_id(term: i64, leader_node: i64, index: i64) -> LogId {
     )
 }
 
+/// This node's id, recorded when it was created or joined a cluster
+/// (`raft_meta` belongs to this node and never travels in a snapshot)
+pub async fn read_node_id(pool: &SqlitePool) -> io::Result<Option<super::types::NodeId>> {
+    match read_meta(pool, "node_id").await? {
+        Some(json) => serde_json::from_str(&json).map_err(io::Error::other),
+        None => Ok(None),
+    }
+}
+
+/// Record this node's id
+pub async fn write_node_id(pool: &SqlitePool, node_id: super::types::NodeId) -> io::Result<()> {
+    let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+    write_meta(&mut conn, "node_id", &node_id).await
+}
+
 async fn read_meta(pool: &SqlitePool, key: &str) -> io::Result<Option<String>> {
     sqlx::query_scalar("SELECT value FROM raft_meta WHERE key = ?")
         .bind(key)
@@ -331,15 +346,18 @@ impl SnapshotScratch {
 }
 
 /// A file URI as a SQLite string literal (ATTACH and VACUUM INTO take no
-/// bound file name). Explicitly a writable file: a database opened by URI
-/// (the in-memory test pool: `mode=memory`) would otherwise pass its mode on.
-fn sql_literal(path: &std::path::Path) -> String {
+/// bound file name), with an explicit `mode`: a database opened by URI (the
+/// in-memory test pool: `mode=memory`) would otherwise pass its own on. An
+/// attached file may not ask for more than the main database was opened
+/// with (mudd opens it without create), so reading uses `ro`.
+fn sql_literal(path: &std::path::Path, mode: &str) -> String {
     let uri = format!(
-        "file:{}?mode=rwc",
+        "file:{}?mode={}",
         path.to_string_lossy()
             .replace('%', "%25")
             .replace('?', "%3f")
-            .replace('#', "%23")
+            .replace('#', "%23"),
+        mode
     );
     format!("'{}'", uri.replace('\'', "''"))
 }
@@ -508,7 +526,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
             let pool = self.pool.read().await;
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "VACUUM INTO {}",
-                sql_literal(&file)
+                sql_literal(&file, "rwc")
             )))
             .execute(&*pool)
             .await
@@ -682,7 +700,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         let mut conn = pool.acquire().await.map_err(io::Error::other)?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "ATTACH DATABASE {} AS snap",
-            sql_literal(&file)
+            sql_literal(&file, "ro")
         )))
         .execute(&mut *conn)
         .await

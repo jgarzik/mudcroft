@@ -82,17 +82,20 @@ upgrades live (`Database::upgrade`), and there are none yet.
 
 ## Startup Sequence
 
-1. Parse CLI args: `--bind`, `--database`, `--node-id`, `--raft-port`,
-   `--peers`, `--static-dir` ([admin.md](admin.md) has details).
+1. Parse CLI args: `--bind`, `--database`, `--static-dir`, and for a
+   cluster member `--advertise`, `--cluster-*` and `--join`
+   ([admin.md](admin.md) has details).
 2. If `--static-dir` is set, fail unless it contains `index.html`.
 3. Open and validate the database.
-4. Create the `RaftWriter`: single-node (`RaftWriter::single_node`) unless
-   `--peers` is given (`RaftWriter::cluster`). Single-node initializes a
-   one-member cluster only when the database has no Raft state yet; on a
-   database it has served before it resumes the persisted vote, log and
-   membership, so restarts work.
-5. Wait up to 10 seconds for a Raft leader (`wait_for_leader`). The HTTP port
-   is not bound until this succeeds.
+4. Start Raft (`RaftWriter::start`). The node's id is kept in its own
+   `raft_meta` (never in a snapshot). A node resumes with that id; a new
+   node given `--join` asks the cluster for an id first; otherwise it is
+   node 1 and initializes a one-member cluster (once: on a database it has
+   served before it resumes the persisted vote, log and membership). A
+   cluster member also serves the cluster port.
+5. Wait for a Raft leader (`wait_for_leader`: 10 s, or 120 s for a cluster
+   member, which may first receive a snapshot). The HTTP port is not bound
+   until this succeeds.
 6. Build `AppState` (`api::router`): `ConnectionManager`, `ObjectStore`,
    `ClassRegistry`, `ActionRegistry`, `PermissionManager`, `PlayerManager`,
    `TimerManager`, `CreditManager`, `VeniceClient`, `ImageStore`,
@@ -568,17 +571,28 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   table's rows in one transaction, with foreign keys deferred, then records
   the position: the node has the old state or the new, its own Raft log and
   vote stay, and no connection the application holds is closed.
-- **Timing**: heartbeat 500 ms, election timeout 1.5-3 s in a cluster. A
-  single node turns its tick, heartbeat and election timers off (no peers).
-- **Network**: `raft/network.rs` (`RaftNetworkV2`) sends RPCs as HTTP POSTs
-  to `http://<peer>/raft/<endpoint>` (`append_entries`, `vote`, and
-  `snapshot` for a whole snapshot). Nothing serves these endpoints yet.
-- **Modes**: single-node by default. `--peers "1=host1:9000,2=host2:9001"`
-  selects cluster mode, where node 1 initializes the membership.
+- **Timing**: heartbeat 100 ms, election timeout 400-800 ms. Timers start
+  off and are switched on at runtime once the membership has more than one
+  node.
+- **Transport** (`raft/transport.rs`, after the sister project roodb): one
+  TLS listener per node; frames `[kind][len][JSON body]` (JSON because log
+  entries carry `serde_json::Value` parameters), each sent as one write
+  with `TCP_NODELAY`; one kept connection per peer, re-made and the request
+  repeated once when it turns out dead; every RPC under openraft's
+  `soft_ttl`; snapshots streamed on their own connection in 1 MiB chunks.
+  The server is verified against the cluster CA as `mudd-cluster`, then the
+  client's `Hello` must carry the shared secret (constant-time compare).
+- **Membership**: a new node (`mudd_init --empty`, `mudd --join`) asks any
+  member; one that is not the leader names the leader. The leader assigns
+  the next id, snapshots and purges its log (node 1's `mudd_init` data
+  predates the log, so a newcomer must start from a snapshot), adds the
+  node as a learner (waiting for it to catch up) and promotes it to voter.
+  As leader, a node records its own advertised address in the membership if
+  it changed (e.g. a single-node database given cluster flags).
 
-Multi-node operation is not working yet: see
-[docs/roadmap.md](../../docs/roadmap.md) for the gaps and known issues
-(including per-node caches).
+Still to build (gateways, primary-only schedulers): see
+[docs/cluster-design.md](../../docs/cluster-design.md) and
+[docs/roadmap.md](../../docs/roadmap.md).
 
 ## Key Design Decisions
 

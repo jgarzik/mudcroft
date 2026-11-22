@@ -112,8 +112,9 @@ production-like tests:
   `option.soft_ttl()` (openraft leaves timeouts to the transport).
 - Snapshots on a dedicated connection, streamed in 1 MiB chunks with a stall
   timeout, cancellable.
-- This replaces today's `raft/network.rs`, which posts JSON to `/raft/*`
-  routes that nothing serves.
+- Bodies are JSON rather than bincode: log entries carry
+  `serde_json::Value` parameters, which bincode cannot decode. (Built:
+  `raft/transport.rs`.)
 
 **Security:**
 

@@ -15,6 +15,7 @@
 //! - Robustness: Input handling and state consistency
 
 pub mod chat;
+pub mod cluster;
 pub mod combat;
 pub mod credits;
 pub mod inventory;

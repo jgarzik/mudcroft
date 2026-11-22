@@ -156,6 +156,22 @@ impl Database {
     /// Open an existing database (does not create or run migrations)
     /// Used by mudd server at runtime - requires pre-initialized database
     pub async fn open(path: &str) -> Result<Self> {
+        let db = Self::open_unvalidated(path).await?;
+        db.validate().await?;
+        db.validate_has_admin().await?;
+        Ok(db)
+    }
+
+    /// Open the database of a node joining a cluster (`mudd --join`): it may
+    /// still be empty, as its data (admin account included) arrives in a
+    /// snapshot, so only the schema is checked
+    pub async fn open_joining(path: &str) -> Result<Self> {
+        let db = Self::open_unvalidated(path).await?;
+        db.validate().await?;
+        Ok(db)
+    }
+
+    async fn open_unvalidated(path: &str) -> Result<Self> {
         // Verify file exists
         if !Path::new(path).exists() {
             bail!(
@@ -178,15 +194,10 @@ impl Database {
             .connect_with(options)
             .await?;
 
-        let db = Self { pool };
-
-        // Validate the database is properly initialized
-        db.validate().await?;
-
-        Ok(db)
+        Ok(Self { pool })
     }
 
-    /// Validate that the database has required tables and an admin account
+    /// Validate the schema version and that the required tables exist
     pub async fn validate(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version != SCHEMA_VERSION {
@@ -229,8 +240,11 @@ impl Database {
                 );
             }
         }
+        Ok(())
+    }
 
-        // Check that at least one administrator (admin or owner) exists
+    /// Check that at least one administrator (admin or owner) exists
+    async fn validate_has_admin(&self) -> Result<()> {
         let admin_count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM accounts WHERE access_level IN ('admin', 'owner')",
         )

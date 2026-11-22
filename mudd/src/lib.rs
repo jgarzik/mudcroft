@@ -31,7 +31,21 @@ use tokio::sync::watch;
 use tracing::info;
 
 use db::Database;
-use raft::{RaftNodeConfig, RaftWriter};
+use raft::{ClusterFiles, ClusterSecurity, ClusterSetup, RaftWriter};
+
+/// Cluster membership settings (see docs/cluster-design.md)
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    /// Address the cluster port listens on
+    pub listen: SocketAddr,
+    /// Address peers reach this node at (`host:port`; not 0.0.0.0)
+    pub advertise: String,
+    /// Members to join through, for a new node created with
+    /// `mudd_init --empty` (ignored once the node has joined)
+    pub join: Vec<String>,
+    /// TLS certificate, key, CA and shared secret files
+    pub files: ClusterFiles,
+}
 
 /// Server configuration
 #[derive(Debug, Clone)]
@@ -39,14 +53,10 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     /// Path to pre-initialized database (created by mudd_init)
     pub db_path: String,
-    /// Raft node ID (unique within cluster)
-    pub node_id: u64,
-    /// Raft port for inter-node communication
-    pub raft_port: u16,
-    /// Cluster peers (format: "1=host1:9000,2=host2:9001"). None = single-node.
-    pub peers: Option<String>,
     /// Directory of the built web client to serve (None = API only)
     pub static_dir: Option<std::path::PathBuf>,
+    /// Cluster settings (None = a single node)
+    pub cluster: Option<ClusterConfig>,
 }
 
 impl Default for Config {
@@ -54,10 +64,8 @@ impl Default for Config {
         Self {
             bind_addr: "127.0.0.1:8080".parse().unwrap(),
             db_path: String::new(),
-            node_id: 1,
-            raft_port: 9000,
-            peers: None,
             static_dir: None,
+            cluster: None,
         }
     }
 }
@@ -84,29 +92,43 @@ impl Server {
             }
         }
 
-        let db = Database::open(&config.db_path).await?;
+        // A node joining a cluster starts empty (mudd_init --empty)
+        let joining = config.cluster.as_ref().is_some_and(|c| !c.join.is_empty());
+        let db = if joining {
+            Database::open_joining(&config.db_path).await?
+        } else {
+            Database::open(&config.db_path).await?
+        };
         let db = Arc::new(db);
 
-        // Initialize RaftWriter
-        let raft_writer = if let Some(ref peers_str) = config.peers {
-            // Multi-node cluster mode
-            let peers = RaftNodeConfig::parse_peers(peers_str);
-            let raft_config = RaftNodeConfig::cluster(config.node_id, config.raft_port, peers)
-                .with_db_path(&config.db_path);
-            RaftWriter::cluster(db.pool().clone(), raft_config, &config.db_path).await?
-        } else {
-            // Single-node mode
-            RaftWriter::single_node(
-                db.pool().clone(),
-                config.node_id,
-                config.raft_port,
-                &config.db_path,
-            )
-            .await?
+        // Raft: a single node, or a cluster member serving the cluster port
+        let (raft_writer, leader_wait) = match config.cluster {
+            None => (
+                RaftWriter::single_node(db.pool().clone(), &config.db_path).await?,
+                Duration::from_secs(10),
+            ),
+            Some(ref cluster) => {
+                if cluster.advertise.starts_with("0.0.0.0") {
+                    anyhow::bail!("--advertise must be an address peers can reach, not 0.0.0.0");
+                }
+                let security = Arc::new(ClusterSecurity::load(&cluster.files)?);
+                let listener = TcpListener::bind(cluster.listen).await?;
+                info!("cluster port listening on {}", cluster.listen);
+                let setup = ClusterSetup {
+                    security,
+                    listener,
+                    advertise: cluster.advertise.clone(),
+                    join: cluster.join.clone(),
+                };
+                (
+                    RaftWriter::start(db.pool().clone(), &config.db_path, Some(setup)).await?,
+                    // A new member receives a snapshot first
+                    Duration::from_secs(120),
+                )
+            }
         };
 
-        // Wait for leader election
-        raft_writer.wait_for_leader(Duration::from_secs(10)).await?;
+        raft_writer.wait_for_leader(leader_wait).await?;
 
         let raft_writer = Arc::new(raft_writer);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

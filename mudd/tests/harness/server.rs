@@ -345,7 +345,7 @@ impl TestServer {
 
 /// Find a binary path by name (e.g., "mudd" or "mudd_init")
 /// Uses the same build profile as the test: debug for `cargo test`, release for `cargo test --release`
-fn find_binary_path(name: &str) -> Result<PathBuf> {
+pub(super) fn find_binary_path(name: &str) -> Result<PathBuf> {
     // Match the build profile of the test runner
     #[cfg(debug_assertions)]
     let candidates = [
@@ -480,7 +480,7 @@ impl Drop for TestServer {
 /// Spawn mudd and wait until it answers /health. The child is guarded
 /// immediately, so any early return (startup timeout, exit) kills it.
 /// Output is appended to `log_path`.
-async fn spawn_mudd(
+pub(super) async fn spawn_mudd(
     client: &Client,
     mudd_path: &Path,
     addr: SocketAddr,
@@ -552,21 +552,21 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Owns a child process and kills it when dropped, so no exit path
 /// (early return, `?`, panic) can leak a running server.
-struct ChildGuard(Option<Child>);
+pub(super) struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
+    pub(super) fn new(child: Child) -> Self {
         Self(Some(child))
     }
 
     /// Wait for the process to exit normally
-    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+    pub(super) fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
         let mut child = self.0.take().expect("child already taken");
         child.wait()
     }
 
     /// Exit status if the process has already exited
-    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    pub(super) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match self.0.as_mut() {
             Some(child) => child.try_wait(),
             None => Ok(None),
@@ -598,7 +598,7 @@ impl ChildGuard {
     }
 
     /// Kill and reap the process (idempotent)
-    fn kill(&mut self) {
+    pub(super) fn kill(&mut self) {
         if let Some(mut child) = self.0.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -615,7 +615,7 @@ impl Drop for ChildGuard {
 /// Ask the kernel to SIGKILL the child if the test process dies without
 /// running destructors (Ctrl-C, timeout kill). Linux only; elsewhere the
 /// `ChildGuard` drop is the only cleanup.
-fn die_with_parent(cmd: &mut Command) -> &mut Command {
+pub(super) fn die_with_parent(cmd: &mut Command) -> &mut Command {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
@@ -633,7 +633,7 @@ fn die_with_parent(cmd: &mut Command) -> &mut Command {
 }
 
 /// Last `lines` lines of a log file (best effort)
-fn log_tail(path: &Path, lines: usize) -> String {
+pub(super) fn log_tail(path: &Path, lines: usize) -> String {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let all: Vec<&str> = text.lines().collect();

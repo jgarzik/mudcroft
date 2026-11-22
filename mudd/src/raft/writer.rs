@@ -3,18 +3,36 @@
 //! All SQLite writes must go through this coordinator to ensure
 //! consensus across the cluster.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use openraft::async_runtime::WatchReceiver;
-use openraft::BasicNode;
+use openraft::{BasicNode, ChangeMembers};
 use sqlx::SqlitePool;
-use tracing::{debug, info};
+use tokio::net::TcpListener;
+use tracing::{debug, info, warn};
 
-use super::config::RaftNodeConfig;
-use super::network::NetworkConfig;
+use super::storage::{read_node_id, write_node_id};
+use super::transport::{self, ClusterNetwork, ClusterSecurity, ClusterService};
 use super::types::{NodeId, Request, Response};
 use super::{create_raft_node, GameRaft};
+
+/// How long a new node keeps trying to join
+const JOIN_LIMIT: Duration = Duration::from_secs(120);
+
+/// What a node needs to be part of a cluster
+pub struct ClusterSetup {
+    /// TLS configuration and shared secret
+    pub security: Arc<ClusterSecurity>,
+    /// The bound cluster port
+    pub listener: TcpListener,
+    /// The address peers reach this node at (`host:port`)
+    pub advertise: String,
+    /// Members to join through (empty: this node is or was node 1)
+    pub join: Vec<String>,
+}
 
 /// Central coordinator for all database writes via Raft consensus
 pub struct RaftWriter {
@@ -24,77 +42,77 @@ pub struct RaftWriter {
 }
 
 impl RaftWriter {
-    /// Create a single-node RaftWriter (no replication, but still uses Raft log)
-    pub async fn single_node(
+    /// A node without a cluster: a one-member Raft cluster (node 1 unless
+    /// the database records another id)
+    pub async fn single_node(pool: SqlitePool, db_path: &str) -> Result<Self> {
+        Self::start(pool, db_path, None).await
+    }
+
+    /// Start this node's Raft. Without `cluster`, a one-member cluster.
+    /// With it: serve the cluster port, and either resume (the database
+    /// records the node's id), join through `cluster.join` (a new, empty
+    /// node), or become node 1 of a new cluster.
+    pub async fn start(
         pool: SqlitePool,
-        node_id: NodeId,
-        port: u16,
         db_path: &str,
+        cluster: Option<ClusterSetup>,
     ) -> Result<Self> {
-        info!("Creating single-node RaftWriter (node_id={})", node_id);
+        let stored = read_node_id(&pool).await?;
+        let security = cluster.as_ref().map(|c| c.security.clone());
+        let joining = stored.is_none() && cluster.as_ref().is_some_and(|c| !c.join.is_empty());
+        let node_id = match (&cluster, stored) {
+            (_, Some(id)) => id,
+            (Some(c), None) if joining => {
+                transport::join_cluster(&c.join, &c.advertise, c.security.clone(), JOIN_LIMIT)
+                    .await?
+            }
+            _ => 1,
+        };
+        if stored.is_none() {
+            write_node_id(&pool, node_id).await?;
+        }
+        info!(
+            "Starting Raft node {} ({})",
+            node_id,
+            if cluster.is_some() {
+                "cluster"
+            } else {
+                "single node"
+            }
+        );
 
-        let config = RaftNodeConfig::single(node_id, port).with_db_path(db_path);
-        let network_config = NetworkConfig::from_raft_config(&config);
-
-        let (raft, _read_pool) = create_raft_node(
+        let raft = create_raft_node(
             node_id,
             pool,
-            network_config,
-            true,
+            ClusterNetwork::new(security),
             Some(db_path.to_string()),
         )
         .await?;
 
-        // Initialize as a single-node cluster the first time only: on a
-        // database this node has served before, the Raft state (vote, log)
-        // is already persisted and initialize() is refused.
-        if raft.is_initialized().await? {
-            info!("Raft state found; resuming existing single-node cluster");
-        } else {
-            let mut members = std::collections::BTreeMap::new();
-            members.insert(node_id, BasicNode::default());
+        let advertise = cluster
+            .as_ref()
+            .map(|c| c.advertise.clone())
+            .unwrap_or_default();
+        // A new cluster (or single node) is initialized the first time only:
+        // on a database this node has served before, the Raft state (vote,
+        // log) is already persisted and initialize() is refused. A joining
+        // node is brought in by the leader instead.
+        if !joining && !raft.is_initialized().await? {
+            let mut members = BTreeMap::new();
+            members.insert(node_id, BasicNode::new(advertise.clone()));
             raft.initialize(members).await?;
         }
 
-        Ok(Self {
-            raft,
-            node_id,
-            db_path: db_path.to_string(),
-        })
-    }
-
-    /// Create a cluster RaftWriter (multi-node replication)
-    pub async fn cluster(pool: SqlitePool, config: RaftNodeConfig, db_path: &str) -> Result<Self> {
-        info!(
-            "Creating cluster RaftWriter (node_id={}, peers={:?})",
-            config.node_id, config.peers
-        );
-
-        let node_id = config.node_id;
-        let network_config = NetworkConfig::from_raft_config(&config);
-
-        let (raft, _read_pool) = create_raft_node(
-            node_id,
-            pool,
-            network_config,
-            false,
-            Some(db_path.to_string()),
-        )
-        .await?;
-
-        // Build initial membership from peers
-        let members: std::collections::BTreeMap<NodeId, BasicNode> = config
-            .peers
-            .keys()
-            .map(|&id| (id, BasicNode::default()))
-            .collect();
-
-        // Only initialize if this is the first node or if not already initialized
-        // In practice, only node 1 should call initialize; others join via replication
-        if node_id == 1 {
-            if let Err(e) = raft.initialize(members).await {
-                debug!("Cluster may already be initialized: {}", e);
-            }
+        if let Some(cluster) = cluster {
+            let service = ClusterService::new(raft.clone());
+            tokio::spawn(transport::serve(
+                cluster.listener,
+                cluster.security,
+                service,
+            ));
+            // Timers on whenever the cluster has (or gains) other members;
+            // and the leader keeps its own advertised address current
+            tokio::spawn(watch_membership(raft.clone(), node_id, advertise));
         }
 
         Ok(Self {
@@ -205,6 +223,46 @@ impl RaftWriter {
     }
 }
 
+/// Switch the Raft timers on once the membership has more than one node,
+/// and, as leader, record this node's advertised address if it changed
+/// (e.g. a single node that has just been given cluster flags)
+async fn watch_membership(raft: GameRaft, node_id: NodeId, advertise: String) {
+    let mut metrics = raft.metrics();
+    let mut timers_on = false;
+    let mut address_checked = false;
+    loop {
+        let (leader, membership) = {
+            let m = metrics.borrow_watched();
+            (m.current_leader, m.membership_config.clone())
+        };
+        if !timers_on && membership.membership().nodes().count() > 1 {
+            transport::enable_cluster_timers(&raft);
+            timers_on = true;
+        }
+        if !address_checked && leader == Some(node_id) {
+            let current = membership
+                .membership()
+                .get_node(&node_id)
+                .map(|n| n.addr.clone());
+            if current.as_deref() != Some(advertise.as_str()) {
+                let mut nodes = BTreeMap::new();
+                nodes.insert(node_id, BasicNode::new(advertise.clone()));
+                match raft
+                    .change_membership(ChangeMembers::SetNodes(nodes), false)
+                    .await
+                {
+                    Ok(_) => info!("cluster: node {} now advertised at {}", node_id, advertise),
+                    Err(e) => warn!("cluster: recording this node's address failed: {}", e),
+                }
+            }
+            address_checked = true;
+        }
+        if metrics.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,7 +333,7 @@ mod tests {
     async fn test_single_node_writer_creation() {
         let pool = test_pool_with_raft_tables().await;
         let (_dir, db_path) = test_db_path();
-        let writer = RaftWriter::single_node(pool, 1, 19000, &db_path).await;
+        let writer = RaftWriter::single_node(pool, &db_path).await;
         assert!(writer.is_ok());
     }
 
@@ -283,9 +341,7 @@ mod tests {
     async fn test_single_node_write() {
         let pool = test_pool_with_raft_tables().await;
         let (_dir, db_path) = test_db_path();
-        let writer = RaftWriter::single_node(pool, 1, 19001, &db_path)
-            .await
-            .unwrap();
+        let writer = RaftWriter::single_node(pool, &db_path).await.unwrap();
 
         // Wait for leader election
         writer
@@ -313,9 +369,7 @@ mod tests {
     async fn test_is_leader() {
         let pool = test_pool_with_raft_tables().await;
         let (_dir, db_path) = test_db_path();
-        let writer = RaftWriter::single_node(pool, 1, 19002, &db_path)
-            .await
-            .unwrap();
+        let writer = RaftWriter::single_node(pool, &db_path).await.unwrap();
 
         writer
             .wait_for_leader(Duration::from_secs(5))
@@ -334,7 +388,7 @@ mod tests {
         let pool = test_pool_with_raft_tables().await;
         let (_dir, db_path) = test_db_path();
         let writer = std::sync::Arc::new(
-            RaftWriter::single_node(pool.clone(), 1, 19003, &db_path)
+            RaftWriter::single_node(pool.clone(), &db_path)
                 .await
                 .unwrap(),
         );
@@ -372,9 +426,7 @@ mod tests {
     async fn test_stopped_resolves_when_core_stops() {
         let pool = test_pool_with_raft_tables().await;
         let (_dir, db_path) = test_db_path();
-        let writer = RaftWriter::single_node(pool, 1, 19004, &db_path)
-            .await
-            .unwrap();
+        let writer = RaftWriter::single_node(pool, &db_path).await.unwrap();
         writer
             .wait_for_leader(Duration::from_secs(5))
             .await

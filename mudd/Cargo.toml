@@ -37,6 +37,9 @@ mlua = { version = "0.12", features = ["lua54", "vendored", "async", "serialize"
 
 # Consensus (Raft)
 openraft = { version = "0.10", features = ["serde", "type-alias"] }
+# Cluster transport: framed messages over TLS (as in the sister project roodb)
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 futures-util = "0.3"
 
 # Serialization
