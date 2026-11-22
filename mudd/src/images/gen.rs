@@ -10,6 +10,38 @@ use crate::theme::Theme;
 use crate::venice::{ChatMessage, ImageSize, ImageStyle, ModelTier, VeniceClient};
 use tracing::{debug, info};
 
+/// Statement recording a generated image on a room: sets only
+/// `image_hash` and `image_generated_at`, and only if the room still has no
+/// image (one set meanwhile, e.g. by a builder, wins)
+pub fn store_image_statement(
+    universe_id: &str,
+    room_id: &str,
+    image_hash: &str,
+) -> anyhow::Result<(String, Vec<serde_json::Value>)> {
+    let (mut sql, params) = ObjectStore::set_properties_statement(
+        universe_id,
+        room_id,
+        &[
+            ("image_hash", serde_json::json!(image_hash)),
+            (
+                "image_generated_at",
+                serde_json::json!(chrono::Utc::now().timestamp()),
+            ),
+        ],
+    )?;
+    sql.push_str(" AND json_extract(properties, '$.image_hash') IS NULL");
+    Ok((sql, params))
+}
+
+/// Whether a room needs a generated image: it has none (missing or null).
+/// Matches the write-back's `IS NULL` guard, so any other value, even a
+/// bad one, never starts a generation that could not be stored.
+pub fn room_needs_image(room: &crate::objects::Object) -> bool {
+    room.properties
+        .get("image_hash")
+        .is_none_or(serde_json::Value::is_null)
+}
+
 /// Generate a room image using the two-step pipeline
 ///
 /// Returns the image hash on success
@@ -17,6 +49,7 @@ pub async fn generate_room_image(
     venice: &VeniceClient,
     image_store: &ImageStore,
     object_store: &ObjectStore,
+    universe_id: &str,
     room_id: &str,
     theme: &Theme,
     account_id: &str,
@@ -28,10 +61,15 @@ pub async fn generate_room_image(
 
     // Get room data
     let room = object_store
-        .get(room_id)
+        .get(universe_id, room_id)
         .await
         .map_err(|e| format!("Failed to get room: {}", e))?
         .ok_or_else(|| format!("Room not found: {}", room_id))?;
+    // Another job may have finished between the viewer's read and this one
+    // starting: never pay for a second image
+    if !room_needs_image(&room) {
+        return Err(format!("Room {} already has an image", room_id));
+    }
 
     let room_name = room
         .properties
@@ -48,7 +86,7 @@ pub async fn generate_room_image(
     // Get region for environment type (if available)
     let environment_type =
         if let Some(region_id) = room.properties.get("region_id").and_then(|v| v.as_str()) {
-            if let Ok(Some(region)) = object_store.get(region_id).await {
+            if let Ok(Some(region)) = object_store.get(universe_id, region_id).await {
                 region
                     .properties
                     .get("environment_type")
@@ -125,19 +163,15 @@ Respond with ONLY the image prompt, no explanations or preamble."#,
         image_hash, room_name
     );
 
-    // Step 4: Update room with image hash
-    let mut updated_room = room.clone();
-    updated_room.properties.insert(
-        "image_hash".to_string(),
-        serde_json::json!(image_hash.clone()),
-    );
-    updated_room.properties.insert(
-        "image_generated_at".to_string(),
-        serde_json::json!(chrono::Utc::now().timestamp()),
-    );
-
+    // Step 4: Record it on the room, in place: the room may have changed
+    // during the seconds generation took
     object_store
-        .update(&updated_room)
+        .execute_batch(vec![store_image_statement(
+            universe_id,
+            room_id,
+            &image_hash,
+        )
+        .map_err(|e| e.to_string())?])
         .await
         .map_err(|e| format!("Failed to update room with image hash: {}", e))?;
 
@@ -148,6 +182,59 @@ Respond with ONLY the image prompt, no explanations or preamble."#,
 mod tests {
     use super::*;
 
+    /// The write-back sets only the image properties, in place, and never
+    /// replaces an image set meanwhile
+    #[tokio::test]
+    async fn test_store_image_statement() {
+        let pool = crate::db::test_utils::test_pool().await;
+        sqlx::query(
+            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES ('a', 'a', 'x', 'admin', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO universes (id, name, owner_id, config, created_at)
+             VALUES ('u', 'u', 'a', '{}', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectStore::new(pool.clone(), None);
+        let mut room = crate::objects::Object::new("/rooms/a", "u", "room").unwrap();
+        room.set_property("name", serde_json::json!("Old"));
+        store.create(&room).await.unwrap();
+        // Renamed while the image was being generated
+        store
+            .set_properties("u", "/rooms/a", &[("name", serde_json::json!("New"))])
+            .await
+            .unwrap();
+
+        store
+            .execute_batch(vec![
+                store_image_statement("u", "/rooms/a", "hash1").unwrap()
+            ])
+            .await
+            .unwrap();
+        let room = store.get("u", "/rooms/a").await.unwrap().unwrap();
+        assert_eq!(room.properties["image_hash"], "hash1");
+        assert_eq!(room.properties["name"], "New");
+        assert!(room.properties.contains_key("image_generated_at"));
+
+        store
+            .execute_batch(vec![
+                store_image_statement("u", "/rooms/a", "hash2").unwrap()
+            ])
+            .await
+            .unwrap();
+        let room = store.get("u", "/rooms/a").await.unwrap().unwrap();
+        assert_eq!(
+            room.properties["image_hash"], "hash1",
+            "kept the existing image"
+        );
+    }
+
     #[test]
     fn test_system_prompt_formatting() {
         let theme = Theme::sierra_retro();
@@ -157,5 +244,23 @@ mod tests {
         );
         assert!(prompt.contains("Sierra"));
         assert!(prompt.contains("256-color"));
+    }
+
+    /// A room needs an image only when it has none (missing or null); any
+    /// other value, even a bad one, counts as an image so nothing regenerates
+    #[test]
+    fn test_room_needs_image() {
+        let mut room = crate::objects::Object::new("/rooms/a", "u", "room").unwrap();
+        assert!(room_needs_image(&room));
+        room.set_property("image_hash", serde_json::Value::Null);
+        assert!(room_needs_image(&room));
+        for v in [
+            serde_json::json!("abc"),
+            serde_json::json!(false),
+            serde_json::json!(0),
+        ] {
+            room.set_property("image_hash", v);
+            assert!(!room_needs_image(&room));
+        }
     }
 }

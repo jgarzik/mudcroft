@@ -96,13 +96,6 @@ impl TestWorld {
 
         let wizard_account_id = account_id_from(server, wizard_resp, "test_wizard").await?;
 
-        // Promote to wizard level
-        sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
-            .bind("wizard")
-            .bind(&wizard_account_id)
-            .execute(server.pool())
-            .await?;
-
         // Create builder account via API
         let builder_resp = server
             .post(
@@ -116,13 +109,6 @@ impl TestWorld {
 
         let builder_account_id = account_id_from(server, builder_resp, "test_builder").await?;
 
-        // Promote to builder level
-        sqlx::query("UPDATE accounts SET access_level = ? WHERE id = ?")
-            .bind("builder")
-            .bind(&builder_account_id)
-            .execute(server.pool())
-            .await?;
-
         // Create test universe directly via store (with core lib hashes)
         let universe_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -132,9 +118,28 @@ impl TestWorld {
             "lib_hashes": core_lib_hashes
         });
 
+        // Owned by the global admin, so the wizard and builder are exactly
+        // their member levels (a universe's owner is owner inside it)
+        let (admin_id,): (String,) =
+            sqlx::query_as("SELECT id FROM accounts WHERE username = 'test_admin'")
+                .fetch_one(server.pool())
+                .await?;
         store
-            .create_universe(&universe_id, "Test Universe", &wizard_account_id, config)
+            .create_universe(&universe_id, "Test Universe", &admin_id, config)
             .await?;
+        for (account, level) in [
+            (&wizard_account_id, "wizard"),
+            (&builder_account_id, "builder"),
+        ] {
+            sqlx::query(
+                "INSERT INTO universe_members (universe_id, account_id, level) VALUES (?, ?, ?)",
+            )
+            .bind(&universe_id)
+            .bind(account)
+            .bind(level)
+            .execute(server.pool())
+            .await?;
+        }
 
         // Create dark-caves region
         let mut region = Object::new("/regions/dark-caves", &universe_id, "region")?;
@@ -189,15 +194,27 @@ impl TestWorld {
 
         // Link rooms with exits (matching cave_adventure.lua)
         // entrance -> north -> passage
-        store.set_exit(&entrance_id, "north", &passage_id).await?;
+        store
+            .set_exit(&universe_id, &entrance_id, "north", &passage_id)
+            .await?;
         // passage -> south -> entrance, north -> chamber, east -> pool
-        store.set_exit(&passage_id, "south", &entrance_id).await?;
-        store.set_exit(&passage_id, "north", &chamber_id).await?;
-        store.set_exit(&passage_id, "east", &pool_id).await?;
+        store
+            .set_exit(&universe_id, &passage_id, "south", &entrance_id)
+            .await?;
+        store
+            .set_exit(&universe_id, &passage_id, "north", &chamber_id)
+            .await?;
+        store
+            .set_exit(&universe_id, &passage_id, "east", &pool_id)
+            .await?;
         // chamber -> south -> passage
-        store.set_exit(&chamber_id, "south", &passage_id).await?;
+        store
+            .set_exit(&universe_id, &chamber_id, "south", &passage_id)
+            .await?;
         // pool -> west -> passage
-        store.set_exit(&pool_id, "west", &passage_id).await?;
+        store
+            .set_exit(&universe_id, &pool_id, "west", &passage_id)
+            .await?;
 
         // Create Giant Bat NPC in passage (15 HP)
         let mut bat = Object::new("/npcs/giant-bat", &universe_id, "npc")?;
@@ -322,8 +339,12 @@ impl TestWorld {
 
     /// Link two rooms with exits
     pub async fn link_rooms(&self, room1: &str, dir1: &str, room2: &str, dir2: &str) -> Result<()> {
-        self.store.set_exit(room1, dir1, room2).await?;
-        self.store.set_exit(room2, dir2, room1).await?;
+        self.store
+            .set_exit(&self.universe_id, room1, dir1, room2)
+            .await?;
+        self.store
+            .set_exit(&self.universe_id, room2, dir2, room1)
+            .await?;
         Ok(())
     }
 

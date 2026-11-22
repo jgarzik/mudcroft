@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use mlua::{Function, Table, Value};
 
+use std::future::Future;
+use std::pin::Pin;
+
 use super::{AppState, ServerMessage};
 use crate::lua::{json_to_lua, GameApi, GameMessage, MessageQueue, Sandbox, SandboxConfig};
 
@@ -28,6 +31,10 @@ pub struct ScriptContext {
     pub room_id: Option<String>,
     /// Object context (timers, object-scoped actions)
     pub object_id: Option<String>,
+    /// The account that pays for credit spending (`"actor"`): the player
+    /// who typed the verb, or whoever ran eval / a script. None for hooks
+    /// and timers, which nobody chose to run.
+    pub payer: Option<String>,
 }
 
 /// Sandbox limits for interactive wizard `eval` and admin scripts, which
@@ -91,45 +98,178 @@ pub async fn invoke_handler(
     method: &str,
     args: serde_json::Value,
 ) -> Result<Option<String>, String> {
-    let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
-        return Ok(None);
-    };
-    let ctx = ScriptContext {
-        universe_id: universe_id.to_string(),
-        user_id: owner_id,
+    invoke_handler_at(
+        state,
+        universe_id,
+        object_id,
         room_id,
-        object_id: Some(object_id.to_string()),
-    };
-    let libs = load_universe_lib_codes(state, universe_id).await?;
-    let queue = MessageQueue::shared();
-
-    let result = {
-        let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
-        call_handler(&mut sandbox, &code, method, &args)
-    };
-
-    deliver(state, &queue, &ctx.universe_id).await;
-    result
+        method,
+        args,
+        Origin {
+            payer: None,
+            hooks: HookBudget::new(),
+        },
+    )
+    .await
 }
 
-/// How often the timer loop checks for due call_outs and heartbeats
-const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+/// invoke_handler for a verb a player typed. `payer` is their account when
+/// they clearly picked this object: it then pays for the handler's credit
+/// spending (`"actor"`)
+pub async fn invoke_verb_handler(
+    state: &AppState,
+    universe_id: &str,
+    object_id: &str,
+    room_id: Option<String>,
+    method: &str,
+    args: serde_json::Value,
+    payer: Option<&str>,
+) -> Result<Option<String>, String> {
+    invoke_handler_at(
+        state,
+        universe_id,
+        object_id,
+        room_id,
+        method,
+        args,
+        Origin {
+            payer: payer.map(str::to_string),
+            hooks: HookBudget::new(),
+        },
+    )
+    .await
+}
 
-/// Fire due call_out timers and heartbeats forever.
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// How deeply move hooks may nest: a hook that moves something runs more
+/// hooks, so rooms that pass an object back and forth stop here
+const MAX_MOVE_HOOK_DEPTH: u32 = 4;
+
+/// How many move hooks one top-level run may cause in total: a hook can
+/// move many objects, so depth alone does not bound the work
+const MAX_MOVE_HOOKS_PER_RUN: u32 = 32;
+
+/// The move-hook allowance of one top-level run, carried down through the
+/// hooks it causes
+#[derive(Clone)]
+struct HookBudget {
+    depth: u32,
+    remaining: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl HookBudget {
+    fn new() -> Self {
+        Self {
+            depth: 0,
+            remaining: Arc::new(std::sync::atomic::AtomicU32::new(MAX_MOVE_HOOKS_PER_RUN)),
+        }
+    }
+
+    fn deeper(&self) -> Self {
+        Self {
+            depth: self.depth + 1,
+            remaining: self.remaining.clone(),
+        }
+    }
+
+    /// Take one hook from the allowance; false when none is left
+    fn take(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.remaining
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
+/// What a handler run inherits from the run that caused it
+struct Origin {
+    /// Who pays for its credit spending (see ScriptContext::payer)
+    payer: Option<String>,
+    /// The move-hook allowance it may use
+    hooks: HookBudget,
+}
+
+/// invoke_handler at a hook nesting depth (move hooks run handlers that can
+/// move things and so run more hooks; see MAX_MOVE_HOOK_DEPTH)
+fn invoke_handler_at<'a>(
+    state: &'a AppState,
+    universe_id: &'a str,
+    object_id: &'a str,
+    room_id: Option<String>,
+    method: &'a str,
+    args: serde_json::Value,
+    origin: Origin,
+) -> BoxFuture<'a, Result<Option<String>, String>> {
+    let Origin {
+        payer,
+        hooks: budget,
+    } = origin;
+    Box::pin(async move {
+        let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
+            return Ok(None);
+        };
+        let ctx = ScriptContext {
+            universe_id: universe_id.to_string(),
+            user_id: owner_id,
+            room_id,
+            object_id: Some(object_id.to_string()),
+            payer,
+        };
+        let libs = load_universe_lib_codes(state, universe_id).await?;
+        let queue = MessageQueue::shared();
+
+        let result = {
+            let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
+            call_handler(&mut sandbox, &code, method, &args)
+        };
+
+        deliver_at(state, &queue, &ctx.universe_id, budget).await;
+        result
+    })
+}
+
+/// Longest timer-loop sleep with nothing due (a safety net: additions wake
+/// it sooner)
+const TIMER_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Fire due call_out timers and heartbeats forever. Deadline-driven: the
+/// loop sleeps until the earliest fire_at or heartbeat (or until one is
+/// added), not on a fixed poll.
 ///
 /// Each callback runs the named handler on the object's code (as the
 /// object's owner, see [`invoke_handler`]) with {object_id, room_id, args}.
 pub async fn run_timer_loop(state: AppState) {
-    let mut interval = tokio::time::interval(TIMER_TICK);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        interval.tick().await;
+        // Register for change notification before reading the deadline,
+        // so a timer added in between is not missed
+        let changed = state.timers.changed();
+        tokio::pin!(changed);
+        let now = chrono::Utc::now().timestamp_millis();
+        let wait = match state.timers.next_deadline().await {
+            Some(due) if due <= now => std::time::Duration::ZERO,
+            Some(due) => std::time::Duration::from_millis((due - now) as u64).min(TIMER_IDLE_WAIT),
+            None => TIMER_IDLE_WAIT,
+        };
+        if !wait.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = &mut changed => continue,
+            }
+        }
         for fired in state.timers.tick().await {
-            let room_id = match state.object_store.get(&fired.object_id).await {
+            let room_id = match state
+                .object_store
+                .get(&fired.universe_id, &fired.object_id)
+                .await
+            {
                 Ok(Some(obj)) => obj.parent_id,
                 Ok(None) => {
                     // Object is gone: stop its heartbeat too
-                    state.timers.remove_heartbeat(&fired.object_id).await;
+                    state
+                        .timers
+                        .remove_heartbeat(&fired.universe_id, &fired.object_id)
+                        .await;
                     continue;
                 }
                 Err(e) => {
@@ -163,24 +303,18 @@ pub async fn run_timer_loop(state: AppState) {
     }
 }
 
-/// An object's attached code and its owner, if it has code. Objects from
-/// another universe never run in this one.
+/// An object's attached code and its owner, if it has code (objects are
+/// looked up within the universe, so foreign objects never run here)
 async fn object_code(
     state: &AppState,
     object_id: &str,
     universe_id: &str,
 ) -> Result<Option<(String, Option<String>)>, String> {
-    let obj = match state.object_store.get(object_id).await {
+    let obj = match state.object_store.get(universe_id, object_id).await {
         Ok(Some(obj)) => obj,
         Ok(None) => return Ok(None),
         Err(e) => return Err(format!("Failed to load {}: {}", object_id, e)),
     };
-    if obj.universe_id != universe_id {
-        return Err(format!(
-            "{} belongs to universe {}, not {}",
-            object_id, obj.universe_id, universe_id
-        ));
-    }
     let Some(hash) = obj.code_hash else {
         return Ok(None);
     };
@@ -230,12 +364,14 @@ fn prepare(
         state.credits.clone(),
         state.venice.clone(),
         state.image_store.clone(),
+        state.effects.clone(),
         &ctx.universe_id,
     );
     // Contexts are captured when functions are registered, so set them first
     game_api.set_user_context(ctx.user_id.clone());
     game_api.set_room_context(ctx.room_id.clone());
     game_api.set_object_context(ctx.object_id.clone());
+    game_api.set_payer(ctx.payer.clone());
 
     let mut sandbox =
         Sandbox::new(config).map_err(|e| format!("Failed to create sandbox: {}", e))?;
@@ -251,50 +387,187 @@ fn prepare(
     Ok(sandbox)
 }
 
-/// Deliver queued script messages to connected players in `universe_id`.
-/// Player ids are the same in every universe, so sessions elsewhere are
-/// skipped.
+/// Deliver queued script messages to connected players in `universe_id`
+/// (sessions are keyed per universe, so nothing reaches other universes)
 pub async fn deliver(state: &AppState, queue: &MessageQueue, universe_id: &str) {
-    for msg in queue.drain() {
-        match msg {
-            GameMessage::Send { target_id, message } => {
-                if state
-                    .connections
-                    .get_universe_id(&target_id)
-                    .await
-                    .as_deref()
-                    == Some(universe_id)
-                {
+    deliver_at(state, queue, universe_id, HookBudget::new()).await
+}
+
+fn deliver_at<'a>(
+    state: &'a AppState,
+    queue: &'a MessageQueue,
+    universe_id: &'a str,
+    budget: HookBudget,
+) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        for msg in queue.drain() {
+            match msg {
+                GameMessage::Send { target_id, message } => {
                     state
                         .connections
-                        .send_to_player(&target_id, ServerMessage::Output { text: message })
+                        .send_to_player(
+                            universe_id,
+                            &target_id,
+                            ServerMessage::Output { text: message },
+                        )
                         .await;
                 }
-            }
-            GameMessage::Broadcast {
-                room_id,
-                message,
-                exclude_id,
-            } => {
-                // Only rooms of the script's own universe
-                let in_universe = matches!(
-                    state.object_store.get(&room_id).await,
-                    Ok(Some(room)) if room.universe_id == universe_id
-                );
-                if in_universe {
+                GameMessage::Confirm {
+                    target_id,
+                    id,
+                    text,
+                    amount,
+                } => {
+                    state
+                        .connections
+                        .send_to_player(
+                            universe_id,
+                            &target_id,
+                            ServerMessage::Confirm { id, text, amount },
+                        )
+                        .await;
+                }
+                GameMessage::Broadcast {
+                    room_id,
+                    message,
+                    exclude_id,
+                } => {
                     state
                         .connections
                         .broadcast_room_except(
+                            universe_id,
                             &room_id,
                             exclude_id.as_deref(),
                             ServerMessage::Output { text: message },
                         )
                         .await;
                 }
+                GameMessage::BroadcastRegion { region_id, message } => {
+                    broadcast_region(state, universe_id, &region_id, &message).await;
+                }
+                GameMessage::Moved {
+                    object_id,
+                    from,
+                    to,
+                    moved_by,
+                } => {
+                    handle_moved(state, universe_id, &object_id, from, to, moved_by, &budget).await;
+                }
             }
-            GameMessage::BroadcastRegion { region_id, message } => {
-                broadcast_region(state, universe_id, &region_id, &message).await;
+        }
+    })
+}
+
+/// A Lua move_object: move a connected player's session (and show them the
+/// new room), then run on_leave on the old container and on_enter on the
+/// new one, with moved_id naming what moved and moved_by the account the
+/// script acted as. actor_id is not set: no player chose to move, so hook
+/// code that trusts actor_id cannot be triggered on someone's behalf.
+async fn handle_moved(
+    state: &AppState,
+    universe_id: &str,
+    object_id: &str,
+    from: Option<String>,
+    to: Option<String>,
+    moved_by: Option<String>,
+    budget: &HookBudget,
+) {
+    if state
+        .connections
+        .account_id(universe_id, object_id)
+        .await
+        .is_some()
+    {
+        state
+            .connections
+            .update_room(universe_id, object_id, to.clone())
+            .await;
+        if let Some(ref room) = to {
+            // No account: a script's move must not start (and charge the
+            // moved player for) room image generation
+            if let Some(room_msg) =
+                super::websocket::build_room_message(state, universe_id, room, None).await
+            {
+                state
+                    .connections
+                    .send_to_player(universe_id, object_id, room_msg)
+                    .await;
             }
+        }
+    }
+
+    // A player moved into a safe room respawns there (as for a walk)
+    if let Some(ref room) = to {
+        if object_id.starts_with("/players/") {
+            if let Ok(Some(player)) = state.object_store.get(universe_id, object_id).await {
+                if let Ok(true) = state
+                    .player_manager
+                    .is_safe_zone(universe_id, room, &player)
+                    .await
+                {
+                    if let Err(e) = state
+                        .player_manager
+                        .update_safe_location(universe_id, object_id, room)
+                        .await
+                    {
+                        tracing::warn!("safe location for {} not saved: {}", object_id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    if budget.depth >= MAX_MOVE_HOOK_DEPTH {
+        tracing::warn!(
+            "move hooks for {} not run: nested {} deep",
+            object_id,
+            budget.depth
+        );
+        return;
+    }
+    let hooks = [
+        (from.clone(), "on_leave", serde_json::json!({ "to": to })),
+        (to.clone(), "on_enter", serde_json::json!({ "from": from })),
+    ];
+    for (container, method, mut args) in hooks {
+        let Some(container) = container else { continue };
+        // Only containers with code use up the budget (most have none)
+        if !matches!(
+            object_code(state, &container, universe_id).await,
+            Ok(Some(_))
+        ) {
+            continue;
+        }
+        if !budget.take() {
+            tracing::warn!(
+                "{} hook on {} not run: the run's move-hook budget is spent",
+                method,
+                container
+            );
+            return;
+        }
+        if let Some(map) = args.as_object_mut() {
+            map.insert("object_id".into(), container.clone().into());
+            map.insert("room_id".into(), container.clone().into());
+            map.insert("moved_id".into(), object_id.into());
+            map.insert("moved_by".into(), moved_by.clone().into());
+        }
+        if let Err(e) = invoke_handler_at(
+            state,
+            universe_id,
+            &container,
+            Some(container.clone()),
+            method,
+            args,
+            Origin {
+                // A move hook is passive: nobody chose to run it, nobody pays
+                payer: None,
+                hooks: budget.deeper(),
+            },
+        )
+        .await
+        {
+            tracing::warn!("{} hook on {} failed: {}", method, container, e);
         }
     }
 }
@@ -303,25 +576,17 @@ pub async fn deliver(state: &AppState, queue: &MessageQueue, universe_id: &str) 
 /// under the region's path, or the room's parent is the region object.
 async fn broadcast_region(state: &AppState, universe_id: &str, region_id: &str, message: &str) {
     let prefix = format!("{}/", region_id.trim_end_matches('/'));
-    for (player_id, room_id) in state.connections.player_rooms().await {
-        if state
-            .connections
-            .get_universe_id(&player_id)
-            .await
-            .as_deref()
-            != Some(universe_id)
-        {
-            continue;
-        }
+    for (player_id, room_id) in state.connections.player_rooms(universe_id).await {
         let in_region = room_id.starts_with(&prefix)
             || matches!(
-                state.object_store.get(&room_id).await,
+                state.object_store.get(universe_id, &room_id).await,
                 Ok(Some(room)) if room.parent_id.as_deref() == Some(region_id)
             );
         if in_region {
             state
                 .connections
                 .send_to_player(
+                    universe_id,
                     &player_id,
                     ServerMessage::Output {
                         text: message.to_string(),

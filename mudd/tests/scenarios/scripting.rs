@@ -87,7 +87,13 @@ pub async fn player(server: &TestServer, name: &str) -> TestClient {
 
 /// Direction of the exit from `from` that leads to `to`
 async fn direction(server: &TestServer, from: &str, to: &str) -> String {
-    let room = server.world().store().get(from).await.unwrap().unwrap();
+    let room = server
+        .world()
+        .store()
+        .get(server.universe_id(), from)
+        .await
+        .unwrap()
+        .unwrap();
     room.properties["exits"]
         .as_object()
         .unwrap()
@@ -323,7 +329,7 @@ async fn test_object_code_runs_as_owner_not_triggerer() {
     let server = TestServer::start().await.expect("server");
     let entrance = server.world().entrance_id.clone();
     let pl = player(&server, "trap_target").await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
     let mut wiz = wizard(&server, "trap_wiz").await;
     eval(
         &mut wiz,
@@ -374,7 +380,7 @@ async fn test_add_action_requires_access_and_nearby_object() {
     let entrance = server.world().entrance_id.clone();
     let pool_room = server.world().pool_id.clone();
     let pl = player(&server, "action_player").await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
     drop(pl);
     let mut wiz = wizard(&server, "action_wiz").await;
 
@@ -560,4 +566,119 @@ async fn test_db_query_limit_for_object_code() {
         "got: {}",
         reply
     );
+}
+
+/// Timer functions need an object context: outside object code (eval) they
+/// do nothing and say so
+#[tokio::test]
+async fn test_timer_functions_need_an_object() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "timer_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command("eval return tostring(game.set_heart_beat(1000)) .. ':' .. tostring(game.remove_call_out('no-such-timer'))")
+        .await
+        .unwrap();
+    let _ = wiz.expect("echo").await;
+    let out = wiz.expect("output").await.expect("eval output");
+    assert_eq!(out["text"], "false:false");
+}
+
+/// A heartbeat is stored, so it keeps beating after a restart
+#[tokio::test]
+async fn test_heartbeat_survives_restart() {
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "beat_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local h = game.store_code([[return {{
+                 wind = function(a) return tostring(game.set_heart_beat(300)) end,
+                 heart_beat = function(a) game.broadcast(a.room_id, "Tick-tock.") end,
+               }}]])
+               game.create_object("/items/metronome", "item", "{room}", {{name = "metronome", code_hash = h}})
+               return game.use_object("/items/metronome", "x", "wind")"#,
+            room = entrance
+        ),
+    )
+    .await;
+    server.restart().await.expect("restart");
+
+    let mut alice = player(&server, "beat_listener").await;
+    alice
+        .expect_output_containing("Tick-tock.")
+        .await
+        .expect("the heartbeat came back after the restart");
+}
+
+/// Custom verbs are stored in the database: they survive a restart (and a
+/// failover), and go with their object
+#[tokio::test]
+async fn test_custom_verbs_survive_restart() {
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "verb_keeper".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local h = game.store_code([[return {{ ring = function(a) return "Ding!" end }}]])
+           game.create_object("/items/gong", "item", "{}", {{name = "gong", fixed = true, code_hash = h}})
+           return tostring(game.add_action("ring", "/items/gong", "ring"))"#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("true")
+        .await
+        .expect("verb added");
+    drop(wiz);
+
+    server.restart().await.expect("restart");
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "gong_ringer".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    pl.command("ring gong").await.unwrap();
+    pl.expect_output_containing("Ding!")
+        .await
+        .expect("the verb survived the restart");
+
+    // Deleting the object takes its verb with it
+    let pool = server.pool().clone();
+    let rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM actions WHERE object_id = '/items/gong'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(rows().await, 1);
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "verb_keeper".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(r#"eval return tostring(game.delete_object("/items/gong"))"#)
+        .await
+        .unwrap();
+    wiz.expect_output_containing("true").await.expect("deleted");
+    assert_eq!(rows().await, 0);
+    pl.drain().await;
+    pl.command("ring gong").await.unwrap();
+    pl.expect_output_containing("Unknown command")
+        .await
+        .expect("the verb went with its object");
 }

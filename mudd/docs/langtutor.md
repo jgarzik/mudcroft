@@ -73,11 +73,10 @@ them:
 eval local t = {} for _, r in ipairs(game.get_children("/d/town", {class = "room"})) do t[#t+1] = r.id end return table.concat(t, ", ")
 ```
 
-Where logged-in players appear:
+Where players appear:
 
 - **New players** appear in the portal room.
 - **Returning players** reappear in the last *safe* room they stood in. A safe room is the portal room at that time, a room with `is_portal = true`, or the player's `workroom_id`. If that room no longer exists, they go to the portal.
-- **Guests** always appear in the portal room.
 
 The portal is set **only** by `setportal`. Universe config keys such as
 `spawn_room` are not read by the server.
@@ -180,10 +179,11 @@ done in Lua (Part B).
 
 ### Lesson 4: Custom classes
 
-A class supplies default properties. Classes are shared by every
-universe on the server. Only wizards+ can define them, built-in classes
-can't be redefined, and a custom class can be redefined only by the
-account that defined it (or an admin).
+A class supplies default properties. A class you define belongs to
+your universe (the built-in classes exist everywhere) and is stored, so it
+survives a restart. Only wizards+ can define them, built-in classes can't
+be redefined, and a custom class can be redefined only by the account that
+defined it (or an admin).
 
 ```lua
 game.define_class("potion", {
@@ -202,7 +202,7 @@ return p.metadata.heal_dice   -- "2d4+2", inherited from the class
 
 Things to know:
 
-- **Restarts.** Custom classes are currently kept **in memory only** and are lost when the server restarts. Objects keep the properties they were created with, so you only need to define the class again before creating more objects from it.
+- **Persistence.** Custom classes are stored in the database and survive restarts.
 - **Inheritance.** A new object gets the defaults of its class and every ancestor (`potion` → `item` → `thing`), and your props override them. Empty-string defaults and a class's `code_hash` default are not copied; attach code by passing `code_hash` in the props.
 - **Reading properties.** Custom properties appear under `obj.metadata`. `name` and `description` are also copied to `obj.name` and `obj.description`.
 - **Checking class.** `game.is_a(id, "item")` checks inheritance, and so do the `attack` and `take` commands. `game.get_living_in` and the `get_children` class filter match class names exactly, so a monster of a custom `npc` subclass is missing from `get_living_in`; use `all_inventory` with `game.is_a` to find it.
@@ -219,6 +219,7 @@ attach it by setting `code_hash`.
 local h = game.store_code([[
 return {
     on_enter = function(a)
+        if not a.actor_id then return end  -- an item was dropped or moved in
         if a.from == nil then return end   -- nil when the player just logged in
         game.send(a.actor_id, "The smell of fresh bread drifts over from the bakery.")
         game.broadcast(a.room_id, "Someone wanders into the square.", a.actor_id)
@@ -261,7 +262,9 @@ These handler names **never fire on their own**: `on_create`,
 `on_destroy`) can't be triggered with `game.use_object` either. Other
 limits:
 
-- `game.move_object` fires no hooks.
+- `game.move_object` runs the old and new rooms' `on_leave`/`on_enter`
+  (with `moved_id`) after your script ends, and moves a connected player's
+  view too.
 - Region objects get no hooks.
 - Hook return values are ignored.
 - By the time `on_death` runs, the NPC is already out of the room, so use `args.room_id`, not `game.environment(...)`.
@@ -301,7 +304,7 @@ How verbs behave:
 - **Built-in commands win.** You can't override `look`, `get`, `say` and the other built-ins.
 - **Choosing an object.** If several nearby objects register the same verb, the one whose name matches what the player typed is chosen.
 - **Replies.** Return `nil` to send no reply; that's useful when the handler already used `game.send`. If the handler raises an error, players see `Something went wrong.` and wizards see the real error.
-- **Restarts.** Actions are kept **in memory only** and are lost when the server restarts. Keep the `add_action` calls in a function you can run again (Part B's `crypt_verbs()`), or register them from a room's `on_enter` hook.
+- **Persistence.** Actions are stored in the database: they survive restarts (and, in a cluster, failovers), and are removed with their object or room.
 
 #### Calling another object's code
 
@@ -327,7 +330,7 @@ only work **inside that object's code**. In `eval`, `call_out` returns
 |---|---|
 | `game.call_out(delay_secs, method, args)` | Run `method` on this object once, after `delay_secs` (fractions allowed). `args` is an optional **string**. Returns a timer ID, or `""`. Up to 32 pending per object. Saved across restarts. |
 | `game.remove_call_out(timer_id)` | Cancel a pending call_out. |
-| `game.set_heart_beat(interval_ms)` | Run this object's `heart_beat` handler every `interval_ms` (at least 100). Memory only: stops on restart. |
+| `game.set_heart_beat(interval_ms)` | Run this object's `heart_beat` handler every `interval_ms` (at least 100). Survives restarts. |
 | `game.remove_heart_beat()` | Stop this object's heartbeat. |
 
 Timer callbacks run as the object's owner and receive
@@ -482,7 +485,7 @@ A library runs before *every* script in the universe, so it only
 **defines** things:
 
 - `build_crypt()` builds the area once.
-- `crypt_verbs()` registers the custom verbs. Run it after building and again after every server restart, because verbs aren't saved.
+- `crypt_verbs()` registers the custom verbs (once: they are saved).
 - `crypt_strike()` is a shared attack helper. Object code can call it because libraries are loaded into object code too.
 
 To play it, connect as a wizard and run:
@@ -497,11 +500,9 @@ Everything is created and owned by the wizard who runs `build_crypt()`,
 so all the crypt's code runs with that wizard's rights. That's needed
 here, because the code updates the HP of player objects.
 
-Player objects are shared by every universe (they are created in the
-first one the player joins), so the crypt can hurt, heal and hand items to
-any visiting player; Lua's universe confinement exempts player objects
-(see the [roadmap](../../docs/roadmap.md#known-issues) for the open issues
-around global player objects).
+Each player has a separate player object in every universe they visit,
+created on their first visit, so the crypt hurts, heals and hands items to
+the visitor's player object in this universe only.
 
 `build_crypt()` is meant for a fresh universe. To rebuild, delete the
 `/d/crypt/...` objects first, contents before containers.
@@ -596,7 +597,7 @@ return {
 Code.trap = [=[
 return {
     on_enter = function(a)
-        if a.from == nil then return end
+        if not a.actor_id or a.from == nil then return end
         if game.roll_dice("1d100") > 50 then return end
         game.send(a.actor_id, "Click. You feel a pressure plate sink under your foot!")
         game.call_out(1, "spring", a.actor_id)
@@ -618,6 +619,7 @@ return {
 Code.lair = [=[
 return {
     on_enter = function(a)
+        if not a.actor_id then return end   -- only living arrivals
         for _, npc in ipairs(game.get_living_in(a.object_id)) do
             if npc.class == "npc" and npc.code_hash then
                 game.use_object(npc.id, a.actor_id, "wake")
@@ -843,10 +845,8 @@ The actual numbers depend on the dice.
 | `only the owner or a superior may attach code` | You tried to set `code_hash` on an object owned by someone of your level or higher. |
 | `database query limit exceeded (101 > 100)` | Object code may make 100 `game.*` database calls per run. Loop less, or cache results in locals. |
 | Verbs answer `Unknown command` after a restart | Actions are memory-only. Run your registration function again (`crypt_verbs()`). |
-| A heartbeat stopped after a restart | Heartbeats are memory-only. Restart them from a hook, as the lair rooms do. |
 | `attack` says "You can't attack ..." | The target's class is neither `npc` (or a class derived from it) nor `monster`. |
 | `game.environment(id)` is `nil` in `on_death` | The dead NPC was already removed from the room. Use `args.room_id`. |
-| A player is moved with `game.move_object` but still sees the old room | Lua moves change only the database, not a connected player's session. Don't teleport players from Lua. |
 
 Limits per run:
 
@@ -870,8 +870,6 @@ Don't build on them yet:
 - **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
 - **NPC behaviour:** `aggro` and `respawn_time` do nothing, and NPCs don't fight back in the built-in combat. Script it as in Part B.
 - **Commands and combat:** there are no `use`, `give` or `flee` player commands (add verbs instead), no PvP, and no Lua access to the combat engine's damage types and effects.
-- **Movement from Lua:** `game.move_object` fires no hooks and can't teleport connected players.
-- **Persistence:** custom verbs, heartbeats and classes defined with `define_class` don't survive a restart.
 - **Universe config:** keys like `pvp_mode` or `spawn_room` have no effect. Use `setportal` for the spawn room.
 
 ---

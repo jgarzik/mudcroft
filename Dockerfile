@@ -28,7 +28,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
 COPY mudd/Cargo.toml mudd/Cargo.lock ./
 COPY mudd/src ./src
-RUN cargo build --release --bin mudd --bin mudd_init
+RUN cargo build --release --bin mudd --bin mudd_init --bin mudd_admin
 
 # =============================================================================
 # Stage 3: Node frontend build
@@ -54,56 +54,41 @@ LABEL org.opencontainers.image.source="https://github.com/jgarzik/mudcroft"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.description="Mudcroft multi-user dungeon server"
 
-# Install runtime dependencies
+# mudd serves the client, the API and the WebSocket itself (gzip and
+# security headers included): no proxy or process supervisor needed.
+# curl is for the health check; setpriv (util-linux) drops root.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    nginx \
-    supervisor \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 -s /bin/bash appuser
+# Unprivileged user that runs mudd_init and mudd
+RUN useradd -m -u 1000 -s /usr/sbin/nologin appuser \
+    && mkdir -p /app/lib /app/scripts /app/static /data \
+    && chown appuser:appuser /data
 
-# Create directories
-RUN mkdir -p /app/lib /data /var/www/html /var/log/supervisor \
-    && chown -R appuser:appuser /app /data /var/www/html /var/log/supervisor
-
-# Copy Rust binaries
 COPY --from=rust-builder /mudd/target/release/mudd /app/mudd
 COPY --from=rust-builder /mudd/target/release/mudd_init /app/mudd_init
-RUN chmod +x /app/mudd /app/mudd_init
-
-# Copy Lua library files
-COPY --chown=appuser:appuser mudd/lib/*.lua /app/lib/
-
-# Copy frontend static files
-COPY --from=node-builder --chown=appuser:appuser /client/dist /var/www/html
-
-# Copy nginx configuration
-COPY docker/nginx.conf /etc/nginx/sites-available/default
-
-# Copy supervisord configuration
-COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-# Copy entrypoint script
+COPY --from=rust-builder /mudd/target/release/mudd_admin /app/mudd_admin
+COPY mudd/lib/*.lua /app/lib/
+# Scripts for POST /universe/{id}/run_script (read relative to /app)
+COPY scripts/*.lua /app/scripts/
+COPY --from=node-builder /client/dist /app/static
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Environment variables with defaults
+WORKDIR /app
+
 ENV MUDD_DATABASE_PATH=/data/mudcroft.db \
-    MUDD_BIND_ADDR=127.0.0.1:8080 \
+    MUDD_BIND_ADDR=0.0.0.0:8080 \
     MUDD_LIB_DIR=/app/lib \
     RUST_LOG=mudd=info
 
-# Expose nginx port (mudd runs on localhost only)
-EXPOSE 80
+EXPOSE 8080
 
-# Volume for persistent database
 VOLUME ["/data"]
 
-# Health check - verifies both nginx and mudd backend are running
-HEALTHCHECK --interval=30s --timeout=3s --retries=3 --start-period=10s \
-    CMD curl -f http://localhost/health || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 --start-period=15s \
+    CMD curl -fsS http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

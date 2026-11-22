@@ -1,290 +1,235 @@
-//! Combined Raft storage implementation using v1 RaftStorage trait
+//! Raft storage on SQLite (openraft v2 storage traits)
 //!
-//! OpenRaft 0.9 uses sealed v2 traits (RaftLogStorage, RaftStateMachine).
-//! The proper approach is to implement v1 RaftStorage and wrap with Adaptor.
-
-#![allow(clippy::type_complexity)]
-#![allow(clippy::result_large_err)]
+//! - [`LogStore`]: the log (`raft_log`), the vote (`raft_vote`) and the last
+//!   purged log id (`raft_meta` `last_purged`).
+//! - [`StateMachine`]: applies committed SQL requests to the game tables and
+//!   records its position (`raft_meta` `last_applied`, `last_membership`) in
+//!   the same transaction, so every entry is applied exactly once even across
+//!   a crash.
+//!
+//! Both share one pool. A snapshot is a consistent copy of the game tables
+//! only (`VACUUM INTO`, Raft tables dropped), installed by replacing the
+//! game tables' rows in one transaction, so no connection is closed.
 
 use std::io;
 use std::io::Cursor;
+use std::ops::{Bound, RangeBounds};
+use std::sync::Arc;
 
-use openraft::storage::{RaftSnapshotBuilder, RaftStorage, Snapshot};
-use openraft::{
-    BasicNode, Entry, EntryPayload, LogId, LogState, OptionalSend, RaftLogReader, SnapshotMeta,
-    StorageError, StorageIOError, StoredMembership, Vote,
-};
-use sqlx::sqlite::SqlitePool;
+use futures_util::{Stream, TryStreamExt};
+use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
+use openraft::impls::leader_id_adv::LeaderId;
+use openraft::storage::{EntryResponder, IOFlushed, RaftLogStorage, RaftStateMachine};
+use openraft::{EntryPayload, LogState, OptionalSend, RaftLogReader, RaftSnapshotBuilder};
+use serde::{Deserialize, Serialize};
+use sqlx::sqlite::{SqliteConnection, SqlitePool};
 use tokio::sync::RwLock;
 use tracing::{debug, error};
 
-use super::state_machine::SnapshotData;
-use super::types::{NodeId, Request, Response, TypeConfig};
+use super::types::{Request, Response, TypeConfig};
 
-/// Combined Raft storage implementing v1 RaftStorage trait
-pub struct CombinedStorage {
-    pool: RwLock<SqlitePool>,
-    db_path: Option<String>,
-    vote: RwLock<Option<Vote<NodeId>>>,
-    last_purged: RwLock<Option<LogId<NodeId>>>,
-    last_applied: RwLock<Option<LogId<NodeId>>>,
-    membership: RwLock<StoredMembership<NodeId, BasicNode>>,
-    current_snapshot: RwLock<Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)>>,
+type LogId = LogIdOf<TypeConfig>;
+type Vote = VoteOf<TypeConfig>;
+type Entry = EntryOf<TypeConfig>;
+type StoredMembership = StoredMembershipOf<TypeConfig>;
+type SnapshotMeta = SnapshotMetaOf<TypeConfig>;
+type Snapshot = SnapshotOf<TypeConfig, Cursor<Vec<u8>>>;
+
+/// The database pool, shared by the log store and the state machine
+pub type SharedPool = Arc<RwLock<SqlitePool>>;
+
+/// A log id from its stored parts: (term, leader node, index)
+fn log_id(term: i64, leader_node: i64, index: i64) -> LogId {
+    LogId::new(
+        LeaderId {
+            term: term as u64,
+            node_id: leader_node as u64,
+        },
+        index as u64,
+    )
 }
 
-impl CombinedStorage {
-    /// Create a new CombinedStorage
-    /// Requires raft tables (raft_log, raft_vote, raft_meta) to already exist.
-    /// Tables are created by mudd_init via Database migrations.
-    pub async fn new(pool: SqlitePool) -> Result<Self, StorageError<NodeId>> {
-        let storage = Self {
-            pool: RwLock::new(pool),
-            db_path: None,
-            vote: RwLock::new(None),
-            last_purged: RwLock::new(None),
-            last_applied: RwLock::new(None),
-            membership: RwLock::new(StoredMembership::default()),
-            current_snapshot: RwLock::new(None),
-        };
-        storage.ensure_schema().await?;
-        storage.load_state().await?;
-        Ok(storage)
+/// This node's id, recorded when it was created or joined a cluster
+/// (`raft_meta` belongs to this node and never travels in a snapshot)
+pub async fn read_node_id(pool: &SqlitePool) -> io::Result<Option<super::types::NodeId>> {
+    match read_meta(pool, "node_id").await? {
+        Some(json) => serde_json::from_str(&json).map_err(io::Error::other),
+        None => Ok(None),
     }
+}
 
-    /// Create a new CombinedStorage with database path for snapshots
-    pub async fn with_db_path(
-        pool: SqlitePool,
-        db_path: String,
-    ) -> Result<Self, StorageError<NodeId>> {
-        let storage = Self {
-            pool: RwLock::new(pool),
-            db_path: Some(db_path),
-            vote: RwLock::new(None),
-            last_purged: RwLock::new(None),
-            last_applied: RwLock::new(None),
-            membership: RwLock::new(StoredMembership::default()),
-            current_snapshot: RwLock::new(None),
-        };
-        storage.ensure_schema().await?;
-        storage.load_state().await?;
-        Ok(storage)
-    }
-
-    /// Get a reference to the pool (read lock)
-    pub async fn pool(&self) -> tokio::sync::RwLockReadGuard<'_, SqlitePool> {
-        self.pool.read().await
-    }
-
-    /// Add columns newer than the database (raft_log.leader_node records
-    /// which node led each entry's term; without it log ids cannot be
-    /// reconstructed exactly after a restart)
-    async fn ensure_schema(&self) -> Result<(), StorageError<NodeId>> {
-        let pool = self.pool.read().await;
-        let has_leader_node: Option<(String,)> = sqlx::query_as(
-            "SELECT name FROM pragma_table_info('raft_log') WHERE name = 'leader_node'",
-        )
-        .fetch_optional(&*pool)
+/// Whether this node has any Raft state yet (a vote, log entries, or an
+/// applied position): a node that was given an id but crashed before any
+/// of these must join again rather than start a cluster of its own
+pub async fn has_raft_state(pool: &SqlitePool) -> io::Result<bool> {
+    let vote: Option<i64> = sqlx::query_scalar("SELECT 1 FROM raft_vote LIMIT 1")
+        .fetch_optional(pool)
         .await
-        .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
-        if has_leader_node.is_none() {
-            sqlx::query("ALTER TABLE raft_log ADD COLUMN leader_node INTEGER NOT NULL DEFAULT 0")
-                .execute(&*pool)
-                .await
-                .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-            // Existing entries came from the only leader such a database has
-            // had (they could not survive a restart before this column): the
-            // node in the persisted vote
-            sqlx::query(
-                "UPDATE raft_log SET leader_node =
-                 COALESCE((SELECT node_id FROM raft_vote WHERE id = 1), 0)",
-            )
-            .execute(&*pool)
-            .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-        }
-        Ok(())
+        .map_err(io::Error::other)?;
+    let log: Option<i64> = sqlx::query_scalar("SELECT 1 FROM raft_log LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(io::Error::other)?;
+    Ok(vote.is_some() || log.is_some() || read_meta(pool, "last_applied").await?.is_some())
+}
+
+/// Record this node's id
+pub async fn write_node_id(pool: &SqlitePool, node_id: super::types::NodeId) -> io::Result<()> {
+    let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+    write_meta(&mut conn, "node_id", &node_id).await
+}
+
+/// One durable commit per write (as in the sister project roodb): the Raft
+/// log append syncs (the connection's default `synchronous = FULL`), and
+/// applying it does not (`NORMAL`: in WAL mode a commit is then not synced
+/// until a later sync or checkpoint). Nothing is lost: an apply that a crash
+/// rolls back takes its `last_applied` with it (same transaction), so the
+/// entry is applied again from the log, exactly once. The log is purged only
+/// up to a snapshot, and building one first forces a sync (`durable_fence`).
+async fn relaxed_sync(conn: &mut SqliteConnection) -> io::Result<()> {
+    sqlx::query("PRAGMA synchronous = NORMAL")
+        .execute(&mut *conn)
+        .await
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
+/// A pooled connection set to `synchronous = NORMAL`. It goes back to the
+/// pool only through `restore` (back to FULL); dropped any other way (an
+/// error, or the future cancelled) it is detached and closed, so no log
+/// append can ever run on it unsynced.
+struct RelaxedConn {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+}
+
+impl RelaxedConn {
+    async fn acquire(pool: &SqlitePool) -> io::Result<Self> {
+        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+        relaxed_sync(&mut conn).await?;
+        Ok(Self { conn: Some(conn) })
     }
 
-    async fn load_state(&self) -> Result<(), StorageError<NodeId>> {
-        let pool = self.pool.read().await;
+    fn conn(&mut self) -> &mut SqliteConnection {
+        self.conn
+            .as_mut()
+            .expect("connection present until restore")
+    }
 
-        if let Some((term, node_id, committed)) = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
-            "SELECT term, node_id, committed FROM raft_vote WHERE id = 1",
-        )
-        .fetch_optional(&*pool)
-        .await
-        .map_err(|e| StorageIOError::read_vote(&io::Error::other(e)))?
-        {
-            *self.vote.write().await = Some(Vote {
-                leader_id: openraft::LeaderId {
-                    term: term as u64,
-                    node_id: node_id.unwrap_or(0) as u64,
-                },
-                committed: committed != 0,
-            });
-        }
-
-        if let Some((value,)) =
-            sqlx::query_as::<_, (String,)>("SELECT value FROM raft_meta WHERE key = 'last_purged'")
-                .fetch_optional(&*pool)
-                .await
-                .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
-        {
-            if let Ok(log_id) = serde_json::from_str(&value) {
-                *self.last_purged.write().await = Some(log_id);
+    /// Back to FULL, then back to the pool
+    async fn restore(mut self) -> io::Result<()> {
+        let mut conn = self.conn.take().expect("connection present until restore");
+        match full_sync(&mut conn).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                conn.detach();
+                Err(e)
             }
         }
+    }
+}
 
-        if let Some((value,)) =
-            sqlx::query_as::<_, (String,)>("SELECT value FROM raft_meta WHERE key = 'last_applied'")
-                .fetch_optional(&*pool)
-                .await
-                .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
-        {
-            if let Ok(log_id) = serde_json::from_str(&value) {
-                *self.last_applied.write().await = Some(log_id);
-            }
+impl Drop for RelaxedConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            conn.detach();
         }
+    }
+}
 
-        // Cluster membership as of the last applied membership entry. Without
-        // it a restarted node has no voters and can never elect a leader.
-        if let Some((value,)) = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM raft_meta WHERE key = 'last_membership'",
-        )
-        .fetch_optional(&*pool)
+/// Back to the pool's default before the connection is returned
+async fn full_sync(conn: &mut SqliteConnection) -> io::Result<()> {
+    sqlx::query("PRAGMA synchronous = FULL")
+        .execute(&mut *conn)
         .await
-        .map_err(|e| StorageIOError::read(&io::Error::other(e)))?
-        {
-            if let Ok(membership) = serde_json::from_str(&value) {
-                *self.membership.write().await = membership;
-            }
-        }
+        .map_err(io::Error::other)?;
+    Ok(())
+}
 
-        Ok(())
+async fn read_meta(pool: &SqlitePool, key: &str) -> io::Result<Option<String>> {
+    sqlx::query_scalar("SELECT value FROM raft_meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .map_err(io::Error::other)
+}
+
+async fn write_meta(
+    conn: &mut SqliteConnection,
+    key: &str,
+    value: &impl Serialize,
+) -> io::Result<()> {
+    let json = serde_json::to_string(value).map_err(io::Error::other)?;
+    sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES (?, ?)")
+        .bind(key)
+        .bind(json)
+        .execute(conn)
+        .await
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Log store
+// ---------------------------------------------------------------------------
+
+/// The Raft log, vote and purge point
+#[derive(Clone)]
+pub struct LogStore {
+    pool: SharedPool,
+}
+
+impl LogStore {
+    /// A log store over the raft tables (created by mudd_init)
+    pub fn new(pool: SharedPool) -> Self {
+        Self { pool }
     }
 
     fn row_to_entry(
-        log_index: i64,
+        index: i64,
         term: i64,
         leader_node: i64,
         entry_type: &str,
         payload: Option<&str>,
-    ) -> Result<Entry<TypeConfig>, StorageError<NodeId>> {
-        let log_id = LogId {
-            leader_id: openraft::LeaderId {
-                term: term as u64,
-                node_id: leader_node as u64,
-            },
-            index: log_index as u64,
-        };
-
-        let entry_payload = match entry_type {
+    ) -> io::Result<Entry> {
+        let payload = match entry_type {
             "blank" => EntryPayload::Blank,
-            "normal" => {
-                let request: Request = serde_json::from_str(payload.unwrap_or("{}"))
-                    .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
-                EntryPayload::Normal(request)
-            }
-            "membership" => {
-                let membership = serde_json::from_str(payload.unwrap_or("{}"))
-                    .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
-                EntryPayload::Membership(membership)
-            }
+            "normal" => EntryPayload::Normal(
+                serde_json::from_str(payload.unwrap_or("{}")).map_err(io::Error::other)?,
+            ),
+            "membership" => EntryPayload::Membership(
+                serde_json::from_str(payload.unwrap_or("{}")).map_err(io::Error::other)?,
+            ),
             other => {
-                return Err(StorageIOError::read_logs(&io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unknown entry type: {}", other),
                 ))
-                .into())
             }
         };
-
         Ok(Entry {
-            log_id,
-            payload: entry_payload,
+            log_id: log_id(term, leader_node, index),
+            payload,
         })
-    }
-
-    async fn execute_sql(&self, request: &Request) -> Response {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-
-        debug!("Executing SQL: {}", request.sql);
-
-        let pool = self.pool.read().await;
-
-        let mut query = sqlx::query(&request.sql);
-        for param in &request.params {
-            query = match param {
-                serde_json::Value::Null => query.bind(Option::<String>::None),
-                serde_json::Value::Bool(b) => query.bind(*b),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        query.bind(i)
-                    } else if let Some(f) = n.as_f64() {
-                        query.bind(f)
-                    } else {
-                        query.bind(n.to_string())
-                    }
-                }
-                serde_json::Value::String(s) => {
-                    // Handle "blob:" prefix for binary data
-                    if let Some(b64_data) = s.strip_prefix("blob:") {
-                        match BASE64.decode(b64_data) {
-                            Ok(bytes) => query.bind(bytes),
-                            Err(e) => {
-                                error!("Failed to decode base64 blob: {}", e);
-                                query.bind(s.clone())
-                            }
-                        }
-                    } else {
-                        query.bind(s.clone())
-                    }
-                }
-                _ => query.bind(param.to_string()),
-            };
-        }
-
-        match query.execute(&*pool).await {
-            Ok(result) => {
-                // Checkpoint WAL to ensure read visibility across all connections
-                // This is needed because reads may use different connections than writes
-                if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-                    .execute(&*pool)
-                    .await
-                {
-                    debug!("WAL checkpoint failed (non-fatal): {}", e);
-                }
-                Response::ok(result.rows_affected())
-            }
-            Err(e) => {
-                error!("SQL execution failed: {}", e);
-                Response::error(e.to_string())
-            }
-        }
     }
 }
 
-// Implement RaftLogReader (not sealed)
-impl RaftLogReader<TypeConfig> for CombinedStorage {
-    async fn try_get_log_entries<
-        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
-    >(
+impl RaftLogReader<TypeConfig> for LogStore {
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
+    ) -> io::Result<Vec<Entry>> {
         let start = match range.start_bound() {
-            std::ops::Bound::Included(&n) => n as i64,
-            std::ops::Bound::Excluded(&n) => (n + 1) as i64,
-            std::ops::Bound::Unbounded => 0,
+            Bound::Included(&n) => n as i64,
+            Bound::Excluded(&n) => (n + 1) as i64,
+            Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            std::ops::Bound::Included(&n) => (n + 1) as i64,
-            std::ops::Bound::Excluded(&n) => n as i64,
-            std::ops::Bound::Unbounded => i64::MAX,
+            Bound::Included(&n) => (n + 1) as i64,
+            Bound::Excluded(&n) => n as i64,
+            Bound::Unbounded => i64::MAX,
         };
 
         let pool = self.pool.read().await;
-
         let rows: Vec<(i64, i64, i64, String, Option<String>)> = sqlx::query_as(
             "SELECT log_index, term, leader_node, entry_type, payload FROM raft_log
              WHERE log_index >= ? AND log_index < ? ORDER BY log_index",
@@ -293,96 +238,51 @@ impl RaftLogReader<TypeConfig> for CombinedStorage {
         .bind(end)
         .fetch_all(&*pool)
         .await
-        .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
+        .map_err(io::Error::other)?;
 
         rows.into_iter()
-            .map(|(idx, term, leader, etype, payload)| {
-                Self::row_to_entry(idx, term, leader, &etype, payload.as_deref())
+            .map(|(index, term, leader, etype, payload)| {
+                Self::row_to_entry(index, term, leader, &etype, payload.as_deref())
             })
             .collect()
     }
-}
 
-// Implement RaftSnapshotBuilder (not sealed)
-impl RaftSnapshotBuilder<TypeConfig> for CombinedStorage {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let last_applied = *self.last_applied.read().await;
-        let membership = self.membership.read().await.clone();
-
-        // Read the database file if path is set
-        let db_snapshot = if let Some(ref db_path) = self.db_path {
-            // Checkpoint WAL to ensure all data is in the main DB file
-            let pool = self.pool.read().await;
-            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .execute(&*pool)
+    async fn read_vote(&mut self) -> io::Result<Option<Vote>> {
+        let pool = self.pool.read().await;
+        let row: Option<(i64, Option<i64>, i64)> =
+            sqlx::query_as("SELECT term, node_id, committed FROM raft_vote WHERE id = 1")
+                .fetch_optional(&*pool)
                 .await
-                .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
-            drop(pool);
-
-            // Read the database file
-            tokio::fs::read(db_path)
-                .await
-                .map_err(|e| StorageIOError::read_snapshot(None, &e))?
-        } else {
-            vec![]
-        };
-
-        let data = SnapshotData {
-            last_applied_log: last_applied,
-            last_membership: membership.clone(),
-            db_snapshot,
-        };
-
-        let bytes = serde_json::to_vec(&data)
-            .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
-
-        let snapshot_id = last_applied
-            .map(|id| format!("{}-{}", id.leader_id.term, id.index))
-            .unwrap_or_else(|| "0-0".to_string());
-
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
-            snapshot_id,
-        };
-
-        // Store snapshot
-        *self.current_snapshot.write().await = Some((meta.clone(), bytes.clone()));
-
-        debug!("Built snapshot at {:?}", last_applied);
-
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(bytes)),
-        })
+                .map_err(io::Error::other)?;
+        Ok(row.map(|(term, node_id, committed)| Vote {
+            leader_id: LeaderId {
+                term: term as u64,
+                node_id: node_id.unwrap_or(0) as u64,
+            },
+            committed: committed != 0,
+        }))
     }
 }
 
-// Implement RaftStorage (v1 combined trait)
-impl RaftStorage<TypeConfig> for CombinedStorage {
+impl RaftLogStorage<TypeConfig> for LogStore {
     type LogReader = Self;
-    type SnapshotBuilder = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let last_purged = *self.last_purged.read().await;
+    async fn get_log_state(&mut self) -> io::Result<LogState<TypeConfig>> {
         let pool = self.pool.read().await;
-
+        let last_purged: Option<LogId> = match read_meta(&pool, "last_purged").await? {
+            Some(json) => serde_json::from_str(&json).map_err(io::Error::other)?,
+            None => None,
+        };
         let last_log: Option<(i64, i64, i64)> = sqlx::query_as(
             "SELECT log_index, term, leader_node FROM raft_log ORDER BY log_index DESC LIMIT 1",
         )
         .fetch_optional(&*pool)
         .await
-        .map_err(|e| StorageIOError::read_logs(&io::Error::other(e)))?;
+        .map_err(io::Error::other)?;
 
         // An empty log after purging still has a last log id: the purged one
         let last_log_id = last_log
-            .map(|(index, term, leader)| LogId {
-                leader_id: openraft::LeaderId {
-                    term: term as u64,
-                    node_id: leader as u64,
-                },
-                index: index as u64,
-            })
+            .map(|(index, term, leader)| log_id(term, leader, index))
             .or(last_purged);
 
         Ok(LogState {
@@ -391,70 +291,65 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
         })
     }
 
-    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
+    }
+
+    /// Recorded without forcing a sync: openraft only needs a lower bound
+    /// (the next log append's sync carries it)
+    async fn save_committed(&mut self, committed: Option<LogId>) -> io::Result<()> {
+        let pool = self.pool.read().await;
+        let mut conn = RelaxedConn::acquire(&pool).await?;
+        write_meta(conn.conn(), "committed", &committed).await?;
+        conn.restore().await
+    }
+
+    async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
+        let pool = self.pool.read().await;
+        match read_meta(&pool, "committed").await? {
+            Some(json) => serde_json::from_str(&json).map_err(io::Error::other),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
         let pool = self.pool.read().await;
         sqlx::query(
             "INSERT OR REPLACE INTO raft_vote (id, term, node_id, committed) VALUES (1, ?, ?, ?)",
         )
         .bind(vote.leader_id.term as i64)
         .bind(vote.leader_id.node_id as i64)
-        .bind(if vote.committed { 1i64 } else { 0i64 })
+        .bind(vote.committed as i64)
         .execute(&*pool)
         .await
-        .map_err(|e| StorageIOError::write_vote(&io::Error::other(e)))?;
-
-        *self.vote.write().await = Some(*vote);
+        .map_err(io::Error::other)?;
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(*self.vote.read().await)
-    }
-
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        CombinedStorage {
-            pool: RwLock::new(self.pool.read().await.clone()),
-            db_path: self.db_path.clone(),
-            vote: RwLock::new(*self.vote.read().await),
-            last_purged: RwLock::new(*self.last_purged.read().await),
-            last_applied: RwLock::new(*self.last_applied.read().await),
-            membership: RwLock::new(self.membership.read().await.clone()),
-            current_snapshot: RwLock::new(self.current_snapshot.read().await.clone()),
-        }
-    }
-
-    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NodeId>>
+    async fn append<I>(&mut self, entries: I, callback: IOFlushed<TypeConfig>) -> io::Result<()>
     where
-        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+        I: IntoIterator<Item = Entry> + OptionalSend,
+        I::IntoIter: OptionalSend,
     {
-        let entries: Vec<_> = entries.into_iter().collect();
-        if entries.is_empty() {
-            return Ok(());
-        }
-
+        // openraft hands over every entry it has ready at once (concurrent
+        // client writes batched together): one transaction for all of them
         let pool = self.pool.read().await;
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-
-        for entry in &entries {
+        let mut tx = pool.begin().await.map_err(io::Error::other)?;
+        for entry in entries {
             let (entry_type, payload) = match &entry.payload {
                 EntryPayload::Blank => ("blank", None),
-                EntryPayload::Normal(req) => {
-                    let json = serde_json::to_string(req)
-                        .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-                    ("normal", Some(json))
-                }
-                EntryPayload::Membership(m) => {
-                    let json = serde_json::to_string(m)
-                        .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-                    ("membership", Some(json))
-                }
+                EntryPayload::Normal(req) => (
+                    "normal",
+                    Some(serde_json::to_string(req).map_err(io::Error::other)?),
+                ),
+                EntryPayload::Membership(m) => (
+                    "membership",
+                    Some(serde_json::to_string(m).map_err(io::Error::other)?),
+                ),
             };
-
             sqlx::query(
-                "INSERT OR REPLACE INTO raft_log (log_index, term, leader_node, entry_type, payload) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO raft_log (log_index, term, leader_node, entry_type, payload)
+                 VALUES (?, ?, ?, ?, ?)",
             )
             .bind(entry.log_id.index as i64)
             .bind(entry.log_id.leader_id.term as i64)
@@ -463,220 +358,526 @@ impl RaftStorage<TypeConfig> for CombinedStorage {
             .bind(payload)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
+            .map_err(io::Error::other)?;
         }
-
-        tx.commit()
-            .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-
+        tx.commit().await.map_err(io::Error::other)?;
+        callback.io_completed(Ok(()));
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn truncate_after(&mut self, last_log_id: Option<LogId>) -> io::Result<()> {
+        let keep_through = last_log_id.map(|id| id.index as i64).unwrap_or(-1);
         let pool = self.pool.read().await;
-        sqlx::query("DELETE FROM raft_log WHERE log_index >= ?")
-            .bind(log_id.index as i64)
+        sqlx::query("DELETE FROM raft_log WHERE log_index > ?")
+            .bind(keep_through)
             .execute(&*pool)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
-    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+    async fn purge(&mut self, log_id: LogId) -> io::Result<()> {
         let pool = self.pool.read().await;
+        let mut tx = pool.begin().await.map_err(io::Error::other)?;
         sqlx::query("DELETE FROM raft_log WHERE log_index <= ?")
             .bind(log_id.index as i64)
-            .execute(&*pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-
-        let json = serde_json::to_string(&log_id)
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-        sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_purged', ?)")
-            .bind(&json)
-            .execute(&*pool)
-            .await
-            .map_err(|e| StorageIOError::write_logs(&io::Error::other(e)))?;
-
-        *self.last_purged.write().await = Some(log_id);
+            .map_err(io::Error::other)?;
+        write_meta(&mut tx, "last_purged", &Some(log_id)).await?;
+        tx.commit().await.map_err(io::Error::other)?;
         Ok(())
     }
+}
 
-    async fn last_applied_state(
-        &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
-    {
-        Ok((
-            *self.last_applied.read().await,
-            self.membership.read().await.clone(),
-        ))
+// ---------------------------------------------------------------------------
+// State machine
+// ---------------------------------------------------------------------------
+
+/// What a snapshot carries
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotPayload {
+    last_applied_log: Option<LogId>,
+    last_membership: StoredMembership,
+    /// Schema version of the game tables (only the same version installs)
+    schema_version: i64,
+    /// A SQLite database file holding the game tables (no Raft tables) as
+    /// of `last_applied_log`
+    db_snapshot: Vec<u8>,
+}
+
+/// Tables that belong to this node's Raft log store, never to a snapshot
+const RAFT_TABLES: [&str; 3] = ["raft_log", "raft_vote", "raft_meta"];
+
+/// A private scratch directory for snapshot files (random name, mode 0700,
+/// removed with everything in it when dropped), next to the database when
+/// its path is known. Nobody else can create or swap files in it, so the
+/// fixed file name inside is safe.
+struct SnapshotScratch(tempfile::TempDir);
+
+impl SnapshotScratch {
+    fn new(db_path: Option<&str>) -> io::Result<Self> {
+        let builder = {
+            let mut b = tempfile::Builder::new();
+            b.prefix(".mudd-snapshot-");
+            // Owner only, whatever the umask
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                b.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            b
+        };
+        let dir = db_path
+            .and_then(|p| std::path::Path::new(p).parent())
+            .filter(|d| !d.as_os_str().is_empty());
+        Ok(Self(match dir {
+            Some(dir) => builder.tempdir_in(dir)?,
+            None => builder.tempdir()?,
+        }))
     }
 
-    async fn apply_to_state_machine(
-        &mut self,
-        entries: &[Entry<TypeConfig>],
-    ) -> Result<Vec<Response>, StorageError<NodeId>> {
-        let mut results = Vec::new();
+    /// The snapshot file's path (not created yet)
+    fn file(&self) -> std::path::PathBuf {
+        self.0.path().join("snapshot.db")
+    }
+}
 
-        for entry in entries {
-            *self.last_applied.write().await = Some(entry.log_id);
+/// A file URI as a SQLite string literal (ATTACH and VACUUM INTO take no
+/// bound file name), with an explicit `mode`: a database opened by URI (the
+/// in-memory test pool: `mode=memory`) would otherwise pass its own on. An
+/// attached file may not ask for more than the main database was opened
+/// with (mudd opens it without create), so reading uses `ro`.
+fn sql_literal(path: &std::path::Path, mode: &str) -> String {
+    let uri = format!(
+        "file:{}?mode={}",
+        path.to_string_lossy()
+            .replace('%', "%25")
+            .replace('?', "%3f")
+            .replace('#', "%23"),
+        mode
+    );
+    format!("'{}'", uri.replace('\'', "''"))
+}
 
-            match &entry.payload {
-                EntryPayload::Blank => results.push(Response::ok(0)),
-                EntryPayload::Normal(request) => {
-                    let response = self.execute_sql(request).await;
-                    results.push(response);
-                }
-                EntryPayload::Membership(membership) => {
-                    *self.membership.write().await =
-                        StoredMembership::new(Some(entry.log_id), membership.clone());
-                    results.push(Response::ok(0));
+/// Game tables in the attached snapshot, ordered so that inserts satisfy
+/// the credits holder trigger (credits after accounts and objects)
+async fn snapshot_tables(conn: &mut SqliteConnection) -> io::Result<Vec<String>> {
+    let mut tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM snap.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(io::Error::other)?;
+    tables.retain(|t| !RAFT_TABLES.contains(&t.as_str()));
+    tables.sort_by_key(|t| t == "credits");
+    Ok(tables)
+}
+
+/// An SQL identifier, quoted
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+struct SmState {
+    last_applied: Option<LogId>,
+    membership: StoredMembership,
+    current_snapshot: Option<(SnapshotMeta, Vec<u8>)>,
+}
+
+/// Applies committed SQL requests to the database
+#[derive(Clone)]
+pub struct StateMachine {
+    pool: SharedPool,
+    db_path: Option<String>,
+    state: Arc<RwLock<SmState>>,
+}
+
+impl StateMachine {
+    /// A state machine resuming from the position recorded in `raft_meta`
+    pub async fn new(pool: SharedPool, db_path: Option<String>) -> io::Result<Self> {
+        let (last_applied, membership) = {
+            let p = pool.read().await;
+            let last_applied: Option<LogId> = match read_meta(&p, "last_applied").await? {
+                Some(json) => serde_json::from_str(&json).map_err(io::Error::other)?,
+                None => None,
+            };
+            // Without the persisted membership a restarted node has no
+            // voters and can never elect a leader
+            let membership: StoredMembership = match read_meta(&p, "last_membership").await? {
+                Some(json) => serde_json::from_str(&json).map_err(io::Error::other)?,
+                None => StoredMembership::default(),
+            };
+            (last_applied, membership)
+        };
+        Ok(Self {
+            pool,
+            db_path,
+            state: Arc::new(RwLock::new(SmState {
+                last_applied,
+                membership,
+                current_snapshot: None,
+            })),
+        })
+    }
+
+    /// Apply one request's statements inside a savepoint: all or nothing.
+    /// A failing statement rolls back only this request; an error is
+    /// returned only if the transaction itself is broken.
+    async fn apply_request(conn: &mut SqliteConnection, request: &Request) -> io::Result<Response> {
+        sqlx::query("SAVEPOINT entry")
+            .execute(&mut *conn)
+            .await
+            .map_err(io::Error::other)?;
+        let mut rows = 0;
+        for statement in &request.statements {
+            debug!("Executing SQL: {}", statement.sql);
+            // Requests are built only from SQL literals in this crate, with
+            // every value bound as a parameter (see RaftWriter::execute)
+            let query = sqlx::query(sqlx::AssertSqlSafe(statement.sql.as_str()));
+            match bind_params(query, &statement.params)
+                .execute(&mut *conn)
+                .await
+            {
+                Ok(result) => rows += result.rows_affected(),
+                Err(e) => {
+                    // A constraint refusing a write (e.g. credits' balance
+                    // CHECK on an overdraft) is an expected outcome
+                    let message = e.to_string();
+                    if message.contains("CHECK constraint failed")
+                        || message.contains("credits holder does not exist")
+                    {
+                        debug!("request refused by a constraint (rolled back): {}", message);
+                    } else {
+                        error!("SQL execution failed (rolling back the request): {}", e);
+                    }
+                    sqlx::query("ROLLBACK TO entry")
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(io::Error::other)?;
+                    sqlx::query("RELEASE entry")
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(io::Error::other)?;
+                    return Ok(Response::error(e.to_string()));
                 }
             }
         }
+        sqlx::query("RELEASE entry")
+            .execute(&mut *conn)
+            .await
+            .map_err(io::Error::other)?;
+        Ok(Response::ok(rows))
+    }
+}
 
-        // Persist the membership if this batch changed it
-        if entries
-            .iter()
-            .any(|e| matches!(e.payload, EntryPayload::Membership(_)))
+/// Bind JSON parameters to a query. Strings prefixed `blob:` carry base64
+/// binary data.
+fn bind_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+    params: &[serde_json::Value],
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    for param in params {
+        query = match param {
+            serde_json::Value::Null => query.bind(Option::<String>::None),
+            serde_json::Value::Bool(b) => query.bind(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    query.bind(i)
+                } else if let Some(f) = n.as_f64() {
+                    query.bind(f)
+                } else {
+                    query.bind(n.to_string())
+                }
+            }
+            serde_json::Value::String(s) => {
+                if let Some(b64_data) = s.strip_prefix("blob:") {
+                    match BASE64.decode(b64_data) {
+                        Ok(bytes) => query.bind(bytes),
+                        Err(e) => {
+                            error!("Failed to decode base64 blob: {}", e);
+                            query.bind(s.as_str())
+                        }
+                    }
+                } else {
+                    query.bind(s.as_str())
+                }
+            }
+            _ => query.bind(param.to_string()),
+        };
+    }
+    query
+}
+
+impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    async fn build_snapshot(&mut self) -> io::Result<Snapshot> {
+        // A consistent copy (VACUUM INTO reads in one transaction while
+        // writes go on). Its position is the one recorded inside the copy,
+        // not the in-memory one: openraft builds snapshots while applying.
+        let scratch = SnapshotScratch::new(self.db_path.as_deref())?;
+        let file = scratch.file();
         {
             let pool = self.pool.read().await;
-            let json = serde_json::to_string(&*self.membership.read().await)
-                .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
+            // Applies are not synced (relaxed_sync); the log is purged up to
+            // this snapshot, so first make everything applied durable: a
+            // commit on a FULL connection syncs the WAL, earlier frames too
             sqlx::query(
-                "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_membership', ?)",
+                "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('durable_fence', ?)",
             )
-            .bind(&json)
+            .bind(chrono::Utc::now().to_rfc3339())
             .execute(&*pool)
             .await
-            .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
+            .map_err(io::Error::other)?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "VACUUM INTO {}",
+                sql_literal(&file, "rwc")
+            )))
+            .execute(&*pool)
+            .await
+            .map_err(io::Error::other)?;
+        }
+        let copy = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&file)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete),
+            )
+            .await
+            .map_err(io::Error::other)?;
+        let last_applied: Option<LogId> = match read_meta(&copy, "last_applied").await? {
+            Some(json) => serde_json::from_str(&json).map_err(io::Error::other)?,
+            None => None,
+        };
+        let membership: StoredMembership = match read_meta(&copy, "last_membership").await? {
+            Some(json) => serde_json::from_str(&json).map_err(io::Error::other)?,
+            None => StoredMembership::default(),
+        };
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&copy)
+            .await
+            .map_err(io::Error::other)?;
+        // Only the game tables travel: this node's log and vote stay here
+        for table in RAFT_TABLES {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP TABLE IF EXISTS {}",
+                ident(table)
+            )))
+            .execute(&copy)
+            .await
+            .map_err(io::Error::other)?;
+        }
+        sqlx::query("VACUUM")
+            .execute(&copy)
+            .await
+            .map_err(io::Error::other)?;
+        copy.close().await;
+        let db_snapshot = tokio::fs::read(&file).await?;
+
+        let bytes = serde_json::to_vec(&SnapshotPayload {
+            last_applied_log: last_applied,
+            last_membership: membership.clone(),
+            schema_version,
+            db_snapshot,
+        })
+        .map_err(io::Error::other)?;
+
+        let meta = SnapshotMeta {
+            last_log_id: last_applied,
+            last_membership: membership,
+        };
+        self.state.write().await.current_snapshot = Some((meta.clone(), bytes.clone()));
+        debug!("Built snapshot at {:?}", meta.last_log_id);
+
+        Ok(Snapshot {
+            meta,
+            snapshot: Cursor::new(bytes),
+        })
+    }
+}
+
+impl RaftStateMachine<TypeConfig> for StateMachine {
+    type SnapshotData = Cursor<Vec<u8>>;
+    type SnapshotBuilder = Self;
+
+    async fn applied_state(&mut self) -> io::Result<(Option<LogId>, StoredMembership)> {
+        let state = self.state.read().await;
+        Ok((state.last_applied, state.membership.clone()))
+    }
+
+    /// Apply everything openraft has ready as one transaction (group commit):
+    /// each request in its own savepoint, plus the new position, then answer
+    /// the clients once it is durable
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> io::Result<()>
+    where
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
+    {
+        let mut batch = Vec::new();
+        while let Some(item) = entries.try_next().await? {
+            batch.push(item);
+        }
+        if batch.is_empty() {
+            return Ok(());
         }
 
-        // Persist last_applied
-        if let Some(last) = self.last_applied.read().await.as_ref() {
-            let pool = self.pool.read().await;
-            let json = serde_json::to_string(last)
-                .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
-            sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_applied', ?)")
-                .bind(&json)
-                .execute(&*pool)
+        let (mut last_applied, mut membership) = {
+            let state = self.state.read().await;
+            (state.last_applied, state.membership.clone())
+        };
+        let mut membership_changed = false;
+        let mut replies = Vec::with_capacity(batch.len());
+
+        let pool = self.pool.read().await;
+        // Not synced: the log entry already is (see relaxed_sync)
+        let mut conn = RelaxedConn::acquire(&pool).await?;
+        let applied = async {
+            let mut tx = sqlx::Connection::begin(conn.conn())
                 .await
-                .map_err(|e| StorageIOError::write(&io::Error::other(e)))?;
+                .map_err(io::Error::other)?;
+            for (entry, responder) in batch {
+                last_applied = Some(entry.log_id);
+                let response = match entry.payload {
+                    EntryPayload::Blank => Response::ok(0),
+                    EntryPayload::Normal(request) => Self::apply_request(&mut tx, &request).await?,
+                    EntryPayload::Membership(m) => {
+                        membership = StoredMembership::new(Some(entry.log_id), m);
+                        membership_changed = true;
+                        Response::ok(0)
+                    }
+                };
+                replies.push((responder, response));
+            }
+            write_meta(&mut tx, "last_applied", &last_applied).await?;
+            if membership_changed {
+                write_meta(&mut tx, "last_membership", &membership).await?;
+            }
+            tx.commit().await.map_err(io::Error::other)
         }
+        .await;
+        // Whatever happened, the connection goes back syncing: log appends
+        // use the same pool (RelaxedConn sees to it, even if cancelled)
+        conn.restore().await?;
+        applied?;
 
-        Ok(results)
+        // No checkpoint here: in WAL mode a committed transaction is visible
+        // to every connection at once, and SQLite checkpoints on its own
+        drop(pool);
+
+        {
+            let mut state = self.state.write().await;
+            state.last_applied = last_applied;
+            state.membership = membership;
+        }
+        for (responder, response) in replies {
+            if let Some(responder) = responder {
+                responder.send(response);
+            }
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        CombinedStorage {
-            pool: RwLock::new(self.pool.read().await.clone()),
-            db_path: self.db_path.clone(),
-            vote: RwLock::new(*self.vote.read().await),
-            last_purged: RwLock::new(*self.last_purged.read().await),
-            last_applied: RwLock::new(*self.last_applied.read().await),
-            membership: RwLock::new(self.membership.read().await.clone()),
-            current_snapshot: RwLock::new(self.current_snapshot.read().await.clone()),
-        }
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+        self.clone()
     }
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<NodeId>> {
-        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-        use std::str::FromStr;
-
+        meta: &SnapshotMeta,
+        snapshot: Cursor<Vec<u8>>,
+    ) -> io::Result<()> {
         let data = snapshot.into_inner();
-
-        // Parse snapshot data
-        let snapshot_data: SnapshotData = serde_json::from_slice(&data)
-            .map_err(|e| StorageIOError::read_snapshot(None, &io::Error::other(e)))?;
-
-        // If there's a database snapshot and we have a db_path, restore it
-        if !snapshot_data.db_snapshot.is_empty() {
-            if let Some(ref db_path) = self.db_path {
-                debug!(
-                    "Installing snapshot database ({} bytes)",
-                    snapshot_data.db_snapshot.len()
-                );
-
-                // Close current pool connections
-                {
-                    let pool = self.pool.read().await;
-                    pool.close().await;
-                }
-
-                // Write the new database file
-                tokio::fs::write(db_path, &snapshot_data.db_snapshot)
-                    .await
-                    .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
-
-                // Reopen the pool
-                let conn_str = format!("sqlite:{}?mode=rw", db_path);
-                let options = SqliteConnectOptions::from_str(&conn_str)
-                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?
-                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                    .foreign_keys(true);
-
-                let new_pool = SqlitePoolOptions::new()
-                    .max_connections(10)
-                    .connect_with(options)
-                    .await
-                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?;
-
-                *self.pool.write().await = new_pool;
-            }
+        let payload: SnapshotPayload = serde_json::from_slice(&data).map_err(io::Error::other)?;
+        if payload.schema_version != crate::db::SCHEMA_VERSION {
+            return Err(io::Error::other(format!(
+                "cannot install a snapshot of schema version {} (this node has {})",
+                payload.schema_version,
+                crate::db::SCHEMA_VERSION
+            )));
         }
-
-        // Apply snapshot state, and persist it so a restart resumes from it
-        {
-            let pool = self.pool.read().await;
-            for (key, value) in [
-                (
-                    "last_applied",
-                    serde_json::to_string(&snapshot_data.last_applied_log),
-                ),
-                (
-                    "last_membership",
-                    serde_json::to_string(&snapshot_data.last_membership),
-                ),
-            ] {
-                let json = value
-                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?;
-                sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES (?, ?)")
-                    .bind(key)
-                    .bind(&json)
-                    .execute(&*pool)
-                    .await
-                    .map_err(|e| StorageIOError::write_snapshot(None, &io::Error::other(e)))?;
-            }
+        if payload.db_snapshot.is_empty() {
+            return Err(io::Error::other(
+                "cannot install a snapshot that carries no database",
+            ));
         }
-        *self.last_applied.write().await = snapshot_data.last_applied_log;
-        *self.membership.write().await = snapshot_data.last_membership;
-        *self.current_snapshot.write().await = Some((meta.clone(), data));
+        debug!(
+            "Installing snapshot database ({} bytes)",
+            payload.db_snapshot.len()
+        );
+        let scratch = SnapshotScratch::new(self.db_path.as_deref())?;
+        let file = scratch.file();
+        tokio::fs::write(&file, &payload.db_snapshot).await?;
 
+        // Replace the game tables in one transaction on the live database:
+        // the node holds the old state or the new, never a mix, and no
+        // connection the application holds is closed. ATTACH cannot run
+        // inside a transaction, so it comes first, on a dedicated connection.
+        let pool = self.pool.read().await;
+        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ATTACH DATABASE {} AS snap",
+            sql_literal(&file, "ro")
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(io::Error::other)?;
+        let result = async {
+            let tables = snapshot_tables(&mut conn).await?;
+            let mut tx = sqlx::Connection::begin(&mut *conn)
+                .await
+                .map_err(io::Error::other)?;
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .map_err(io::Error::other)?;
+            for table in &tables {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM main.{}",
+                    ident(table)
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(io::Error::other)?;
+            }
+            for table in &tables {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO main.{t} SELECT * FROM snap.{t}",
+                    t = ident(table)
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(io::Error::other)?;
+            }
+            write_meta(&mut tx, "last_applied", &payload.last_applied_log).await?;
+            write_meta(&mut tx, "last_membership", &payload.last_membership).await?;
+            tx.commit().await.map_err(io::Error::other)
+        }
+        .await;
+        let detached = sqlx::query("DETACH DATABASE snap")
+            .execute(&mut *conn)
+            .await
+            .map_err(io::Error::other);
+        drop(conn);
+        drop(pool);
+        result?;
+        detached?;
+
+        let mut state = self.state.write().await;
+        state.last_applied = payload.last_applied_log;
+        state.membership = payload.last_membership;
+        state.current_snapshot = Some((meta.clone(), data));
         debug!("Installed snapshot at {:?}", meta.last_log_id);
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        let snapshot = self.current_snapshot.read().await.clone();
-        Ok(snapshot.map(|(meta, data)| Snapshot {
+    async fn get_current_snapshot(&mut self) -> io::Result<Option<Snapshot>> {
+        let state = self.state.read().await;
+        Ok(state.current_snapshot.clone().map(|(meta, data)| Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Cursor::new(data),
         }))
     }
 }
@@ -686,83 +887,286 @@ mod tests {
     use super::*;
     use crate::db::test_utils::test_pool;
 
-    /// Upgrading a database whose raft_log predates the leader_node column
-    /// must label existing entries with the persisted leader, not node 0
-    #[tokio::test]
-    async fn test_leader_node_migration_uses_persisted_leader() {
-        let pool = test_pool().await;
-        sqlx::query("DROP TABLE raft_log")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE raft_log (log_index INTEGER PRIMARY KEY, term INTEGER NOT NULL,
-             entry_type TEXT NOT NULL, payload TEXT,
-             created_at INTEGER NOT NULL DEFAULT (unixepoch()))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO raft_log (log_index, term, entry_type) VALUES (1, 1, 'blank')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO raft_vote (id, term, node_id, committed) VALUES (1, 1, 7, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let mut storage = CombinedStorage::new(pool).await.unwrap();
-        let state = storage.get_log_state().await.unwrap();
-        let last = state.last_log_id.expect("last log id");
-        assert_eq!(last.leader_id.node_id, 7);
+    fn shared(pool: SqlitePool) -> SharedPool {
+        Arc::new(RwLock::new(pool))
     }
 
-    #[tokio::test]
-    async fn test_storage_creation() {
-        let pool = test_pool().await;
-        let storage = CombinedStorage::new(pool).await;
-        assert!(storage.is_ok());
+    fn normal(index: u64, request: Request) -> Entry {
+        Entry {
+            log_id: log_id(1, 1, index as i64),
+            payload: EntryPayload::Normal(request),
+        }
+    }
+
+    async fn apply(sm: &mut StateMachine, entries: Vec<Entry>) {
+        let stream =
+            futures_util::stream::iter(entries.into_iter().map(|e| Ok::<_, io::Error>((e, None))));
+        sm.apply(stream).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_vote_persistence() {
-        let pool = test_pool().await;
-        let mut storage = CombinedStorage::new(pool).await.unwrap();
-
+        let mut store = LogStore::new(shared(test_pool().await));
         let vote = Vote {
-            leader_id: openraft::LeaderId {
+            leader_id: LeaderId {
                 term: 5,
                 node_id: 2,
             },
             committed: true,
         };
-
-        storage.save_vote(&vote).await.unwrap();
-        let loaded = storage.read_vote().await.unwrap();
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().leader_id.term, 5);
+        store.save_vote(&vote).await.unwrap();
+        let loaded = store.read_vote().await.unwrap().expect("vote");
+        assert_eq!(loaded.leader_id.term, 5);
+        assert_eq!(loaded.leader_id.node_id, 2);
+        assert!(loaded.committed);
     }
 
     #[tokio::test]
-    async fn test_log_append_and_read() {
+    async fn test_log_append_read_truncate_purge() {
+        let mut store = LogStore::new(shared(test_pool().await));
+        let entries: Vec<Entry> = (1..=4)
+            .map(|i| normal(i, Request::simple("SELECT 1")))
+            .collect();
+        store.append(entries, IOFlushed::noop()).await.unwrap();
+        assert_eq!(store.try_get_log_entries(1..5).await.unwrap().len(), 4);
+
+        store.truncate_after(Some(log_id(1, 1, 2))).await.unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id.unwrap().index, 2);
+
+        store.purge(log_id(1, 1, 2)).await.unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id.unwrap().index, 2);
+        assert_eq!(
+            state.last_log_id.unwrap().index,
+            2,
+            "the purged id is the last"
+        );
+        assert!(store.try_get_log_entries(0..10).await.unwrap().is_empty());
+    }
+
+    /// Each request is atomic: a failing one leaves no rows behind and does
+    /// not disturb the others applied in the same batch, and the position
+    /// covers the whole batch and survives a restart
+    #[tokio::test]
+    async fn test_apply_batch_is_atomic_per_request() {
         let pool = test_pool().await;
-        let mut storage = CombinedStorage::new(pool).await.unwrap();
+        sqlx::query("CREATE TABLE batch_t (v INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut sm = StateMachine::new(shared(pool.clone()), None).await.unwrap();
 
-        let entries = vec![Entry {
-            log_id: LogId {
-                leader_id: openraft::LeaderId {
-                    term: 1,
-                    node_id: 1,
-                },
-                index: 1,
-            },
-            payload: EntryPayload::Normal(Request::simple("SELECT 1")),
-        }];
+        apply(
+            &mut sm,
+            vec![
+                normal(
+                    1,
+                    Request::batch(vec![
+                        ("INSERT INTO batch_t VALUES (1)".into(), vec![]),
+                        ("INSERT INTO batch_t VALUES (2)".into(), vec![]),
+                    ]),
+                ),
+                normal(
+                    2,
+                    Request::batch(vec![
+                        ("INSERT INTO batch_t VALUES (3)".into(), vec![]),
+                        ("INSERT INTO batch_t VALUES (NULL)".into(), vec![]),
+                    ]),
+                ),
+                normal(3, Request::simple("INSERT INTO batch_t VALUES (4)")),
+            ],
+        )
+        .await;
 
-        storage.append_to_log(entries).await.unwrap();
+        let values: Vec<i64> = sqlx::query_scalar("SELECT v FROM batch_t ORDER BY v")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(values, vec![1, 2, 4], "the failed request left no rows");
 
-        let read = storage.try_get_log_entries(1..2).await.unwrap();
-        assert_eq!(read.len(), 1);
+        let mut resumed = StateMachine::new(shared(pool), None).await.unwrap();
+        let (last_applied, _) = resumed.applied_state().await.unwrap();
+        assert_eq!(last_applied.unwrap().index, 3);
+    }
+
+    async fn seed_account(pool: &SqlitePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES (?, ?, 'x', 'player', '2026-01-01')",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn accounts(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM accounts ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn vote_term(pool: &SqlitePool) -> Option<i64> {
+        sqlx::query_scalar("SELECT term FROM raft_vote WHERE id = 1")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A snapshot carries the game tables as of its position, never the
+    /// sender's Raft log or vote; installing it replaces the receiver's game
+    /// tables in one step, keeps its own Raft state, and leaves the pool the
+    /// application holds working
+    #[tokio::test]
+    async fn test_snapshot_round_trip() {
+        // The leader on a database file, as in mudd (opened without a URI)
+        let leader_dir = tempfile::tempdir().unwrap();
+        let leader_db = leader_dir.path().join("leader.db");
+        let leader_pool = crate::db::Database::new(Some(leader_db.to_str().unwrap()))
+            .await
+            .unwrap()
+            .pool()
+            .clone();
+        seed_account(&leader_pool, "alice").await;
+        seed_account(&leader_pool, "bob").await;
+        let mut leader_log = LogStore::new(shared(leader_pool.clone()));
+        leader_log.save_vote(&Vote::new(3, 1)).await.unwrap();
+        let mut leader = StateMachine::new(shared(leader_pool.clone()), None)
+            .await
+            .unwrap();
+        apply(&mut leader, vec![normal(5, Request::simple("SELECT 1"))]).await;
+        let snapshot = leader
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.meta.last_log_id.unwrap().index, 5);
+        // The temp copy went to a real file, not one named "file:..."
+        let stray = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("file:"));
+        assert!(!stray, "VACUUM INTO took the URI literally");
+
+        // The payload's database has no Raft tables
+        let payload: SnapshotPayload = serde_json::from_slice(snapshot.snapshot.get_ref()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("snap.db");
+        std::fs::write(&file, &payload.db_snapshot).unwrap();
+        let snap_pool = SqlitePool::connect(&format!("sqlite:{}", file.display()))
+            .await
+            .unwrap();
+        let raft_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'raft_%'",
+        )
+        .fetch_one(&snap_pool)
+        .await
+        .unwrap();
+        assert_eq!(raft_tables, 0);
+        snap_pool.close().await;
+
+        let follower_pool = test_pool().await;
+        seed_account(&follower_pool, "stranger").await;
+        let mut follower_log = LogStore::new(shared(follower_pool.clone()));
+        follower_log.save_vote(&Vote::new(9, 2)).await.unwrap();
+        let app_handle = follower_pool.clone();
+        let mut follower = StateMachine::new(shared(follower_pool.clone()), None)
+            .await
+            .unwrap();
+        follower
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(accounts(&app_handle).await, vec!["alice", "bob"]);
+        assert_eq!(vote_term(&follower_pool).await, Some(9), "own vote kept");
+        let mut resumed = StateMachine::new(shared(follower_pool), None)
+            .await
+            .unwrap();
+        let (last_applied, _) = resumed.applied_state().await.unwrap();
+        assert_eq!(last_applied.unwrap().index, 5);
+    }
+
+    /// A snapshot from another schema version cannot be installed
+    #[tokio::test]
+    async fn test_install_refuses_other_schema_version() {
+        let mut leader = StateMachine::new(shared(test_pool().await), None)
+            .await
+            .unwrap();
+        apply(&mut leader, vec![normal(7, Request::simple("SELECT 1"))]).await;
+        let snapshot = leader
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut payload: SnapshotPayload =
+            serde_json::from_slice(snapshot.snapshot.get_ref()).unwrap();
+        payload.schema_version += 1;
+        let data = serde_json::to_vec(&payload).unwrap();
+
+        let mut follower = StateMachine::new(shared(test_pool().await), None)
+            .await
+            .unwrap();
+        assert!(follower
+            .install_snapshot(&snapshot.meta, Cursor::new(data))
+            .await
+            .is_err());
+        let (last_applied, _) = follower.applied_state().await.unwrap();
+        assert!(last_applied.is_none(), "nothing recorded");
+    }
+
+    /// Snapshot files live in a fresh private directory (mode 0700) next to
+    /// the database, removed afterwards: nothing in a shared temp dir
+    #[test]
+    fn test_snapshot_scratch_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("game.db");
+        let scratch = SnapshotScratch::new(Some(db.to_str().unwrap())).unwrap();
+        let path = scratch.0.path().to_path_buf();
+        assert_eq!(path.parent(), Some(dir.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        assert!(!scratch.file().exists());
+        drop(scratch);
+        assert!(!path.exists(), "removed when done");
+    }
+
+    /// Applying does not sync, but the connection goes back to the pool
+    /// syncing (log appends share the pool), also after a failed request
+    #[tokio::test]
+    async fn test_apply_returns_connection_syncing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.db");
+        crate::db::Database::new(Some(path.to_str().unwrap()))
+            .await
+            .unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        let mut sm = StateMachine::new(shared(pool.clone()), None).await.unwrap();
+        apply(
+            &mut sm,
+            vec![
+                normal(1, Request::simple("SELECT 1")),
+                normal(2, Request::simple("INSERT INTO no_such_table VALUES (1)")),
+            ],
+        )
+        .await;
+        let level: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(level, 2, "FULL");
     }
 }

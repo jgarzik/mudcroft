@@ -15,7 +15,10 @@ For access levels, see [permissions.md](permissions.md#access-levels).
 - **Tokens** are opaque: 64 random hex characters stored on the account row.
   They are not JWTs and do not expire. Each account has one token at a time:
   a new login replaces it, and logout clears it.
-- **Passwords** are stored as salted SHA-256 hashes.
+- **Passwords** are stored as argon2id hashes (PHC strings with a random
+  salt) and verified in constant time; a login for an unknown username takes
+  as long as one with a wrong password. At most one argon2 operation per CPU
+  core runs at a time; further logins wait.
 - **Errors** are JSON `{"error": "<message>"}`, with these exceptions, which
   return plain text:
   - `GET /images/{hash}` failures
@@ -23,6 +26,15 @@ For access levels, see [permissions.md](permissions.md#access-levels).
   - Requests the framework rejects before a handler runs: a missing or wrong
     `Content-Type` (415), malformed or incomplete JSON (400 or 422), or a
     missing required query parameter (400)
+- **Clusters:** any node answers. A node that is not the primary forwards
+  `/auth/*` and `/universe/*` to it and relays game connections; it answers
+  `503` (plain text) when there is no primary at the moment, and `502` when
+  the primary did not answer. Retry either.
+- **Every response** carries `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN` and
+  `Referrer-Policy: strict-origin-when-cross-origin`, and text bodies are
+  gzip-compressed when the request sends `Accept-Encoding: gzip`, so `mudd`
+  needs no proxy in front for these.
 
 ## Server
 
@@ -50,7 +62,7 @@ This route exists only when `mudd` runs **without** `--static-dir`. With
 ### POST /auth/register
 
 Creates a `player` account and logs it in. Usernames must be 3-32 ASCII
-letters, digits, `_` or `-`; passwords must be at least 6 characters.
+letters, digits, `_` or `-`; passwords must be 6 characters to 1 KiB.
 
 ```json
 {"username": "player1", "password": "secretpassword123"}
@@ -59,31 +71,50 @@ letters, digits, `_` or `-`; passwords must be at least 6 characters.
 | Status | Body |
 |--------|------|
 | 201 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player"}` |
-| 400 | `{"error": "username must be 3-32 characters"}`, `{"error": "username may contain only letters, digits, _ and -"}` or `{"error": "password must be at least 6 characters"}` |
+| 400 | `{"error": "username must be 3-32 characters"}`, `{"error": "username may contain only letters, digits, _ and -"}` `{"error": "password must be at least 6 characters"}` or `{"error": "password must be at most 1024 bytes"}` |
 | 409 | `{"error": "username already exists"}` |
 | 500 | `{"error": "database error: ..."}` |
 
 ### POST /auth/login
 
 ```json
-{"username": "player1", "password": "secretpassword123"}
+{"username": "player1", "password": "secretpassword123", "device_token": "<optional>"}
 ```
 
 | Status | Body |
 |--------|------|
-| 200 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player"}` |
+| 200 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player", "device_token": "<64 hex>"}` |
 | 401 | `{"error": "invalid credentials"}` (unknown user or wrong password) |
 
 Logging in issues a new token and invalidates the account's previous one.
 
+`device_token` (also returned by registration) proves this device has
+logged in to the account before: send it with the next login, which returns
+a fresh one in its place. Tokens last 30 days and are kept in the server's
+memory only (a restart or failover forgets them; the device then gets a new
+one at its next login). A token presented with a wrong password is revoked.
+An account keeps at most 10 (its oldest goes); when the server holds as many
+as it allows, new devices are simply not remembered.
+
+Limited to `--auth-limit` failed logins a minute per username and client
+(default 30), and twice that many login and registration requests per
+client (an IPv4 address or an IPv6 /64): beyond that,
+`429 {"error": "too many attempts; try again later"}` with a `Retry-After`
+header (seconds), before the password is checked. A successful login does
+not count, and one client never blocks another. Beyond ten times the rate of
+failures for one username across all clients, attempts for it go one at a
+time, a second apart, except logins presenting a valid `device_token` for
+the account, which go straight through (the owner's devices are never held
+up by an attack); beyond a hundred times the rate they are refused.
+
 ### POST /auth/logout
 
 ```json
-{"token": "<token>"}
+{"token": "<token>", "device_token": "<optional>"}
 ```
 
 Response 200: `{"success": true}`, or `{"success": false}` if no account had
-that token.
+that token. A `device_token` given is revoked.
 
 ### GET /auth/validate?token=\<token\>
 
@@ -129,7 +160,7 @@ Creates a universe. Requires an **admin+** token.
 |-------|----------|-------------|
 | `id` | yes | Universe id. DNS-style: 3-64 characters, `[a-z0-9-]`, starts and ends alphanumeric, no `--`. Uppercase is lowercased. |
 | `name` | yes | Display name |
-| `owner_id` | yes | An existing account id. That account may later call `run_script` on this universe. |
+| `owner_id` | yes | An existing account id. That account is `owner` inside this universe (see [permissions.md](permissions.md#access-levels)). |
 | `config` | no | JSON object, stored as-is plus the server-set `lib_hashes` key. Lua reads it with `game.get_universe().config`. |
 | `libs` | no | Map of library name to Lua source. These are added to the core libraries from `mudd_init`, and override any with the same name. |
 
@@ -173,9 +204,12 @@ Runs a Lua file from the server's `scripts/` directory inside a universe.
 {"script": "cave_adventure.lua", "account_id": "<optional account id>"}
 ```
 
-- **Who may call:** an admin+, or the account that owns universe `{id}`.
+- **Who may call:** an account that is admin+ in universe `{id}`: a global
+  admin or owner, an admin member, or the universe's owner.
 - **Runs as:** the authenticated caller. If `account_id` names another account,
-  the caller must be admin+ **and** strictly outrank that account. Otherwise
+  the caller must be admin+ **and** outrank that account in universe `{id}`
+  (a global admin or owner only by a higher global level; see
+  [permissions.md](permissions.md#access-levels)). Otherwise
   the response is 403. Objects the script creates are owned by the account it
   runs as.
 - **Script path:** read from `scripts/<script>`, relative to `mudd`'s working
@@ -192,6 +226,26 @@ Runs a Lua file from the server's `scripts/` directory inside a universe.
 | 401 | Missing, malformed or invalid token |
 | 403 | `{"error": "Admin access or universe ownership required"}` or `{"error": "Cannot run a script as that account"}` |
 | 404 | `{"error": "Universe not found: <id>"}` or `{"error": "Script not found: <name> (...)"}` |
+
+### POST /universe/{id}/portal
+
+Sets the universe's portal: the room players spawn in.
+
+```json
+{"room_id": "/rooms/cave-entrance"}
+```
+
+- **Who may call:** admin+ in universe `{id}`, as for `run_script`.
+- The room must be an object of class `room` in universe `{id}`.
+- `{id}` is lowercased before lookup.
+
+| Status | Body |
+|--------|------|
+| 200 | `{"universe_id": "<id>", "room_id": "<room>"}` |
+| 400 | `{"error": "Invalid universe ID: ..."}` or `{"error": "<room> is not a room"}` |
+| 401 | Missing, malformed or invalid token |
+| 403 | `{"error": "Admin access or universe ownership required"}` |
+| 404 | `{"error": "Universe not found: <id>"}` or `{"error": "Room not found: <room>"}` |
 
 ## Images
 
@@ -219,29 +273,27 @@ ws://127.0.0.1:8080/ws?universe=<universe_id>&token=<token>
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `universe` | yes | Universe id (lowercased before lookup) |
-| `token` | no | Session token. If it is missing **or invalid**, the connection is accepted as a guest. No error is returned. |
+| `token` | yes | Session token from `/auth/login` or `/auth/register`. There are no guests. |
 
 Upgrade failures are plain-text HTTP responses:
 
 | Status | Body |
 |--------|------|
 | 400 | `Universe ID required in query param: ?universe=<id>` or `Invalid universe ID: ...` |
+| 401 | `A valid token is required: ?token=<token>` (missing, invalid or logged-out token) |
 | 404 | `Universe not found: <id>` |
 | 500 | `Failed to verify universe` |
 
-**Logged-in players** have a persistent player object,
+Every player has a persistent player object in the universe,
 `/players/p-<account_id>`, which holds their inventory. A player spawns at
 their `last_safe_location`. If that is not set, they spawn in the room they
 were last in, if it is a safe zone (the portal, a room with `is_portal = true`,
 or their workroom). Otherwise they spawn at the universe portal.
 
-When a logged-in player disconnects, the server waits 5 seconds for a
-reconnect. If the player does not return and is outside a safe zone, their
+One player has one connection per universe: a new connection replaces the
+old one, which receives `replaced`. When a player disconnects, the server
+waits 5 seconds for a reconnect. If the player does not return and is outside a safe zone, their
 inventory is dropped in the room.
-
-**Guests** get a random player id and no player object. They spawn at the
-portal and can look, move and `say` (shown as "Someone"). Commands that need a
-player object, such as `get` and `inventory`, fail.
 
 ### Client to server
 
@@ -254,6 +306,13 @@ Every message is JSON with a `type` field.
 ```json
 {"type": "ping"}
 ```
+
+```json
+{"type": "confirm", "id": "<payment id>", "accept": true}
+```
+
+`confirm` answers a payment prompt (see `confirm` below); typing the command
+`yes` or `no` answers the latest one.
 
 `ping` gets no reply. Messages that are not valid JSON, or have an unknown
 `type`, are ignored.
@@ -304,6 +363,25 @@ and messages sent by Lua (`game.send`, `game.broadcast`).
 
 ```json
 {"type": "echo", "command": "look"}
+```
+
+**replaced**: a newer connection for the same player and universe (another
+tab or device) has taken over, and the server closes this one right after.
+Clients must not reconnect automatically on it, or the two connections would
+keep evicting each other.
+
+```json
+{"type": "replaced", "message": "You connected from another window; this one is now disconnected."}
+```
+
+**confirm**: object code asks the player to pay (`game.request_payment`).
+Nothing is charged unless the client answers with `{"type": "confirm", "id",
+"accept": true}` (or the player types `yes`) within a minute; the reply is an
+`output` (the object's answer, or a decline/expiry message) or an `error`
+(no such request).
+
+```json
+{"type": "confirm", "id": "<payment id>", "text": "Pay 3 credits for an oil lamp?", "amount": 3}
 ```
 
 If no spawn room exists, the server sends this right after `welcome`:

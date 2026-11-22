@@ -22,6 +22,22 @@ pub enum GameMessage {
     },
     /// Broadcast to all players in a region
     BroadcastRegion { region_id: String, message: String },
+    /// Ask a player to confirm a payment (game.request_payment)
+    Confirm {
+        target_id: String,
+        id: String,
+        text: String,
+        amount: i64,
+    },
+    /// An object was moved by game.move_object: update a connected player's
+    /// session and run the containers' on_leave/on_enter hooks
+    Moved {
+        object_id: String,
+        from: Option<String>,
+        to: Option<String>,
+        /// Account the moving script acted as
+        moved_by: Option<String>,
+    },
 }
 
 /// Queue for messages generated during Lua execution
@@ -58,11 +74,37 @@ impl MessageQueue {
         });
     }
 
+    /// Queue a payment prompt for a player
+    pub fn confirm(&self, target_id: &str, id: &str, text: &str, amount: i64) {
+        self.messages.lock().push(GameMessage::Confirm {
+            target_id: target_id.to_string(),
+            id: id.to_string(),
+            text: text.to_string(),
+            amount,
+        });
+    }
+
     /// Queue a broadcast to a region
     pub fn broadcast_region(&self, region_id: &str, message: &str) {
         self.messages.lock().push(GameMessage::BroadcastRegion {
             region_id: region_id.to_string(),
             message: message.to_string(),
+        });
+    }
+
+    /// Queue a move notification (see GameMessage::Moved)
+    pub fn moved(
+        &self,
+        object_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        moved_by: Option<&str>,
+    ) {
+        self.messages.lock().push(GameMessage::Moved {
+            object_id: object_id.to_string(),
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+            moved_by: moved_by.map(str::to_string),
         });
     }
 

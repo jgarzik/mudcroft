@@ -25,12 +25,20 @@ async fn eval(client: &mut TestClient, code: &str) -> String {
     reply["text"].as_str().unwrap_or_default().to_string()
 }
 
+/// The account's stored level in the test universe: its member level, or
+/// its global level when it is not a member
 async fn db_access_level(server: &TestServer, account_id: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT access_level FROM accounts WHERE id = ?")
-        .bind(account_id)
-        .fetch_one(server.pool())
-        .await
-        .expect("account row")
+    sqlx::query_scalar::<_, String>(
+        "SELECT COALESCE(
+            (SELECT level FROM universe_members WHERE universe_id = ? AND account_id = ?),
+            (SELECT access_level FROM accounts WHERE id = ?))",
+    )
+    .bind(server.universe_id())
+    .bind(account_id)
+    .bind(account_id)
+    .fetch_one(server.pool())
+    .await
+    .expect("account row")
 }
 
 async fn connect(server: &TestServer, role: Role) -> TestClient {
@@ -59,7 +67,7 @@ fn player(name: &str) -> Role {
 async fn test_wizard_cannot_set_access_level() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("sec_wiz")).await;
-    let wiz_id = wiz.account_id().unwrap().to_string();
+    let wiz_id = wiz.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -77,8 +85,8 @@ async fn test_admin_set_access_level_rules() {
     let mut adm = connect(&server, admin("sec_admin")).await;
     let peer = connect(&server, admin("sec_admin_peer")).await;
     let pl = connect(&server, player("sec_player")).await;
-    let peer_id = peer.account_id().unwrap().to_string();
-    let pl_id = pl.account_id().unwrap().to_string();
+    let peer_id = peer.account_id().to_string();
+    let pl_id = pl.account_id().to_string();
 
     // Allowed: promote a player to builder
     let out = eval(
@@ -114,7 +122,7 @@ async fn test_grant_credits_requires_admin() {
     let mut wiz = connect(&server, wizard("cred_wiz")).await;
     let mut adm = connect(&server, admin("cred_admin")).await;
     let pl = connect(&server, player("cred_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -150,8 +158,8 @@ async fn test_set_actor_cannot_impersonate_superior() {
     let mut wiz = connect(&server, wizard("actor_wiz")).await;
     let adm = connect(&server, admin("actor_admin")).await;
     let pl = connect(&server, player("actor_player")).await;
-    let adm_id = adm.account_id().unwrap().to_string();
-    let pl_id = pl.account_id().unwrap().to_string();
+    let adm_id = adm.account_id().to_string();
+    let pl_id = pl.account_id().to_string();
 
     // Impersonating a superior is refused and leaves the actor unchanged
     let out = eval(
@@ -230,7 +238,7 @@ async fn test_store_code_requires_wizard() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("code_wiz")).await;
     let pl = connect(&server, player("code_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -255,7 +263,7 @@ async fn test_store_code_requires_wizard() {
 async fn test_created_object_owned_by_creator() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("owner_wiz")).await;
-    let wiz_id = wiz.account_id().unwrap().to_string();
+    let wiz_id = wiz.account_id().to_string();
 
     eval(
         &mut wiz,
@@ -279,7 +287,7 @@ async fn test_lua_object_writes_are_permission_checked() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("perm_wiz")).await;
     let pl = connect(&server, player("perm_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     // Wizard sets up objects (wizards bypass path checks)
     eval(
@@ -453,7 +461,7 @@ async fn test_use_object_runs_as_owner() {
         })
         .await
         .unwrap();
-    let bld_id = bld.account_id().unwrap().to_string();
+    let bld_id = bld.account_id().to_string();
 
     // The builder owns a trinket whose code tries to promote the builder
     let out = eval(
@@ -482,14 +490,14 @@ async fn test_use_object_runs_as_owner() {
     assert_eq!(db_access_level(&server, &bld_id).await, "builder");
 }
 
-/// Classes are shared by every universe: only wizards+ may define them, and
+/// Only wizards+ may define classes (in their universe), and
 /// built-in base classes cannot be redefined
 #[tokio::test]
 async fn test_define_class_restrictions() {
     let server = TestServer::start().await.expect("server");
     let mut wiz = connect(&server, wizard("class_wiz")).await;
     let pl = connect(&server, player("class_player")).await;
-    let pl_id = pl.account_id().unwrap().to_string();
+    let pl_id = pl.account_id().to_string();
 
     let out = eval(
         &mut wiz,
@@ -534,35 +542,62 @@ async fn other_universe(server: &TestServer) {
         .expect("create gem");
 }
 
-/// Scripts cannot modify, move, delete or clone objects of another universe
+/// Object ids are per universe: another universe's objects are invisible to
+/// scripts, so they can be neither read nor changed
 #[tokio::test]
-async fn test_lua_writes_stay_in_universe() {
+async fn test_lua_cannot_see_other_universes() {
     let server = TestServer::start().await.expect("server");
     other_universe(&server).await;
     let mut wiz = connect(&server, wizard("xuni_writer")).await;
 
-    for code in [
-        r#"return tostring(pcall(game.update_object, "/d/other/gem", {name = "mine"}))"#,
-        r#"return tostring(pcall(game.move_object, "/d/other/gem", nil))"#,
-        r#"return tostring(pcall(game.delete_object, "/d/other/gem"))"#,
-    ] {
-        assert_eq!(eval(&mut wiz, code).await, "false", "{}", code);
-    }
     let out = eval(
         &mut wiz,
-        r#"local c = game.clone_object("/d/other/gem", "/d/here/gem", nil)
-           return c == nil and "none" or (c.error and "error" or c.universe_id)"#,
+        r#"local seen = game.get_object("/d/other/gem")
+           local updated = game.update_object("/d/other/gem", {name = "mine"})
+           local deleted = game.delete_object("/d/other/gem")
+           local moved = pcall(game.move_object, "/d/other/gem", nil)
+           local cloned = game.clone_object("/d/other/gem", "/d/here/gem", nil)
+           return table.concat({tostring(seen), tostring(updated), tostring(deleted),
+                                tostring(moved), tostring(cloned)}, ",")"#,
     )
     .await;
-    assert_ne!(
-        out, "other-world",
-        "clone must not land in the other universe"
-    );
-    assert_ne!(
-        out,
-        server.universe_id(),
-        "nor copy another universe's object"
-    );
+    assert_eq!(out, "nil,false,false,false,nil");
+
+    let name: String = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.name') FROM objects
+         WHERE universe_id = 'other-world' AND id = '/d/other/gem'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .expect("gem untouched");
+    assert_eq!(name, "gem");
+}
+
+/// The same path can exist in two universes, independently
+#[tokio::test]
+async fn test_same_path_in_two_universes() {
+    let server = TestServer::start().await.expect("server");
+    other_universe(&server).await;
+    let mut wiz = connect(&server, wizard("twin_paths")).await;
+
+    let out = eval(
+        &mut wiz,
+        r#"local g = game.create_object("/d/other/gem", "item", nil, {name = "local gem"})
+           game.update_object("/d/other/gem", {shiny = true})
+           return g.universe_id .. ":" .. game.get_object("/d/other/gem").name"#,
+    )
+    .await;
+    assert_eq!(out, format!("{}:local gem", server.universe_id()));
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT universe_id, json_extract(properties, '$.name') FROM objects
+         WHERE id = '/d/other/gem' ORDER BY universe_id",
+    )
+    .fetch_all(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "one object per universe: {:?}", rows);
+    assert!(rows.contains(&("other-world".to_string(), "gem".to_string())));
 }
 
 /// Script messages only reach players in the script's universe
@@ -764,11 +799,10 @@ async fn test_add_action_respects_owner_and_private_handlers() {
     assert_eq!(out, "true", "owner may add a normal action");
 }
 
-/// Player objects are shared across universes (created in the first one the
-/// player joins). The universe confinement of Lua writes must not stop a
-/// player from picking things up in a second universe.
+/// Each universe has its own player object for an account, so play (and the
+/// inventory) in a second universe is independent of the first
 #[tokio::test]
-async fn test_take_works_in_second_universe() {
+async fn test_inventory_is_per_universe() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let server = TestServer::start().await.expect("server");
@@ -846,8 +880,7 @@ async fn test_take_works_in_second_universe() {
     .expect("reply");
     assert_eq!(reply["text"], "You take gem.", "{}", reply);
 
-    // Back in the first universe the gem stays in the pack: dropping it
-    // there would move another universe's object into this one
+    // Back in the first universe the pack does not hold the gem
     ws.close(None).await.ok();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let (mut back, _) = tokio_tungstenite::connect_async(url(server.universe_id()))
@@ -876,48 +909,33 @@ async fn test_take_works_in_second_universe() {
     })
     .await
     .expect("reply");
+    assert_eq!(reply["text"], "You don't have that", "{}", reply);
+
+    // Two player objects, one per universe; the gem is in the other one's pack
+    let owners: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT universe_id, (SELECT parent_id FROM objects g
+                               WHERE g.universe_id = p.universe_id AND g.id = '/d/other/gem')
+         FROM objects p WHERE p.id = ? ORDER BY universe_id",
+    )
+    .bind(mudd::player::PlayerManager::player_path(
+        reg["account_id"].as_str().unwrap(),
+    ))
+    .fetch_all(server.pool())
+    .await
+    .unwrap();
     assert_eq!(
-        reply["type"], "output",
-        "a clean refusal, not an error: {}",
-        reply
-    );
-    assert!(
-        reply["text"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("another world"),
-        "{}",
-        reply
+        owners.len(),
+        2,
+        "a player object per universe: {:?}",
+        owners
     );
 }
 
-/// Only an account's real player object is shared across universes: an
-/// ordinary object of class "player" gets no exemption, and scripts cannot
-/// create player-class objects at all
+/// Scripts cannot create player objects: the server makes them on connect
 #[tokio::test]
-async fn test_player_exemption_requires_real_player_object() {
+async fn test_scripts_cannot_create_player_objects() {
     let server = TestServer::start().await.expect("server");
-    let owner = server.world().wizard_account_id.clone();
-    sqlx::query("INSERT INTO universes (id, name, owner_id) VALUES ('other-world', 'Other', ?)")
-        .bind(&owner)
-        .execute(server.pool())
-        .await
-        .unwrap();
-    let mut fake = mudd::objects::Object::new("/d/other/fake", "other-world", "player").unwrap();
-    fake.set_property("name", serde_json::json!("decoy"));
-    server.world().store().create(&fake).await.unwrap();
-
     let mut wiz = connect(&server, wizard("fake_player_wiz")).await;
-    let out = eval(
-        &mut wiz,
-        r#"return tostring(pcall(game.update_object, "/d/other/fake", {name = "mine"}))"#,
-    )
-    .await;
-    assert_eq!(
-        out, "false",
-        "a non-account player-class object is not exempt"
-    );
-
     for code in [
         r#"local r = game.create_object("/d/here/fake", "player", nil, {}); return r.error and "refused" or "created""#,
         r#"local r = game.create_object("/players/p-nobody", "item", nil, {}); return r.error and "refused" or "created""#,
@@ -1003,4 +1021,316 @@ async fn test_broadcast_and_create_parent_stay_in_universe() {
         out, "refused",
         "create with a foreign parent must be refused"
     );
+}
+
+/// Access levels are per universe: a wizard of the test universe is a plain
+/// player elsewhere, and a universe's owner is owner inside it only
+#[tokio::test]
+async fn test_access_levels_are_per_universe() {
+    let server = TestServer::start().await.expect("server");
+    let realm_owner = connect(&server, player("realm_owner")).await;
+    let owner_id = realm_owner.account_id().to_string();
+    server
+        .create_universe("owned-realm", &owner_id)
+        .await
+        .expect("second universe");
+
+    // The test universe's wizard is a player in owned-realm
+    let wiz = connect(&server, wizard("home_wiz")).await;
+    let wiz_id = wiz.account_id().to_string();
+    let mut wiz_away = server
+        .connect_in(player("home_wiz"), "owned-realm")
+        .await
+        .expect("connect");
+    wiz_away.drain().await;
+    wiz_away.command("eval return 1").await.unwrap();
+    let _ = wiz_away.expect("echo").await;
+    let err = wiz_away.expect("error").await.expect("eval refused");
+    assert!(err["message"].as_str().unwrap().contains("wizard+"));
+
+    // The realm's owner is owner there and may promote the wizard there
+    let mut owner_home = server
+        .connect_in(player("realm_owner"), "owned-realm")
+        .await
+        .expect("connect");
+    owner_home.drain().await;
+    let level = eval(
+        &mut owner_home,
+        &format!(r#"return game.get_access_level("{}")"#, owner_id),
+    )
+    .await;
+    assert_eq!(level, "owner");
+    let out = eval(
+        &mut owner_home,
+        &format!(r#"return game.set_access_level("{}", "builder")"#, wiz_id),
+    )
+    .await;
+    assert_eq!(out, "true");
+
+    // ...which leaves the wizard's level in the test universe alone
+    assert_eq!(db_access_level(&server, &wiz_id).await, "wizard");
+
+    // In the test universe the realm owner is a plain player
+    let mut owner_away = connect(&server, player("realm_owner")).await;
+    owner_away.drain().await;
+    owner_away.command("eval return 1").await.unwrap();
+    let _ = owner_away.expect("echo").await;
+    assert!(owner_away.expect("error").await.is_ok());
+}
+
+/// A universe's owner (an ordinary account) is owner inside it, but must not
+/// gain a global admin's identity: no set_actor to them, no run_script as them
+#[tokio::test]
+async fn test_universe_owner_cannot_act_as_global_admin() {
+    let server = TestServer::start().await.expect("server");
+    let owner = connect(&server, player("realm_lord")).await;
+    let owner_id = owner.account_id().to_string();
+    server
+        .create_universe("lord-realm", &owner_id)
+        .await
+        .expect("universe");
+    let adm = connect(&server, admin("realm_visitor_admin")).await;
+    let admin_id = adm.account_id().to_string();
+
+    let mut lord = server
+        .connect_in(player("realm_lord"), "lord-realm")
+        .await
+        .expect("connect");
+    let out = eval(
+        &mut lord,
+        &format!(r#"return game.set_actor("{}")"#, admin_id),
+    )
+    .await;
+    assert_eq!(out, "false", "owner must not impersonate a global admin");
+
+    let resp = server
+        .post_auth(
+            "/universe/lord-realm/run_script",
+            &serde_json::json!({"script": "no-such-script.lua", "account_id": admin_id}),
+            lord.auth_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "{}", resp.text().await.unwrap());
+
+    // Acting as an ordinary player in their own universe still works
+    let pl = connect(&server, player("realm_serf")).await;
+    let out = eval(
+        &mut lord,
+        &format!(r#"return game.set_actor("{}")"#, pl.account_id()),
+    )
+    .await;
+    assert_eq!(out, "true");
+}
+
+/// A level change applies to an open session at once, without reconnecting
+#[tokio::test]
+async fn test_level_change_applies_to_open_session() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = connect(&server, player("live_promo")).await;
+    let pl_id = pl.account_id().to_string();
+    let mut adm = connect(&server, admin("live_promoter")).await;
+
+    pl.drain().await;
+    pl.command("eval return 1").await.unwrap();
+    let _ = pl.expect("echo").await;
+    assert!(pl.expect("error").await.is_ok(), "a player cannot eval");
+
+    let out = eval(
+        &mut adm,
+        &format!(r#"return game.set_access_level("{}", "wizard")"#, pl_id),
+    )
+    .await;
+    assert_eq!(out, "true");
+    assert_eq!(
+        eval(&mut pl, "return 6 * 7").await,
+        "42",
+        "promoted session evals"
+    );
+
+    let out = eval(
+        &mut adm,
+        &format!(r#"return game.set_access_level("{}", "player")"#, pl_id),
+    )
+    .await;
+    assert_eq!(out, "true");
+    pl.drain().await;
+    pl.command("eval return 1").await.unwrap();
+    let _ = pl.expect("echo").await;
+    assert!(
+        pl.expect("error").await.is_ok(),
+        "demoted session cannot eval"
+    );
+}
+
+/// POST /universe/{id}/portal sets the spawn room: universe admin+ only
+/// (a universe's owner counts), and only to a room in that universe
+#[tokio::test]
+async fn test_portal_endpoint() {
+    let server = TestServer::start().await.expect("server");
+    let uid = server.universe_id().to_string();
+    let mut spawn = mudd::objects::Object::new("/rooms/new-spawn", &uid, "room").unwrap();
+    spawn.set_property("name", serde_json::json!("New Spawn"));
+    server.world().store().create(&spawn).await.unwrap();
+    let path = format!("/universe/{}/portal", uid);
+    let body = serde_json::json!({"room_id": "/rooms/new-spawn"});
+    let portal = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT value FROM universe_settings WHERE universe_id = ? AND key = 'portal_room_id'",
+        )
+        .bind(server.universe_id())
+        .fetch_one(server.pool())
+        .await
+        .unwrap()
+    };
+    let before = portal().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}{}", server.base_url(), path))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let pl = connect(&server, player("portal_peasant")).await;
+    let resp = server
+        .post_auth(&path, &body, pl.auth_token())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(portal().await, before);
+
+    let adm = connect(&server, admin("portal_admin")).await;
+    for (room, status) in [
+        ("/rooms/nowhere", 404),
+        (server.world().bat_id.as_str(), 400),
+    ] {
+        let resp = server
+            .post_auth(
+                &path,
+                &serde_json::json!({"room_id": room}),
+                adm.auth_token(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "{}", room);
+    }
+    let resp = server
+        .post_auth(&path, &body, adm.auth_token())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    assert_eq!(portal().await, "/rooms/new-spawn");
+
+    // A universe's owner is admin+ inside it, and only inside it
+    let lord_id = pl.account_id().to_string();
+    server
+        .create_universe("peasant-realm", &lord_id)
+        .await
+        .unwrap();
+    let resp = server
+        .post_auth(
+            "/universe/peasant-realm/portal",
+            &serde_json::json!({"room_id": "/rooms/hall"}),
+            pl.auth_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    // The test universe's new spawn room does not exist in peasant-realm
+    let resp = server
+        .post_auth("/universe/peasant-realm/portal", &body, pl.auth_token())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// Login and registration are rate-limited before any password hashing:
+/// per username (the configured rate) and per client IP (twice it)
+#[tokio::test]
+async fn test_auth_rate_limits() {
+    let server = TestServer::start_with_args(false, &["--auth-limit", "3"])
+        .await
+        .expect("server");
+    let login = |name: &str| {
+        let body = serde_json::json!({"username": name, "password": "wrong-password"});
+        let server = &server;
+        async move { server.post("/auth/login", &body).await.unwrap() }
+    };
+    for _ in 0..3 {
+        assert_eq!(login("target").await.status(), 401);
+    }
+    let limited = login("target").await;
+    assert_eq!(limited.status(), 429, "per-username limit");
+    assert!(limited.headers().contains_key("retry-after"));
+    // Other names from the same client still get through, up to the IP limit
+    assert_eq!(login("someone_else").await.status(), 401);
+    assert_eq!(login("third_person").await.status(), 401);
+    assert_eq!(login("fourth_person").await.status(), 429, "per-IP limit");
+}
+
+/// Only failed logins count: the owner logging in again and again is never
+/// limited (by the per-username limits)
+#[tokio::test]
+async fn test_successful_logins_do_not_count() {
+    let server = TestServer::start_with_args(false, &["--auth-limit", "3"])
+        .await
+        .expect("server");
+    let creds = serde_json::json!({"username": "regular", "password": "testpass123"});
+    assert_eq!(
+        server
+            .post("/auth/register", &creds)
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    // 1 registration + 5 logins stays within the client's limit (6)
+    for _ in 0..5 {
+        assert_eq!(
+            server.post("/auth/login", &creds).await.unwrap().status(),
+            200
+        );
+    }
+}
+
+/// A successful login hands out a device token; presenting it renews it
+/// (a new one each time), and logout with it revokes it
+#[tokio::test]
+async fn test_device_tokens_issued_and_renewed() {
+    let server = TestServer::start_with_world(false).await.expect("server");
+    let creds = serde_json::json!({"username": "devicey", "password": "testpass123"});
+    let reg: serde_json::Value = server
+        .post("/auth/register", &creds)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first = reg["device_token"]
+        .as_str()
+        .expect("issued at registration")
+        .to_string();
+    let login = serde_json::json!({"username": "devicey", "password": "testpass123", "device_token": first});
+    let renewed: serde_json::Value = server
+        .post("/auth/login", &login)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second = renewed["device_token"]
+        .as_str()
+        .expect("renewed")
+        .to_string();
+    assert_ne!(first, second);
+    let out = server
+        .post(
+            "/auth/logout",
+            &serde_json::json!({"token": renewed["token"], "device_token": second}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.status(), 200);
 }

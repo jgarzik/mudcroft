@@ -1,7 +1,13 @@
 //! HTTP API module - REST endpoints and WebSocket
 
 mod auth;
+mod devices;
+mod effect_scheduler;
+mod gateway;
 mod images;
+pub mod payments;
+mod primary;
+mod ratelimit;
 pub mod scripting;
 mod universe;
 mod websocket;
@@ -12,7 +18,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use crate::combat::CombatManager;
+use crate::auth::accounts::AccountService;
 use crate::credits::CreditManager;
 use crate::db::Database;
 use crate::images::ImageStore;
@@ -42,7 +48,49 @@ pub struct AppState {
     pub venice: Arc<VeniceClient>,
     pub image_store: Arc<ImageStore>,
     pub themes: Arc<ThemeRegistry>,
-    pub combat: Arc<CombatManager>,
+    /// Login/registration limits: per client IP (twice the configured
+    /// rate) and per username (login; the configured rate)
+    pub auth_by_ip: Arc<ratelimit::RateLimiter>,
+    pub auth_by_user: Arc<ratelimit::RateLimiter>,
+    /// Failed logins per username across all clients (ten times the
+    /// configured rate): beyond it attempts for the name go one at a time,
+    /// a second apart (the owner still gets in, queued)
+    pub auth_by_user_global: Arc<ratelimit::RateLimiter>,
+    /// The hard cap across all clients (a hundred times the rate): refused
+    pub auth_by_user_cap: Arc<ratelimit::RateLimiter>,
+    /// Device tokens (in memory): logins presenting a valid one skip the
+    /// slow per-username queue
+    pub devices: Arc<devices::DeviceTokens>,
+    /// Serializes the slowed attempts per username
+    pub auth_user_locks: Arc<ratelimit::KeyedLocks>,
+    /// True while this node is the active primary: leader, caches rebuilt,
+    /// schedulers running (set by api/primary.rs). Game traffic is served
+    /// locally only then.
+    pub primary: tokio::sync::watch::Receiver<bool>,
+    /// Room images being generated (one job per room)
+    pub image_jobs: crate::images::ImageJobs,
+    /// Status effects: a cache of the active_effects table
+    pub effects: Arc<crate::combat::EffectRegistry>,
+}
+
+impl AppState {
+    /// Whether this node is the active primary
+    pub fn primary_active(&self) -> bool {
+        *self.primary.borrow()
+    }
+
+    /// Wait up to `limit` for this node to be the active primary (a node
+    /// that has just been elected is still rebuilding its caches)
+    pub async fn wait_primary_active(&self, limit: std::time::Duration) -> bool {
+        let mut primary = self.primary.clone();
+        let waited = tokio::time::timeout(limit, primary.wait_for(|active| *active)).await;
+        matches!(waited, Ok(Ok(_)))
+    }
+
+    /// The account service, writing through Raft
+    pub fn accounts(&self) -> AccountService {
+        AccountService::new(self.db.pool().clone(), self.raft_writer.clone())
+    }
 }
 
 /// Build the API router. With `static_dir`, also serve the built web client
@@ -52,14 +100,20 @@ pub async fn router(
     db: Arc<Database>,
     raft_writer: Arc<RaftWriter>,
     static_dir: Option<std::path::PathBuf>,
+    auth_limit: u32,
 ) -> Router {
+    // Before serving: the first unknown-user login must not pay for this
+    let _ = tokio::task::spawn_blocking(crate::auth::accounts::prepare_login_timing).await;
     let connections = Arc::new(ConnectionManager::new());
     let object_store = Arc::new(ObjectStore::new(
         db.pool().clone(),
         Some(raft_writer.clone()),
     ));
-    let mut class_registry = ClassRegistry::with_db(db.pool().clone(), raft_writer.clone());
-    let actions = Arc::new(ActionRegistry::new());
+    let class_registry = ClassRegistry::with_db(db.pool().clone(), raft_writer.clone());
+    let actions = Arc::new(ActionRegistry::with_db(
+        db.pool().clone(),
+        raft_writer.clone(),
+    ));
     let permissions = Arc::new(PermissionManager::with_db(
         db.pool().clone(),
         Some(raft_writer.clone()),
@@ -76,24 +130,14 @@ pub async fn router(
     let venice = Arc::new(VeniceClient::new());
     let image_store = Arc::new(ImageStore::new(db.pool().clone(), raft_writer.clone()));
     let themes = Arc::new(ThemeRegistry::new());
-    let combat = Arc::new(CombatManager::with_db(db.pool().clone()));
 
-    // Load persisted data on startup
-    if let Err(e) = timers.load_from_db().await {
-        tracing::warn!("Failed to load timers from database: {}", e);
-    }
-    if let Err(e) = permissions.load_path_grants().await {
-        tracing::warn!("Failed to load path grants from database: {}", e);
-    }
-    if let Err(e) = class_registry.load_from_db().await {
-        tracing::warn!("Failed to load classes from database: {}", e);
-    }
-    if let Err(e) = combat.load_from_db().await {
-        tracing::warn!("Failed to load combat states from database: {}", e);
-    }
+    // The caches are built from the tables when this node becomes primary
+    // (api/primary.rs)
+    let effects = crate::combat::EffectRegistry::shared();
 
     let classes = Arc::new(RwLock::new(class_registry));
 
+    let (primary_tx, primary_rx) = tokio::sync::watch::channel(false);
     let state = AppState {
         db,
         raft_writer,
@@ -108,27 +152,80 @@ pub async fn router(
         venice,
         image_store,
         themes,
-        combat,
+        image_jobs: crate::images::ImageJobs::new(),
+        primary: primary_rx,
+        auth_by_ip: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(2))),
+        auth_by_user: Arc::new(ratelimit::RateLimiter::new(auth_limit)),
+        auth_by_user_global: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(10))),
+        auth_by_user_cap: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(100))),
+        auth_user_locks: Arc::new(ratelimit::KeyedLocks::default()),
+        devices: Arc::new(devices::DeviceTokens::default()),
+        effects,
     };
 
-    // Fire call_out timers and heartbeats in the background
-    tokio::spawn(scripting::run_timer_loop(state.clone()));
+    // Timers, heartbeats and status effects run on the primary only. A node
+    // that is already the leader (always, for a single node) waits for its
+    // caches before serving, so no request races their first load.
+    let leader_at_start = state.raft_writer.is_leader();
+    tokio::spawn(primary::run(state.clone(), primary_tx));
+    if leader_at_start
+        && !state
+            .wait_primary_active(std::time::Duration::from_secs(30))
+            .await
+    {
+        tracing::warn!("primary not ready after 30 s; serving anyway");
+    }
 
     let api = Router::new()
         .route("/health", get(health_check))
         .route("/ws", get(websocket::ws_handler))
         .nest("/images", images::router())
-        .merge(auth::router())
-        .merge(universe::router());
+        // On a gateway these are forwarded to the primary
+        .merge(
+            auth::router()
+                .merge(universe::router())
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    gateway::forward_to_primary,
+                ))
+                // Outermost: before a gateway forwards anything
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    ratelimit::limit_auth_by_ip,
+                )),
+        );
 
-    match static_dir {
+    let app = match static_dir {
         Some(dir) => {
             let index = tower_http::services::ServeFile::new(dir.join("index.html"));
             let files = tower_http::services::ServeDir::new(dir).fallback(index);
-            api.fallback_service(files).with_state(state)
+            api.fallback_service(files).with_state(state.clone())
         }
-        None => api.route("/", get(root)).with_state(state),
-    }
+        None => api.route("/", get(root)).with_state(state.clone()),
+    };
+    let app = with_web_layers(app);
+    gateway::install_hooks(&state, &app);
+    app
+}
+
+/// What a front-end proxy would otherwise add: gzip for text (images and
+/// WebSocket upgrades pass through) and browser security headers
+fn with_web_layers(app: Router) -> Router {
+    use axum::http::{header, HeaderValue};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    app.layer(tower_http::compression::CompressionLayer::new())
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("SAMEORIGIN"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
 }
 
 /// Root endpoint

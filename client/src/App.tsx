@@ -5,14 +5,16 @@ import { AuthScreen } from './components/AuthScreen'
 import { UniverseSelect } from './components/UniverseSelect'
 import { Terminal } from './components/Terminal'
 import { RoomPanel } from './components/RoomPanel'
+import { PaymentDialog } from './components/PaymentDialog'
 
 function GameScreen() {
-  const { sendCommand } = useWebSocket()
+  const { sendCommand, answerPayment } = useWebSocket()
   const logout = useGameStore((s) => s.logout)
   const username = useGameStore((s) => s.username)
 
   return (
     <div className="game-screen flex flex-col h-full">
+      <PaymentDialog onAnswer={answerPayment} />
       {/* Header */}
       <header
         className="flex items-center justify-between"

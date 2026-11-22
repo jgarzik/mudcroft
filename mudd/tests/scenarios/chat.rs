@@ -60,7 +60,7 @@ async fn test_say_not_heard_in_other_rooms() {
     let exits = server
         .world()
         .store()
-        .get(&server.world().entrance_id)
+        .get(server.universe_id(), &server.world().entrance_id)
         .await
         .unwrap()
         .unwrap()

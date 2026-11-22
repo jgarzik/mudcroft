@@ -5,9 +5,8 @@ browser. For automated browser tests, see [Automated tests](#automated-tests).
 
 ## Prerequisites
 
-- A Rust toolchain, plus Node.js 22 or newer with npm. The start script's
-  `setportal` step uses Node's built-in `WebSocket`.
-- `curl` and `jq`
+- A Rust toolchain, plus Node.js 22 or newer with npm
+- Python 3.10 or newer (the script uses only the standard library)
 - The built server and client:
 
   ```bash
@@ -20,7 +19,7 @@ browser. For automated browser tests, see [Automated tests](#automated-tests).
 From the repository root:
 
 ```bash
-scripts/start-testsrv.sh
+scripts/testsrv.py start
 ```
 
 This one command does everything:
@@ -31,14 +30,15 @@ This one command does everything:
    `client/dist` on the same origin.
 3. Logs in as the admin, creates the universe `test-world` ("Test Universe")
    and runs `scripts/cave_adventure.lua` in it.
-4. Sets the spawn portal to `/rooms/cave-entrance`.
+4. Sets the spawn portal to `/rooms/cave-entrance`
+   (`POST /universe/test-world/portal`).
 
 When it prints `READY FOR PLAY-TESTING`, open **http://127.0.0.1:8080**. Log in
 as `admin` / `testpass123`, or register a new account (a `player`). Then pick
 **Test Universe**.
 
 The server runs in the foreground. Stop it with **Ctrl+C** in that terminal,
-or with `scripts/stop-testsrv.sh` from another one. Either way the temp dir,
+or with `scripts/testsrv.py stop` from another one. Either way the temp dir,
 including the database and logs, is deleted.
 
 | Environment variable | Default | Effect |
@@ -162,9 +162,8 @@ Server-wide known issues are listed in
 |---------|-----|
 | `[ERROR] .../mudd not found` | `(cd mudd && cargo build --release)` |
 | `[ERROR] client not built` | `(cd client && npm ci && npm run build)` |
-| `[ERROR] Something is already listening on port 8080` | Stop the other server, or run `PORT=8081 scripts/start-testsrv.sh` |
-| `[ERROR] A test server is already running` | `scripts/stop-testsrv.sh` |
-| `setportal timed out` | Node is too old (no built-in `WebSocket`), or the server is unhealthy. Check `server.log`. |
+| `[ERROR] Something is already listening on port 8080` | Stop the other server, or run `PORT=8081 scripts/testsrv.py start` |
+| `[ERROR] A test server is already running` | `scripts/testsrv.py stop` |
 | `Universe not initialized` or `You are nowhere.` | The portal step failed. As admin, run `setportal /rooms/cave-entrance`. |
 | No room images | Put `VENICE_API_KEY` in `.env` at the repository root and restart |
 | An `eval` fails | The Lua error comes back as an error message. Try smaller pieces, e.g. `eval return 1 + 1`. |
@@ -174,11 +173,11 @@ The server log is at `<temp dir>/server.log`; the start script prints the path.
 ## Automated Tests
 
 ```bash
-scripts/e2e.sh                                   # whole suite
-scripts/e2e.sh e2e/gameplay.spec.ts --headed     # one file, visible browser
+scripts/e2e.py                                   # whole suite
+scripts/e2e.py e2e/gameplay.spec.ts --headed     # one file, visible browser
 ```
 
-`scripts/e2e.sh` builds `mudd` and the client, then runs the Playwright suite
+`scripts/e2e.py` builds `mudd` and the client, then runs the Playwright suite
 in `client/e2e/` with headless Chromium. The suite starts its own `mudd` on a
 random port in a temp dir. Set `MUDCROFT_E2E_KEEP=1` to keep the temp dir and
 logs. The first time, install the browser with

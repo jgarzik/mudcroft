@@ -6,7 +6,7 @@ use std::sync::Arc;
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 use parking_lot::Mutex;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::sync::RwLock;
 
 use super::actions::{Action, ActionRegistry};
@@ -31,31 +31,119 @@ fn actor_override(lua: &Lua) -> Option<String> {
 /// Block on an async permission lookup from a synchronous Lua callback
 fn block_on_perm<F, T>(fut: F) -> T
 where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
+    F: std::future::Future<Output = T>,
 {
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(fut)
-    })
-    .join()
-    .expect("permission lookup thread panicked")
+    block_now(fut)
 }
 
-/// Whether `obj` is an account's own player object (`/players/p-<account>`,
-/// owned by that account). Only these are shared across universes; scripts
-/// cannot create them (see `is_reserved_object`).
-fn is_account_player_object(obj: &Object) -> bool {
-    obj.class == "player"
-        && obj
-            .owner_id
-            .as_deref()
-            .is_some_and(|owner| obj.id == crate::player::PlayerManager::player_path(owner))
+/// Who pays for a Venice call, and what it costs (universe config
+/// `venice_chat_cost` / `venice_image_cost`, default 0)
+#[derive(Clone)]
+struct VeniceBilling {
+    store: Arc<ObjectStore>,
+    credits: Arc<CreditManager>,
+    universe_id: String,
+    owner: Option<String>,
+    payer: Option<String>,
+    object: Option<String>,
 }
 
-/// Check that `parent_id` (if any) may contain objects of `universe_id`: it
-/// must exist and belong to that universe, or be an account's player object
+impl VeniceBilling {
+    /// The holder `opts.payer` names: "actor" (default; None when nobody
+    /// chose to run this code) or "object"
+    fn payer_holder(&self, opts: Option<&Table>) -> LuaResult<Option<crate::credits::Holder>> {
+        use crate::credits::Holder;
+        let which: Option<String> = match opts {
+            Some(t) => t.get("payer")?,
+            None => None,
+        };
+        match which.as_deref().unwrap_or("actor") {
+            "actor" => Ok(self.payer.clone().map(Holder::Account)),
+            "object" => self
+                .object
+                .clone()
+                .map(|o| Some(Holder::Object(o)))
+                .ok_or_else(|| mlua::Error::runtime("no object here")),
+            _ => Err(mlua::Error::runtime(
+                "payer must be \"actor\" or \"object\"",
+            )),
+        }
+    }
+
+    /// Charge the price under `price_key` to `holder`, run `call` (given the
+    /// rate-limit key: the code's owner), and refund if it fails
+    async fn paid<T, F, Fut>(
+        &self,
+        holder: Option<crate::credits::Holder>,
+        price_key: &str,
+        call: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let config = self
+            .store
+            .get_universe(&self.universe_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|u| u.config)
+            .unwrap_or_default();
+        let price = match config.get(price_key) {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => v
+                .as_i64()
+                .filter(|p| (0..=crate::credits::MAX_AMOUNT).contains(p))
+                .ok_or_else(|| format!("universe config {} is not a valid price", price_key))?,
+        };
+        if price > 0 {
+            if let Some(crate::credits::Holder::Account(_)) = holder {
+                return Err("a player pays only through game.request_payment; bill the \
+                            object ({payer = \"object\"}) instead"
+                    .to_string());
+            }
+            let Some(ref holder) = holder else {
+                return Err("no paying player here (only a verb, eval or script has one)".into());
+            };
+            if !self
+                .credits
+                .deduct(&self.universe_id, holder, price)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                return Err(format!("not enough credits (costs {})", price));
+            }
+        }
+        // Rate-limited under the code's owner, whoever pays: the limit
+        // guards the operator's Venice bill, and keyed by payer every
+        // object (or player) would be a fresh bucket
+        let key = format!(
+            "{}:{}",
+            self.universe_id,
+            self.owner.as_deref().unwrap_or("anonymous")
+        );
+        let result = call(key).await;
+        if result.is_err() && price > 0 {
+            if let Some(ref holder) = holder {
+                if let Err(e) = self.credits.grant(&self.universe_id, holder, price).await {
+                    tracing::warn!("venice refund of {} to {:?} failed: {}", price, holder, e);
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Run a future to completion from synchronous Lua callback code, on the
+/// current (multi-threaded) runtime. Cheap, unlike spawning a thread with
+/// its own runtime per call, which made a few dozen game.* calls blow the
+/// execution's time budget.
+fn block_now<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+}
+
+/// Check that `parent_id` (if any) exists in `universe_id` (object ids are
+/// scoped per universe, so a parent is always in the same universe)
 async fn check_parent(
     store: &ObjectStore,
     universe_id: &str,
@@ -64,9 +152,8 @@ async fn check_parent(
     let Some(parent_id) = parent_id else {
         return Ok(Ok(()));
     };
-    Ok(match store.get(parent_id).await? {
-        Some(p) if p.universe_id == universe_id || is_account_player_object(&p) => Ok(()),
-        Some(_) => Err(format!("{} belongs to another universe", parent_id)),
+    Ok(match store.get(universe_id, parent_id).await? {
+        Some(_) => Ok(()),
         None => Err(format!("parent not found: {}", parent_id)),
     })
 }
@@ -89,10 +176,8 @@ async fn object_permission(
     let Some(user_id) = user_id else {
         return Err("no user context".to_string());
     };
-    // Object ids are global: never touch another universe's objects. Player
-    // objects are the exception: one is shared by every universe its account
-    // visits (it holds the inventory and HP wherever the player is).
-    if obj.universe_id != universe_id && !is_account_player_object(obj) {
+    // Objects are looked up per universe, so this only guards misuse
+    if obj.universe_id != universe_id {
         return Err(format!("{} belongs to another universe", obj.id));
     }
     let ctx = permissions.get_user_context(user_id, universe_id).await;
@@ -145,10 +230,13 @@ pub struct GameApi {
     credits: Arc<CreditManager>,
     venice: Arc<VeniceClient>,
     image_store: Arc<crate::images::ImageStore>,
+    effects: Arc<crate::combat::EffectRegistry>,
     universe_id: String,
     current_room_id: Option<String>,
     current_user_id: Option<String>,
     current_object_id: Option<String>,
+    /// Account paying for credit spending as `"actor"` (see ScriptContext)
+    payer: Option<String>,
     /// Time override for testing (milliseconds since epoch, 0 = use real time)
     time_override: Arc<AtomicU64>,
     /// RNG for dice rolls - seeded for reproducibility in tests
@@ -198,6 +286,7 @@ impl GameApi {
         credits: Arc<CreditManager>,
         venice: Arc<VeniceClient>,
         image_store: Arc<crate::images::ImageStore>,
+        effects: Arc<crate::combat::EffectRegistry>,
         universe_id: &str,
     ) -> Self {
         Self {
@@ -210,10 +299,12 @@ impl GameApi {
             credits,
             venice,
             image_store,
+            effects,
             universe_id: universe_id.to_string(),
             current_room_id: None,
             current_user_id: None,
             current_object_id: None,
+            payer: None,
             time_override: Arc::new(AtomicU64::new(0)),
             rng: Arc::new(Mutex::new(StdRng::from_rng(&mut rand::rng()))),
             use_depth: 0,
@@ -234,15 +325,23 @@ impl GameApi {
             credits: self.credits.clone(),
             venice: self.venice.clone(),
             image_store: self.image_store.clone(),
+            effects: self.effects.clone(),
             universe_id: self.universe_id.clone(),
             current_room_id: None,
             current_user_id: None,
             current_object_id: None,
+            // Nested object code never spends the caller's credits
+            payer: None,
             time_override: self.time_override.clone(),
             rng: self.rng.clone(),
             use_depth: self.use_depth + 1,
             use_calls: self.use_calls.clone(),
         }
+    }
+
+    /// Set the account paying for credit spending as `"actor"`
+    pub fn set_payer(&mut self, payer: Option<String>) {
+        self.payer = payer;
     }
 
     /// Set the current user context for permission checks
@@ -295,6 +394,7 @@ impl GameApi {
         self.register_message_functions(lua, &game)?;
         self.register_permission_functions(lua, &game)?;
         self.register_timer_functions(lua, &game)?;
+        self.register_effect_functions(lua, &game)?;
         self.register_credit_functions(lua, &game)?;
         self.register_venice_functions(lua, &game)?;
         self.register_utility_functions(lua, &game)?;
@@ -305,17 +405,19 @@ impl GameApi {
         // This is a global function, not on the game table
         let classes = self.classes.clone();
         let store = self.store.clone();
+        let parent_universe = self.universe_id.clone();
         let parent_fn = lua.create_function(
             move |lua, (class_name, handler_name, args): (String, String, Table)| {
                 charge_db(lua)?;
                 let classes = classes.clone();
                 let store = store.clone();
+                let universe_id = parent_universe.clone();
 
                 // Get the parent class name
                 let parent_class = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let registry = classes.read().await;
-                        let class = registry.get_class(&class_name);
+                        let class = registry.get_class(&universe_id, &class_name);
                         class.and_then(|c| c.parent.clone())
                     })
                 });
@@ -329,10 +431,11 @@ impl GameApi {
                 let parent_code = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let registry = classes.read().await;
-                        let parent = registry.get_class(&parent_class_name);
+                        let parent = registry.get_class(&universe_id, &parent_class_name);
                         match parent {
                             Some(class_def) => {
-                                // The class's attached code (legacy: a code_hash property)
+                                // The class's code: ClassDef.code_hash, or a code_hash
+                                // property default (how define_class attaches it)
                                 let hash = class_def.code_hash.clone().or_else(|| {
                                     class_def
                                         .properties
@@ -429,8 +532,12 @@ impl GameApi {
                 let classes = classes_clone.clone();
                 let class_name = class.clone();
                 obj.properties = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { classes.read().await.resolve_properties(&class_name) })
+                    tokio::runtime::Handle::current().block_on(async {
+                        classes
+                            .read()
+                            .await
+                            .resolve_properties(&universe_id, &class_name)
+                    })
                 });
                 // A class's code (its code_hash default, used by parent()) is
                 // never attached to instances implicitly: attaching code is an
@@ -512,12 +619,13 @@ impl GameApi {
         // game.get_object(id)
         // Actually fetches from database
         let store_clone = store.clone();
+        let uni = universe_id.clone();
         let get_object = lua.create_function(move |lua, id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async { store.get(&id).await })
+                tokio::runtime::Handle::current().block_on(async { store.get(&uni, &id).await })
             });
 
             match result {
@@ -553,9 +661,9 @@ impl GameApi {
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     // First get the existing object
-                    let obj_result = store.get(&id).await?;
+                    let obj_result = store.get(&universe_id, &id).await?;
                     match obj_result {
-                        Some(mut obj) => {
+                        Some(obj) => {
                             if let Err(reason) = object_permission(
                                 &permissions,
                                 user.as_deref(),
@@ -567,25 +675,28 @@ impl GameApi {
                             {
                                 return Ok(Err(reason));
                             }
-                            // Apply changes; `code_hash` attaches (or, if nil,
-                            // detaches) stored code instead of setting a property
+                            // Write only what changed, in place and in one
+                            // batch: rewriting the whole row could put back
+                            // a property (hp) changed meanwhile. `code_hash`
+                            // attaches (or, if nil, detaches) stored code
+                            // instead of setting a property.
+                            let mut props = Vec::new();
+                            let mut code_change: Option<Option<String>> = None;
                             for (k, v) in changes_vec {
                                 if k == "code_hash" {
                                     // The code will run as the object's owner,
                                     // so only the owner or a superior may set it
                                     if let Some(ref owner) = obj.owner_id {
                                         let actor = user.as_deref().unwrap_or_default();
-                                        if actor != owner {
-                                            let actor_level =
-                                                permissions.get_access_level(actor).await;
-                                            let owner_level =
-                                                permissions.get_access_level(owner).await;
-                                            if !actor_level.can_act_as(owner_level) {
-                                                return Ok(Err(
-                                                    "only the owner or a superior may attach code"
-                                                        .to_string(),
-                                                ));
-                                            }
+                                        if actor != owner
+                                            && !permissions
+                                                .can_act_as(&universe_id, actor, owner)
+                                                .await
+                                        {
+                                            return Ok(Err(
+                                                "only the owner or a superior may attach code"
+                                                    .to_string(),
+                                            ));
                                         }
                                     }
                                     match v {
@@ -593,16 +704,33 @@ impl GameApi {
                                             if store.get_code(&hash).await?.is_none() {
                                                 anyhow::bail!("unknown code_hash {}", hash);
                                             }
-                                            obj.code_hash = Some(hash);
+                                            code_change = Some(Some(hash));
                                         }
-                                        serde_json::Value::Null => obj.code_hash = None,
+                                        serde_json::Value::Null => code_change = Some(None),
                                         _ => anyhow::bail!("code_hash must be a string"),
                                     }
                                 } else {
-                                    obj.properties.insert(k, v);
+                                    props.push((k, v));
                                 }
                             }
-                            store.update(&obj).await?;
+                            let mut statements = Vec::new();
+                            if !props.is_empty() {
+                                statements.push(ObjectStore::set_properties_statement(
+                                    &universe_id,
+                                    &id,
+                                    &props,
+                                )?);
+                            }
+                            if let Some(code) = code_change {
+                                statements.push(ObjectStore::set_code_hash_statement(
+                                    &universe_id,
+                                    &id,
+                                    code.as_deref(),
+                                ));
+                            }
+                            if !statements.is_empty() {
+                                store.execute_batch(statements).await?;
+                            }
                             Ok(Ok(true))
                         }
                         None => Ok(Ok(false)),
@@ -626,17 +754,21 @@ impl GameApi {
             universe_id.clone(),
             permissions.clone(),
         );
-        let cleanup = (self.timers.clone(), self.actions.clone());
+        let cleanup = (
+            self.timers.clone(),
+            self.actions.clone(),
+            self.effects.clone(),
+        );
         let delete_object = lua.create_function(move |lua, id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
             let (user, universe_id, permissions) = ctx_clone.clone();
-            let (timers, actions) = cleanup.clone();
+            let (timers, actions, effects) = cleanup.clone();
             let user = actor_override(lua).or(user);
 
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let Some(obj) = store.get(&id).await? else {
+                    let Some(obj) = store.get(&universe_id, &id).await? else {
                         return Ok(Ok(false));
                     };
                     if let Err(reason) = object_permission(
@@ -650,16 +782,28 @@ impl GameApi {
                     {
                         return Ok(Err(reason));
                     }
-                    let deleted = store.delete(&id).await?;
-                    if deleted {
-                        // Nothing may keep running for (or be dispatched to)
-                        // the deleted object, nor for a later object reusing
-                        // its path
-                        timers.remove_timers_for_object(&id).await;
-                        timers.remove_heartbeat(&id).await;
-                        actions.clear_by_object(&id).await;
-                    }
-                    Ok(Ok(deleted))
+                    // The object and its balance go together, atomically
+                    // (credits has no foreign key: holders may be accounts)
+                    store
+                        .execute_batch(vec![
+                            ObjectStore::delete_statement(&universe_id, &id),
+                            crate::credits::CreditManager::delete_statement(
+                                &universe_id,
+                                &crate::credits::Holder::Object(id.clone()),
+                            ),
+                        ])
+                        .await?;
+                    // Nothing may keep running for (or be dispatched to) the
+                    // deleted object, nor for a later object reusing its
+                    // path. Its timer, heartbeat and effect rows went with
+                    // it (cascade); drop them from the caches too.
+                    timers.remove_timers_for_object(&universe_id, &id).await;
+                    timers.remove_heartbeat(&universe_id, &id).await;
+                    effects.cache_clear(&universe_id, &id).await;
+                    // Its verb rows (and a room's) went with it (cascade)
+                    actions.clear_by_object(&universe_id, &id).await;
+                    actions.clear_room(&universe_id, &id).await;
+                    Ok(Ok(true))
                 })
             });
 
@@ -672,8 +816,10 @@ impl GameApi {
         game.set("delete_object", delete_object)?;
 
         // game.move_object(id, new_parent_id)
-        // Actually moves object in database
+        // Moves the object in the database, then (once the script ends) moves
+        // a connected player's session and runs the containers' hooks
         let store_clone = store.clone();
+        let move_queue = self.messages.clone();
         let ctx_clone = (
             current_user.clone(),
             universe_id.clone(),
@@ -686,10 +832,10 @@ impl GameApi {
                 let (user, universe_id, permissions) = ctx_clone.clone();
                 let user = actor_override(lua).or(user);
 
-                let result: anyhow::Result<Result<(), String>> =
+                let result: anyhow::Result<Result<Option<String>, String>> =
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let Some(obj) = store.get(&id).await? else {
+                            let Some(obj) = store.get(&universe_id, &id).await? else {
                                 anyhow::bail!("Object not found: {}", id);
                             };
                             if let Err(reason) = object_permission(
@@ -703,29 +849,28 @@ impl GameApi {
                             {
                                 return Ok(Err(reason));
                             }
-                            if let Some(ref dest) = new_parent_id {
-                                match store.get(dest).await? {
-                                    Some(d)
-                                        if d.universe_id == universe_id
-                                            || is_account_player_object(&d) => {}
-                                    Some(_) => {
-                                        return Ok(Err(format!(
-                                            "{} belongs to another universe",
-                                            dest
-                                        )))
-                                    }
-                                    None => anyhow::bail!("Destination not found: {}", dest),
-                                }
+                            if let Err(reason) =
+                                check_parent(&store, &universe_id, new_parent_id.as_deref()).await?
+                            {
+                                anyhow::bail!("Destination {}", reason);
                             }
                             store
-                                .move_object(&id, new_parent_id.as_deref())
-                                .await
-                                .map(Ok)
+                                .move_object(&universe_id, &id, new_parent_id.as_deref())
+                                .await?;
+                            Ok(Ok(obj.parent_id))
                         })
                     });
 
                 match result {
-                    Ok(Ok(())) => Ok(true),
+                    Ok(Ok(from)) => {
+                        move_queue.moved(
+                            &id,
+                            from.as_deref(),
+                            new_parent_id.as_deref(),
+                            user.as_deref(),
+                        );
+                        Ok(true)
+                    }
                     Ok(Err(reason)) => Err(denied("move_object", reason)),
                     Err(e) => Err(mlua::Error::external(e)),
                 }
@@ -761,7 +906,7 @@ impl GameApi {
                 let result: anyhow::Result<Result<Option<Object>, String>> =
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let obj_result = store.get(&id).await?;
+                            let obj_result = store.get(&universe_id, &id).await?;
                             match obj_result {
                                 Some(original)
                                     if is_reserved_object(&validated_path, &original.class) =>
@@ -887,7 +1032,7 @@ impl GameApi {
 
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(async { store.get_contents(&parent_id).await })
+                        .block_on(async { store.get_contents(&universe_id, &parent_id).await })
                 });
 
                 match result {
@@ -924,9 +1069,8 @@ impl GameApi {
         let store = self.store.clone();
 
         // game.define_class(name, definition)
-        // Registers a new class with parent and properties. Wizard+ only
-        // (classes are shared by every universe), and built-in base classes
-        // cannot be redefined.
+        // Registers a class in the script's universe, with parent and
+        // properties. Wizard+ only; built-in base classes cannot be redefined.
         let classes_clone = classes.clone();
         let perm_ctx = (
             self.permissions.clone(),
@@ -945,6 +1089,7 @@ impl GameApi {
                     )));
                 }
                 let (permissions, user, universe_id) = perm_ctx.clone();
+                let class_universe = universe_id.clone();
                 let user = actor_override(lua).or(user);
                 let caller = user.clone();
                 let (allowed, is_admin) = block_on_perm(async move {
@@ -987,25 +1132,39 @@ impl GameApi {
                     }
                 }
 
-                // Classes are shared by every universe: an existing custom class
-                // may be replaced only by whoever defined it, or by an admin
+                // An existing class may be replaced only by whoever defined
+                // it, or by an admin
+                // Defines are serialized by the define lock. The registry lock
+                // is held only briefly: a read lock to check the definer, and
+                // the write lock to insert. The Raft write happens with no
+                // registry lock held, so it never stalls class lookups.
                 let replaced: Result<(), String> = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        let mut registry = classes.write().await;
-                        if let Some(existing) = registry.get_class(&name) {
-                            if existing.defined_by != caller && !is_admin {
-                                return Err(format!(
-                                    "define_class: {} is already defined by another account",
-                                    name
-                                ));
+                        let define_lock = classes.read().await.define_lock();
+                        let _defining = define_lock.lock().await;
+                        let persister = {
+                            let registry = classes.read().await;
+                            if let Some(existing) = registry.get_class(&class_universe, &name) {
+                                if existing.defined_by != caller && !is_admin {
+                                    return Err(format!(
+                                        "define_class: {} is already defined by another account",
+                                        name
+                                    ));
+                                }
                             }
-                        }
-                        registry.define_class(
+                            registry.persister()
+                        };
+                        let class = crate::objects::ClassRegistry::build_class(
                             &name,
                             parent.as_deref(),
                             props_map,
                             caller.as_deref(),
                         );
+                        persister
+                            .persist(&class_universe, &class)
+                            .await
+                            .map_err(|e| format!("define_class: {}", e))?;
+                        classes.write().await.insert(&class_universe, class);
                         Ok(())
                     })
                 });
@@ -1018,6 +1177,7 @@ impl GameApi {
         // game.get_class(name)
         // Returns class definition as table
         let classes_clone = classes.clone();
+        let class_universe = self.universe_id.clone();
         let get_class = lua.create_function(move |lua, name: String| {
             charge_db(lua)?;
             let classes = classes_clone.clone();
@@ -1025,7 +1185,7 @@ impl GameApi {
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     let registry = classes.read().await;
-                    registry.get_class(&name).cloned()
+                    registry.get_class(&class_universe, &name).cloned()
                 })
             });
 
@@ -1059,6 +1219,7 @@ impl GameApi {
         // Checks if object is of class or inherits from it
         let store_clone = store.clone();
         let classes_clone = classes.clone();
+        let universe_id = self.universe_id.clone();
         let is_a = lua.create_function(move |lua, (obj_id, class_name): (String, String)| {
             charge_db(lua)?;
             let store = store_clone.clone();
@@ -1066,11 +1227,11 @@ impl GameApi {
 
             let result: anyhow::Result<bool> = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let obj = store.get(&obj_id).await?;
+                    let obj = store.get(&universe_id, &obj_id).await?;
                     match obj {
                         Some(o) => {
                             let registry = classes.read().await;
-                            Ok(registry.is_a(&o.class, &class_name))
+                            Ok(registry.is_a(&universe_id, &o.class, &class_name))
                         }
                         None => Ok(false),
                     }
@@ -1086,6 +1247,7 @@ impl GameApi {
 
         // game.get_class_chain(class_name)
         // Returns inheritance chain as array
+        let class_universe = self.universe_id.clone();
         let get_class_chain = lua.create_function(move |lua, name: String| {
             charge_db(lua)?;
             let classes = classes.clone();
@@ -1093,7 +1255,7 @@ impl GameApi {
             let chain = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     let registry = classes.read().await;
-                    registry.get_inheritance_chain(&name)
+                    registry.get_inheritance_chain(&class_universe, &name)
                 })
             });
 
@@ -1110,17 +1272,19 @@ impl GameApi {
 
     fn register_query_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let store = self.store.clone();
+        let universe = self.universe_id.clone();
 
         // game.environment(obj_id)
         // Returns the parent object (container/room)
         let store_clone = store.clone();
+        let universe_id = universe.clone();
         let environment = lua.create_function(move |lua, obj_id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(async { store.get_environment(&obj_id).await })
+                    .block_on(async { store.get_environment(&universe_id, &obj_id).await })
             });
 
             match result {
@@ -1134,13 +1298,14 @@ impl GameApi {
         // game.all_inventory(obj_id)
         // Returns all contents of an object
         let store_clone = store.clone();
+        let universe_id = universe.clone();
         let all_inventory = lua.create_function(move |lua, obj_id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(async { store.get_contents(&obj_id).await })
+                    .block_on(async { store.get_contents(&universe_id, &obj_id).await })
             });
 
             match result {
@@ -1159,13 +1324,14 @@ impl GameApi {
         // game.present(name, env_id)
         // Find object by name in a location
         let store_clone = store.clone();
+        let universe_id = universe.clone();
         let present = lua.create_function(move |lua, (name, env_id): (String, String)| {
             charge_db(lua)?;
             let store = store_clone.clone();
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(async { store.find_by_name(&env_id, &name).await })
+                    .block_on(async { store.find_by_name(&universe_id, &env_id, &name).await })
             });
 
             match result {
@@ -1180,6 +1346,7 @@ impl GameApi {
         // Returns living entities in a location: anything whose class is
         // living or descends from it (players, npcs and their subclasses)
         let classes = self.classes.clone();
+        let universe_id = universe.clone();
         let get_living_in = lua.create_function(move |lua, env_id: String| {
             charge_db(lua)?;
             let store = store.clone();
@@ -1187,12 +1354,12 @@ impl GameApi {
 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let contents = store.get_contents(&env_id).await?;
+                    let contents = store.get_contents(&universe_id, &env_id).await?;
                     let registry = classes.read().await;
                     Ok::<_, anyhow::Error>(
                         contents
                             .into_iter()
-                            .filter(|o| registry.is_a(&o.class, "living"))
+                            .filter(|o| registry.is_a(&universe_id, &o.class, "living"))
                             .collect::<Vec<_>>(),
                     )
                 })
@@ -1242,7 +1409,7 @@ impl GameApi {
             let user = actor_override(lua).or(user);
             let object_id = object_id.to_string();
             block_on_perm(async move {
-                let Ok(Some(obj)) = store.get(&object_id).await else {
+                let Ok(Some(obj)) = store.get(&universe_id, &object_id).await else {
                     return false;
                 };
                 if object_permission(
@@ -1261,9 +1428,7 @@ impl GameApi {
                     (None, _) => true,
                     (Some(owner), Some(actor)) if owner == actor => true,
                     (Some(owner), Some(actor)) => {
-                        let actor_level = permissions.get_access_level(actor).await;
-                        let owner_level = permissions.get_access_level(owner).await;
-                        actor_level.can_act_as(owner_level)
+                        permissions.can_act_as(&universe_id, actor, owner).await
                     }
                     (Some(_), None) => false,
                 }
@@ -1275,10 +1440,12 @@ impl GameApi {
         let actions_clone = actions.clone();
         let room_id_clone = room_id.clone();
         let perm_clone = perm_ctx.clone();
+        let action_universe = self.universe_id.clone();
         let add_action = lua.create_function(
             move |lua, (verb, object_id, method): (String, String, String)| {
                 let actions = actions_clone.clone();
                 let room_id = room_id_clone.clone();
+                let universe_id = action_universe.clone();
                 if is_private_handler(&method) || !may_modify(lua, &perm_clone, &object_id) {
                     return Ok(false);
                 }
@@ -1293,23 +1460,23 @@ impl GameApi {
 
                 // Store action - for now we'll use the object_id as the scope
                 // The caller should set up proper room context before execution
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        if let Some(rid) = room_id {
-                            actions.add_room_action(&rid, action).await;
-                        } else {
-                            // If no room context, add as object action
-                            actions
-                                .add_object_action(&action.object_id, action.clone())
-                                .await;
-                        }
-                    });
-                })
-                .join()
-                .ok();
-
-                Ok(true)
+                let stored = block_now(async {
+                    if let Some(rid) = room_id {
+                        actions.add_room_action(&universe_id, &rid, action).await
+                    } else {
+                        // If no room context, add as object action
+                        actions
+                            .add_object_action(&universe_id, &action.object_id, action.clone())
+                            .await
+                    }
+                });
+                match stored {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        tracing::warn!("add_action not stored: {}", e);
+                        Ok(false)
+                    }
+                }
             },
         )?;
         game.set("add_action", add_action)?;
@@ -1318,28 +1485,34 @@ impl GameApi {
         // Removes a contextual action
         let actions_clone = actions.clone();
         let room_id_clone = room_id;
+        let action_universe = self.universe_id.clone();
         let remove_action =
             lua.create_function(move |lua, (verb, object_id): (String, String)| {
                 let actions = actions_clone.clone();
                 let room_id = room_id_clone.clone();
+                let universe_id = action_universe.clone();
                 if !may_modify(lua, &perm_ctx, &object_id) {
                     return Ok(false);
                 }
 
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        if let Some(rid) = room_id {
-                            actions.remove_room_action(&rid, &verb, &object_id).await;
-                        } else {
-                            actions.remove_object_action(&object_id, &verb).await;
-                        }
-                    });
-                })
-                .join()
-                .ok();
-
-                Ok(true)
+                let removed = block_now(async {
+                    if let Some(rid) = room_id {
+                        actions
+                            .remove_room_action(&universe_id, &rid, &verb, &object_id)
+                            .await
+                    } else {
+                        actions
+                            .remove_object_action(&universe_id, &object_id, &verb)
+                            .await
+                    }
+                });
+                match removed {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        tracing::warn!("remove_action not stored: {}", e);
+                        Ok(false)
+                    }
+                }
             })?;
         game.set("remove_action", remove_action)?;
 
@@ -1391,9 +1564,10 @@ impl GameApi {
         // game.set_actor(actor_id)
         // Sets the current actor for permission checks in this Lua context.
         // Callers may only act as accounts strictly below their own level
-        // (see AccessLevel::can_act_as); nil clears the override.
+        // (see PermissionManager::can_act_as); nil clears the override.
         let permissions_clone = permissions.clone();
         let current_user_clone = current_user.clone();
+        let actor_universe = self.universe_id.clone();
         let set_actor = lua.create_function(move |lua, actor_id: Option<String>| {
             charge_db(lua)?;
             let Some(id) = actor_id else {
@@ -1407,10 +1581,9 @@ impl GameApi {
             if id != real {
                 let permissions = permissions_clone.clone();
                 let target = id.clone();
+                let universe_id = actor_universe.clone();
                 let allowed = block_on_perm(async move {
-                    let real_level = permissions.get_access_level(&real).await;
-                    let target_level = permissions.get_access_level(&target).await;
-                    real_level.can_act_as(target_level)
+                    permissions.can_act_as(&universe_id, &real, &target).await
                 });
                 if !allowed {
                     return Ok(false);
@@ -1470,20 +1643,15 @@ impl GameApi {
                     .unwrap_or_else(|| "anonymous".to_string());
 
                 // Build contexts synchronously using thread spawn
-                let result_data = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let user_ctx = permissions.get_user_context(&user_id, &universe_id).await;
-                        let obj_ctx = ObjectContext {
-                            object_id: target_id,
-                            owner_id,
-                            is_fixed: is_fixed.unwrap_or(false),
-                        };
-                        permissions.check_permission(&user_ctx, action, &obj_ctx)
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
+                let result_data = block_now(async {
+                    let user_ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                    let obj_ctx = ObjectContext {
+                        object_id: target_id,
+                        owner_id,
+                        is_fixed: is_fixed.unwrap_or(false),
+                    };
+                    permissions.check_permission(&user_ctx, action, &obj_ctx)
+                });
 
                 let result = lua.create_table()?;
                 match result_data {
@@ -1515,16 +1683,11 @@ impl GameApi {
                 .or(current_user)
                 .unwrap_or_else(|| "anonymous".to_string());
 
-            let result = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    permissions
-                        .can_access_path(&user_id, &universe_id, &path)
-                        .await
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let result = block_now(async {
+                permissions
+                    .can_access_path(&user_id, &universe_id, &path)
+                    .await
+            });
 
             Ok(result)
         })?;
@@ -1533,33 +1696,29 @@ impl GameApi {
         // game.get_access_level(account_id)
         // Returns the access level of a user as a string
         let permissions_clone = permissions.clone();
+        let level_universe = self.universe_id.clone();
         let get_access_level = lua.create_function(move |lua, account_id: String| {
             charge_db(lua)?;
             let permissions = permissions_clone.clone();
+            let universe_id = level_universe.clone();
 
-            let level = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async { permissions.get_access_level(&account_id).await })
-            })
-            .join()
-            .expect("Thread panicked");
-
-            let level_str = match level {
-                AccessLevel::Player => "player",
-                AccessLevel::Builder => "builder",
-                AccessLevel::Wizard => "wizard",
-                AccessLevel::Admin => "admin",
-                AccessLevel::Owner => "owner",
-            };
-            Ok(level_str.to_string())
+            let level = block_on_perm(async move {
+                permissions
+                    .get_access_level(&universe_id, &account_id)
+                    .await
+            });
+            Ok(level.as_str().to_string())
         })?;
         game.set("get_access_level", get_access_level)?;
 
         // game.set_access_level(account_id, level_str)
-        // Sets a user's access level. Rules: AccessLevel::can_set_access_level
-        // (admin+, target below caller, admin/owner grants need owner).
+        // Sets an account's level in the script's universe. Rules:
+        // AccessLevel::can_set_access_level (admin+, target below caller,
+        // admin grants need owner); "owner" is not a member level. Returns
+        // false if refused or if the write fails.
         let permissions_clone = permissions.clone();
         let current_user_clone = current_user.clone();
+        let level_universe = self.universe_id.clone();
         let set_access_level =
             lua.create_function(move |lua, (account_id, level_str): (String, String)| {
                 charge_db(lua)?;
@@ -1578,14 +1737,19 @@ impl GameApi {
                     return Ok(false);
                 };
 
+                let universe_id = level_universe.clone();
                 let changed = block_on_perm(async move {
-                    let caller_level = permissions.get_access_level(&caller).await;
-                    let target_level = permissions.get_access_level(&account_id).await;
+                    let caller_level = permissions.get_access_level(&universe_id, &caller).await;
+                    let target_level = permissions
+                        .get_access_level(&universe_id, &account_id)
+                        .await;
                     if !caller_level.can_set_access_level(target_level, level) {
                         return false;
                     }
-                    permissions.set_access_level(&account_id, level).await;
-                    true
+                    permissions
+                        .set_access_level(&universe_id, &account_id, level)
+                        .await
+                        .is_ok()
                 });
 
                 Ok(changed)
@@ -1609,26 +1773,19 @@ impl GameApi {
                     .or(current_user)
                     .unwrap_or_else(|| "anonymous".to_string());
 
-                let result: Result<crate::permissions::PathGrant, String> =
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            let grantor_ctx =
-                                permissions.get_user_context(&user_id, &universe_id).await;
-                            permissions
-                                .grant_path(
-                                    &grantor_ctx,
-                                    &grantee_id,
-                                    &universe_id,
-                                    &path_prefix,
-                                    can_delegate.unwrap_or(false),
-                                )
-                                .await
-                                .map_err(|e| e.to_string())
-                        })
-                    })
-                    .join()
-                    .expect("Thread panicked");
+                let result: Result<crate::permissions::PathGrant, String> = block_now(async {
+                    let grantor_ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                    permissions
+                        .grant_path(
+                            &grantor_ctx,
+                            &grantee_id,
+                            &universe_id,
+                            &path_prefix,
+                            can_delegate.unwrap_or(false),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                });
 
                 match result {
                     Ok(grant) => {
@@ -1667,18 +1824,13 @@ impl GameApi {
                 .or(current_user)
                 .unwrap_or_else(|| "anonymous".to_string());
 
-            let result: Result<bool, String> = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let revoker_ctx = permissions.get_user_context(&user_id, &universe_id).await;
-                    permissions
-                        .revoke_path(&revoker_ctx, &grant_id, &universe_id)
-                        .await
-                        .map_err(|e| e.to_string())
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let result: Result<bool, String> = block_now(async {
+                let revoker_ctx = permissions.get_user_context(&user_id, &universe_id).await;
+                permissions
+                    .revoke_path(&revoker_ctx, &grant_id, &universe_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
 
             match result {
                 Ok(revoked) => Ok(Value::Boolean(revoked)),
@@ -1700,12 +1852,8 @@ impl GameApi {
             let permissions = permissions_clone.clone();
             let universe_id = universe_clone.clone();
 
-            let grants = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async { permissions.get_path_grants(&account_id, &universe_id).await })
-            })
-            .join()
-            .expect("Thread panicked");
+            let grants =
+                block_now(async { permissions.get_path_grants(&account_id, &universe_id).await });
 
             let table = lua.create_table()?;
             for (i, grant) in grants.iter().enumerate() {
@@ -1722,6 +1870,188 @@ impl GameApi {
         })?;
         game.set("get_path_grants", get_path_grants)?;
 
+        Ok(())
+    }
+
+    fn register_effect_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        use crate::combat::{DamageType, EffectType, StatusEffect};
+        use std::str::FromStr;
+
+        /// Bounds a script may set: duration and pulse period (seconds),
+        /// and magnitude
+        const MAX_DURATION_SECS: f64 = 86_400.0;
+        const MIN_PERIOD_SECS: f64 = 0.5;
+        const MAX_PERIOD_SECS: f64 = 3_600.0;
+        const MAX_MAGNITUDE: i64 = 10_000;
+
+        fn effect_type(name: &str) -> LuaResult<EffectType> {
+            EffectType::from_str(name)
+                .map_err(|_| mlua::Error::runtime(format!("unknown effect type {:?}", name)))
+        }
+
+        // game.apply_effect(target_id, type, duration_secs, magnitude [, damage_type [, period_secs]])
+        // Adds (or refreshes) a status effect. Damage over time (or any
+        // effect given a damage type) and regenerating pulse every period
+        // (default 1 s). Checked like other writes to the target (Modify);
+        // persisted, so it survives a restart.
+        let (store, perms, effects, universe, user) = (
+            self.store.clone(),
+            self.permissions.clone(),
+            self.effects.clone(),
+            self.universe_id.clone(),
+            self.current_user_id.clone(),
+        );
+        let apply_effect = lua.create_function(
+            move |lua,
+                  (target, kind, duration, magnitude, dtype, period): (
+                String,
+                String,
+                f64,
+                i64,
+                Option<String>,
+                Option<f64>,
+            )| {
+                charge_db(lua)?;
+                if !duration.is_finite() || period.is_some_and(|p| !p.is_finite()) {
+                    return Err(mlua::Error::runtime(
+                        "apply_effect: duration and period must be finite numbers",
+                    ));
+                }
+                let effect_type = effect_type(&kind)?;
+                let damage_type = match dtype {
+                    Some(name) => Some(DamageType::from_str(&name).map_err(|_| {
+                        mlua::Error::runtime(format!("unknown damage type {:?}", name))
+                    })?),
+                    // Damage-over-time effects default their damage type
+                    None => match effect_type {
+                        EffectType::Poisoned => Some(DamageType::Poison),
+                        EffectType::Burning => Some(DamageType::Fire),
+                        EffectType::Bleeding => Some(DamageType::Physical),
+                        _ => None,
+                    },
+                };
+                let now = crate::combat::now_ms();
+                let duration_ms = (duration.clamp(0.1, MAX_DURATION_SECS) * 1000.0) as u64;
+                let magnitude = magnitude.clamp(-MAX_MAGNITUDE, MAX_MAGNITUDE) as i32;
+                let pulses = damage_type.is_some() || effect_type == EffectType::Regenerating;
+                let effect = if pulses {
+                    let period = period
+                        .unwrap_or(1.0)
+                        .clamp(MIN_PERIOD_SECS, MAX_PERIOD_SECS);
+                    StatusEffect::periodic(
+                        effect_type,
+                        now,
+                        duration_ms,
+                        (period * 1000.0) as u64,
+                        magnitude,
+                        damage_type,
+                    )
+                } else {
+                    StatusEffect::new(effect_type, now, duration_ms, magnitude)
+                };
+                let user = actor_override(lua).or(user.clone());
+                let (store, perms, effects, universe) = (
+                    store.clone(),
+                    perms.clone(),
+                    effects.clone(),
+                    universe.clone(),
+                );
+                let result: anyhow::Result<Result<(), String>> = block_now(async move {
+                    let Some(obj) = store.get(&universe, &target).await? else {
+                        anyhow::bail!("Object not found: {}", target);
+                    };
+                    if let Err(reason) = object_permission(
+                        &perms,
+                        user.as_deref(),
+                        &universe,
+                        &obj,
+                        PermAction::Modify,
+                    )
+                    .await
+                    {
+                        return Ok(Err(reason));
+                    }
+                    effects.apply(&store, &universe, &target, effect).await?;
+                    Ok(Ok(()))
+                });
+                match result {
+                    Ok(Ok(())) => Ok(true),
+                    Ok(Err(reason)) => Err(denied("apply_effect", reason)),
+                    Err(e) => Err(mlua::Error::external(e)),
+                }
+            },
+        )?;
+        game.set("apply_effect", apply_effect)?;
+
+        // game.remove_effect(target_id, type) -> true if it was present
+        let (store, perms, effects, universe, user) = (
+            self.store.clone(),
+            self.permissions.clone(),
+            self.effects.clone(),
+            self.universe_id.clone(),
+            self.current_user_id.clone(),
+        );
+        let remove_effect = lua.create_function(move |lua, (target, kind): (String, String)| {
+            charge_db(lua)?;
+            let effect_type = effect_type(&kind)?;
+            let user = actor_override(lua).or(user.clone());
+            let (store, perms, effects, universe) = (
+                store.clone(),
+                perms.clone(),
+                effects.clone(),
+                universe.clone(),
+            );
+            let result: anyhow::Result<Result<bool, String>> = block_now(async move {
+                let Some(obj) = store.get(&universe, &target).await? else {
+                    anyhow::bail!("Object not found: {}", target);
+                };
+                if let Err(reason) =
+                    object_permission(&perms, user.as_deref(), &universe, &obj, PermAction::Modify)
+                        .await
+                {
+                    return Ok(Err(reason));
+                }
+                if !effects
+                    .get(&universe, &target)
+                    .await
+                    .has(effect_type, crate::combat::now_ms())
+                {
+                    return Ok(Ok(false));
+                }
+                effects
+                    .remove(&store, &universe, &target, effect_type)
+                    .await?;
+                Ok(Ok(true))
+            });
+            match result {
+                Ok(Ok(removed)) => Ok(removed),
+                Ok(Err(reason)) => Err(denied("remove_effect", reason)),
+                Err(e) => Err(mlua::Error::external(e)),
+            }
+        })?;
+        game.set("remove_effect", remove_effect)?;
+
+        // game.get_effects(target_id) -> {{type, remaining, magnitude, damage_type, period}, ...}
+        let (effects, universe) = (self.effects.clone(), self.universe_id.clone());
+        let get_effects = lua.create_function(move |lua, target: String| {
+            charge_db(lua)?;
+            let (effects, universe) = (effects.clone(), universe.clone());
+            let current = block_now(async move { effects.get(&universe, &target).await });
+            let now = crate::combat::now_ms();
+            let list = lua.create_table()?;
+            for (i, e) in current.active(now).into_iter().enumerate() {
+                let t = lua.create_table()?;
+                t.set("type", e.effect_type.to_string())?;
+                // Whole seconds left, rounded up
+                t.set("remaining", (e.expires_at - now).div_ceil(1000))?;
+                t.set("magnitude", e.magnitude)?;
+                t.set("damage_type", e.damage_type.map(|d| d.to_string()))?;
+                t.set("period", e.period_ms.map(|p| p as f64 / 1000.0))?;
+                list.set(i + 1, t)?;
+            }
+            Ok(list)
+        })?;
+        game.set("get_effects", get_effects)?;
         Ok(())
     }
 
@@ -1743,26 +2073,20 @@ impl GameApi {
                 let universe_id = universe_clone.clone();
                 let object_id = object_clone.clone();
 
-                // Negative/NaN delays fire on the next tick
+                // Negative/NaN delays fire after the 100 ms minimum (MIN_TIMER_DELAY_MS)
                 let delay_ms = (delay_secs.max(0.0) * 1000.0) as u64;
 
-                let timer_id = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        // "" when there is no object context or the object is
-                        // at its pending-timer limit
-                        match object_id {
-                            Some(obj_id) => {
-                                let timer =
-                                    Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
-                                timers.try_add_timer(timer).await.unwrap_or_default()
-                            }
-                            None => String::new(),
+                let timer_id = block_now(async {
+                    // "" when there is no object context or the object is
+                    // at its pending-timer limit
+                    match object_id {
+                        Some(obj_id) => {
+                            let timer = Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
+                            timers.try_add_timer(timer).await.unwrap_or_default()
                         }
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
+                        None => String::new(),
+                    }
+                });
 
                 Ok(timer_id)
             },
@@ -1770,25 +2094,32 @@ impl GameApi {
         game.set("call_out", call_out)?;
 
         // game.remove_call_out(timer_id)
-        // Cancel a scheduled timer
+        // Cancel one of the current object's own timers (false otherwise,
+        // and always false outside object code)
         let timers_clone = timers.clone();
+        let universe_clone = universe_id.clone();
+        let object_clone = current_object.clone();
         let remove_call_out = lua.create_function(move |lua, timer_id: String| {
             charge_db(lua)?;
             let timers = timers_clone.clone();
+            let universe_id = universe_clone.clone();
+            let Some(object_id) = object_clone.clone() else {
+                return Ok(false);
+            };
 
-            let removed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async { timers.remove_timer(&timer_id).await })
-            })
-            .join()
-            .expect("Thread panicked");
+            let removed = block_now(async {
+                timers
+                    .remove_timer_owned(&timer_id, &universe_id, &object_id)
+                    .await
+            });
 
             Ok(removed)
         })?;
         game.set("remove_call_out", remove_call_out)?;
 
         // game.set_heart_beat(interval_ms)
-        // Set a recurring heartbeat for the current object
+        // Set a recurring heartbeat for the current object (false outside
+        // object code, where there is no object to call)
         let timers_clone = timers.clone();
         let universe_clone = universe_id.clone();
         let object_clone = current_object.clone();
@@ -1796,21 +2127,15 @@ impl GameApi {
             charge_db(lua)?;
             let timers = timers_clone.clone();
             let universe_id = universe_clone.clone();
-            let object_id = object_clone.clone();
+            let Some(obj_id) = object_clone.clone() else {
+                return Ok(false);
+            };
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(obj_id) = object_id {
-                        let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
-                        timers.set_heartbeat(hb).await;
-                    }
-                });
-            })
-            .join()
-            .ok();
-
-            Ok(true)
+            let stored = block_now(async {
+                let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
+                timers.set_heartbeat(hb).await
+            });
+            Ok(stored.is_ok())
         })?;
         game.set("set_heart_beat", set_heart_beat)?;
 
@@ -1821,19 +2146,15 @@ impl GameApi {
             charge_db(lua)?;
             let timers = timers.clone();
             let object_id = object_clone.clone();
+            let universe_id = universe_id.clone();
 
-            let removed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(obj_id) = object_id {
-                        timers.remove_heartbeat(&obj_id).await
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let removed = block_now(async {
+                if let Some(obj_id) = object_id {
+                    timers.remove_heartbeat(&universe_id, &obj_id).await
+                } else {
+                    false
+                }
+            });
 
             Ok(removed)
         })?;
@@ -1843,82 +2164,223 @@ impl GameApi {
     }
 
     fn register_credit_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
+        use crate::credits::Holder;
         let credits = self.credits.clone();
         let universe_id = self.universe_id.clone();
         let current_user = self.current_user_id.clone();
         let permissions = self.permissions.clone();
+        let payer = self.payer.clone();
+        let object = self.current_object_id.clone();
 
-        // game.get_credits()
-        // Get the current player's credit balance
-        let credits_clone = credits.clone();
-        let universe_clone = universe_id.clone();
-        let user_clone = current_user.clone();
+        // "actor" (the paying player) or "object" (the running object)
+        // A player pays only through game.request_payment (they confirm)
+        let spender = {
+            let object = object.clone();
+            move |which: &str| -> LuaResult<Holder> {
+                match which {
+                    "actor" => Err(mlua::Error::runtime(
+                        "a player's credits are spent only with their consent: use \
+                         game.request_payment",
+                    )),
+                    "object" => object
+                        .clone()
+                        .map(Holder::Object)
+                        .ok_or_else(|| mlua::Error::runtime("no object here")),
+                    _ => Err(mlua::Error::runtime(
+                        "payer must be \"actor\" or \"object\"",
+                    )),
+                }
+            }
+        };
+
+        // game.get_credits(): the paying player's balance (0 if none)
+        let (c, u, p) = (credits.clone(), universe_id.clone(), payer.clone());
         let get_credits = lua.create_function(move |lua, ()| {
             charge_db(lua)?;
-            let credits = credits_clone.clone();
-            let universe_id = universe_clone.clone();
-            let user_id = user_clone.clone();
-
-            let balance = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(uid) = user_id {
-                        credits.get_balance(&universe_id, &uid).await
-                    } else {
-                        0
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
-
-            Ok(balance)
+            let Some(account) = p.clone() else {
+                return Ok(0);
+            };
+            block_now(c.balance(&u, &Holder::Account(account))).map_err(mlua::Error::external)
         })?;
         game.set("get_credits", get_credits)?;
 
-        // game.deduct_credits(amount, reason)
-        // Deduct credits from the current player
-        // Returns true if successful, false if insufficient funds
-        let credits_clone = credits.clone();
-        let universe_clone = universe_id.clone();
-        let user_clone = current_user.clone();
-        let deduct_credits = lua.create_function(move |lua, (amount, reason): (i64, String)| {
+        // game.object_credits(): the running object's balance
+        let (c, u, s) = (credits.clone(), universe_id.clone(), spender.clone());
+        let object_credits = lua.create_function(move |lua, ()| {
             charge_db(lua)?;
-            let credits = credits_clone.clone();
-            let universe_id = universe_clone.clone();
-            let user_id = user_clone.clone();
-
-            let result = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(uid) = user_id {
-                        credits.deduct(&universe_id, &uid, amount, &reason).await
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
-
-            Ok(result)
+            let holder = s("object")?;
+            block_now(c.balance(&u, &holder)).map_err(mlua::Error::external)
         })?;
+        game.set("object_credits", object_credits)?;
+
+        // game.deduct_credits(amount, reason, payer?): spend from "actor"
+        // (default) or "object"; false if it has too little
+        let (c, u, s) = (credits.clone(), universe_id.clone(), spender.clone());
+        let deduct_credits = lua.create_function(
+            move |lua, (amount, reason, which): (i64, String, Option<String>)| {
+                charge_db(lua)?;
+                let holder = s(which.as_deref().unwrap_or("actor"))?;
+                let paid =
+                    block_now(c.deduct(&u, &holder, amount)).map_err(mlua::Error::external)?;
+                if paid {
+                    tracing::debug!("credits: {:?} spent {} on {:?}", holder, amount, reason);
+                }
+                Ok(paid)
+            },
+        )?;
         game.set("deduct_credits", deduct_credits)?;
 
-        // game.admin_grant_credits(account_id, amount)
-        // Grant credits to a player (admin+, via PermAction::GrantCredits)
-        let credits_clone = credits;
-        let universe_clone = universe_id;
-        let user_clone = current_user;
-        let admin_grant_credits =
-            lua.create_function(move |lua, (account_id, amount): (String, i64)| {
+        // game.transfer_credits(from, to, amount): from "actor" or "object";
+        // to "actor", "object", an account id or an object path. Atomic;
+        // false if the payer has too little.
+        let (c, u, s) = (credits.clone(), universe_id.clone(), spender);
+        let transfer_credits =
+            lua.create_function(move |lua, (from, to, amount): (String, String, i64)| {
                 charge_db(lua)?;
-                let credits = credits_clone.clone();
-                let universe_id = universe_clone.clone();
+                let from = s(&from)?;
+                let to = match to.as_str() {
+                    "actor" | "object" => s(&to)?,
+                    other => Holder::parse(other),
+                };
+                block_now(async {
+                    if !c.holder_exists(&u, &to).await? {
+                        anyhow::bail!("no such holder {:?}", to);
+                    }
+                    c.transfer(&u, &from, &to, amount).await
+                })
+                .map_err(mlua::Error::external)
+            })?;
+        game.set("transfer_credits", transfer_credits)?;
+
+        // game.request_payment(amount, reason, handler, data?): ask the
+        // paying player (the one who typed this verb) to pay `amount` to
+        // this object. They get a prompt; if they accept within a minute the
+        // credits move and `handler` runs with {payment_id, amount, reason,
+        // data, actor_id}. Returns the request id at once.
+        let (u, p, o) = (universe_id.clone(), payer.clone(), object.clone());
+        let store = self.store.clone();
+        let messages = self.messages.clone();
+        let request_payment = lua.create_function(
+            move |lua, (amount, reason, handler, data): (i64, String, String, Option<String>)| {
+                charge_db(lua)?;
+                let Some(account) = p.clone() else {
+                    return Err(mlua::Error::runtime(
+                        "no paying player here (only code a player chose to run, such as a \
+                         verb, can ask them to pay)",
+                    ));
+                };
+                let Some(object_id) = o.clone() else {
+                    return Err(mlua::Error::runtime("request_payment needs an object"));
+                };
+                if !(1..=crate::credits::MAX_AMOUNT).contains(&amount) {
+                    return Err(mlua::Error::runtime("amount out of range"));
+                }
+                if is_private_handler(&handler) || handler.is_empty() {
+                    return Err(mlua::Error::runtime(
+                        "handler cannot be private or an engine hook",
+                    ));
+                }
+                let reason: String = reason.chars().take(200).collect();
+                let data = data.unwrap_or_default();
+                if data.len() > 4096 {
+                    return Err(mlua::Error::runtime("data is limited to 4096 bytes"));
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let now = crate::combat::now_ms() as i64;
+                let expires = now + crate::api::payments::PAYMENT_DEADLINE_MS as i64;
+                let universe_id = u.clone();
+                let store = store.clone();
+                let pending: i64 = block_now(async {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM payment_requests
+                         WHERE universe_id = ? AND account_id = ? AND expires_at > ?",
+                    )
+                    .bind(&universe_id)
+                    .bind(&account)
+                    .bind(now)
+                    .fetch_one(store.pool())
+                    .await
+                })
+                .map_err(mlua::Error::external)?;
+                if pending >= crate::api::payments::MAX_PENDING_PER_PLAYER {
+                    return Err(mlua::Error::runtime(
+                        "this player already has too many unanswered payment requests",
+                    ));
+                }
+                block_now(store.execute_batch(vec![
+                        (
+                            "DELETE FROM payment_requests WHERE universe_id = ? AND account_id = ?
+                         AND expires_at <= ?"
+                                .to_string(),
+                            vec![
+                                serde_json::json!(universe_id),
+                                serde_json::json!(account),
+                                serde_json::json!(now),
+                            ],
+                        ),
+                        (
+                            // The cap is enforced in the insert itself
+                            // (concurrent requests cannot both pass a check)
+                            "INSERT INTO payment_requests (id, universe_id, account_id, object_id,
+                         handler, amount, reason, data, expires_at)
+                         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         WHERE (SELECT COUNT(*) FROM payment_requests
+                                WHERE universe_id = ? AND account_id = ? AND expires_at > ?) < ?"
+                                .to_string(),
+                            vec![
+                                serde_json::json!(id),
+                                serde_json::json!(universe_id),
+                                serde_json::json!(account),
+                                serde_json::json!(object_id),
+                                serde_json::json!(handler),
+                                serde_json::json!(amount),
+                                serde_json::json!(reason),
+                                serde_json::json!(data),
+                                serde_json::json!(expires),
+                                serde_json::json!(universe_id),
+                                serde_json::json!(account),
+                                serde_json::json!(now),
+                                serde_json::json!(crate::api::payments::MAX_PENDING_PER_PLAYER),
+                            ],
+                        ),
+                    ]))
+                .map_err(mlua::Error::external)?;
+                let stored: Option<i64> = block_now(
+                    sqlx::query_scalar("SELECT 1 FROM payment_requests WHERE id = ?")
+                        .bind(&id)
+                        .fetch_optional(store.pool()),
+                )
+                .map_err(mlua::Error::external)?;
+                if stored.is_none() {
+                    return Err(mlua::Error::runtime(
+                        "this player already has too many unanswered payment requests",
+                    ));
+                }
+                let player = crate::player::PlayerManager::player_path(&account);
+                messages.confirm(
+                    &player,
+                    &id,
+                    &format!("Pay {} credits for {}?", amount, reason),
+                    amount,
+                );
+                Ok(id)
+            },
+        )?;
+        game.set("request_payment", request_payment)?;
+
+        // game.admin_grant_credits(holder, amount): an account id or object
+        // path (admin+, via PermAction::GrantCredits)
+        let (c, u) = (credits, universe_id);
+        let admin_grant_credits =
+            lua.create_function(move |lua, (holder, amount): (String, i64)| {
+                charge_db(lua)?;
+                let credits = c.clone();
+                let universe_id = u.clone();
                 let permissions = permissions.clone();
-                let Some(user_id) = actor_override(lua).or(user_clone.clone()) else {
+                let Some(user_id) = actor_override(lua).or(current_user.clone()) else {
                     return Ok(false);
                 };
+                let holder = Holder::parse(&holder);
 
                 let result = block_on_perm(async move {
                     let ctx = permissions.get_user_context(&user_id, &universe_id).await;
@@ -1933,10 +2395,8 @@ impl GameApi {
                     {
                         return false;
                     }
-
-                    credits
-                        .grant(&universe_id, &account_id, amount, "admin_grant")
-                        .await
+                    matches!(credits.holder_exists(&universe_id, &holder).await, Ok(true))
+                        && credits.grant(&universe_id, &holder, amount).await.is_ok()
                 });
 
                 Ok(result)
@@ -1949,22 +2409,26 @@ impl GameApi {
     fn register_venice_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let venice = self.venice.clone();
         let image_store = self.image_store.clone();
-        let current_user = self.current_user_id.clone();
+        let billing = VeniceBilling {
+            store: self.store.clone(),
+            credits: self.credits.clone(),
+            universe_id: self.universe_id.clone(),
+            owner: self.current_user_id.clone(),
+            payer: self.payer.clone(),
+            object: self.current_object_id.clone(),
+        };
 
-        // game.llm_chat(messages, tier)
-        // Send a chat completion request to Venice AI
-        // messages: array of {role, content} tables
-        // tier: "fast", "balanced", or "quality"
-        // Returns response text or nil on error
-        let venice_clone = venice.clone();
-        let user_clone = current_user.clone();
+        // game.llm_chat(messages, tier?, opts?)
+        // messages: array of {role, content}; tier: "fast", "balanced" or
+        // "quality"; opts.payer: "actor" (default) or "object".
+        // Returns the response text, or {error = ...}
+        let (venice_clone, bill) = (venice.clone(), billing.clone());
         let llm_chat = lua.create_function(
-            move |lua, (messages_table, tier_str): (Table, Option<String>)| {
+            move |lua, (messages_table, tier_str, opts): (Table, Option<String>, Option<Table>)| {
                 charge_venice(lua)?;
                 let venice = venice_clone.clone();
-                let user_id = user_clone.clone();
+                let holder = bill.payer_holder(opts.as_ref())?;
 
-                // Parse messages from Lua table
                 let mut messages = Vec::new();
                 for pair in messages_table.sequence_values::<Table>() {
                     let msg_table = pair?;
@@ -1972,27 +2436,17 @@ impl GameApi {
                     let content: String = msg_table.get("content")?;
                     messages.push(ChatMessage { role, content });
                 }
-
-                // Parse tier
                 let tier = tier_str
                     .as_deref()
                     .and_then(ModelTier::parse)
                     .unwrap_or(ModelTier::Balanced);
 
-                let result = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let account_id = user_id.as_deref().unwrap_or("anonymous");
-                        venice.chat(account_id, messages, tier).await
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
-
+                let result = block_now(bill.paid(holder, "venice_chat_cost", |key| async move {
+                    venice.chat(&key, messages, tier).await
+                }));
                 match result {
                     Ok(response) => Ok(Value::String(lua.create_string(&response)?)),
                     Err(e) => {
-                        // Return nil and error message
                         let result = lua.create_table()?;
                         result.set("error", e)?;
                         Ok(Value::Table(result))
@@ -2002,21 +2456,22 @@ impl GameApi {
         )?;
         game.set("llm_chat", llm_chat)?;
 
-        // game.llm_image(prompt, style, size)
-        // Generate an image using Venice AI
-        // prompt: text description
-        // style: "realistic", "anime", "digital", "painterly"
-        // size: "small", "medium", "large"
-        // Returns image hash string (for use with /images/{hash}) or error table
-        let user_clone = current_user;
+        // game.llm_image(prompt, style?, size?, opts?)
+        // style: "realistic", "anime", "digital", "painterly"; size: "small",
+        // "medium", "large"; opts.payer as for llm_chat.
+        // Returns an image hash (for /images/{hash}), or {error = ...}
         let llm_image = lua.create_function(
-            move |lua, (prompt, style_str, size_str): (String, Option<String>, Option<String>)| {
+            move |lua,
+                  (prompt, style_str, size_str, opts): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<Table>,
+            )| {
                 charge_venice(lua)?;
                 let venice = venice.clone();
                 let image_store = image_store.clone();
-                let user_id = user_clone.clone();
-
-                // Parse style and size
+                let holder = billing.payer_holder(opts.as_ref())?;
                 let style = style_str
                     .as_deref()
                     .and_then(ImageStyle::parse)
@@ -2026,27 +2481,16 @@ impl GameApi {
                     .and_then(ImageSize::parse)
                     .unwrap_or(ImageSize::Medium);
 
-                let result = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let account_id = user_id.as_deref().unwrap_or("anonymous");
-                        // Generate image (returns raw binary bytes)
-                        let image_bytes = venice
-                            .generate_image(account_id, &prompt, style, size)
-                            .await?;
-                        // Store binary data and get hash
+                let result =
+                    block_now(billing.paid(holder, "venice_image_cost", |key| async move {
+                        let image_bytes = venice.generate_image(&key, &prompt, style, size).await?;
                         image_store
                             .store(&image_bytes, "image/png", "llm_image")
                             .await
-                    })
-                })
-                .join()
-                .expect("Thread panicked");
-
+                    }));
                 match result {
                     Ok(hash) => Ok(Value::String(lua.create_string(&hash)?)),
                     Err(e) => {
-                        // Return nil and error message
                         let result = lua.create_table()?;
                         result.set("error", e)?;
                         Ok(Value::Table(result))
@@ -2091,30 +2535,27 @@ impl GameApi {
         let time_override_clone = time_override.clone();
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
+        let time_universe = self.universe_id.clone();
         let set_time = lua.create_function(move |lua, time_ms: u64| {
             charge_db(lua)?;
             let permissions = permissions_clone.clone();
             let user_id = user_clone.clone();
             let time_override = time_override_clone.clone();
+            let universe_id = time_universe.clone();
 
             // Check for actor override from game.set_actor()
             let actor_override: Option<String> = actor_override(lua);
             let effective_user = actor_override.or(user_id);
 
             // Check wizard+ permission
-            let allowed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(ref uid) = effective_user {
-                        let level = permissions.get_access_level(uid).await;
-                        level >= AccessLevel::Wizard
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let allowed = block_now(async {
+                if let Some(ref uid) = effective_user {
+                    let level = permissions.get_access_level(&universe_id, uid).await;
+                    level >= AccessLevel::Wizard
+                } else {
+                    false
+                }
+            });
 
             if allowed {
                 time_override.store(time_ms, Ordering::Relaxed);
@@ -2130,8 +2571,10 @@ impl GameApi {
         let rng_clone = rng.clone();
         let permissions_clone = permissions.clone();
         let user_clone = current_user.clone();
+        let seed_universe = self.universe_id.clone();
         let set_rng_seed = lua.create_function(move |lua, seed: u64| {
             charge_db(lua)?;
+            let universe_id = seed_universe.clone();
             let permissions = permissions_clone.clone();
             let user_id = user_clone.clone();
             let rng = rng_clone.clone();
@@ -2141,19 +2584,14 @@ impl GameApi {
             let effective_user = actor_override.or(user_id);
 
             // Check wizard+ permission
-            let allowed = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(ref uid) = effective_user {
-                        let level = permissions.get_access_level(uid).await;
-                        level >= AccessLevel::Wizard
-                    } else {
-                        false
-                    }
-                })
-            })
-            .join()
-            .expect("Thread panicked");
+            let allowed = block_now(async {
+                if let Some(ref uid) = effective_user {
+                    let level = permissions.get_access_level(&universe_id, uid).await;
+                    level >= AccessLevel::Wizard
+                } else {
+                    false
+                }
+            });
 
             if allowed {
                 *rng.lock() = StdRng::seed_from_u64(seed);
@@ -2218,7 +2656,7 @@ impl GameApi {
                     type Loaded = Option<(Object, String, String, Vec<(String, String)>)>;
                     let loaded: Result<Loaded, String> = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let obj = match store.get(&obj_id).await {
+                            let obj = match store.get(&universe_id, &obj_id).await {
                                 Ok(Some(o)) => o,
                                 Ok(None) => return Ok(None),
                                 Err(e) => return Err(e.to_string()),
@@ -2272,8 +2710,10 @@ impl GameApi {
                     // Fresh sandbox, contexts set before registration
                     let mut api = nested_api.nested_for(&obj);
                     api.use_depth = nested_api.use_depth;
-                    let result = run_handler_sandboxed(&api, &libs, &code, handler_name, &args)
-                        .map_err(mlua::Error::runtime)?;
+                    let deadline = super::Sandbox::deadline_of(lua);
+                    let result =
+                        run_handler_sandboxed(&api, &libs, &code, handler_name, &args, deadline)
+                            .map_err(mlua::Error::runtime)?;
                     match result {
                         Some(json) => json_to_lua(lua, &json),
                         None => Ok(Value::Nil),
@@ -2381,9 +2821,14 @@ fn run_handler_sandboxed(
     code: &str,
     handler: &str,
     args: &serde_json::Value,
+    caller_deadline: Option<std::time::Instant>,
 ) -> Result<Option<serde_json::Value>, String> {
     let mut sandbox = super::Sandbox::new(super::SandboxConfig::default())
         .map_err(|e| format!("use_object: {}", e))?;
+    // Nesting must not extend the calling run's time
+    if let Some(deadline) = caller_deadline {
+        sandbox.cap_deadline(deadline);
+    }
     api.register(sandbox.lua())
         .map_err(|e| format!("use_object: {}", e))?;
     for (name, lib) in libs {
@@ -2571,6 +3016,45 @@ pub fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Venice calls are rate-limited under the code's owner whoever pays:
+    /// keyed by payer, every object (or player) would be a fresh bucket
+    #[tokio::test]
+    async fn test_venice_rate_key_is_the_owner() {
+        let pool = crate::db::test_utils::test_pool().await;
+        let billing = VeniceBilling {
+            store: Arc::new(ObjectStore::new(pool.clone(), None)),
+            credits: CreditManager::shared(Some(pool), None),
+            universe_id: "u".into(),
+            owner: Some("builder".into()),
+            payer: Some("player".into()),
+            object: Some("/items/oracle".into()),
+        };
+        for holder in [
+            None,
+            Some(crate::credits::Holder::Account("player".into())),
+            Some(crate::credits::Holder::Object("/items/oracle".into())),
+        ] {
+            let key = billing
+                .paid(holder, "venice_chat_cost", |key| async move {
+                    Ok::<_, String>(key)
+                })
+                .await
+                .unwrap();
+            assert_eq!(key, "u:builder");
+        }
+        let ownerless = VeniceBilling {
+            owner: None,
+            ..billing
+        };
+        let key = ownerless
+            .paid(None, "venice_chat_cost", |key| async move {
+                Ok::<_, String>(key)
+            })
+            .await
+            .unwrap();
+        assert_eq!(key, "u:anonymous");
+    }
 
     #[test]
     fn test_lua_to_json_primitives() {

@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -48,7 +47,8 @@ impl Timer {
             universe_id: universe_id.to_string(),
             object_id: object_id.to_string(),
             method: method.to_string(),
-            fire_at: now + delay_ms as i64,
+            fire_at: now
+                .saturating_add(delay_ms.clamp(MIN_TIMER_DELAY_MS, MAX_TIMER_DELAY_MS) as i64),
             args,
         }
     }
@@ -79,8 +79,9 @@ pub struct HeartBeat {
     pub universe_id: String,
     /// Interval between beats in milliseconds
     pub interval_ms: u64,
-    /// Last time the heartbeat fired
-    pub last_fired: Instant,
+    /// When the next beat is due (Unix ms; not stored: after a restart the
+    /// next beat is one interval away)
+    pub next_due: i64,
     /// Method to call (defaults to "heart_beat")
     pub method: String,
 }
@@ -88,23 +89,30 @@ pub struct HeartBeat {
 impl HeartBeat {
     /// Create a new heartbeat
     pub fn new(universe_id: &str, object_id: &str, interval_ms: u64) -> Self {
+        let interval_ms = interval_ms.clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS);
         Self {
             object_id: object_id.to_string(),
             universe_id: universe_id.to_string(),
             interval_ms,
-            last_fired: Instant::now(),
+            next_due: chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(interval_ms as i64),
             method: "heart_beat".to_string(),
         }
     }
 
     /// Check if heartbeat is due to fire
     pub fn is_due(&self) -> bool {
-        self.last_fired.elapsed() >= Duration::from_millis(self.interval_ms)
+        chrono::Utc::now().timestamp_millis() >= self.next_due
     }
 
-    /// Reset the heartbeat timer after firing
+    /// After a beat: the next is one interval from now (a late server does
+    /// not fire a burst of missed beats)
     pub fn reset(&mut self) {
-        self.last_fired = Instant::now();
+        self.interval_ms = self.interval_ms.clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS);
+        self.next_due = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(self.interval_ms as i64);
     }
 }
 
@@ -120,19 +128,29 @@ pub struct TimerFired {
 /// Most pending one-shot timers a single object may have
 pub const MAX_TIMERS_PER_OBJECT: usize = 32;
 
-/// Shortest allowed heartbeat interval (one timer-loop tick)
+/// Shortest allowed heartbeat interval
 pub const MIN_HEARTBEAT_MS: u64 = 100;
+/// Longest heartbeat interval (one day)
+pub const MAX_HEARTBEAT_MS: u64 = 86_400_000;
+/// Shortest call_out delay: with a deadline-driven loop, a handler that
+/// reschedules itself with no delay would otherwise spin
+pub const MIN_TIMER_DELAY_MS: u64 = 100;
+/// Longest call_out delay (30 days)
+pub const MAX_TIMER_DELAY_MS: u64 = 30 * 86_400_000;
 
 /// Timer manager for a universe
 pub struct TimerManager {
     /// One-shot timers (in memory)
     timers: RwLock<BTreeMap<String, Timer>>,
-    /// Heartbeats (in memory only, not persisted)
-    heartbeats: RwLock<BTreeMap<String, HeartBeat>>,
+    /// Heartbeats keyed by (universe, object): a cache of the heartbeats
+    /// table
+    heartbeats: RwLock<BTreeMap<(String, String), HeartBeat>>,
     /// Database pool for persistence
     pool: Option<SqlitePool>,
     /// Raft writer for consensus
     raft_writer: Option<Arc<RaftWriter>>,
+    /// Wakes the timer loop when a new deadline may be earlier
+    changed: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for TimerManager {
@@ -152,6 +170,7 @@ impl TimerManager {
             heartbeats: RwLock::new(BTreeMap::new()),
             pool,
             raft_writer,
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -160,35 +179,43 @@ impl TimerManager {
         Arc::new(Self::new(pool, raft_writer))
     }
 
-    /// Add a one-shot timer
-    pub async fn add_timer(&self, timer: Timer) -> String {
-        let id = timer.id.clone();
-
-        // Persist via Raft if available, otherwise direct SQL
+    /// Run one write: through Raft when available, else directly (tests)
+    async fn write(&self, sql: &'static str, params: Vec<serde_json::Value>) -> anyhow::Result<()> {
         if let Some(ref raft_writer) = self.raft_writer {
-            if let Err(e) = self.persist_timer(&timer, raft_writer).await {
-                warn!("Failed to persist timer: {}", e);
-            }
+            raft_writer.execute(sql, params).await?;
         } else if let Some(ref pool) = self.pool {
-            // Direct SQL fallback (for tests)
-            if let Err(e) = sqlx::query(
-                "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&timer.id)
-            .bind(&timer.universe_id)
-            .bind(&timer.object_id)
-            .bind(&timer.method)
-            .bind(timer.fire_at)
-            .bind(&timer.args)
-            .execute(pool)
-            .await
-            {
-                warn!("Failed to persist timer: {}", e);
+            let mut query = sqlx::query(sql);
+            for param in params {
+                query = match param {
+                    serde_json::Value::String(v) => query.bind(v),
+                    serde_json::Value::Number(n) => query.bind(n.as_i64()),
+                    serde_json::Value::Null => query.bind(Option::<String>::None),
+                    other => query.bind(other.to_string()),
+                };
             }
+            query.execute(pool).await?;
         }
+        Ok(())
+    }
 
+    /// Add a one-shot timer: stored first, cached only once stored
+    pub async fn add_timer(&self, timer: Timer) -> anyhow::Result<String> {
+        self.write(
+            "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
+            vec![
+                serde_json::json!(&timer.id),
+                serde_json::json!(&timer.universe_id),
+                serde_json::json!(&timer.object_id),
+                serde_json::json!(&timer.method),
+                serde_json::json!(timer.fire_at),
+                serde_json::json!(&timer.args),
+            ],
+        )
+        .await?;
+        let id = timer.id.clone();
         self.timers.write().await.insert(id.clone(), timer);
-        id
+        self.changed.notify_one();
+        Ok(id)
     }
 
     /// Add a one-shot timer unless its object already has
@@ -199,7 +226,7 @@ impl TimerManager {
             .read()
             .await
             .values()
-            .filter(|t| t.object_id == timer.object_id)
+            .filter(|t| t.universe_id == timer.universe_id && t.object_id == timer.object_id)
             .count();
         if pending >= MAX_TIMERS_PER_OBJECT {
             warn!(
@@ -208,7 +235,30 @@ impl TimerManager {
             );
             return None;
         }
-        Some(self.add_timer(timer).await)
+        match self.add_timer(timer).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!("Failed to store timer: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Remove a timer only if it belongs to `object_id` in `universe_id`
+    /// (game.remove_call_out: an object may cancel only its own timers)
+    pub async fn remove_timer_owned(
+        &self,
+        timer_id: &str,
+        universe_id: &str,
+        object_id: &str,
+    ) -> bool {
+        let owned = self
+            .timers
+            .read()
+            .await
+            .get(timer_id)
+            .is_some_and(|t| t.universe_id == universe_id && t.object_id == object_id);
+        owned && self.remove_timer(timer_id).await
     }
 
     /// Remove a timer by ID
@@ -232,12 +282,12 @@ impl TimerManager {
         self.timers.write().await.remove(timer_id).is_some()
     }
 
-    /// Remove all timers for an object
-    pub async fn remove_timers_for_object(&self, object_id: &str) {
+    /// Remove all timers for an object in a universe
+    pub async fn remove_timers_for_object(&self, universe_id: &str, object_id: &str) {
         let mut timers = self.timers.write().await;
         let ids_to_remove: Vec<String> = timers
             .values()
-            .filter(|t| t.object_id == object_id)
+            .filter(|t| t.universe_id == universe_id && t.object_id == object_id)
             .map(|t| t.id.clone())
             .collect();
 
@@ -260,18 +310,62 @@ impl TimerManager {
         }
     }
 
-    /// Set a heartbeat for an object (interval clamped to [`MIN_HEARTBEAT_MS`])
-    pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) {
-        heartbeat.interval_ms = heartbeat.interval_ms.max(MIN_HEARTBEAT_MS);
-        self.heartbeats
-            .write()
-            .await
-            .insert(heartbeat.object_id.clone(), heartbeat);
+    /// Set a heartbeat for an object (interval clamped to
+    /// [`MIN_HEARTBEAT_MS`]): stored first (one write; beats themselves
+    /// write nothing), cached only once stored
+    pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) -> anyhow::Result<()> {
+        heartbeat.reset(); // clamps the interval too
+        self.write(
+            "INSERT INTO heartbeats (universe_id, object_id, interval_ms) VALUES (?, ?, ?)
+             ON CONFLICT (universe_id, object_id) DO UPDATE SET interval_ms = excluded.interval_ms",
+            vec![
+                serde_json::json!(&heartbeat.universe_id),
+                serde_json::json!(&heartbeat.object_id),
+                serde_json::json!(heartbeat.interval_ms),
+            ],
+        )
+        .await?;
+        let key = (heartbeat.universe_id.clone(), heartbeat.object_id.clone());
+        self.heartbeats.write().await.insert(key, heartbeat);
+        self.changed.notify_one();
+        Ok(())
     }
 
-    /// Remove heartbeat for an object
-    pub async fn remove_heartbeat(&self, object_id: &str) -> bool {
-        self.heartbeats.write().await.remove(object_id).is_some()
+    /// Remove the heartbeat for an object in a universe; true if it had one
+    pub async fn remove_heartbeat(&self, universe_id: &str, object_id: &str) -> bool {
+        let key = (universe_id.to_string(), object_id.to_string());
+        if !self.heartbeats.read().await.contains_key(&key) {
+            return false;
+        }
+        if let Err(e) = self
+            .write(
+                "DELETE FROM heartbeats WHERE universe_id = ? AND object_id = ?",
+                vec![serde_json::json!(universe_id), serde_json::json!(object_id)],
+            )
+            .await
+        {
+            warn!("Failed to delete heartbeat of {}: {}", object_id, e);
+            return false;
+        }
+        self.heartbeats.write().await.remove(&key).is_some()
+    }
+
+    /// The earliest call_out or heartbeat deadline (Unix ms), if any
+    pub async fn next_deadline(&self) -> Option<i64> {
+        let timers = self.timers.read().await.values().map(|t| t.fire_at).min();
+        let beats = self
+            .heartbeats
+            .read()
+            .await
+            .values()
+            .map(|h| h.next_due)
+            .min();
+        timers.into_iter().chain(beats).min()
+    }
+
+    /// Resolves when a timer or heartbeat is added (it may be due sooner)
+    pub async fn changed(&self) {
+        self.changed.notified().await
     }
 
     /// Check for due timers and heartbeats, returning fired callbacks
@@ -326,7 +420,9 @@ impl TimerManager {
                 .fetch_all(pool)
                 .await?;
 
+        // Replaces the cache: also used to rebuild it on becoming primary
         let mut timers = self.timers.write().await;
+        timers.clear();
         for (id, universe_id, object_id, method, fire_at, args) in rows {
             let timer = Timer {
                 id: id.clone(),
@@ -340,25 +436,22 @@ impl TimerManager {
         }
 
         debug!("Loaded {} timers from database", timers.len());
-        Ok(())
-    }
+        drop(timers);
 
-    /// Persist a timer to database via Raft
-    async fn persist_timer(&self, timer: &Timer, raft_writer: &RaftWriter) -> anyhow::Result<()> {
-        raft_writer
-            .execute(
-                "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
-                vec![
-                    serde_json::json!(&timer.id),
-                    serde_json::json!(&timer.universe_id),
-                    serde_json::json!(&timer.object_id),
-                    serde_json::json!(&timer.method),
-                    serde_json::json!(timer.fire_at),
-                    serde_json::json!(&timer.args),
-                ],
-            )
-            .await?;
-
+        // Heartbeats: the next beat is one interval from now
+        let rows: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT universe_id, object_id, interval_ms FROM heartbeats")
+                .fetch_all(pool)
+                .await?;
+        let mut heartbeats = self.heartbeats.write().await;
+        heartbeats.clear();
+        for (universe_id, object_id, interval_ms) in rows {
+            let hb = HeartBeat::new(&universe_id, &object_id, interval_ms.max(0) as u64);
+            heartbeats.insert((universe_id, object_id), hb);
+        }
+        debug!("Loaded {} heartbeats from database", heartbeats.len());
+        drop(heartbeats);
+        self.changed.notify_one();
         Ok(())
     }
 
@@ -392,6 +485,53 @@ impl TimerManager {
 mod tests {
     use super::*;
 
+    /// A timer can be cancelled only through its own object (and universe)
+    #[tokio::test]
+    async fn test_remove_timer_owned() {
+        let mgr = TimerManager::new(None, None);
+        let id = mgr
+            .try_add_timer(Timer::new("a", "/clock", "tick", 60_000, None))
+            .await
+            .unwrap();
+        assert!(!mgr.remove_timer_owned(&id, "a", "/other").await);
+        assert!(!mgr.remove_timer_owned(&id, "b", "/clock").await);
+        assert_eq!(mgr.timer_count().await, 1);
+        assert!(mgr.remove_timer_owned(&id, "a", "/clock").await);
+        assert_eq!(mgr.timer_count().await, 0);
+    }
+
+    /// The same object id in two universes has independent timers and
+    /// heartbeats
+    #[tokio::test]
+    async fn test_timers_are_per_universe() {
+        let mgr = TimerManager::new(None, None);
+        mgr.set_heartbeat(HeartBeat::new("a", "/clock", 1000))
+            .await
+            .unwrap();
+        mgr.set_heartbeat(HeartBeat::new("b", "/clock", 1000))
+            .await
+            .unwrap();
+        assert_eq!(mgr.heartbeat_count().await, 2, "one heartbeat per universe");
+
+        for _ in 0..MAX_TIMERS_PER_OBJECT {
+            assert!(mgr
+                .try_add_timer(Timer::new("a", "/clock", "tick", 60_000, None))
+                .await
+                .is_some());
+        }
+        // Universe b's object has its own cap
+        assert!(mgr
+            .try_add_timer(Timer::new("b", "/clock", "tick", 60_000, None))
+            .await
+            .is_some());
+
+        // Removing b's object's timers and heartbeat leaves a's alone
+        mgr.remove_timers_for_object("b", "/clock").await;
+        assert!(mgr.remove_heartbeat("b", "/clock").await);
+        assert_eq!(mgr.timer_count().await, MAX_TIMERS_PER_OBJECT);
+        assert_eq!(mgr.heartbeat_count().await, 1);
+    }
+
     #[test]
     fn test_timer_creation() {
         let timer = Timer::new("universe1", "obj1", "on_timer", 1000, None);
@@ -420,7 +560,7 @@ mod tests {
         let manager = TimerManager::new(None, None);
 
         let timer = Timer::new("u1", "obj1", "test_method", 10000, None);
-        let id = manager.add_timer(timer).await;
+        let id = manager.add_timer(timer).await.unwrap();
 
         assert_eq!(manager.timer_count().await, 1);
 
@@ -434,11 +574,11 @@ mod tests {
         let manager = TimerManager::new(None, None);
 
         let hb = HeartBeat::new("u1", "obj1", 100);
-        manager.set_heartbeat(hb).await;
+        manager.set_heartbeat(hb).await.unwrap();
 
         assert_eq!(manager.heartbeat_count().await, 1);
 
-        let removed = manager.remove_heartbeat("obj1").await;
+        let removed = manager.remove_heartbeat("u1", "obj1").await;
         assert!(removed);
         assert_eq!(manager.heartbeat_count().await, 0);
     }
@@ -450,7 +590,7 @@ mod tests {
         // Create a timer that's already due
         let mut timer = Timer::new("u1", "obj1", "on_fire", 0, Some("test_arg".to_string()));
         timer.fire_at = chrono::Utc::now().timestamp_millis() - 100;
-        manager.add_timer(timer).await;
+        manager.add_timer(timer).await.unwrap();
 
         let fired = manager.tick().await;
         assert_eq!(fired.len(), 1);
@@ -468,17 +608,56 @@ mod tests {
 
         manager
             .add_timer(Timer::new("u1", "obj1", "m1", 10000, None))
-            .await;
+            .await
+            .unwrap();
         manager
             .add_timer(Timer::new("u1", "obj1", "m2", 10000, None))
-            .await;
+            .await
+            .unwrap();
         manager
             .add_timer(Timer::new("u1", "obj2", "m1", 10000, None))
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(manager.timer_count().await, 3);
 
-        manager.remove_timers_for_object("obj1").await;
+        manager.remove_timers_for_object("u1", "obj1").await;
         assert_eq!(manager.timer_count().await, 1); // Only obj2's timer remains
+    }
+
+    /// The loop sleeps until the earliest deadline of either kind
+    #[tokio::test]
+    async fn test_next_deadline() {
+        let mgr = TimerManager::new(None, None);
+        assert_eq!(mgr.next_deadline().await, None);
+        let id = mgr
+            .try_add_timer(Timer::new("u", "/a", "m", 60_000, None))
+            .await
+            .unwrap();
+        let fire_at = mgr.timers.read().await[&id].fire_at;
+        assert_eq!(mgr.next_deadline().await, Some(fire_at));
+        mgr.set_heartbeat(HeartBeat::new("u", "/b", 1_000))
+            .await
+            .unwrap();
+        let beat = mgr.next_deadline().await.unwrap();
+        assert!(beat < fire_at, "the heartbeat is due first");
+    }
+
+    /// Huge intervals and delays are clamped, never wrapped into the past
+    /// (which would fire them in a tight loop)
+    #[test]
+    fn test_times_are_clamped() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let hb = HeartBeat::new("u", "/o", u64::MAX);
+        assert_eq!(hb.interval_ms, MAX_HEARTBEAT_MS);
+        assert!(hb.next_due > now);
+        let timer = Timer::new("u", "/o", "m", u64::MAX, None);
+        assert!(timer.fire_at > now && timer.fire_at <= now + MAX_TIMER_DELAY_MS as i64 + 1_000);
+        assert!(!timer.is_due());
+
+        // A zero delay is at least the minimum: a handler that reschedules
+        // itself cannot spin
+        let soon = Timer::new("u", "/o", "m", 0, None);
+        assert!(soon.fire_at >= now + MIN_TIMER_DELAY_MS as i64);
     }
 }

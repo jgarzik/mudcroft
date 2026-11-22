@@ -11,6 +11,26 @@ use tracing::info;
 use crate::auth::accounts::AccountService;
 use crate::db::Database;
 
+/// Create an empty database for a node that will join a cluster: the
+/// schema only. Refuses an existing file (a joining node must start empty;
+/// its data arrives in a snapshot from the cluster).
+pub async fn init_empty_database(path: &Path) -> Result<()> {
+    if path.exists() {
+        bail!(
+            "{} already exists; a node joining a cluster starts from an empty database",
+            path.display()
+        );
+    }
+    let db = Database::new(Some(
+        path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("database path is not UTF-8"))?,
+    ))
+    .await?;
+    db.pool().close().await;
+    info!("Created empty database at {}", path.display());
+    Ok(())
+}
+
 /// Initialize or upgrade a game server database (idempotent)
 ///
 /// # Arguments
@@ -59,7 +79,7 @@ pub async fn init_database(
         let db = Database::new(Some(path.to_str().unwrap())).await?;
 
         // Create admin account
-        let service = AccountService::new(db.pool().clone());
+        let service = AccountService::offline(db.pool().clone());
         let account = service.create(admin_username, admin_password).await?;
         info!(
             "Created admin account '{}' ({})",
@@ -184,7 +204,7 @@ mod tests {
 
         // Verify admin account exists with correct level
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        let service = AccountService::new(db.pool().clone());
+        let service = AccountService::offline(db.pool().clone());
         let account = service.get_by_username("admin").await.unwrap().unwrap();
         assert_eq!(account.access_level, "admin");
     }
@@ -211,9 +231,48 @@ mod tests {
 
         // Verify admin account still exists
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        let service = AccountService::new(db.pool().clone());
+        let service = AccountService::offline(db.pool().clone());
         let account = service.get_by_username("admin").await.unwrap().unwrap();
         assert_eq!(account.access_level, "admin");
+    }
+
+    /// A database older than the current schema is refused by mudd and
+    /// (with no upgrade steps from its version) by mudd_init, with a clear
+    /// error instead of failing at runtime
+    #[tokio::test]
+    async fn test_old_schema_version_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Pretend it predates schema versioning
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            sqlx::query("PRAGMA user_version = 0")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.pool().close().await;
+        }
+
+        let err = Database::open(db_path.to_str().unwrap())
+            .await
+            .err()
+            .expect("mudd must refuse an old schema");
+        assert!(err.to_string().contains("schema version"), "{}", err);
+
+        let err = init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .expect_err("mudd_init has no upgrade from version 0");
+        assert!(err.to_string().contains("schema version 0"), "{}", err);
     }
 
     #[tokio::test]
@@ -268,5 +327,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 1);
+    }
+
+    /// Upgrades chain: a version 6 database gets the credits holder trigger
+    /// (7), the actions table (8), cluster_nodes (9), online_players (10)
+    /// and payment_requests (11)
+    #[tokio::test]
+    async fn test_upgrade_6_to_11() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            sqlx::query("DROP TRIGGER credits_holder_exists")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("DROP TABLE actions")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("DROP TABLE cluster_nodes")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("DROP TABLE online_players")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("DROP TABLE payment_requests")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA user_version = 6")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.pool().close().await;
+        }
+        init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .expect("mudd_init upgrades 6 -> 11");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), 11);
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('actions', 'cluster_nodes', 'online_players', 'payment_requests')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(tables, 4);
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'credits_holder_exists'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(triggers, 1);
+    }
+
+    /// Upgrading a cluster member's database to 9 records the members it
+    /// knows in cluster_nodes (so their ids are never reused)
+    #[tokio::test]
+    async fn test_upgrade_records_cluster_members() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("member.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            for sql in [
+                "DROP TABLE cluster_nodes",
+                "DROP TABLE online_players",
+                "DROP TABLE payment_requests",
+                "PRAGMA user_version = 8",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_membership', ?)")
+                .bind(r#"{"log_id":null,"membership":{"configs":[[1,3]],"nodes":{"1":{"addr":"a:1"},"3":{"addr":"c:3"}}}}"#)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.pool().close().await;
+        }
+        init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .unwrap();
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT node_id FROM cluster_nodes ORDER BY node_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ids, vec![1, 3]);
     }
 }

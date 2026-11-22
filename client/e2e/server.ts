@@ -89,40 +89,6 @@ async function api(url: string, method: string, route: string, body?: unknown, t
   return text ? JSON.parse(text) : {}
 }
 
-/** Send one command over the game WebSocket and wait for its reply */
-async function wsCommand(url: string, token: string, command: string): Promise<string> {
-  const wsUrl = `${url.replace(/^http/, 'ws')}/ws?universe=${UNIVERSE.id}&token=${token}`
-  const ws = new WebSocket(wsUrl)
-  return await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      ws.close()
-      reject(new Error(`no reply to ${command}`))
-    }, 10_000)
-    // The reply is the first output/error after our command is echoed back
-    // (the server may send other output first, e.g. a greeting)
-    let sent = false
-    let echoed = false
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(String(ev.data))
-      if (msg.type === 'welcome' && !sent) {
-        sent = true
-        ws.send(JSON.stringify({ type: 'command', text: command }))
-      } else if (msg.type === 'echo') {
-        echoed = true
-      } else if (echoed && (msg.type === 'output' || msg.type === 'error')) {
-        clearTimeout(timer)
-        ws.close()
-        if (msg.type === 'error') reject(new Error(`${command}: ${msg.message}`))
-        else resolve(msg.text)
-      }
-    }
-    ws.onerror = () => {
-      clearTimeout(timer)
-      reject(new Error(`WebSocket error for ${command}`))
-    }
-  })
-}
-
 async function seed(url: string) {
   const login = await api(url, 'POST', '/auth/login', ADMIN)
   await api(
@@ -133,7 +99,7 @@ async function seed(url: string) {
     login.token,
   )
   await api(url, 'POST', `/universe/${UNIVERSE.id}/run_script`, { script: 'cave_adventure.lua' }, login.token)
-  await wsCommand(url, login.token, `setportal ${PORTAL}`)
+  await api(url, 'POST', `/universe/${UNIVERSE.id}/portal`, { room_id: PORTAL }, login.token)
 }
 
 /** Start and seed a server. Throws (after cleaning up) on failure. */
@@ -166,7 +132,8 @@ export async function startServer(): Promise<ServerState> {
       const log = fs.openSync(logPath, 'a')
       const child = spawn(
         path.join(BIN_DIR, 'mudd'),
-        ['--bind', `127.0.0.1:${port}`, '--database', dbPath, '--static-dir', dist],
+        // Every test logs in from 127.0.0.1: no login rate limits
+        ['--bind', `127.0.0.1:${port}`, '--database', dbPath, '--static-dir', dist, '--auth-limit', '0'],
         {
           // run_script reads scripts/ relative to the working directory
           cwd: REPO_DIR,

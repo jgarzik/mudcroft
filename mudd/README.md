@@ -76,7 +76,7 @@ Or open `http://127.0.0.1:8080/` in a browser. The universe has no rooms until
 you build some and set a portal; see
 [docs/admin.md](docs/admin.md#building-and-opening-a-universe).
 
-To get a server with a world already loaded, run `scripts/start-testsrv.sh`
+To get a server with a world already loaded, run `scripts/testsrv.py start`
 from the repository root (see [../playtest.md](../playtest.md)).
 
 All flags and environment variables for `mudd` and `mudd_init`, plus Docker
@@ -91,7 +91,7 @@ cargo clippy --all-targets   # lint
 ```
 
 For browser end-to-end tests (Playwright, headless Chromium), run
-`scripts/e2e.sh` from the repository root.
+`scripts/e2e.py` from the repository root.
 
 ## HTTP and WebSocket Endpoints
 

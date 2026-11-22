@@ -1,4 +1,4 @@
-import { test, expect, command, terminal, newPlayer } from './fixtures'
+import { test, expect, command, terminal, newPlayer, enterWorld } from './fixtures'
 
 test('players in the same room hear each other', async ({ browser }) => {
   const alice = await newPlayer(browser, 'alice')
@@ -28,5 +28,24 @@ test('players in other rooms do not', async ({ browser }) => {
   } finally {
     await alice.context.close()
     await carol.context.close()
+  }
+})
+
+test('a second tab takes over without the two fighting', async ({ browser }) => {
+  const first = await newPlayer(browser, 'tabs')
+  try {
+    // Same account (the session is shared by the context) in a second tab
+    const second = await first.context.newPage()
+    await second.goto('/')
+    await enterWorld(second)
+
+    await expect(terminal(first.page)).toContainText('another window')
+    await expect(first.page.getByTestId('connection-status')).toHaveText('disconnected')
+    // The first tab does not reconnect and evict the second
+    await first.page.waitForTimeout(2500)
+    await expect(first.page.getByTestId('connection-status')).toHaveText('disconnected')
+    await expect(second.getByTestId('connection-status')).toHaveText('connected')
+  } finally {
+    await first.context.close()
   }
 })

@@ -16,146 +16,61 @@ affected feature.
 
 ### Multi-node coherence
 
-`mudd` works single-node only.
+Clusters work as described in `docs/cluster-design.md` (joining, the
+primary lifecycle, gateways, failover), with these gaps:
 
-- **No Raft RPC server.** `mudd/src/raft/network.rs` POSTs to
-  `http://<peer>/raft/<endpoint>`, but no route serves `/raft/*`
-  (`mudd/src/api/mod.rs`) and nothing binds `--raft-port`. Nodes started with
-  `--peers` cannot reach each other.
-- **Timers fire once per node.** Every node spawns the timer loop and loads
-  the persisted call_outs (`mudd/src/api/mod.rs`, `run_timer_loop` in
-  `mudd/src/api/scripting.rs`), so in a cluster each call_out and heartbeat
-  would run on every node.
-- **Writes that bypass Raft.** Account registration, login and logout tokens
-  (`mudd/src/auth/accounts.rs`) and combat state and effects
-  (`mudd/src/combat/state.rs`, `effects.rs`) write straight to SQLite.
-- **Per-node caches are never invalidated.** Access levels
-  (`PermissionManager`, `mudd/src/permissions/mod.rs`) and credit balances
-  (`CreditManager`, `mudd/src/credits/mod.rs`) are cached per node and not
-  updated when Raft applies another node's write. Credit writes store an
-  absolute balance computed from the local cache, so concurrent writers would
-  lose updates.
-- **Snapshots.** Install overwrites the live database file while the pool is
-  open (`mudd/src/raft/storage.rs`). `SnapshotStore`
-  (`mudd/src/raft/snapshot.rs`) is unused by the active storage, and its
-  `cleanup_old_snapshots` orders by mtime, so a file whose mtime cannot be
-  read sorts last and is deleted even if it is the newest.
-
-### Universes and objects
-
-- **Object ids and player objects are global.** `objects.id` is the primary
-  key and paths carry no universe, so two universes cannot both use
-  `/rooms/start`. A player's object `/players/p-<account>` is created in the
-  first universe joined and reused in every other one, carrying one
-  inventory and one HP pool across universes (`mudd/src/player.rs`). Lua's
-  universe confinement exempts player objects so play works everywhere, and
-  spawning ignores remembered rooms from other universes, but inventory and
-  stats should become per-universe.
-- **Lua reads are not universe-checked.** `game.get_object` and the query
-  functions return objects from any universe; only writes are confined
-  (`object_permission` in `mudd/src/lua/game_api.rs`).
-- **One session per account.** `ConnectionManager` keys sessions by player id
-  (`mudd/src/api/websocket.rs`), so the same account connected to two
-  universes at once collides.
-- **`game.move_object` on a connected player** changes only the database; the
-  session stays in the old room.
-- **Lua-defined classes are not persisted.** `ClassRegistry::define_class`
-  (`mudd/src/objects/class.rs`) writes `classes`, `class_properties` and
-  `class_handlers` rows with `universe_id = ''` and with built-in parents
-  that are not rows in `classes`; both violate foreign keys
-  (`mudd/src/db/mod.rs`), so the write fails with a logged warning. The class
-  registry is global across universes.
-- **Room image generation** writes back a room snapshot loaded before the
-  slow Venice calls, overwriting changes made meanwhile, and can run several
-  times for the same room (`mudd/src/images/gen.rs`).
-
-### Lua runtime
-
-- **Credits and Venice bill the object's owner.** In object code the credit
-  functions and Venice usage act on the real user, the owner, and ignore
-  `set_actor` (`mudd/src/lua/game_api.rs`). A player triggering a verb spends
-  the owner's credits.
-- **Timer ownership.** `game.remove_call_out` cancels any timer id without
-  checking that it belongs to the current object, and `game.set_heart_beat`
-  returns `true` even without an object context (`mudd/src/lua/game_api.rs`).
-- **Wall-clock timeout is not enforced.** It is checked only after a chunk
-  finishes, and `Sandbox::call` never checks it (`mudd/src/lua/sandbox.rs`);
-  the instruction limit is the effective bound. The per-execution call budget
-  resets on every `Sandbox::execute`, so each universe library chunk, the
-  object code and the handler call get separate budgets.
-
-### Accounts and permissions
-
-- **Weak password hashing.** One salted SHA-256 round compared with `==`
-  (`mudd/src/auth/mod.rs`). Needs a slow KDF (argon2 or bcrypt) and a
-  constant-time compare.
-- `PermissionManager::set_access_level` logs a failed database write but
-  still updates its cache and reports success, so a promotion can vanish on
-  restart.
-- A session's access level is fixed at connect (`mudd/src/api/websocket.rs`);
-  promotions and demotions apply after the player reconnects.
-- Guests connect with an empty account id and a random UUID player id
-  (`mudd/src/api/websocket.rs`); take/drop/inventory run their Lua with that
-  empty account.
-
-### Docker
-
-- `docker/entrypoint.sh` runs `mudd_init` as root (the `Dockerfile` sets no
-  `USER`), while supervisord runs `mudd` as `appuser`, so a new database may
-  be root-owned (unverified at runtime).
-- The nginx upstream is hard-coded to `127.0.0.1:8080` (`docker/nginx.conf`),
-  so `MUDD_BIND_ADDR` cannot change.
+- **Commands are not exactly-once across a failover.** A command in flight
+  when the primary dies may or may not have taken effect; the player is told
+  and nothing is retried (one batch per command and command ids would fix
+  it).
+- **A payment and its handler are separate changes.** Accepting a payment
+  moves the credits, then runs the object's handler (its own writes); a
+  crash in between leaves the player charged with nothing handed over, and
+  a handler failing part way keeps both its writes and the payment. One
+  batch per Lua run (below) would make them one change.
+- **Device tokens can run out.** The in-memory store holds 200,000 (10 per
+  account). Registering about 20,000 accounts fills it. Live tokens are
+  never evicted (expired ones are swept out when room is needed, and an
+  expired token is never accepted), so new devices are then not remembered
+  (they log in normally, without the fast lane during an attack on their
+  name) until tokens expire: to keep the store full an attacker must log
+  every account in again within each 30 days. Accepted as is
+  (`mudd/src/api/devices.rs`).
+- **Snapshots are held in memory whole.** A snapshot travels in 1 MiB
+  chunks, but is built, sent and installed from one in-memory buffer (the
+  whole game database) on each side (`mudd/src/raft/storage.rs`,
+  `transport.rs`).
 
 ## Raft Cluster Operation
 
-Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
-(`Request { sql, params }`). Planned:
+Clusters are built (see [cluster-design.md](cluster-design.md)): `--join`
+membership, a TLS cluster port with a shared secret, a single primary that
+runs the game, gateways that relay to it, and failover. Planned:
 
-- **Raft RPC endpoints** for append-entries, vote and install-snapshot,
-  served on `--raft-port`.
-- **Leader-only execution.** Only the leader runs Lua. A trigger (player
-  command, timer, scheduled task) runs on the leader, which collects the
-  resulting SQL mutations, proposes them, and broadcasts events to room
-  occupants. Followers apply the SQL and never run Lua. Followers redirect
-  or proxy client writes to the leader.
-- **Typed log entries** instead of raw SQL:
+- **One batch per Lua run.** Each `game.*` write is its own Raft entry
+  today. Collecting a whole execution's writes into one entry would make
+  each command atomic and, with a command id recorded in the batch, let a
+  gateway retry a command interrupted by a failover exactly once. Typed log
+  entries could replace raw SQL at the same time:
 
   ```rust
   pub enum GameLogEntry {
       CreateUniverse { universe_id, name, owner_account_id, initial_config },
       DeleteUniverse { universe_id },
-      Mutations { universe_id, sql_statements: Vec<String> },
+      Mutations { universe_id, command_id, sql_statements: Vec<String> },
       StoreCode { universe_id, hash, code, author_account_id },
   }
   ```
 
-  One `Mutations` entry per execution would also make each Lua run's writes
-  atomic (today each statement is its own entry).
-- **Cold start**: a new node requests a snapshot from the leader (SQLite
-  backup, compressed, streamed), applies it, replays log entries since the
-  snapshot, and joins as a follower.
-- **Failover**: target about 500 ms of disruption; in-flight commands may
-  time out and the client retries; no committed data lost.
-- **Cache coherence**: invalidate or bypass per-node caches when entries are
-  applied (see Known Issues).
-- **Node configuration file** (TOML), in addition to the CLI flags:
-
-  ```toml
-  node_id = 1
-  peers = ["10.0.1.1:9000", "10.0.1.2:9000", "10.0.1.3:9000"]
-  venice_api_key = "venice-..."
-  venice_api_url = "https://api.venice.ai/api/v1"
-  ```
-
-- **Multi-node tests**: a cluster harness that starts several nodes and
-  checks election, replication, snapshot transfer and failover.
+- **Streamed snapshots** built and installed without holding the whole
+  database in memory (see Known Issues).
+- **Node configuration file** (TOML), in addition to the CLI flags.
 
 ## Storage
 
 - **Per-universe databases**: a shared database for accounts and the
   universe registry, plus one database per universe, under a data directory
   (`raft/`, `shared.db`, `universes/*.db`). Today everything is in one file.
-- Universe-scoped object IDs (see Known Issues).
 - **Event log** table (event type, actor, target, room, data) for auditing
   and moderation.
 - **Backups**: Raft replicates but is not an offsite backup; add periodic
@@ -175,7 +90,9 @@ Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
   | Bot monthly fee | 50¢ |
   | Class definition | $50 |
 
-  Players pay credits to the universe; the operator pays Venice.
+  Players pay credits to the universe; the operator pays Venice. Lua Venice
+  calls already charge per-universe prices (`venice_chat_cost`,
+  `venice_image_cost` in the universe config); the rest are unpriced.
 - **Execution cost model** charging per instruction block, DB read, DB write,
   LLM tier, image and object creation.
 - **Credit ledger**: a `credit_transactions` table (amount, type
@@ -185,8 +102,6 @@ Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
   account; 60 Venice calls per minute per bot. Today only Venice has a
   per-account limiter (60 requests per minute), and the sandbox caps calls
   per execution.
-- A preemptive wall-clock timeout for Lua (today it is checked after the
-  run returns).
 
 ## Game Logic
 
@@ -215,14 +130,13 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Equipment**: wield/unwield, wear/remove, armor slots.
 - **Region hooks**: `on_enter`/`on_leave` on the region when a player
   crosses region boundaries.
-- **`game.move_object` fires hooks**, including an LPC-style `init()`
-  cascade: on any move the destination's `on_enter`, then `on_init` between
+- **An LPC-style `init()` cascade on moves.** `game.move_object` already
+  runs the containers' `on_leave`/`on_enter`; add `on_init` between
   the newcomer and each object present, so objects can offer contextual
   verbs ("get sword", "wield sword") and remove them on `on_move`.
 - **More lifecycle handlers**: `on_create`, `on_destroy`, `on_move`,
   `on_reset` (room respawn timer), `on_disconnect`.
-- **Persistent heartbeats and actions**: heartbeats and registered verbs are
-  in memory and lost on restart.
+- **Persistent actions**: registered verbs are in memory and lost on restart.
 - **High-occupancy rooms**: above about 100 occupants, send an aggregated
   view (count, notable entities, sampled chat).
 - **Player commands**: `who`, `quit`, `give`/`use` as server commands (the
@@ -254,7 +168,7 @@ list is in [langref.md](../mudd/docs/langref.md)):
 
 - Use the universe's `theme_id` for the welcome message and image prompts
   (today always `sierra-retro`).
-- Charge credits for room images and deduplicate in-flight generations.
+- Charge credits for room images.
 - Creator hints for the prompt step.
 - Layering: background from Venice, object sprites (or Venice), client-side
   entity sprites and UI (names, health bars).
@@ -276,8 +190,6 @@ Ideas from the original design, beyond today's `/auth/*` and `/universe/*`:
 
 - REST universe resources: `GET /api/universes`, `POST /api/universes`,
   `GET /api/universes/:id`, and universe deletion.
-- Universe memberships: per-universe access level and player object
-  (`universe_memberships`), instead of one global access level per account.
 - Account fields such as last login and bans.
 - Cross-universe identity: the account as the global identity with friends,
   and whisper/mail between universes through shared messaging.
@@ -294,8 +206,9 @@ Ideas from the original design, beyond today's `/auth/*` and `/universe/*`:
 ## Deployment
 
 Today there is a single-container Docker image (`Dockerfile`, `docker/`):
-nginx serves the client and proxies to one `mudd`. Planned:
+one `mudd` serving the client and the API. Planned:
 
-- Docker Compose for a three-node cluster plus the client.
+- Docker Compose for a three-node cluster plus the client (with
+  operator-supplied cluster certificates and secret).
 - A script to start a local three-node cluster.
 - Production deployment and performance work.

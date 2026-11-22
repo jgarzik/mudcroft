@@ -1,52 +1,58 @@
-//! Credit system for in-game currency
+//! Credits: per-universe balances held by accounts or objects
 //!
-//! Provides:
-//! - Balance management (get, deduct, grant)
-//! - Transaction logging for auditing
-//! - Persistence in SQLite
+//! The `credits` table is the only copy of a balance (no cache). Every
+//! change is a relative update inside one atomic batch, and the table's
+//! `CHECK (balance >= 0)` rejects an overdraft, so a spend or transfer is
+//! all-or-nothing with no read-modify-write anywhere.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde_json::{json, Value};
 use sqlx::SqlitePool;
-use tokio::sync::RwLock;
-use tracing::{debug, warn};
 
 use crate::raft::RaftWriter;
 
-/// Credit balance for a player in a universe
-#[derive(Debug, Clone)]
-pub struct CreditBalance {
-    /// Universe ID
-    pub universe_id: String,
-    /// Player account ID
-    pub account_id: String,
-    /// Current balance
-    pub balance: i64,
+/// Largest single grant, spend or transfer
+pub const MAX_AMOUNT: i64 = 1_000_000_000_000;
+
+/// Who holds a balance
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Holder {
+    /// An account (player)
+    Account(String),
+    /// An object in the universe (a room's budget, a shop's till)
+    Object(String),
 }
 
-/// Transaction record for auditing
-#[derive(Debug, Clone)]
-pub struct CreditTransaction {
-    /// Universe ID
-    pub universe_id: String,
-    /// Player account ID
-    pub account_id: String,
-    /// Amount (positive = credit, negative = debit)
-    pub amount: i64,
-    /// Reason for transaction
-    pub reason: String,
-    /// Timestamp
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+impl Holder {
+    /// An object id (a path, starting with `/`) or else an account id
+    pub fn parse(id: &str) -> Self {
+        if id.starts_with('/') {
+            Holder::Object(id.to_string())
+        } else {
+            Holder::Account(id.to_string())
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Holder::Account(_) => "account",
+            Holder::Object(_) => "object",
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Holder::Account(id) | Holder::Object(id) => id,
+        }
+    }
 }
 
-/// Credit manager for handling in-game currency
+type Statement = (String, Vec<Value>);
+
+/// Credit balances (a stateless handle on the credits table)
 pub struct CreditManager {
-    /// In-memory cache of balances: (universe_id, account_id) -> balance
-    balances: RwLock<HashMap<(String, String), i64>>,
-    /// Database pool for persistence
     pool: Option<SqlitePool>,
-    /// Raft writer for consensus
     raft_writer: Option<Arc<RaftWriter>>,
 }
 
@@ -59,14 +65,28 @@ impl std::fmt::Debug for CreditManager {
     }
 }
 
+fn check_amount(amount: i64) -> anyhow::Result<()> {
+    if !(1..=MAX_AMOUNT).contains(&amount) {
+        anyhow::bail!("amount must be 1 to {}", MAX_AMOUNT);
+    }
+    Ok(())
+}
+
+/// Whether a failed write was the balance CHECK (an overdraft)
+fn is_overdraft(e: &anyhow::Error) -> bool {
+    format!("{:#}", e).contains("CHECK constraint failed")
+}
+
+/// Whether a failed write was the holder trigger (no such account/object)
+fn is_missing_holder(e: &anyhow::Error) -> bool {
+    format!("{:#}", e).contains("credits holder does not exist")
+}
+
 impl CreditManager {
-    /// Create a new credit manager
+    /// A credit manager over the database: through Raft when a writer is
+    /// given (the server), else directly (tests)
     pub fn new(pool: Option<SqlitePool>, raft_writer: Option<Arc<RaftWriter>>) -> Self {
-        Self {
-            balances: RwLock::new(HashMap::new()),
-            pool,
-            raft_writer,
-        }
+        Self { pool, raft_writer }
     }
 
     /// Create a shared instance
@@ -74,378 +94,317 @@ impl CreditManager {
         Arc::new(Self::new(pool, raft_writer))
     }
 
-    /// Get balance for a player in a universe
-    pub async fn get_balance(&self, universe_id: &str, account_id: &str) -> i64 {
-        let key = (universe_id.to_string(), account_id.to_string());
-
-        // Check cache first
-        {
-            let balances = self.balances.read().await;
-            if let Some(&balance) = balances.get(&key) {
-                return balance;
-            }
-        }
-
-        // Cache miss: load under the write lock, so a concurrent grant or
-        // deduct cannot be overwritten by the stale value read here
-        let mut balances = self.balances.write().await;
-        match self
-            .cached_or_stored(&balances, universe_id, account_id)
-            .await
-        {
-            Ok(balance) => {
-                balances.insert(key, balance);
-                balance
-            }
-            Err(e) => {
-                // Report 0 but do not cache it, so the next read retries
-                warn!("Failed to load credit balance: {}", e);
-                0
-            }
-        }
+    /// Statement making sure a holder has a row (balance 0 if new)
+    fn ensure_statement(universe_id: &str, holder: &Holder) -> Statement {
+        (
+            "INSERT OR IGNORE INTO credits (universe_id, holder_kind, holder_id, balance)
+             VALUES (?, ?, ?, 0)"
+                .to_string(),
+            vec![json!(universe_id), json!(holder.kind()), json!(holder.id())],
+        )
     }
 
-    /// Deduct credits from a player's balance
-    /// Returns true if successful, false if insufficient funds
-    pub async fn deduct(
-        &self,
-        universe_id: &str,
-        account_id: &str,
-        amount: i64,
-        reason: &str,
-    ) -> bool {
-        if amount <= 0 {
-            return false;
+    /// Statement adding to a holder's balance
+    fn credit_statement(universe_id: &str, holder: &Holder, amount: i64) -> Statement {
+        (
+            "INSERT INTO credits (universe_id, holder_kind, holder_id, balance) VALUES (?, ?, ?, ?)
+             ON CONFLICT (universe_id, holder_kind, holder_id)
+             DO UPDATE SET balance = balance + excluded.balance"
+                .to_string(),
+            vec![
+                json!(universe_id),
+                json!(holder.kind()),
+                json!(holder.id()),
+                json!(amount),
+            ],
+        )
+    }
+
+    /// Statements taking from a holder's balance: the CHECK fails the batch
+    /// if that would go below zero
+    fn debit_statements(universe_id: &str, holder: &Holder, amount: i64) -> Vec<Statement> {
+        vec![
+            Self::ensure_statement(universe_id, holder),
+            (
+                "UPDATE credits SET balance = balance - ?
+                 WHERE universe_id = ? AND holder_kind = ? AND holder_id = ?"
+                    .to_string(),
+                vec![
+                    json!(amount),
+                    json!(universe_id),
+                    json!(holder.kind()),
+                    json!(holder.id()),
+                ],
+            ),
+        ]
+    }
+
+    /// Statement deleting a holder's balance (e.g. its object is deleted)
+    pub fn delete_statement(universe_id: &str, holder: &Holder) -> Statement {
+        (
+            "DELETE FROM credits WHERE universe_id = ? AND holder_kind = ? AND holder_id = ?"
+                .to_string(),
+            vec![json!(universe_id), json!(holder.kind()), json!(holder.id())],
+        )
+    }
+
+    async fn execute(&self, statements: Vec<Statement>) -> anyhow::Result<()> {
+        if let Some(ref raft_writer) = self.raft_writer {
+            return raft_writer.execute_batch(statements).await;
         }
+        let Some(ref pool) = self.pool else {
+            anyhow::bail!("credits: no database");
+        };
+        let mut tx = pool.begin().await?;
+        for (sql, params) in &statements {
+            // Statements built above from literals, values bound
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+            for param in params {
+                query = match param {
+                    Value::String(s) => query.bind(s.clone()),
+                    Value::Number(n) => query.bind(n.as_i64()),
+                    other => query.bind(other.to_string()),
+                };
+            }
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 
-        let key = (universe_id.to_string(), account_id.to_string());
-        let mut balances = self.balances.write().await;
-
-        let current = match self
-            .cached_or_stored(&balances, universe_id, account_id)
-            .await
-        {
-            Ok(balance) => balance,
-            Err(e) => {
-                warn!("Failed to load credit balance: {}", e);
-                return false;
+    /// Whether a holder exists: an account, or an object in the universe
+    /// (credits sent to a typo would be lost)
+    pub async fn holder_exists(&self, universe_id: &str, holder: &Holder) -> anyhow::Result<bool> {
+        let Some(ref pool) = self.pool else {
+            anyhow::bail!("credits: no database");
+        };
+        let found: Option<i64> = match holder {
+            Holder::Account(id) => {
+                sqlx::query_scalar("SELECT 1 FROM accounts WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Holder::Object(id) => {
+                sqlx::query_scalar("SELECT 1 FROM objects WHERE universe_id = ? AND id = ?")
+                    .bind(universe_id)
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
             }
         };
-        if current < amount {
-            debug!(
-                "Insufficient credits: {} has {} but needs {}",
-                account_id, current, amount
-            );
-            return false;
-        }
-
-        let new_balance = current - amount;
-        if let Err(e) = self
-            .save_balance(universe_id, account_id, new_balance)
-            .await
-        {
-            warn!("Failed to persist credit balance: {}", e);
-            return false;
-        }
-        balances.insert(key, new_balance);
-
-        debug!(
-            "Deducted {} credits from {}: {} -> {} ({})",
-            amount, account_id, current, new_balance, reason
-        );
-        true
+        Ok(found.is_some())
     }
 
-    /// Grant credits to a player (admin function)
-    /// Returns false for a non-positive amount, an overflowing balance, or a
-    /// failed load/persist; the balance is unchanged in those cases.
+    /// A holder's balance (0 if it has none). A failed read is an error,
+    /// never a silent zero.
+    pub async fn balance(&self, universe_id: &str, holder: &Holder) -> anyhow::Result<i64> {
+        let Some(ref pool) = self.pool else {
+            anyhow::bail!("credits: no database");
+        };
+        let balance: Option<i64> = sqlx::query_scalar(
+            "SELECT balance FROM credits WHERE universe_id = ? AND holder_kind = ? AND holder_id = ?",
+        )
+        .bind(universe_id)
+        .bind(holder.kind())
+        .bind(holder.id())
+        .fetch_optional(pool)
+        .await?;
+        Ok(balance.unwrap_or(0))
+    }
+
+    /// Add `amount` to a holder's balance
     pub async fn grant(
         &self,
         universe_id: &str,
-        account_id: &str,
+        holder: &Holder,
         amount: i64,
-        reason: &str,
-    ) -> bool {
-        if amount <= 0 {
-            return false;
-        }
-
-        let key = (universe_id.to_string(), account_id.to_string());
-        let mut balances = self.balances.write().await;
-
-        let current = match self
-            .cached_or_stored(&balances, universe_id, account_id)
-            .await
-        {
-            Ok(balance) => balance,
-            Err(e) => {
-                warn!("Failed to load credit balance: {}", e);
-                return false;
-            }
-        };
-        let Some(new_balance) = current.checked_add(amount) else {
-            warn!("Credit grant to {} would overflow", account_id);
-            return false;
-        };
-        if let Err(e) = self
-            .save_balance(universe_id, account_id, new_balance)
-            .await
-        {
-            warn!("Failed to persist credit balance: {}", e);
-            return false;
-        }
-        balances.insert(key, new_balance);
-
-        debug!(
-            "Granted {} credits to {}: {} -> {} ({})",
-            amount, account_id, current, new_balance, reason
-        );
-        true
-    }
-
-    /// Set balance directly (used for initialization)
-    pub async fn set_balance(&self, universe_id: &str, account_id: &str, balance: i64) {
-        let key = (universe_id.to_string(), account_id.to_string());
-        self.balances.write().await.insert(key, balance);
-
-        if let Err(e) = self.save_balance(universe_id, account_id, balance).await {
-            warn!("Failed to persist credit balance: {}", e);
-        }
-    }
-
-    /// Load balance from database
-    async fn load_balance(
-        &self,
-        universe_id: &str,
-        account_id: &str,
-        pool: &SqlitePool,
-    ) -> anyhow::Result<i64> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT balance FROM credits WHERE universe_id = ? AND player_id = ?")
-                .bind(universe_id)
-                .bind(account_id)
-                .fetch_optional(pool)
-                .await?;
-
-        Ok(row.map(|(b,)| b).unwrap_or(0))
-    }
-
-    /// Current balance: the cached value, or the stored one on a cache miss
-    /// (e.g. after a restart). Callers hold the write lock across the
-    /// read-modify-write, so the DB read cannot race another update.
-    /// A failed DB read is an error, never a zero balance.
-    async fn cached_or_stored(
-        &self,
-        balances: &HashMap<(String, String), i64>,
-        universe_id: &str,
-        account_id: &str,
-    ) -> anyhow::Result<i64> {
-        let key = (universe_id.to_string(), account_id.to_string());
-        if let Some(&balance) = balances.get(&key) {
-            return Ok(balance);
-        }
-        match self.pool {
-            Some(ref pool) => self.load_balance(universe_id, account_id, pool).await,
-            None => Ok(0),
-        }
-    }
-
-    /// Persist a balance: via Raft when available, otherwise direct SQL
-    async fn save_balance(
-        &self,
-        universe_id: &str,
-        account_id: &str,
-        balance: i64,
     ) -> anyhow::Result<()> {
-        const UPSERT: &str = "INSERT INTO credits (id, universe_id, player_id, balance) VALUES (?, ?, ?, ?) ON CONFLICT(universe_id, player_id) DO UPDATE SET balance = ?";
-        // Pre-compute UUID for deterministic replication
-        let id = uuid::Uuid::new_v4().to_string();
+        check_amount(amount)?;
+        self.execute(vec![Self::credit_statement(universe_id, holder, amount)])
+            .await
+    }
 
-        if let Some(ref raft_writer) = self.raft_writer {
-            raft_writer
-                .execute(
-                    UPSERT,
-                    vec![
-                        serde_json::json!(&id),
-                        serde_json::json!(universe_id),
-                        serde_json::json!(account_id),
-                        serde_json::json!(balance),
-                        serde_json::json!(balance),
-                    ],
-                )
-                .await?;
-        } else if let Some(ref pool) = self.pool {
-            sqlx::query(UPSERT)
-                .bind(&id)
-                .bind(universe_id)
-                .bind(account_id)
-                .bind(balance)
-                .bind(balance)
-                .execute(pool)
-                .await?;
+    /// Spend `amount` from a holder's balance. `Ok(false)` if it does not
+    /// have enough (nothing changes).
+    pub async fn deduct(
+        &self,
+        universe_id: &str,
+        holder: &Holder,
+        amount: i64,
+    ) -> anyhow::Result<bool> {
+        check_amount(amount)?;
+        match self
+            .execute(Self::debit_statements(universe_id, holder, amount))
+            .await
+        {
+            Ok(()) => Ok(true),
+            // A holder that does not exist has nothing to spend
+            Err(e) if is_overdraft(&e) || is_missing_holder(&e) => Ok(false),
+            Err(e) => Err(e),
         }
+    }
 
-        Ok(())
+    /// Move `amount` from one holder to another, atomically. `Ok(false)` if
+    /// the payer does not have enough (nothing changes).
+    pub async fn transfer(
+        &self,
+        universe_id: &str,
+        from: &Holder,
+        to: &Holder,
+        amount: i64,
+    ) -> anyhow::Result<bool> {
+        check_amount(amount)?;
+        if from == to {
+            // Nothing moves, but the payer must still have the funds
+            return Ok(self.balance(universe_id, from).await? >= amount);
+        }
+        let mut statements = Self::debit_statements(universe_id, from, amount);
+        statements.push(Self::credit_statement(universe_id, to, amount));
+        match self.execute(statements).await {
+            Ok(()) => Ok(true),
+            Err(e) if is_overdraft(&e) => Ok(false),
+            // A missing payer has nothing to spend; a missing recipient is
+            // the caller's error
+            Err(e) if is_missing_holder(&e) && !self.holder_exists(universe_id, from).await? => {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_utils::test_pool;
 
-    /// Single-connection in-memory DB with a credits table holding one balance
-    async fn pool_with_balance(balance: i64) -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+    async fn manager() -> CreditManager {
+        let pool = test_pool().await;
+        for name in ["acct", "alice", "bob"] {
+            sqlx::query(
+                "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+                 VALUES (?, ?, 'x', 'player', '2026-01-01')",
+            )
+            .bind(name)
+            .bind(name)
+            .execute(&pool)
             .await
             .unwrap();
+        }
+        for u in ["u1", "u2"] {
+            sqlx::query(
+                "INSERT INTO universes (id, name, owner_id, config, created_at)
+                 VALUES (?, ?, 'acct', '{}', '2026-01-01')",
+            )
+            .bind(u)
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         sqlx::query(
-            "CREATE TABLE credits (id TEXT PRIMARY KEY, universe_id TEXT NOT NULL,
-             player_id TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0,
-             UNIQUE(universe_id, player_id))",
+            "INSERT INTO objects (id, universe_id, class, properties, created_at, updated_at)
+             VALUES ('/shops/till', 'u1', 'item', '{}', '2026-01-01', '2026-01-01')",
         )
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO credits VALUES ('c1', 'u1', 'player1', ?)")
-            .bind(balance)
-            .execute(&pool)
+        CreditManager::new(Some(pool), None)
+    }
+
+    fn alice() -> Holder {
+        Holder::Account("alice".into())
+    }
+
+    #[tokio::test]
+    async fn test_grant_and_deduct() {
+        let credits = manager().await;
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 0);
+        credits.grant("u1", &alice(), 100).await.unwrap();
+        credits.grant("u1", &alice(), 50).await.unwrap();
+        assert!(credits.deduct("u1", &alice(), 30).await.unwrap());
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 120);
+        // Per universe
+        assert_eq!(credits.balance("u2", &alice()).await.unwrap(), 0);
+    }
+
+    /// An overdraft is refused and changes nothing
+    #[tokio::test]
+    async fn test_overdraft_refused() {
+        let credits = manager().await;
+        credits.grant("u1", &alice(), 10).await.unwrap();
+        assert!(!credits.deduct("u1", &alice(), 11).await.unwrap());
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 10);
+        // A holder with no row at all has nothing to spend
+        assert!(!credits
+            .deduct("u1", &Holder::Account("bob".into()), 1)
             .await
-            .unwrap();
-        pool
+            .unwrap());
     }
 
-    /// After a restart the cache is empty: grant must add to the stored
-    /// balance, not overwrite it, and the result must persist.
+    /// Transfers are atomic between accounts and objects
     #[tokio::test]
-    async fn test_grant_on_cold_cache_adds_to_stored_balance() {
-        let pool = pool_with_balance(100).await;
-        let manager = CreditManager::new(Some(pool.clone()), None);
-        manager.grant("u1", "player1", 10, "test").await;
-        assert_eq!(manager.get_balance("u1", "player1").await, 110);
-
-        let restarted = CreditManager::new(Some(pool), None);
-        assert_eq!(restarted.get_balance("u1", "player1").await, 110);
+    async fn test_transfer_atomic() {
+        let credits = manager().await;
+        let till = Holder::parse("/shops/till");
+        assert_eq!(till, Holder::Object("/shops/till".into()));
+        credits.grant("u1", &alice(), 40).await.unwrap();
+        assert!(credits.transfer("u1", &alice(), &till, 25).await.unwrap());
+        assert_eq!(credits.balance("u1", &till).await.unwrap(), 25);
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 15);
+        // Too much: neither side changes
+        assert!(!credits.transfer("u1", &alice(), &till, 16).await.unwrap());
+        assert_eq!(credits.balance("u1", &till).await.unwrap(), 25);
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 15);
     }
 
-    /// A failed DB read must not be treated as a zero balance (and written
-    /// back over the real one)
     #[tokio::test]
-    async fn test_failed_load_does_not_clobber_balance() {
-        // No credits table: every load fails
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+    async fn test_amounts_are_bounded() {
+        let credits = manager().await;
+        for bad in [0, -5, MAX_AMOUNT + 1] {
+            assert!(credits.grant("u1", &alice(), bad).await.is_err());
+            assert!(credits.deduct("u1", &alice(), bad).await.is_err());
+        }
+    }
+
+    /// A transfer to oneself still requires the funds
+    #[tokio::test]
+    async fn test_self_transfer_checks_balance() {
+        let credits = manager().await;
+        assert!(!credits.transfer("u1", &alice(), &alice(), 5).await.unwrap());
+        credits.grant("u1", &alice(), 5).await.unwrap();
+        assert!(credits.transfer("u1", &alice(), &alice(), 5).await.unwrap());
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 5);
+    }
+
+    /// The table refuses a balance for a holder that does not exist (an
+    /// object deleted meanwhile, or in another universe; an unknown
+    /// account), so credits are never stranded
+    #[tokio::test]
+    async fn test_missing_holders_refused() {
+        let credits = manager().await;
+        let till = Holder::Object("/shops/till".into());
+        assert!(credits.grant("u1", &till, 5).await.is_ok());
+        assert!(credits.grant("u2", &till, 5).await.is_err());
+        assert!(credits
+            .grant("u1", &Holder::Account("ghost".into()), 5)
             .await
-            .unwrap();
-        let manager = CreditManager::new(Some(pool), None);
-        assert!(!manager.grant("u1", "player1", 10, "test").await);
-        assert!(!manager.deduct("u1", "player1", 1, "test").await);
-        // Nothing cached from the failed reads
-        assert!(manager.balances.read().await.is_empty());
+            .is_err());
+        // A transfer to a missing holder changes nothing
+        credits.grant("u1", &alice(), 10).await.unwrap();
+        let gone = Holder::Object("/shops/gone".into());
+        assert!(credits.transfer("u1", &alice(), &gone, 4).await.is_err());
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 10);
     }
 
+    /// Spending from a holder that does not exist (an object deleted
+    /// meanwhile) is "not enough", not an error
     #[tokio::test]
-    async fn test_grant_rejects_invalid_and_overflowing_amounts() {
-        let manager = CreditManager::new(None, None);
-        assert!(!manager.grant("u1", "player1", 0, "test").await);
-        assert!(!manager.grant("u1", "player1", -5, "test").await);
-        assert!(manager.grant("u1", "player1", i64::MAX, "test").await);
-        assert!(!manager.grant("u1", "player1", 1, "overflow").await);
-        assert_eq!(manager.get_balance("u1", "player1").await, i64::MAX);
-    }
-
-    /// Deduct must see the stored balance on a cold cache
-    #[tokio::test]
-    async fn test_deduct_on_cold_cache_uses_stored_balance() {
-        let pool = pool_with_balance(100).await;
-        let manager = CreditManager::new(Some(pool.clone()), None);
-        assert!(manager.deduct("u1", "player1", 30, "test").await);
-        assert_eq!(manager.get_balance("u1", "player1").await, 70);
-
-        let restarted = CreditManager::new(Some(pool), None);
-        assert_eq!(restarted.get_balance("u1", "player1").await, 70);
-    }
-
-    #[tokio::test]
-    async fn test_get_balance_default() {
-        let manager = CreditManager::new(None, None);
-        let balance = manager.get_balance("u1", "player1").await;
-        assert_eq!(balance, 0);
-    }
-
-    #[tokio::test]
-    async fn test_set_balance() {
-        let manager = CreditManager::new(None, None);
-        manager.set_balance("u1", "player1", 100).await;
-        let balance = manager.get_balance("u1", "player1").await;
-        assert_eq!(balance, 100);
-    }
-
-    #[tokio::test]
-    async fn test_grant() {
-        let manager = CreditManager::new(None, None);
-        manager.grant("u1", "player1", 50, "admin grant").await;
-        let balance = manager.get_balance("u1", "player1").await;
-        assert_eq!(balance, 50);
-
-        manager.grant("u1", "player1", 30, "bonus").await;
-        let balance = manager.get_balance("u1", "player1").await;
-        assert_eq!(balance, 80);
-    }
-
-    #[tokio::test]
-    async fn test_deduct_success() {
-        let manager = CreditManager::new(None, None);
-        manager.set_balance("u1", "player1", 100).await;
-
-        let result = manager.deduct("u1", "player1", 30, "purchase").await;
-        assert!(result);
-
-        let balance = manager.get_balance("u1", "player1").await;
-        assert_eq!(balance, 70);
-    }
-
-    #[tokio::test]
-    async fn test_deduct_insufficient() {
-        let manager = CreditManager::new(None, None);
-        manager.set_balance("u1", "player1", 20).await;
-
-        let result = manager.deduct("u1", "player1", 50, "purchase").await;
-        assert!(!result);
-
-        // Balance unchanged
-        let balance = manager.get_balance("u1", "player1").await;
-        assert_eq!(balance, 20);
-    }
-
-    #[tokio::test]
-    async fn test_deduct_invalid_amount() {
-        let manager = CreditManager::new(None, None);
-        manager.set_balance("u1", "player1", 100).await;
-
-        // Zero amount
-        let result = manager.deduct("u1", "player1", 0, "test").await;
-        assert!(!result);
-
-        // Negative amount
-        let result = manager.deduct("u1", "player1", -10, "test").await;
-        assert!(!result);
-
-        // Balance unchanged
-        let balance = manager.get_balance("u1", "player1").await;
-        assert_eq!(balance, 100);
-    }
-
-    #[tokio::test]
-    async fn test_multiple_universes() {
-        let manager = CreditManager::new(None, None);
-
-        manager.set_balance("u1", "player1", 100).await;
-        manager.set_balance("u2", "player1", 200).await;
-
-        assert_eq!(manager.get_balance("u1", "player1").await, 100);
-        assert_eq!(manager.get_balance("u2", "player1").await, 200);
+    async fn test_deduct_from_missing_holder_is_false() {
+        let credits = manager().await;
+        let gone = Holder::Object("/shops/gone".into());
+        assert!(!credits.deduct("u1", &gone, 1).await.unwrap());
+        assert!(!credits.transfer("u1", &gone, &alice(), 1).await.unwrap());
     }
 }

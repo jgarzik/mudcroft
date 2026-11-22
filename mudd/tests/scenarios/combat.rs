@@ -209,3 +209,598 @@ async fn test_npc_subclasses_are_attackable() {
     let text = attack(&mut wiz, "attack wolf").await;
     assert!(text.contains("Wolf"), "{}", text);
 }
+
+/// HP has one home, the object row: after a hit, the bat's `hp` property
+/// (what Lua sees) is the HP the attack reported, written in one Raft entry
+#[tokio::test]
+async fn test_attack_writes_hp_to_the_object() {
+    let server = TestServer::start().await.expect("Failed to start server");
+    let mut alice = player_in_passage(&server, "row_fighter").await;
+    let bat = server.world().bat_id.clone();
+    for _ in 0..30 {
+        let text = attack(&mut alice, "attack bat").await;
+        if text.contains("slain") {
+            return;
+        }
+        let Some(remaining) = text
+            .lines()
+            .find(|l| l.contains("HP remaining"))
+            .and_then(|l| l.split(" has ").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse::<i64>().ok())
+        else {
+            continue; // miss or fumble
+        };
+        let stored: serde_json::Value = sqlx::query_scalar(
+            "SELECT json_extract(properties, '$.hp') FROM objects WHERE universe_id = ? AND id = ?",
+        )
+        .bind(server.universe_id())
+        .bind(&bat)
+        .fetch_one(server.pool())
+        .await
+        .map(|v: i64| serde_json::json!(v))
+        .unwrap();
+        assert_eq!(stored, serde_json::json!(remaining), "{}", text);
+        return;
+    }
+    panic!("no hit landed in 30 attacks");
+}
+
+async fn eval_as(c: &mut TestClient, code: &str) -> serde_json::Value {
+    c.drain().await;
+    c.command(&format!("eval {}", code)).await.unwrap();
+    let _ = c.expect("echo").await;
+    c.expect_any().await.expect("eval reply")
+}
+
+/// game.apply_effect / get_effects / remove_effect, stored in the table
+/// (surviving a restart), and checked like other object writes
+#[tokio::test]
+async fn test_lua_effects_api() {
+    let mut server = TestServer::start().await.expect("server");
+    let bat = server.world().bat_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "effect_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"game.apply_effect("{b}", "poisoned", 5, 2)
+               game.apply_effect("{b}", "stunned", 3, 0)
+               local e = game.get_effects("{b}")
+               table.sort(e, function(x, y) return x.type < y.type end)
+               return e[1].type .. ":" .. e[1].remaining .. ":" .. e[1].magnitude .. ":" .. e[1].damage_type .. "," .. e[2].type"#,
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "poisoned:5:2:poison,stunned", "{}", out);
+
+    server.restart().await.expect("restart");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "effect_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"local removed = game.remove_effect("{b}", "stunned")
+               return tostring(removed) .. ":" .. #game.get_effects("{b}")"#,
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "true:1", "survived the restart: {}", out);
+
+    // A builder (no grant covering the bat) may not apply effects to it
+    let bld = server
+        .connect_as(Role::Builder {
+            username: "effect_builder".into(),
+            regions: vec![],
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"game.set_actor("{who}")
+               local ok = pcall(game.apply_effect, "{b}", "stunned", 3, 0)
+               game.set_actor(nil)
+               return tostring(ok)"#,
+            who = bld.account_id(),
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "false", "{}", out);
+}
+
+async fn bat_row(server: &TestServer) -> (Option<i64>, Option<String>) {
+    sqlx::query_as(
+        "SELECT json_extract(properties, '$.hp'), parent_id FROM objects
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&server.world().bat_id)
+    .fetch_one(server.pool())
+    .await
+    .unwrap()
+}
+
+/// Effects tick once a second: poison deals its damage each tick, through
+/// the object's HP, and expires when its ticks run out
+#[tokio::test]
+async fn test_effects_tick_down() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "tick_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    eval_as(
+        &mut wiz,
+        &format!(r#"return game.apply_effect("{}", "poisoned", 3, 2)"#, bat),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    let (hp, parent) = bat_row(&server).await;
+    assert_eq!(hp, Some(15 - 3 * 2), "three ticks of 2 poison");
+    assert!(parent.is_some(), "still alive");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_effects WHERE entity_id = ?")
+        .bind(&bat)
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "expired effects are gone");
+}
+
+/// Damage over time can kill: the NPC leaves the room and onlookers hear it
+#[tokio::test]
+async fn test_effect_damage_kills() {
+    let server = TestServer::start().await.expect("server");
+    let mut watcher = player_in_passage(&server, "burn_watcher").await;
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "burn_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    eval_as(
+        &mut wiz,
+        &format!(r#"return game.apply_effect("{}", "burning", 2, 50)"#, bat),
+    )
+    .await;
+    watcher
+        .expect_output_containing("Giant Bat dies")
+        .await
+        .expect("the room hears the death");
+    let (hp, parent) = bat_row(&server).await;
+    assert_eq!((hp, parent), (Some(0), None));
+}
+
+/// A player under an effect is told what it does each tick
+#[tokio::test]
+async fn test_player_hears_their_effects() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "poisoned_player").await;
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "poisoner_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "poisoned", 2, 3)"#,
+            pl.player_id().unwrap()
+        ),
+    )
+    .await;
+    pl.expect_output_containing("3 poison damage")
+        .await
+        .expect("damage message");
+    pl.expect_output_containing("no longer poisoned")
+        .await
+        .expect("expiry message");
+}
+
+/// Deadlines, not a sweep: a plain effect writes once when applied and once
+/// when it ends, nothing while it lasts
+#[tokio::test]
+async fn test_plain_effect_costs_no_writes_while_active() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "stun_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    async fn effect_writes(server: &TestServer) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%active_effects%'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap()
+    }
+    let before = effect_writes(&server).await;
+    eval_as(
+        &mut wiz,
+        &format!(r#"return game.apply_effect("{}", "stunned", 2.5, 0)"#, bat),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(effect_writes(&server).await - before, 1, "only the apply");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(effect_writes(&server).await - before, 2, "and the end");
+}
+
+/// A stunned attacker cannot act
+#[tokio::test]
+async fn test_stunned_player_cannot_attack() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "dazed_player").await;
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "stunner_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "stunned", 30, 0)"#,
+            pl.player_id().unwrap()
+        ),
+    )
+    .await;
+    pl.drain().await;
+    pl.command("attack bat").await.unwrap();
+    let _ = pl.expect("echo").await;
+    let reply = pl.expect("error").await.expect("refused");
+    assert!(
+        reply["message"].as_str().unwrap().contains("stunned"),
+        "{}",
+        reply
+    );
+}
+
+/// Durations and periods must be real numbers: NaN would defeat the clamps
+#[tokio::test]
+async fn test_effect_times_must_be_finite() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "nan_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    let out = eval_as(
+        &mut wiz,
+        &format!(
+            r#"local a = pcall(game.apply_effect, "{b}", "poisoned", 0/0, 1)
+               local b = pcall(game.apply_effect, "{b}", "poisoned", 5, 1, nil, 0/0)
+               return tostring(a) .. ":" .. tostring(b) .. ":" .. #game.get_effects("{b}")"#,
+            b = bat
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "false:false:0", "{}", out);
+}
+
+/// Effects belong to one object: deleting it and creating a new one with
+/// the same id does not hand the old effects to the new object
+#[tokio::test]
+async fn test_effects_do_not_survive_object_recreation() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "recreate_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        r#"game.create_object("/npcs/ghost", "npc", nil, {name = "ghost", hp = 20})
+           game.apply_effect("/npcs/ghost", "poisoned", 3, 5)
+           game.delete_object("/npcs/ghost")
+           game.create_object("/npcs/ghost", "npc", nil, {name = "ghost", hp = 20})
+           return #game.get_effects("/npcs/ghost")"#,
+    )
+    .await;
+    assert_eq!(out["text"], "0", "{}", out);
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let hp: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.hp') FROM objects WHERE universe_id = ? AND id = '/npcs/ghost'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(hp, 20, "the new object takes no poison");
+}
+
+/// A target that is already dead (as a second attacker racing the killing
+/// blow would find it) cannot be killed again: no second death or on_death
+#[tokio::test]
+async fn test_dead_target_is_not_killed_twice() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "late_attacker").await;
+    sqlx::query(
+        "UPDATE objects SET properties = json_set(properties, '$.hp', 0)
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&server.world().bat_id)
+    .execute(server.pool())
+    .await
+    .unwrap();
+    for _ in 0..10 {
+        pl.drain().await;
+        pl.command("attack bat").await.unwrap();
+        let _ = pl.expect("echo").await;
+        let reply = pl.expect_any().await.unwrap();
+        let text = reply["text"]
+            .as_str()
+            .or(reply["message"].as_str())
+            .unwrap_or_default();
+        assert!(!text.contains("slain"), "killed twice: {}", text);
+    }
+}
+
+/// update_object writes only the properties it was given, so it cannot put
+/// back an HP that combat or an effect changed meanwhile
+#[tokio::test]
+async fn test_update_object_writes_only_given_properties() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "partial_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.update_object("{}", {{name = "Old Bat"}})"#,
+            bat
+        ),
+    )
+    .await;
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM raft_log WHERE payload LIKE '%Old Bat%' ORDER BY log_index DESC LIMIT 1",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(payload.contains("json_set"), "{}", payload);
+    assert!(!payload.contains("hp"), "hp was rewritten: {}", payload);
+}
+
+/// An NPC killed by an effect fires on_death like a kill by attack, with
+/// the effect's source as killer
+#[tokio::test]
+async fn test_effect_death_fires_on_death() {
+    let server = TestServer::start().await.expect("server");
+    let mut watcher = player_in_passage(&server, "death_watcher").await;
+    let passage = server.world().passage_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "doom_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"local h = game.store_code([[return {{
+                 on_death = function(a) game.broadcast("{room}", "rat on_death fired") end,
+               }}]])
+               game.create_object("/npcs/rat", "npc", "{room}", {{name = "rat", hp = 3, code_hash = h}})
+               return game.apply_effect("/npcs/rat", "burning", 2, 50)"#,
+            room = passage
+        ),
+    )
+    .await;
+    watcher
+        .expect_output_containing("rat on_death fired")
+        .await
+        .expect("on_death ran for the effect kill");
+}
+
+/// A player killed by an effect respawns at once (HP restored, moved to the
+/// respawn room) and is shown the new room
+#[tokio::test]
+async fn test_player_killed_by_effect_respawns() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "doomed_player").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "reaper_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "burning", 2, 500)"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("death message");
+    let room = pl.expect("room").await.expect("shown the respawn room");
+    assert_eq!(room["name"], "Cave Entrance");
+    let (hp, parent): (i64, String) = sqlx::query_as(
+        "SELECT json_extract(properties, '$.hp'), parent_id FROM objects WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (hp, parent.as_str()),
+        (100, server.world().entrance_id.as_str())
+    );
+}
+
+/// With no respawn room (no workroom, no portal yet) a player killed by an
+/// effect still dies once and revives where they fell, instead of the
+/// lethal pulse being retried forever
+#[tokio::test]
+async fn test_effect_death_without_respawn_room() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "portalless").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    sqlx::query("DELETE FROM universe_settings WHERE universe_id = ? AND key = 'portal_room_id'")
+        .bind(server.universe_id())
+        .execute(server.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE objects SET properties = json_remove(properties, '$.workroom_id')
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "nowhere_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "burning", 2, 500)"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("died");
+    let (hp, parent, effects): (i64, String, i64) = sqlx::query_as(
+        "SELECT json_extract(properties, '$.hp'), parent_id,
+                (SELECT COUNT(*) FROM active_effects e WHERE e.universe_id = o.universe_id AND e.entity_id = o.id)
+         FROM objects o WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (hp, parent.as_str(), effects),
+        (100, server.world().passage_id.as_str(), 0)
+    );
+}
+
+/// A player killed by an effect drops what they carry in the same atomic
+/// batch that revives them
+#[tokio::test]
+async fn test_effect_death_drops_inventory_atomically() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "gem_carrier").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "gem_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"game.create_object("/items/gem", "item", "{p}", {{name = "gem"}})
+               return game.apply_effect("{p}", "burning", 2, 500)"#,
+            p = player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("died");
+    let gem_parent: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/gem'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(gem_parent, server.world().passage_id);
+    // One Raft entry both revives the player and drops the gem
+    let entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%/items/gem%'
+           AND payload LIKE '%SET parent_id%' AND payload LIKE '%json_set%'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(entries, 1);
+}
+
+/// A portal pointing at a deleted room counts as no respawn room: the
+/// player revives in place, and other effects keep ticking
+#[tokio::test]
+async fn test_effect_death_with_dangling_portal() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "dangling").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    sqlx::query("UPDATE universe_settings SET value = '/rooms/demolished' WHERE universe_id = ? AND key = 'portal_room_id'")
+        .bind(server.universe_id())
+        .execute(server.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE objects SET properties = json_remove(properties, '$.workroom_id')
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "dangle_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "burning", 2, 500)"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("died despite the dangling portal");
+    let parent: String =
+        sqlx::query_scalar("SELECT parent_id FROM objects WHERE universe_id = ? AND id = ?")
+            .bind(server.universe_id())
+            .bind(&player_id)
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(parent, server.world().passage_id);
+}

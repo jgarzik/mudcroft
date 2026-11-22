@@ -104,7 +104,7 @@ async fn test_object_crud() {
 
     // Read
     let loaded = store
-        .get(&obj.id)
+        .get(&universe_id, &obj.id)
         .await
         .expect("Failed to get object")
         .expect("Object not found");
@@ -117,14 +117,20 @@ async fn test_object_crud() {
     updated.set_property("damage_dice", serde_json::json!("3d6"));
     store.update(&updated).await.expect("Failed to update");
 
-    let reloaded = store.get(&obj.id).await.unwrap().unwrap();
+    let reloaded = store.get(&universe_id, &obj.id).await.unwrap().unwrap();
     assert_eq!(reloaded.get_string("damage_dice"), Some("3d6"));
 
     // Delete
-    let deleted = store.delete(&obj.id).await.expect("Failed to delete");
+    let deleted = store
+        .delete(&universe_id, &obj.id)
+        .await
+        .expect("Failed to delete");
     assert!(deleted);
 
-    let gone = store.get(&obj.id).await.expect("Failed to check deletion");
+    let gone = store
+        .get(&universe_id, &obj.id)
+        .await
+        .expect("Failed to check deletion");
     assert!(gone.is_none());
 }
 
@@ -162,18 +168,18 @@ async fn test_object_hierarchy() {
 
     // Get room contents
     let contents = store
-        .get_contents(&room.id)
+        .get_contents(&universe_id, &room.id)
         .await
         .expect("Failed to get contents");
     assert_eq!(contents.len(), 2);
 
     // Move sword out of room
     store
-        .move_object(&sword.id, None)
+        .move_object(&universe_id, &sword.id, None)
         .await
         .expect("Failed to move");
 
-    let contents_after = store.get_contents(&room.id).await.unwrap();
+    let contents_after = store.get_contents(&universe_id, &room.id).await.unwrap();
     assert_eq!(contents_after.len(), 1);
 }
 
@@ -210,18 +216,18 @@ async fn test_class_registry() {
     let registry = ClassRegistry::new();
 
     // Verify inheritance chain
-    assert!(registry.is_a("weapon", "item"));
-    assert!(registry.is_a("weapon", "thing"));
-    assert!(registry.is_a("player", "living"));
+    assert!(registry.is_a("u", "weapon", "item"));
+    assert!(registry.is_a("u", "weapon", "thing"));
+    assert!(registry.is_a("u", "player", "living"));
 
     // Verify property resolution
-    let props = registry.resolve_properties("weapon");
+    let props = registry.resolve_properties("u", "weapon");
     assert!(props.contains_key("damage_dice")); // from weapon
     assert!(props.contains_key("weight")); // from item
     assert!(props.contains_key("name")); // from thing
 
     // Verify handlers resolution
-    let handlers = registry.resolve_handlers("npc");
+    let handlers = registry.resolve_handlers("u", "npc");
     assert!(handlers.contains(&"heart_beat".to_string())); // from living
     assert!(handlers.contains(&"ai_idle_tick".to_string())); // from npc
     assert!(handlers.contains(&"on_init".to_string())); // from thing
@@ -258,14 +264,17 @@ async fn test_find_by_name() {
 
     // Find by name
     let found = store
-        .find_by_name(&room.id, "Magic Sword")
+        .find_by_name(&universe_id, &room.id, "Magic Sword")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(found.id, sword.id);
 
     // Not found
-    let not_found = store.find_by_name(&room.id, "Missing Item").await.unwrap();
+    let not_found = store
+        .find_by_name(&universe_id, &room.id, "Missing Item")
+        .await
+        .unwrap();
     assert!(not_found.is_none());
 }
 
@@ -291,23 +300,44 @@ async fn test_room_exits() {
     store.create(&room2).await.unwrap();
 
     // Set exits
-    store.set_exit(&room1.id, "north", &room2.id).await.unwrap();
-    store.set_exit(&room2.id, "south", &room1.id).await.unwrap();
+    store
+        .set_exit(&universe_id, &room1.id, "north", &room2.id)
+        .await
+        .unwrap();
+    store
+        .set_exit(&universe_id, &room2.id, "south", &room1.id)
+        .await
+        .unwrap();
 
     // Verify exits
-    let north_dest = store.get_exit(&room1.id, "north").await.unwrap();
+    let north_dest = store
+        .get_exit(&universe_id, &room1.id, "north")
+        .await
+        .unwrap();
     assert_eq!(north_dest, Some(room2.id.clone()));
 
-    let south_dest = store.get_exit(&room2.id, "south").await.unwrap();
+    let south_dest = store
+        .get_exit(&universe_id, &room2.id, "south")
+        .await
+        .unwrap();
     assert_eq!(south_dest, Some(room1.id.clone()));
 
     // No exit in that direction
-    let no_exit = store.get_exit(&room1.id, "west").await.unwrap();
+    let no_exit = store
+        .get_exit(&universe_id, &room1.id, "west")
+        .await
+        .unwrap();
     assert!(no_exit.is_none());
 
     // Remove exit
-    store.remove_exit(&room1.id, "north").await.unwrap();
-    let removed = store.get_exit(&room1.id, "north").await.unwrap();
+    store
+        .remove_exit(&universe_id, &room1.id, "north")
+        .await
+        .unwrap();
+    let removed = store
+        .get_exit(&universe_id, &room1.id, "north")
+        .await
+        .unwrap();
     assert!(removed.is_none());
 }
 
@@ -333,12 +363,15 @@ async fn test_environment_query() {
     store.create(&player).await.unwrap();
 
     // Get environment
-    let env = store.get_environment(&player.id).await.unwrap();
+    let env = store
+        .get_environment(&universe_id, &player.id)
+        .await
+        .unwrap();
     assert!(env.is_some());
     assert_eq!(env.unwrap().id, room.id);
 
     // Room has no environment (top level)
-    let room_env = store.get_environment(&room.id).await.unwrap();
+    let room_env = store.get_environment(&universe_id, &room.id).await.unwrap();
     assert!(room_env.is_none());
 }
 
@@ -376,7 +409,7 @@ async fn test_get_living_in() {
     store.create(&sword).await.unwrap();
 
     // Get living entities
-    let living = store.get_living_in(&room.id).await.unwrap();
+    let living = store.get_living_in(&universe_id, &room.id).await.unwrap();
     assert_eq!(living.len(), 2);
 
     let names: Vec<_> = living.iter().filter_map(|o| o.get_string("name")).collect();
@@ -403,7 +436,10 @@ async fn test_player_movement() {
     room2.set_property("name", serde_json::json!("End"));
     store.create(&room2).await.unwrap();
 
-    store.set_exit(&room1.id, "east", &room2.id).await.unwrap();
+    store
+        .set_exit(&universe_id, &room1.id, "east", &room2.id)
+        .await
+        .unwrap();
 
     // Create player in room1
     let mut player = Object::new("/players/adventurer", &universe_id, "player").unwrap();
@@ -412,26 +448,49 @@ async fn test_player_movement() {
     store.create(&player).await.unwrap();
 
     // Verify player is in room1
-    let contents1 = store.get_living_in(&room1.id).await.unwrap();
+    let contents1 = store.get_living_in(&universe_id, &room1.id).await.unwrap();
     assert_eq!(contents1.len(), 1);
 
     // Get exit destination
-    let dest = store.get_exit(&room1.id, "east").await.unwrap().unwrap();
+    let dest = store
+        .get_exit(&universe_id, &room1.id, "east")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(dest, room2.id);
 
     // Move player to room2
-    store.move_object(&player.id, Some(&dest)).await.unwrap();
+    store
+        .move_object(&universe_id, &player.id, Some(&dest))
+        .await
+        .unwrap();
 
     // Verify player moved
-    let contents1_after = store.get_living_in(&room1.id).await.unwrap();
+    let contents1_after = store.get_living_in(&universe_id, &room1.id).await.unwrap();
     assert_eq!(contents1_after.len(), 0);
 
-    let contents2 = store.get_living_in(&room2.id).await.unwrap();
+    let contents2 = store.get_living_in(&universe_id, &room2.id).await.unwrap();
     assert_eq!(contents2.len(), 1);
     assert_eq!(contents2[0].get_string("name"), Some("Adventurer"));
 }
 
 // WebSocket Tests
+
+/// There are no guests: /ws without a valid token is refused before upgrade
+#[tokio::test]
+async fn test_websocket_requires_token() {
+    use tokio_tungstenite::tungstenite::Error;
+    let mudd = MuddTest::start().await.expect("Failed to start server");
+    for url in [
+        mudd.ws_url(),
+        format!("{}&token=not-a-real-token", mudd.ws_url()),
+    ] {
+        match tokio_tungstenite::connect_async(&url).await {
+            Err(Error::Http(resp)) => assert_eq!(resp.status(), 401, "{}", url),
+            other => panic!("expected 401 for {}, got {:?}", url, other.map(|_| ())),
+        }
+    }
+}
 
 #[tokio::test]
 async fn test_websocket_connect() {
@@ -683,8 +742,8 @@ async fn test_harness_connect_as_player() {
 
     // Verify we got a player ID from the welcome message
     assert!(player.player_id().is_some(), "Should have player ID");
-    assert!(player.account_id().is_some(), "Should have account ID");
-    assert!(player.auth_token().is_some(), "Should have auth token");
+    assert!(!player.account_id().is_empty(), "Should have account ID");
+    assert!(!player.auth_token().is_empty(), "Should have auth token");
 }
 
 #[tokio::test]
@@ -701,18 +760,24 @@ async fn test_harness_connect_as_wizard() {
 
     // Verify wizard account
     assert!(
-        wizard.account_id().is_some(),
+        !wizard.account_id().is_empty(),
         "Wizard should have account ID"
     );
 
-    // Verify access level was set to wizard
-    let account_id = wizard.account_id().unwrap();
-    let level: (String,) = sqlx::query_as("SELECT access_level FROM accounts WHERE id = ?")
-        .bind(account_id)
-        .fetch_one(server.pool())
-        .await
-        .expect("Failed to query account");
-    assert_eq!(level.0, "wizard", "Account should have wizard access level");
+    // Verify the account is a wizard member of the test universe
+    let account_id = wizard.account_id();
+    let level: (String,) = sqlx::query_as(
+        "SELECT level FROM universe_members WHERE universe_id = ? AND account_id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(account_id)
+    .fetch_one(server.pool())
+    .await
+    .expect("Failed to query membership");
+    assert_eq!(
+        level.0, "wizard",
+        "Account should be a wizard in the universe"
+    );
 }
 
 #[tokio::test]
@@ -928,6 +993,17 @@ async fn test_timer_persistence() {
         .execute(&pool)
         .await
         .expect("Failed to create timers table");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS heartbeats (
+                universe_id TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                interval_ms INTEGER NOT NULL,
+                PRIMARY KEY (universe_id, object_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create heartbeats table");
 
         let timer_mgr = TimerManager::new(Some(pool.clone()), None);
         let timer = Timer::new(
@@ -937,7 +1013,7 @@ async fn test_timer_persistence() {
             60000,
             Some("test_args".to_string()),
         );
-        timer_mgr.add_timer(timer).await;
+        timer_mgr.add_timer(timer).await.expect("timer stored");
 
         assert_eq!(timer_mgr.timer_count().await, 1);
         // Pool dropped here
@@ -960,92 +1036,6 @@ async fn test_timer_persistence() {
             timer_mgr.timer_count().await,
             1,
             "Timer should persist across restarts"
-        );
-    }
-}
-
-/// Test: Permission access level persistence
-#[tokio::test]
-async fn test_permission_persistence() {
-    use mudd::permissions::{AccessLevel, PermissionManager};
-
-    // A temp dir (not a temp file) so SQLite sidecar files are removed too
-    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
-
-    let account_id: String;
-
-    // First phase: Set access level
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        // Create accounts table
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS accounts (
-                id TEXT PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT,
-                salt TEXT,
-                token TEXT,
-                access_level TEXT NOT NULL DEFAULT 'player',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create accounts table");
-
-        // Create builder_regions table
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS builder_regions (
-                account_id TEXT NOT NULL,
-                region_id TEXT NOT NULL,
-                PRIMARY KEY (account_id, region_id)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create builder_regions table");
-
-        // Create test account
-        account_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO accounts (id, username, access_level) VALUES (?, 'wizard_test', 'player')",
-        )
-        .bind(&account_id)
-        .execute(&pool)
-        .await
-        .expect("Failed to create account");
-
-        let perms = PermissionManager::with_db(pool, None);
-        perms
-            .set_access_level(&account_id, AccessLevel::Wizard)
-            .await;
-
-        assert_eq!(
-            perms.get_access_level(&account_id).await,
-            AccessLevel::Wizard
-        );
-    }
-
-    // Second phase: Verify persistence
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        let perms = PermissionManager::with_db(pool, None);
-
-        // Should load from DB since not in cache
-        let level = perms.get_access_level(&account_id).await;
-        assert_eq!(
-            level,
-            AccessLevel::Wizard,
-            "Access level should persist to database"
         );
     }
 }
@@ -1137,147 +1127,6 @@ async fn test_path_grants_persistence() {
         );
     }
 }
-
-/// Test: Combat state (HP) persistence
-#[tokio::test]
-async fn test_combat_state_persistence() {
-    use mudd::combat::CombatManager;
-
-    // A temp dir (not a temp file) so SQLite sidecar files are removed too
-    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
-
-    // First phase: Take damage
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        // Create combat_state table
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS combat_state (
-                entity_id TEXT PRIMARY KEY,
-                universe_id TEXT NOT NULL,
-                hp INTEGER NOT NULL,
-                max_hp INTEGER NOT NULL,
-                armor_class INTEGER NOT NULL DEFAULT 10,
-                attack_bonus INTEGER NOT NULL DEFAULT 0
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create combat_state table");
-
-        let combat = CombatManager::with_db(pool);
-        combat
-            .init_entity_with_universe("player1", Some("universe1"), 100)
-            .await;
-
-        // Verify initial state
-        let state = combat.get_state("player1").await.expect("Entity not found");
-        assert_eq!(state.hp, 100);
-
-        // Take damage
-        combat
-            .deal_damage("player1", 30, mudd::combat::DamageType::Physical, false)
-            .await
-            .expect("Failed to deal damage");
-
-        let state = combat.get_state("player1").await.expect("Entity not found");
-        assert_eq!(state.hp, 70, "HP should be 70 after 30 damage");
-    }
-
-    // Second phase: Verify HP persisted
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        let combat = CombatManager::with_db(pool);
-        combat
-            .load_from_db()
-            .await
-            .expect("Failed to load combat state");
-
-        let state = combat.get_state("player1").await.expect("Entity not found");
-        assert_eq!(state.hp, 70, "HP should persist across restarts");
-        assert_eq!(state.max_hp, 100, "Max HP should persist");
-    }
-}
-
-/// Test: Active effects persistence
-#[tokio::test]
-async fn test_effects_persistence() {
-    use mudd::combat::{EffectRegistry, EffectType, StatusEffect};
-
-    // A temp dir (not a temp file) so SQLite sidecar files are removed too
-    let db_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let db_path = db_dir.path().join("test.db").to_string_lossy().to_string();
-
-    // First phase: Apply effect
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        // Create active_effects table
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS active_effects (
-                id TEXT PRIMARY KEY,
-                entity_id TEXT NOT NULL,
-                effect_type TEXT NOT NULL,
-                remaining_ticks INTEGER NOT NULL,
-                magnitude INTEGER NOT NULL DEFAULT 0,
-                damage_type TEXT,
-                source_id TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create active_effects table");
-
-        let effects = EffectRegistry::with_db(pool);
-        effects
-            .add_effect("player1", StatusEffect::new(EffectType::Poisoned, 10, 5))
-            .await;
-        effects
-            .add_effect("player1", StatusEffect::new(EffectType::Stunned, 3, 0))
-            .await;
-
-        assert!(effects.has_effect("player1", EffectType::Poisoned).await);
-        assert!(effects.has_effect("player1", EffectType::Stunned).await);
-    }
-
-    // Second phase: Verify persistence
-    {
-        let db_url = format!("sqlite:{}?mode=rwc", db_path);
-        let pool = sqlx::SqlitePool::connect(&db_url)
-            .await
-            .expect("Failed to connect");
-
-        let effects = EffectRegistry::with_db(pool);
-        effects
-            .load_from_db()
-            .await
-            .expect("Failed to load effects");
-
-        assert!(
-            effects.has_effect("player1", EffectType::Poisoned).await,
-            "Poisoned effect should persist"
-        );
-        assert!(
-            effects.has_effect("player1", EffectType::Stunned).await,
-            "Stunned effect should persist"
-        );
-    }
-}
-
-// =============================================================================
-// Lua Eval Tests
-// =============================================================================
 
 /// Test: Wizard can create objects via eval
 #[tokio::test]

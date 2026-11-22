@@ -91,7 +91,12 @@ impl TestServer {
             );
         }
 
-        let extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
+        // Every test client logs in from 127.0.0.1: limits off unless the
+        // test sets them
+        let mut extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
+        if !extra_args.iter().any(|a| a == "--auth-limit") {
+            extra_args.extend(["--auth-limit".to_string(), "0".to_string()]);
+        }
         let log_path = temp_dir.path().join("mudd.log");
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
         // Pick a free port and start; if another process took the port in the
@@ -102,7 +107,17 @@ impl TestServer {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let addr = listener.local_addr()?;
             drop(listener);
-            match spawn_mudd(&client, &mudd_path, addr, &db_path, &extra_args, &log_path).await {
+            match spawn_mudd(
+                &client,
+                &mudd_path,
+                addr,
+                &db_path,
+                &extra_args,
+                &log_path,
+                None,
+            )
+            .await
+            {
                 Ok(child) => break (addr, child),
                 Err(e) if attempt < 3 && e.to_string().contains("exited during startup") => {
                     continue
@@ -150,7 +165,24 @@ impl TestServer {
     /// Stop the server process and start it again on the same database,
     /// port and arguments (simulates a server restart)
     pub async fn restart(&mut self) -> Result<()> {
+        self.stop();
+        self.start_again().await
+    }
+
+    /// Send mudd SIGTERM (as `docker stop` or systemd would) and wait up to
+    /// `timeout` for it to exit; its exit status, or None if still running
+    pub fn terminate(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        self.child.terminate(timeout).expect("signal mudd")
+    }
+
+    /// Stop the server process (the database stays; see start_again)
+    pub fn stop(&mut self) {
         self.child.kill();
+    }
+
+    /// Start the server again after stop(), on the same database, port and
+    /// arguments
+    pub async fn start_again(&mut self) -> Result<()> {
         self.child = spawn_mudd(
             &self.client,
             &self.mudd_path,
@@ -158,6 +190,7 @@ impl TestServer {
             &self.db_path,
             &self.extra_args,
             &self.log_path,
+            None,
         )
         .await?;
         Ok(())
@@ -262,14 +295,36 @@ impl TestServer {
         )
     }
 
-    /// Connect a guest (unauthenticated) client
-    pub async fn connect_guest(&self) -> Result<TestClient> {
-        TestClient::connect(self, Role::Guest).await
-    }
-
     /// Connect as a specific role (creates account if needed)
     pub async fn connect_as(&self, role: Role) -> Result<TestClient> {
         TestClient::connect(self, role).await
+    }
+
+    /// Connect as a role to another universe on this server
+    pub async fn connect_in(&self, role: Role, universe_id: &str) -> Result<TestClient> {
+        TestClient::connect_in(self, role, universe_id).await
+    }
+
+    /// Create another universe with one portal room, owned by `owner_id`
+    pub async fn create_universe(&self, universe_id: &str, owner_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO universes (id, name, owner_id, config)
+             SELECT ?, ?, ?, config FROM universes WHERE id = ?",
+        )
+        .bind(universe_id)
+        .bind(universe_id)
+        .bind(owner_id)
+        .bind(self.universe_id())
+        .execute(self.pool())
+        .await?;
+        let mut hall = mudd::objects::Object::new("/rooms/hall", universe_id, "room")?;
+        hall.set_property("name", serde_json::json!("Hall"));
+        self.world().store().create(&hall).await?;
+        self.world()
+            .store()
+            .set_portal(universe_id, "/rooms/hall")
+            .await?;
+        Ok(())
     }
 
     /// Connect multiple clients with specified roles
@@ -281,10 +336,24 @@ impl TestServer {
         Ok(clients)
     }
 
-    /// Connect to the WebSocket endpoint (backward compatibility)
-    /// Returns a raw WsClient without automatic welcome message handling
+    /// Register a fresh player account and connect to the WebSocket
+    /// endpoint with its token. Returns a raw WsClient without automatic
+    /// welcome message handling.
     pub async fn connect_ws(&self) -> Result<RawWsClient> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&self.ws_url()).await?;
+        let username = format!("raw-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let resp: serde_json::Value = self
+            .post(
+                "/auth/register",
+                &serde_json::json!({"username": username, "password": "test123"}),
+            )
+            .await?
+            .json()
+            .await?;
+        let token = resp["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("register failed: {}", resp))?;
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async(&self.ws_url_with_token(token)).await?;
         let (write, read) = futures_util::StreamExt::split(ws_stream);
         Ok(RawWsClient { write, read })
     }
@@ -292,7 +361,7 @@ impl TestServer {
 
 /// Find a binary path by name (e.g., "mudd" or "mudd_init")
 /// Uses the same build profile as the test: debug for `cargo test`, release for `cargo test --release`
-fn find_binary_path(name: &str) -> Result<PathBuf> {
+pub(super) fn find_binary_path(name: &str) -> Result<PathBuf> {
     // Match the build profile of the test runner
     #[cfg(debug_assertions)]
     let candidates = [
@@ -427,20 +496,26 @@ impl Drop for TestServer {
 /// Spawn mudd and wait until it answers /health. The child is guarded
 /// immediately, so any early return (startup timeout, exit) kills it.
 /// Output is appended to `log_path`.
-async fn spawn_mudd(
+pub(super) async fn spawn_mudd(
     client: &Client,
     mudd_path: &Path,
     addr: SocketAddr,
     db_path: &Path,
     extra_args: &[String],
     log_path: &Path,
+    current_dir: Option<&Path>,
 ) -> Result<ChildGuard> {
     let log_out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
+    let mut command = Command::new(mudd_path);
+    if let Some(dir) = current_dir {
+        // run_script reads scripts/ relative to the working directory
+        command.current_dir(dir);
+    }
     let mut child = ChildGuard::new(
-        die_with_parent(&mut Command::new(mudd_path))
+        die_with_parent(&mut command)
             .arg("--bind")
             .arg(addr.to_string())
             .arg("--database")
@@ -499,29 +574,53 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Owns a child process and kills it when dropped, so no exit path
 /// (early return, `?`, panic) can leak a running server.
-struct ChildGuard(Option<Child>);
+pub(super) struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
+    pub(super) fn new(child: Child) -> Self {
         Self(Some(child))
     }
 
     /// Wait for the process to exit normally
-    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+    pub(super) fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
         let mut child = self.0.take().expect("child already taken");
         child.wait()
     }
 
     /// Exit status if the process has already exited
-    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    pub(super) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match self.0.as_mut() {
             Some(child) => child.try_wait(),
             None => Ok(None),
         }
     }
 
+    /// Send SIGTERM and wait up to `timeout` for the process to exit;
+    /// its exit status, or None if it is still running
+    fn terminate(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.0.as_mut() else {
+            return Ok(None);
+        };
+        // SAFETY: kill(2) on our own child's pid
+        if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                self.0 = None;
+                return Ok(Some(status));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(None)
+    }
+
     /// Kill and reap the process (idempotent)
-    fn kill(&mut self) {
+    pub(super) fn kill(&mut self) {
         if let Some(mut child) = self.0.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -538,7 +637,7 @@ impl Drop for ChildGuard {
 /// Ask the kernel to SIGKILL the child if the test process dies without
 /// running destructors (Ctrl-C, timeout kill). Linux only; elsewhere the
 /// `ChildGuard` drop is the only cleanup.
-fn die_with_parent(cmd: &mut Command) -> &mut Command {
+pub(super) fn die_with_parent(cmd: &mut Command) -> &mut Command {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
@@ -556,7 +655,7 @@ fn die_with_parent(cmd: &mut Command) -> &mut Command {
 }
 
 /// Last `lines` lines of a log file (best effort)
-fn log_tail(path: &Path, lines: usize) -> String {
+pub(super) fn log_tail(path: &Path, lines: usize) -> String {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let all: Vec<&str> = text.lines().collect();

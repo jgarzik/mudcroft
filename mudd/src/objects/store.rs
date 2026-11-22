@@ -17,12 +17,21 @@ pub struct ObjectStore {
 
 impl ObjectStore {
     /// Create a new object store with the given connection pool
+    /// The database pool (reads)
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub fn new(pool: SqlitePool, raft_writer: Option<Arc<RaftWriter>>) -> Self {
         Self { pool, raft_writer }
     }
 
     /// Execute a write operation either through Raft (if available) or directly
-    async fn execute_write(&self, sql: &str, params: Vec<serde_json::Value>) -> Result<u64> {
+    async fn execute_write(
+        &self,
+        sql: &'static str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<u64> {
         if let Some(ref raft_writer) = self.raft_writer {
             let result = raft_writer.execute(sql, params).await?;
             Ok(result.rows_affected)
@@ -72,14 +81,15 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// Get an object by ID
-    pub async fn get(&self, id: &str) -> Result<Option<Object>> {
+    /// Get an object by ID within a universe
+    pub async fn get(&self, universe_id: &str, id: &str) -> Result<Option<Object>> {
         let row: Option<ObjectRow> = sqlx::query_as(
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
-            FROM objects WHERE id = ?
+            FROM objects WHERE universe_id = ? AND id = ?
             "#,
         )
+        .bind(universe_id)
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -97,13 +107,14 @@ impl ObjectStore {
         let updated_at = chrono::Utc::now().to_rfc3339();
 
         self.execute_write(
-            "UPDATE objects SET class = ?, parent_id = ?, properties = ?, code_hash = ?, updated_at = ? WHERE id = ?",
+            "UPDATE objects SET class = ?, parent_id = ?, properties = ?, code_hash = ?, updated_at = ? WHERE universe_id = ? AND id = ?",
             vec![
                 serde_json::json!(&obj.class),
                 serde_json::json!(&obj.parent_id),
                 serde_json::json!(&properties),
                 serde_json::json!(&obj.code_hash),
                 serde_json::json!(&updated_at),
+                serde_json::json!(&obj.universe_id),
                 serde_json::json!(&obj.id),
             ],
         )
@@ -112,12 +123,132 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// One statement that sets some properties of an object in place
+    /// (`json_set`), leaving the rest of the row untouched: unlike `update`
+    /// it cannot lose a concurrent change to other properties, and it can
+    /// go into an atomic batch with other statements.
+    ///
+    /// The JSON path is bound (quoted), so any property name works except
+    /// one containing `"`, `\` or a control character.
+    pub fn set_properties_statement<K: AsRef<str>>(
+        universe_id: &str,
+        id: &str,
+        props: &[(K, serde_json::Value)],
+    ) -> Result<(String, Vec<serde_json::Value>)> {
+        let mut sql = String::from("UPDATE objects SET properties = json_set(properties");
+        let mut params = Vec::with_capacity(props.len() * 2 + 3);
+        for (key, value) in props {
+            let key = key.as_ref();
+            if key.is_empty()
+                || key.len() > 255
+                || key.chars().any(|c| c == '"' || c == '\\' || c.is_control())
+            {
+                anyhow::bail!("invalid property name {:?}", key);
+            }
+            sql.push_str(", ?, json(?)");
+            params.push(serde_json::json!(format!("$.\"{}\"", key)));
+            params.push(serde_json::json!(value.to_string()));
+        }
+        sql.push_str("), updated_at = ? WHERE universe_id = ? AND id = ?");
+        params.push(serde_json::json!(chrono::Utc::now().to_rfc3339()));
+        params.push(serde_json::json!(universe_id));
+        params.push(serde_json::json!(id));
+        Ok((sql, params))
+    }
+
+    /// Statement setting an object's container (`None`: nowhere)
+    pub fn set_parent_statement(
+        universe_id: &str,
+        id: &str,
+        parent_id: Option<&str>,
+    ) -> (String, Vec<serde_json::Value>) {
+        (
+            "UPDATE objects SET parent_id = ?, updated_at = ? WHERE universe_id = ? AND id = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(parent_id),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                serde_json::json!(universe_id),
+                serde_json::json!(id),
+            ],
+        )
+    }
+
+    /// Statement attaching (or, with `None`, detaching) an object's code
+    pub fn set_code_hash_statement(
+        universe_id: &str,
+        id: &str,
+        code_hash: Option<&str>,
+    ) -> (String, Vec<serde_json::Value>) {
+        (
+            "UPDATE objects SET code_hash = ?, updated_at = ? WHERE universe_id = ? AND id = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(code_hash),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                serde_json::json!(universe_id),
+                serde_json::json!(id),
+            ],
+        )
+    }
+
+    /// Statement deleting an object
+    pub fn delete_statement(universe_id: &str, id: &str) -> (String, Vec<serde_json::Value>) {
+        (
+            "DELETE FROM objects WHERE universe_id = ? AND id = ?".to_string(),
+            vec![serde_json::json!(universe_id), serde_json::json!(id)],
+        )
+    }
+
+    /// Set some properties of an object in place (see
+    /// set_properties_statement)
+    pub async fn set_properties<K: AsRef<str>>(
+        &self,
+        universe_id: &str,
+        id: &str,
+        props: &[(K, serde_json::Value)],
+    ) -> Result<()> {
+        let statement = Self::set_properties_statement(universe_id, id, props)?;
+        self.execute_batch(vec![statement]).await
+    }
+
+    /// Run statements atomically: one Raft batch, or one transaction
+    /// without Raft (tests)
+    pub async fn execute_batch(
+        &self,
+        statements: Vec<(String, Vec<serde_json::Value>)>,
+    ) -> Result<()> {
+        if let Some(ref raft_writer) = self.raft_writer {
+            return raft_writer.execute_batch(statements).await;
+        }
+        let mut tx = self.pool.begin().await?;
+        for (sql, params) in &statements {
+            // Statements come from builders in this crate, values bound
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+            for param in params {
+                query = match param {
+                    serde_json::Value::String(s) => query.bind(s.clone()),
+                    serde_json::Value::Number(n) => match n.as_i64() {
+                        Some(i) => query.bind(i),
+                        None => query.bind(n.as_f64()),
+                    },
+                    serde_json::Value::Bool(b) => query.bind(*b),
+                    serde_json::Value::Null => query.bind(Option::<String>::None),
+                    other => query.bind(other.to_string()),
+                };
+            }
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Delete an object
-    pub async fn delete(&self, id: &str) -> Result<bool> {
+    pub async fn delete(&self, universe_id: &str, id: &str) -> Result<bool> {
         let rows = self
             .execute_write(
-                "DELETE FROM objects WHERE id = ?",
-                vec![serde_json::json!(id)],
+                "DELETE FROM objects WHERE universe_id = ? AND id = ?",
+                vec![serde_json::json!(universe_id), serde_json::json!(id)],
             )
             .await?;
 
@@ -125,13 +256,14 @@ impl ObjectStore {
     }
 
     /// Get all objects with a given parent (contents of a room/container)
-    pub async fn get_contents(&self, parent_id: &str) -> Result<Vec<Object>> {
+    pub async fn get_contents(&self, universe_id: &str, parent_id: &str) -> Result<Vec<Object>> {
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
-            FROM objects WHERE parent_id = ?
+            FROM objects WHERE universe_id = ? AND parent_id = ?
             "#,
         )
+        .bind(universe_id)
         .bind(parent_id)
         .fetch_all(&self.pool)
         .await?;
@@ -140,15 +272,21 @@ impl ObjectStore {
     }
 
     /// Move an object to a new parent
-    pub async fn move_object(&self, id: &str, new_parent_id: Option<&str>) -> Result<()> {
+    pub async fn move_object(
+        &self,
+        universe_id: &str,
+        id: &str,
+        new_parent_id: Option<&str>,
+    ) -> Result<()> {
         // Pre-compute timestamp for deterministic replication
         let updated_at = chrono::Utc::now().to_rfc3339();
 
         self.execute_write(
-            "UPDATE objects SET parent_id = ?, updated_at = ? WHERE id = ?",
+            "UPDATE objects SET parent_id = ?, updated_at = ? WHERE universe_id = ? AND id = ?",
             vec![
                 serde_json::json!(new_parent_id),
                 serde_json::json!(&updated_at),
+                serde_json::json!(universe_id),
                 serde_json::json!(id),
             ],
         )
@@ -212,7 +350,12 @@ impl ObjectStore {
 
     /// Find object by name property in a given location.
     /// Does case-insensitive partial matching: "sword" matches "Rusty Short Sword".
-    pub async fn find_by_name(&self, parent_id: &str, name: &str) -> Result<Option<Object>> {
+    pub async fn find_by_name(
+        &self,
+        universe_id: &str,
+        parent_id: &str,
+        name: &str,
+    ) -> Result<Option<Object>> {
         // SQLite JSON extraction with case-insensitive LIKE matching.
         // The search term is matched literally (its own % and _ escaped) and
         // wrapped in % for partial matching.
@@ -225,9 +368,11 @@ impl ObjectStore {
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects
-            WHERE parent_id = ? AND lower(json_extract(properties, '$.name')) LIKE lower(?) ESCAPE '\'
+            WHERE universe_id = ? AND parent_id = ?
+              AND lower(json_extract(properties, '$.name')) LIKE lower(?) ESCAPE '\'
             "#,
         )
+        .bind(universe_id)
         .bind(parent_id)
         .bind(&search_pattern)
         .fetch_all(&self.pool)
@@ -240,11 +385,11 @@ impl ObjectStore {
     }
 
     /// Get the environment (parent) of an object
-    pub async fn get_environment(&self, obj_id: &str) -> Result<Option<Object>> {
-        let obj = self.get(obj_id).await?;
+    pub async fn get_environment(&self, universe_id: &str, obj_id: &str) -> Result<Option<Object>> {
+        let obj = self.get(universe_id, obj_id).await?;
         match obj {
             Some(o) => match &o.parent_id {
-                Some(parent_id) => self.get(parent_id).await,
+                Some(parent_id) => self.get(universe_id, parent_id).await,
                 None => Ok(None),
             },
             None => Ok(None),
@@ -252,14 +397,15 @@ impl ObjectStore {
     }
 
     /// Get all living entities (players, npcs) in a location
-    pub async fn get_living_in(&self, parent_id: &str) -> Result<Vec<Object>> {
+    pub async fn get_living_in(&self, universe_id: &str, parent_id: &str) -> Result<Vec<Object>> {
         let rows: Vec<ObjectRow> = sqlx::query_as(
             r#"
             SELECT id, universe_id, class, parent_id, properties, code_hash, owner_id, created_at, updated_at
             FROM objects
-            WHERE parent_id = ? AND (class = 'player' OR class = 'npc' OR class = 'living')
+            WHERE universe_id = ? AND parent_id = ? AND (class = 'player' OR class = 'npc' OR class = 'living')
             "#,
         )
+        .bind(universe_id)
         .bind(parent_id)
         .fetch_all(&self.pool)
         .await?;
@@ -268,8 +414,13 @@ impl ObjectStore {
     }
 
     /// Get room exit destination
-    pub async fn get_exit(&self, room_id: &str, direction: &str) -> Result<Option<String>> {
-        let room = self.get(room_id).await?;
+    pub async fn get_exit(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        direction: &str,
+    ) -> Result<Option<String>> {
+        let room = self.get(universe_id, room_id).await?;
         match room {
             Some(r) => {
                 if let Some(exits) = r.properties.get("exits") {
@@ -286,8 +437,14 @@ impl ObjectStore {
     }
 
     /// Set a room exit
-    pub async fn set_exit(&self, room_id: &str, direction: &str, dest_room_id: &str) -> Result<()> {
-        let room = self.get(room_id).await?;
+    pub async fn set_exit(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        direction: &str,
+        dest_room_id: &str,
+    ) -> Result<()> {
+        let room = self.get(universe_id, room_id).await?;
         if let Some(mut r) = room {
             let exits = r
                 .properties
@@ -304,8 +461,13 @@ impl ObjectStore {
     }
 
     /// Remove a room exit
-    pub async fn remove_exit(&self, room_id: &str, direction: &str) -> Result<()> {
-        let room = self.get(room_id).await?;
+    pub async fn remove_exit(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        direction: &str,
+    ) -> Result<()> {
+        let room = self.get(universe_id, room_id).await?;
         if let Some(mut r) = room {
             if let Some(exits) = r.properties.get_mut("exits") {
                 if let Some(exits_obj) = exits.as_object_mut() {
@@ -564,5 +726,60 @@ mod tests {
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
         assert_eq!(hash1.len(), 64); // SHA-256 = 64 hex chars
+    }
+
+    /// set_properties changes only the named properties, in place
+    #[tokio::test]
+    async fn test_set_properties_in_place() {
+        let pool = crate::db::test_utils::test_pool().await;
+        sqlx::query(
+            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES ('acct', 'acct', 'x', 'admin', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectStore::new(pool, None);
+        store
+            .create_universe("u", "U", "acct", serde_json::json!({}))
+            .await
+            .unwrap();
+        let mut obj = Object::new("/npcs/rat", "u", "npc").unwrap();
+        obj.set_property("name", serde_json::json!("rat"));
+        obj.set_property("hp", serde_json::json!(10));
+        store.create(&obj).await.unwrap();
+
+        store
+            .set_properties(
+                "u",
+                "/npcs/rat",
+                &[
+                    ("hp", serde_json::json!(3)),
+                    ("angry", serde_json::json!(true)),
+                ],
+            )
+            .await
+            .unwrap();
+        let rat = store.get("u", "/npcs/rat").await.unwrap().unwrap();
+        assert_eq!(rat.properties["hp"], 3);
+        assert_eq!(rat.properties["angry"], true);
+        assert_eq!(rat.properties["name"], "rat", "other properties untouched");
+
+        // Any name works (the path is bound, quoted), except ones that
+        // could not be quoted
+        store
+            .set_properties("u", "/npcs/rat", &[("max-hp.v2", serde_json::json!(7))])
+            .await
+            .unwrap();
+        let rat = store.get("u", "/npcs/rat").await.unwrap().unwrap();
+        assert_eq!(rat.properties["max-hp.v2"], 7);
+        for bad in ["", "q\"r", "back\\slash", "nl\n"] {
+            assert!(ObjectStore::set_properties_statement(
+                "u",
+                "/npcs/rat",
+                &[(bad, serde_json::json!(1))]
+            )
+            .is_err());
+        }
     }
 }

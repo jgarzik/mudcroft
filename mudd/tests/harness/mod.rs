@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 mod client;
+mod cluster;
 mod server;
 mod world;
 
@@ -34,6 +35,8 @@ mod world;
 pub use client::Role;
 #[allow(unused_imports)]
 pub use client::TestClient;
+#[allow(unused_imports)]
+pub use cluster::{make_certs, ClusterCerts, ClusterPlayer, TestCluster};
 #[allow(unused_imports)]
 pub use server::{MuddTest, RawWsClient, TestServer};
 #[allow(unused_imports)]

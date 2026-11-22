@@ -1,7 +1,9 @@
 //! Player management for persistent player objects
 //!
-//! Handles player object lifecycle:
-//! - Create player object on first connect
+//! Each account has one player object per universe it visits, at
+//! `/players/p-<account>` inside that universe (object ids are scoped per
+//! universe). Handles the player object lifecycle:
+//! - Create the player object on first connect to a universe
 //! - Track last safe location for respawn
 //! - Handle disconnect (drop inventory if not in safe zone)
 //! - Handle death (drop inventory, respawn)
@@ -24,14 +26,13 @@ impl PlayerManager {
         Self { object_store }
     }
 
-    /// Get player object path for an account.
+    /// Get player object path for an account (the same in every universe).
     /// Uses 'p-' prefix since UUIDs may start with digits but path segments must start with letters.
     pub fn player_path(account_id: &str) -> String {
         format!("/players/p-{}", account_id)
     }
 
-    /// Get or create a persistent player object for an account.
-    /// Returns the player object (existing or newly created).
+    /// Get or create the account's player object in a universe.
     pub async fn get_or_create_player(
         &self,
         account_id: &str,
@@ -40,14 +41,15 @@ impl PlayerManager {
     ) -> Result<Object> {
         let player_id = Self::player_path(account_id);
 
-        // Check if player already exists
-        if let Some(player) = self.object_store.get(&player_id).await? {
-            info!("Found existing player object: {}", player_id);
+        if let Some(player) = self.object_store.get(universe_id, &player_id).await? {
+            info!(
+                "Found existing player object: {} in {}",
+                player_id, universe_id
+            );
             return Ok(player);
         }
 
-        // Create new player object
-        info!("Creating new player object: {}", player_id);
+        info!("Creating player object: {} in {}", player_id, universe_id);
         let mut player = Object::new_with_owner(&player_id, universe_id, "player", account_id)?;
         player.set_property("name", serde_json::json!(username));
         player.set_property("hp", serde_json::json!(100));
@@ -59,42 +61,51 @@ impl PlayerManager {
     }
 
     /// Get the spawn location for a player on connect.
-    /// Priority: last_safe_location > current safe room > universe portal.
-    /// The player object is shared by every universe the account visits, so
-    /// remembered rooms count only if they belong to `universe_id`.
+    /// Priority: last_safe_location > current safe room > universe portal
     pub async fn get_spawn_location(
         &self,
         player: &Object,
         universe_id: &str,
     ) -> Result<Option<String>> {
-        // Check last safe location (still exists, in this universe)
+        // Check last safe location (verify room still exists)
         if let Some(last_safe) = player.get_string("last_safe_location") {
-            if let Some(room) = self.object_store.get(last_safe).await? {
-                if room.universe_id == universe_id {
-                    return Ok(Some(last_safe.to_string()));
-                }
+            if self
+                .object_store
+                .get(universe_id, last_safe)
+                .await?
+                .is_some()
+            {
+                return Ok(Some(last_safe.to_string()));
             }
         }
 
         // Check if player has a current location (parent_id) that's a valid room
         if let Some(ref parent_id) = player.parent_id {
-            if let Some(room) = self.object_store.get(parent_id).await? {
-                if room.class == "room" && room.universe_id == universe_id {
-                    // Check if it's a safe zone
-                    if self.is_safe_zone(parent_id, player).await? {
-                        return Ok(Some(parent_id.clone()));
-                    }
+            if let Some(room) = self.object_store.get(universe_id, parent_id).await? {
+                if room.class == "room" && self.is_safe_zone(universe_id, parent_id, player).await?
+                {
+                    return Ok(Some(parent_id.clone()));
                 }
             }
         }
 
-        // Fallback to universe portal
-        self.object_store.get_portal(universe_id).await
+        // Fallback to universe portal, if its room still exists
+        match self.object_store.get_portal(universe_id).await? {
+            Some(portal) if self.object_store.get(universe_id, &portal).await?.is_some() => {
+                Ok(Some(portal))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Check if a room is a safe zone.
     /// Safe zones: rooms with is_portal=true, universe portal room, OR player's workroom
-    pub async fn is_safe_zone(&self, room_id: &str, player: &Object) -> Result<bool> {
+    pub async fn is_safe_zone(
+        &self,
+        universe_id: &str,
+        room_id: &str,
+        player: &Object,
+    ) -> Result<bool> {
         // Check if room is player's workroom
         if let Some(workroom_id) = player.get_string("workroom_id") {
             if workroom_id == room_id {
@@ -102,37 +113,89 @@ impl PlayerManager {
             }
         }
 
-        // Check if room has is_portal property
-        if let Some(room) = self.object_store.get(room_id).await? {
+        if let Some(room) = self.object_store.get(universe_id, room_id).await? {
             if room.get_bool("is_portal").unwrap_or(false) {
                 return Ok(true);
             }
-
-            // Check if this room is the universe portal
-            if let Some(portal_id) = self.object_store.get_portal(&room.universe_id).await? {
-                if portal_id == room_id {
-                    return Ok(true);
-                }
-            }
         }
 
-        Ok(false)
+        // Check if this room is the universe portal
+        Ok(self.object_store.get_portal(universe_id).await?.as_deref() == Some(room_id))
     }
 
     /// Update the player's last safe location.
     /// Called when player moves to a safe zone.
-    pub async fn update_safe_location(&self, player_id: &str, room_id: &str) -> Result<()> {
-        if let Some(mut player) = self.object_store.get(player_id).await? {
-            player.set_property("last_safe_location", serde_json::json!(room_id));
-            self.object_store.update(&player).await?;
-        }
-        Ok(())
+    pub async fn update_safe_location(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        room_id: &str,
+    ) -> Result<()> {
+        // In place: rewriting the whole row could undo HP changed meanwhile
+        self.object_store
+            .set_properties(
+                universe_id,
+                player_id,
+                &[("last_safe_location", serde_json::json!(room_id))],
+            )
+            .await
     }
 
     /// Handle player disconnect.
     /// If not in a safe zone, drops all inventory to the current room.
-    pub async fn handle_disconnect(&self, player_id: &str) -> Result<()> {
-        let player = match self.object_store.get(player_id).await? {
+    /// Record that a player has a game session; the `since` value written
+    /// (which identifies this session's row)
+    pub async fn mark_online(&self, universe_id: &str, player_id: &str) -> Result<String> {
+        let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        self.object_store
+            .execute_batch(vec![(
+                "INSERT OR REPLACE INTO online_players (universe_id, player_id, since)
+                 VALUES (?, ?, ?)"
+                    .to_string(),
+                vec![
+                    serde_json::json!(universe_id),
+                    serde_json::json!(player_id),
+                    serde_json::json!(since),
+                ],
+            )])
+            .await?;
+        Ok(since)
+    }
+
+    /// Handle a disconnect, then record the player as offline: removes the
+    /// row only if it is still the one written at `since` (a newer session
+    /// for the player writes its own)
+    pub async fn finish_disconnect(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        since: &str,
+    ) -> Result<()> {
+        self.handle_disconnect(universe_id, player_id).await?;
+        self.object_store
+            .execute_batch(vec![(
+                "DELETE FROM online_players WHERE universe_id = ? AND player_id = ? AND since = ?"
+                    .to_string(),
+                vec![
+                    serde_json::json!(universe_id),
+                    serde_json::json!(player_id),
+                    serde_json::json!(since),
+                ],
+            )])
+            .await
+    }
+
+    /// Players recorded as online: (universe, player, since)
+    pub async fn online_players(&self) -> Result<Vec<(String, String, String)>> {
+        Ok(
+            sqlx::query_as("SELECT universe_id, player_id, since FROM online_players")
+                .fetch_all(self.object_store.pool())
+                .await?,
+        )
+    }
+
+    pub async fn handle_disconnect(&self, universe_id: &str, player_id: &str) -> Result<()> {
+        let player = match self.object_store.get(universe_id, player_id).await? {
             Some(p) => p,
             None => {
                 warn!("Player object not found during disconnect: {}", player_id);
@@ -149,7 +212,10 @@ impl PlayerManager {
         };
 
         // Check if in safe zone
-        if self.is_safe_zone(&current_room_id, &player).await? {
+        if self
+            .is_safe_zone(universe_id, &current_room_id, &player)
+            .await?
+        {
             info!(
                 "Player {} disconnected in safe zone {}, inventory persists",
                 player_id, current_room_id
@@ -162,13 +228,19 @@ impl PlayerManager {
             "Player {} disconnected outside safe zone, dropping inventory",
             player_id
         );
-        self.drop_inventory(player_id, &current_room_id).await?;
+        self.drop_inventory(universe_id, player_id, &current_room_id)
+            .await?;
 
         // Move player to last safe location or leave in place
         if let Some(last_safe) = player.get_string("last_safe_location") {
-            if self.object_store.get(last_safe).await?.is_some() {
+            if self
+                .object_store
+                .get(universe_id, last_safe)
+                .await?
+                .is_some()
+            {
                 self.object_store
-                    .move_object(player_id, Some(last_safe))
+                    .move_object(universe_id, player_id, Some(last_safe))
                     .await?;
                 info!("Moved disconnected player {} to safe location", player_id);
             }
@@ -181,7 +253,7 @@ impl PlayerManager {
     /// Drops all inventory to current room and respawns player.
     /// Returns the respawn room ID.
     pub async fn handle_death(&self, player_id: &str, universe_id: &str) -> Result<String> {
-        let player = match self.object_store.get(player_id).await? {
+        let player = match self.object_store.get(universe_id, player_id).await? {
             Some(p) => p,
             None => {
                 return Err(anyhow::anyhow!(
@@ -195,19 +267,25 @@ impl PlayerManager {
 
         // Drop all inventory to current room
         if !current_room_id.is_empty() {
-            self.drop_inventory(player_id, &current_room_id).await?;
+            self.drop_inventory(universe_id, player_id, &current_room_id)
+                .await?;
         }
 
         // Determine respawn location
         let respawn_room_id = self.get_respawn_location(&player, universe_id).await?;
 
-        // Reset player HP and move to respawn
-        if let Some(mut player) = self.object_store.get(player_id).await? {
-            let max_hp = player.get_i64("max_hp").unwrap_or(100);
-            player.set_property("hp", serde_json::json!(max_hp));
-            player.parent_id = Some(respawn_room_id.clone());
-            self.object_store.update(&player).await?;
-        }
+        // Restore HP and move to respawn, in place and atomically
+        let max_hp = player.get_i64("max_hp").unwrap_or(100);
+        self.object_store
+            .execute_batch(vec![
+                ObjectStore::set_properties_statement(
+                    universe_id,
+                    player_id,
+                    &[("hp", serde_json::json!(max_hp))],
+                )?,
+                ObjectStore::set_parent_statement(universe_id, player_id, Some(&respawn_room_id)),
+            ])
+            .await?;
 
         info!(
             "Player {} died and respawned at {}",
@@ -219,62 +297,108 @@ impl PlayerManager {
 
     /// Get respawn location for death.
     /// Priority: workroom > universe portal
-    async fn get_respawn_location(&self, player: &Object, universe_id: &str) -> Result<String> {
+    pub async fn get_respawn_location(&self, player: &Object, universe_id: &str) -> Result<String> {
+        self.respawn_room(player, universe_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("No respawn location found for universe {}", universe_id)
+            })
+    }
+
+    /// Where a player respawns: their workroom if it exists, else the
+    /// universe portal; None if there is neither (an error is a failed read)
+    pub async fn respawn_room(&self, player: &Object, universe_id: &str) -> Result<Option<String>> {
         // Check workroom
         if let Some(workroom_id) = player.get_string("workroom_id") {
-            if self.object_store.get(workroom_id).await?.is_some() {
-                return Ok(workroom_id.to_string());
+            if self
+                .object_store
+                .get(universe_id, workroom_id)
+                .await?
+                .is_some()
+            {
+                return Ok(Some(workroom_id.to_string()));
             }
         }
 
-        // Fallback to universe portal
-        if let Some(portal_id) = self.object_store.get_portal(universe_id).await? {
-            return Ok(portal_id);
+        // Fallback to universe portal, if its room still exists
+        match self.object_store.get_portal(universe_id).await? {
+            Some(portal) if self.object_store.get(universe_id, &portal).await?.is_some() => {
+                Ok(Some(portal))
+            }
+            _ => Ok(None),
         }
+    }
 
-        Err(anyhow::anyhow!(
-            "No respawn location found for universe {}",
-            universe_id
-        ))
+    /// Statements dropping everything a player carries (but fixed items)
+    /// into `room_id`, for an atomic batch
+    pub async fn drop_statements(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        room_id: &str,
+    ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        let items = self
+            .object_store
+            .get_contents(universe_id, player_id)
+            .await?;
+        Ok(items
+            .iter()
+            .filter(|item| !item.get_bool("fixed").unwrap_or(false))
+            .map(|item| {
+                // Only if it is still carried when the batch commits (it may
+                // have been given away meanwhile)
+                let (mut sql, mut params) =
+                    ObjectStore::set_parent_statement(universe_id, &item.id, Some(room_id));
+                sql.push_str(" AND parent_id = ?");
+                params.push(serde_json::json!(player_id));
+                (sql, params)
+            })
+            .collect())
     }
 
     /// Drop all inventory items from a player to a room.
-    async fn drop_inventory(&self, player_id: &str, room_id: &str) -> Result<()> {
-        let items = self.object_store.get_contents(player_id).await?;
-
-        for item in items {
-            // Skip items that shouldn't be dropped (though they shouldn't be in inventory anyway)
-            if item.get_bool("fixed").unwrap_or(false) {
-                continue;
-            }
-
-            self.object_store
-                .move_object(&item.id, Some(room_id))
-                .await?;
-            info!("Dropped {} from {} to {}", item.id, player_id, room_id);
+    pub async fn drop_inventory(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        room_id: &str,
+    ) -> Result<()> {
+        // All of it or none, in one batch
+        let statements = self
+            .drop_statements(universe_id, player_id, room_id)
+            .await?;
+        if !statements.is_empty() {
+            let count = statements.len();
+            self.object_store.execute_batch(statements).await?;
+            info!("Dropped {} items from {} in {}", count, player_id, room_id);
         }
-
         Ok(())
     }
 
     /// Move player to a new room and update safe location if needed.
     /// Returns true if the new room is a safe zone.
-    pub async fn move_player(&self, player_id: &str, new_room_id: &str) -> Result<bool> {
+    pub async fn move_player(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        new_room_id: &str,
+    ) -> Result<bool> {
         // Move player object
         self.object_store
-            .move_object(player_id, Some(new_room_id))
+            .move_object(universe_id, player_id, Some(new_room_id))
             .await?;
 
         // Check if new room is safe zone
-        let player = match self.object_store.get(player_id).await? {
+        let player = match self.object_store.get(universe_id, player_id).await? {
             Some(p) => p,
             None => return Ok(false),
         };
 
-        let is_safe = self.is_safe_zone(new_room_id, &player).await?;
+        let is_safe = self.is_safe_zone(universe_id, new_room_id, &player).await?;
 
         if is_safe {
-            self.update_safe_location(player_id, new_room_id).await?;
+            self.update_safe_location(universe_id, player_id, new_room_id)
+                .await?;
         }
 
         Ok(is_safe)

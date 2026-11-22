@@ -2,64 +2,74 @@
 //!
 //! Core types for Raft replication: Request, Response, and type configuration.
 
-use std::fmt::Display;
-use std::io::Cursor;
+use std::fmt;
 
-use openraft::{BasicNode, Entry, RaftTypeConfig};
+use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 /// Node ID type for Raft cluster
 pub type NodeId = u64;
 
-/// Type configuration for our Raft instance
-#[derive(
-    Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
-)]
-pub struct TypeConfig;
+// Everything not named here takes openraft's default (leader_id_adv
+// LeaderId, Tokio runtime). The log store persists a log id as (term,
+// leader node, index), which is the adv committed leader id.
+openraft::declare_raft_types!(
+    pub TypeConfig:
+        D = Request,
+        R = Response,
+        NodeId = NodeId,
+        Node = BasicNode,
+);
 
-impl Display for TypeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TypeConfig")
-    }
-}
-
-impl RaftTypeConfig for TypeConfig {
-    type D = Request;
-    type R = Response;
-    type Node = BasicNode;
-    type NodeId = NodeId;
-    type Entry = Entry<TypeConfig>;
-    type SnapshotData = Cursor<Vec<u8>>;
-    type AsyncRuntime = openraft::TokioRuntime;
-    type Responder = openraft::impls::OneshotResponder<TypeConfig>;
-}
-
-/// Application request - SQL command to replicate
-///
-/// All non-deterministic values (UUIDs, timestamps) must be
-/// pre-computed by the leader before replication.
+/// One SQL statement with its bound parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Request {
+pub struct Statement {
     /// SQL statement to execute
     pub sql: String,
     /// Bound parameters as JSON values
     pub params: Vec<serde_json::Value>,
 }
 
+/// Application request: SQL statements to replicate, applied atomically in
+/// one transaction (all or nothing)
+///
+/// All non-deterministic values (UUIDs, timestamps) must be
+/// pre-computed by the leader before replication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Request {
+    /// Statements, applied in order inside one transaction
+    pub statements: Vec<Statement>,
+}
+
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Request({} statements)", self.statements.len())
+    }
+}
+
 impl Request {
-    /// Create a new request
+    /// A request with one statement
     pub fn new(sql: impl Into<String>, params: Vec<serde_json::Value>) -> Self {
         Self {
-            sql: sql.into(),
-            params,
+            statements: vec![Statement {
+                sql: sql.into(),
+                params,
+            }],
         }
     }
 
-    /// Create a simple request with no parameters
+    /// A request with one statement and no parameters
     pub fn simple(sql: impl Into<String>) -> Self {
+        Self::new(sql, vec![])
+    }
+
+    /// A request applying several statements atomically
+    pub fn batch(statements: Vec<(String, Vec<serde_json::Value>)>) -> Self {
         Self {
-            sql: sql.into(),
-            params: vec![],
+            statements: statements
+                .into_iter()
+                .map(|(sql, params)| Statement { sql, params })
+                .collect(),
         }
     }
 }
@@ -105,15 +115,16 @@ mod tests {
             "INSERT INTO test VALUES (?)",
             vec![serde_json::json!("hello")],
         );
-        assert_eq!(req.sql, "INSERT INTO test VALUES (?)");
-        assert_eq!(req.params.len(), 1);
+        assert_eq!(req.statements.len(), 1);
+        assert_eq!(req.statements[0].sql, "INSERT INTO test VALUES (?)");
+        assert_eq!(req.statements[0].params.len(), 1);
     }
 
     #[test]
     fn test_request_simple() {
         let req = Request::simple("DELETE FROM test");
-        assert_eq!(req.sql, "DELETE FROM test");
-        assert!(req.params.is_empty());
+        assert_eq!(req.statements[0].sql, "DELETE FROM test");
+        assert!(req.statements[0].params.is_empty());
     }
 
     #[test]

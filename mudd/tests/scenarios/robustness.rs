@@ -100,11 +100,13 @@ async fn test_item_names_match_literally() {
 #[tokio::test]
 async fn test_register_validates_credentials() {
     let server = TestServer::start_with_world(false).await.expect("server");
+    let huge = "x".repeat(1025);
     for (user, pass) in [
         ("", ""),
         ("ab", "secret1"),
         ("has space", "secret1"),
         ("fine_user", "12345"),
+        ("fine_user", huge.as_str()),
     ] {
         let resp = server
             .post(
@@ -249,4 +251,391 @@ async fn test_run_script_requires_auth_first() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+/// One account may play two universes at once: the sessions are independent
+#[tokio::test]
+async fn test_one_account_in_two_universes() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let server = TestServer::start().await.expect("server");
+    sqlx::query(
+        "INSERT INTO universes (id, name, owner_id, config)
+         SELECT 'second-world', 'Second', owner_id, config FROM universes WHERE id = ?",
+    )
+    .bind(server.universe_id())
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let mut hall = mudd::objects::Object::new("/rooms/hall", "second-world", "room").unwrap();
+    hall.set_property("name", serde_json::json!("Second Hall"));
+    server.world().store().create(&hall).await.unwrap();
+    server
+        .world()
+        .store()
+        .set_portal("second-world", "/rooms/hall")
+        .await
+        .unwrap();
+
+    let reg: serde_json::Value = server
+        .post(
+            "/auth/register",
+            &serde_json::json!({"username": "two_worlds", "password": "test123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = reg["token"].as_str().unwrap().to_string();
+    let url = |u: &str| format!("ws://{}/ws?universe={}&token={}", server.addr, u, token);
+
+    let (mut a, _) = tokio_tungstenite::connect_async(url(server.universe_id()))
+        .await
+        .unwrap();
+    let (mut b, _) = tokio_tungstenite::connect_async(url("second-world"))
+        .await
+        .unwrap();
+
+    async fn look(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> String {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        ws.send(Message::Text(
+            serde_json::json!({"type": "command", "text": "look"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                let v: serde_json::Value =
+                    serde_json::from_str(msg.to_text().unwrap_or("{}")).unwrap_or_default();
+                if v["type"] == "room" {
+                    return v["name"].as_str().unwrap_or_default().to_string();
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    assert_eq!(look(&mut a).await, "Cave Entrance");
+    assert_eq!(look(&mut b).await, "Second Hall");
+
+    // Closing one session leaves the other working
+    a.close(None).await.ok();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(look(&mut b).await, "Second Hall");
+}
+
+/// Classes defined with game.define_class are persisted and survive a restart
+#[tokio::test]
+async fn test_defined_class_survives_restart() {
+    let mut server = TestServer::start().await.expect("server");
+    let mut wiz = connect(
+        &server,
+        Role::Wizard {
+            username: "class_keeper".into(),
+        },
+    )
+    .await;
+    let text = reply_text(
+        &mut wiz,
+        r#"eval return tostring(game.define_class("lantern", {parent = "item", properties = {lit = {type = "boolean", default = true}}}))"#,
+    )
+    .await;
+    assert_eq!(text, "true");
+    wiz.close().await.ok();
+
+    server.restart().await.expect("restart");
+
+    let mut wiz = connect(
+        &server,
+        Role::Wizard {
+            username: "class_keeper".into(),
+        },
+    )
+    .await;
+    let text = reply_text(
+        &mut wiz,
+        r#"eval local o = game.create_object("/items/lamp", "lantern", nil, {}); return tostring(o.metadata.lit) .. ":" .. tostring(game.is_a("/items/lamp", "item"))"#,
+    )
+    .await;
+    assert_eq!(text, "true:true");
+}
+
+/// Account writes (register, login, logout) are replicated through Raft
+#[tokio::test]
+async fn test_account_writes_go_through_raft() {
+    let server = TestServer::start().await.expect("server");
+    async fn account_entries(server: &TestServer) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%accounts SET token%'
+                OR payload LIKE '%INSERT INTO accounts%'",
+        )
+        .fetch_one(server.pool())
+        .await
+        .unwrap()
+    }
+    let before = account_entries(&server).await;
+    let creds = serde_json::json!({"username": "raft_acct", "password": "test123"});
+    let reg: serde_json::Value = server
+        .post("/auth/register", &creds)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(reg["token"].is_string());
+    let login: serde_json::Value = server
+        .post("/auth/login", &creds)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+    let resp: serde_json::Value = server
+        .post("/auth/logout", &serde_json::json!({ "token": token }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["success"], true);
+    assert_eq!(
+        account_entries(&server).await - before,
+        3,
+        "register, login and logout each append one Raft entry"
+    );
+}
+
+/// A second connection for the same player replaces the first, which is
+/// told so (and the client then stops reconnecting) instead of silently
+/// closed
+#[tokio::test]
+async fn test_replaced_connection_is_told() {
+    let server = TestServer::start().await.expect("server");
+    let role = Role::Player {
+        username: "two_tabs".into(),
+    };
+    let mut first = server.connect_as(role.clone()).await.expect("first");
+    first.drain().await;
+    let mut second = server.connect_as(role).await.expect("second");
+    let msg = first.expect("replaced").await.expect("replaced notice");
+    assert!(msg["message"].as_str().unwrap().contains("another"));
+
+    // The second connection keeps working
+    second.drain().await;
+    second.command("look").await.unwrap();
+    assert!(second.expect("room").await.is_ok());
+}
+
+/// A universe can be created by uploading a zip of universe.json and libs
+#[tokio::test]
+async fn test_universe_upload_zip() {
+    use std::io::Write;
+    let server = TestServer::start().await.expect("server");
+    let login: serde_json::Value = server
+        .post(
+            "/auth/login",
+            &serde_json::json!({"username": "test_admin", "password": "testpass123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+    let admin_id = login["account_id"].as_str().unwrap();
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("universe.json", opts).unwrap();
+        zip.write_all(
+            serde_json::json!({"id": "zipped-world", "name": "Zipped", "owner_id": admin_id})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        zip.start_file("lib/greet.lua", opts).unwrap();
+        zip.write_all(b"return { hello = function() return 'hi' end }")
+            .unwrap();
+        zip.finish().unwrap();
+    }
+
+    let resp = server
+        .client
+        .post(format!("{}/universe/upload", server.base_url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .body(buf.into_inner())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 201, "{}", body);
+    assert_eq!(body["id"], "zipped-world");
+    // The uploaded lib, alongside the core mudlib
+    let libs = body["libs_loaded"].as_array().unwrap();
+    assert!(libs.contains(&serde_json::json!("greet")), "{}", body);
+}
+
+/// mudd_admin (run while mudd is stopped) grants a global level that applies
+/// in every universe, and reports unknown accounts with a failing exit
+#[tokio::test]
+async fn test_mudd_admin_set_level() {
+    let mut server = TestServer::start().await.expect("server");
+    let pl = server
+        .connect_as(Role::Player {
+            username: "made_admin".into(),
+        })
+        .await
+        .unwrap();
+    drop(pl);
+    server.stop();
+
+    let admin_bin = env!("CARGO_BIN_EXE_mudd_admin");
+    let run = |user: &str, level: &str| {
+        std::process::Command::new(admin_bin)
+            .arg("--database")
+            .arg(&server.db_path)
+            .args(["set-level", user, level])
+            .output()
+            .expect("run mudd_admin")
+    };
+    let out = run("made_admin", "admin");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run("no_such_user", "admin");
+    assert!(!out.status.success(), "unknown account must fail");
+
+    server.start_again().await.expect("restart");
+    let mut adm = server
+        .connect_as(Role::Player {
+            username: "made_admin".into(),
+        })
+        .await
+        .unwrap();
+    adm.drain().await;
+    adm.command("eval return 'admin here'").await.unwrap();
+    let _ = adm.expect("echo").await;
+    let out = adm.expect_any().await.unwrap();
+    assert_eq!(out["text"], "admin here", "{}", out);
+}
+
+/// SIGTERM (docker stop, systemd) shuts mudd down gracefully and promptly,
+/// with a clean exit, even as PID 1 where unhandled SIGTERM is ignored
+#[tokio::test]
+async fn test_sigterm_shuts_down_gracefully() {
+    let mut server = TestServer::start().await.expect("server");
+    // An open game connection must not hold the shutdown up
+    let _player = server
+        .connect_as(crate::harness::Role::Player {
+            username: "lingering".into(),
+        })
+        .await
+        .expect("connect");
+    let status = server
+        .terminate(std::time::Duration::from_secs(5))
+        .expect("mudd exits on SIGTERM");
+    assert!(status.success(), "exit status {:?}", status);
+    let log = std::fs::read_to_string(&server.log_path).unwrap();
+    assert!(log.contains("mudd shutdown complete"), "{}", log);
+}
+
+/// Acknowledged writes survive a crash (SIGKILL mid-stream), and the
+/// database comes back consistent: the Raft log is the durable record, and
+/// an apply lost in the crash is replayed from it exactly once
+#[tokio::test]
+async fn test_crash_loses_no_acknowledged_write() {
+    let mut server = TestServer::start_with_world(false).await.expect("server");
+    for round in 0..3 {
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let mut writers = tokio::task::JoinSet::new();
+        for i in 0..40 {
+            let (client, base) = (client.clone(), base.clone());
+            writers.spawn(async move {
+                let name = format!("crash{}_{}", round, i);
+                let resp = client
+                    .post(format!("{}/auth/register", base))
+                    .json(&serde_json::json!({"username": name, "password": "testpass123"}))
+                    .send()
+                    .await;
+                matches!(resp, Ok(r) if r.status().as_u16() == 201).then_some(name)
+            });
+        }
+        // Kill while registrations are in flight
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        server.stop();
+        let mut acknowledged = Vec::new();
+        while let Some(done) = writers.join_next().await {
+            if let Ok(Some(name)) = done {
+                acknowledged.push(name);
+            }
+        }
+        server.start_again().await.expect("restart after crash");
+        for name in &acknowledged {
+            let found: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE username = ?")
+                .bind(name)
+                .fetch_one(server.pool())
+                .await
+                .unwrap();
+            assert_eq!(found, 1, "round {}: acknowledged {} lost", round, name);
+        }
+        let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+        assert_eq!(check, "ok");
+    }
+}
+
+/// Probe (run by hand): time of 300 sequential Raft writes from Lua
+#[tokio::test]
+#[ignore]
+async fn zz_write_latency_probe() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "latency_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    let entrance = server.world().entrance_id.clone();
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/counter", "item", "{}", {{name = "counter"}}) return "made""#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("made").await.unwrap();
+    let started = std::time::Instant::now();
+    wiz.command(
+        r#"eval for i = 1, 300 do game.update_object("/items/counter", {n = i}) end return "done""#,
+    )
+    .await
+    .unwrap();
+    wiz.expect_output_containing("done").await.unwrap();
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "PROBE 300 writes: {:.0} ms ({:.2} ms/write)",
+        ms,
+        ms / 300.0
+    );
 }

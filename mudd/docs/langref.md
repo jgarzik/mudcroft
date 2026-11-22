@@ -67,8 +67,6 @@ an account ID. To find the account, read the player object's `owner_id`:
 local account_id = game.get_object(args.actor_id).owner_id
 ```
 
-Guests have a random UUID as their player ID and no player object.
-
 ### Contexts
 
 Each execution may have a **room context** and an **object context**:
@@ -84,7 +82,7 @@ Each execution may have a **room context** and an **object context**:
 The context decides how some functions behave:
 
 - **Room context:** `game.add_action` registers a *room* action. Without a room context it registers an *object* action.
-- **Object context:** `game.call_out`, `game.set_heart_beat` and `game.remove_heart_beat` need one. Without it they do nothing.
+- **Object context:** `game.call_out`, `game.remove_call_out`, `game.set_heart_beat` and `game.remove_heart_beat` need one. Without it they do nothing (and return `""` or `false`).
 
 ### Output
 
@@ -98,7 +96,8 @@ The context decides how some functions behave:
 ### Sandbox limits
 
 Limits apply per execution. Each hook, verb, timer callback and `use_object`
-call is one execution.
+call is one execution, and one budget covers all of it: the universe
+libraries, the object code and the handler together.
 
 | Limit | Object code | `eval` and `run_script` |
 |---|---|---|
@@ -110,10 +109,14 @@ call is one execution.
 
 Exceeding a limit raises an error, for example `database query limit exceeded (101 > 100)`.
 
-The instruction, memory and call limits stop a script as soon as it
-exceeds them. The timeout works differently: it is checked only after a
-chunk finishes, and not at all for the handler call in object code. Rely
-on the instruction limit to stop runaway loops.
+Every limit stops a script as soon as it is exceeded, while it runs: the
+instruction count and the wall-clock timeout are both checked every 1,000
+instructions. They hold even for `while true do end`, and `pcall`/`xpcall`
+cannot catch them (once a limit is hit they re-raise instead of returning
+`false`). Time spent inside a single `game.*` call is not interrupted, but
+it counts: the deadline is checked again when control returns to Lua and
+when the run ends. A `game.use_object` call runs within its caller's
+deadline, so nesting never adds time.
 
 Every `game.*` function counts as a database call except these:
 `add_action`, `remove_action`, `send`, `broadcast`, `broadcast_region`,
@@ -127,7 +130,7 @@ object-code budget. One top-level execution may make at most 32
 
 ### Sandbox globals
 
-- **Available:** `string`, `table`, `math`, `utf8`, the Lua base functions (`pairs`, `ipairs`, `pcall`, `error`, `tostring`, `type`, ...), and `print`, which does nothing.
+- **Available:** `string`, `table`, `math`, `utf8`, the Lua base functions (`pairs`, `ipairs`, `pcall`, `error`, `tostring`, `type`, ...), and `print`, which does nothing. `pcall` and `xpcall` are the sandbox's own: they catch ordinary errors but pass the error to you (or to the `xpcall` handler) as a string, even if `error` was given a table.
 - **Removed:** `os`, `io`, `load`, `loadstring`, `loadfile`, `dofile`, `require`, `package`, `debug`, `collectgarbage`.
 - **Added:** the `game` table, the [`parent`](#parentclass_name-handler_name-args) function, and any globals defined by the universe's libraries (see [Core library](#core-library)).
 
@@ -165,9 +168,12 @@ for object code, or the `game.set_actor` override if one is set.
 | [`broadcast(room_id, message, exclude_id)`](#gamebroadcastroom_id-message-exclude_id) | `true` | — |
 | [`broadcast_region(region_id, message)`](#gamebroadcast_regionregion_id-message) | `true` | — |
 | [`call_out(delay_secs, method, args)`](#gamecall_outdelay_secs-method-args) | timer ID or `""` | object context |
-| [`remove_call_out(timer_id)`](#gameremove_call_outtimer_id) | boolean | — |
-| [`set_heart_beat(interval_ms)`](#gameset_heart_beatinterval_ms) | `true` | object context |
+| [`remove_call_out(timer_id)`](#gameremove_call_outtimer_id) | boolean | object context; own timers only |
+| [`set_heart_beat(interval_ms)`](#gameset_heart_beatinterval_ms) | boolean | object context |
 | [`remove_heart_beat()`](#gameremove_heart_beat) | boolean | object context |
+| [`apply_effect(target_id, type, duration, magnitude, damage_type, period)`](#gameapply_effecttarget_id-type-duration-magnitude-damage_type-period) | `true` | Modify on the target |
+| [`remove_effect(target_id, type)`](#gameremove_effecttarget_id-type) | boolean | Modify on the target |
+| [`get_effects(target_id)`](#gameget_effectstarget_id) | list of effects | — |
 | [`set_actor(account_id)`](#gameset_actoraccount_id) | boolean | wizard+, target below caller |
 | [`get_actor()`](#gameget_actor) | account ID or `nil` | — |
 | [`check_permission(action, target_id, is_fixed, owner_id)`](#gamecheck_permissionaction-target_id-is_fixed-owner_id) | `{allowed, error}` | — |
@@ -178,10 +184,13 @@ for object code, or the `game.set_actor` override if one is set.
 | [`revoke_path(grant_id)`](#gamerevoke_pathgrant_id) | boolean or `{error}` | wizard+, the grantor, or a delegable grant |
 | [`get_path_grants(account_id)`](#gameget_path_grantsaccount_id) | array | — |
 | [`get_credits()`](#gameget_credits) | integer | — |
-| [`deduct_credits(amount, reason)`](#gamededuct_creditsamount-reason) | boolean | — |
-| [`admin_grant_credits(account_id, amount)`](#gameadmin_grant_creditsaccount_id-amount) | boolean | admin+ |
-| [`llm_chat(messages, tier)`](#gamellm_chatmessages-tier) | string or `{error}` | Venice configured |
-| [`llm_image(prompt, style, size)`](#gamellm_imageprompt-style-size) | image hash or `{error}` | Venice configured |
+| [`object_credits()`](#gameobject_credits) | integer | — |
+| [`request_payment(amount, reason, handler, data)`](#gamerequest_paymentamount-reason-handler-data) | request id | a paying player |
+| [`deduct_credits(amount, reason, payer)`](#gamededuct_creditsamount-reason-payer) | boolean | — |
+| [`transfer_credits(from, to, amount)`](#gametransfer_creditsfrom-to-amount) | boolean | — |
+| [`admin_grant_credits(holder, amount)`](#gameadmin_grant_creditsholder-amount) | boolean | admin+ |
+| [`llm_chat(messages, tier, opts)`](#gamellm_chatmessages-tier-opts) | string or `{error}` | Venice configured |
+| [`llm_image(prompt, style, size, opts)`](#gamellm_imageprompt-style-size-opts) | image hash or `{error}` | Venice configured |
 | [`time()`](#gametime) | milliseconds | — |
 | [`set_time(time_ms)`](#gameset_timetime_ms) | boolean | wizard+ |
 | [`roll_dice(dice)`](#gameroll_dicedice) | integer | — |
@@ -204,16 +213,12 @@ Every object ID is a filesystem-style path such as `/d/forest/clearing`.
 - A path is at most 255 characters.
 - Uppercase letters are converted to lowercase.
 
-Object IDs are unique across the **whole server**, not per universe.
-Writes stay in the script's universe: `update_object`, `delete_object` and
-`move_object` refuse objects (and move destinations) that belong to another
-universe, and `clone_object` refuses a source from another universe.
-An account's player object (`/players/p-<account>`, owned by that account)
-is the exception: one is shared by every universe its account visits (it
-carries inventory and HP), so scripts may update it and move items into it
-from any universe. Scripts cannot create player objects: `create_object`
-and `clone_object` refuse class `player` and paths under `/players/`. Reads such as `get_object` are not
-universe-checked.
+Object IDs are scoped per universe: two universes may both have
+`/rooms/start`, and every `game.*` function reads and writes only the
+script's own universe. An account has its own player object
+(`/players/p-<account>`, with its own inventory and HP) in each universe it
+visits. Scripts cannot create player objects: `create_object` and
+`clone_object` refuse class `player` and paths under `/players/`.
 
 Path grants work on prefixes, so group an area under one prefix such as
 `/d/crypt/...`. Then a single grant covers the whole area.
@@ -285,7 +290,10 @@ return npc and npc.metadata.hp
 #### `game.update_object(id, changes)`
 
 Merges `changes` into the object's properties. Each top-level key replaces
-the old value: `{exits = {north = ...}}` replaces the whole `exits` table.
+the old value: `{exits = {north = ...}}` replaces the whole `exits` table. Only the
+keys you pass are written (in place, in one atomic change), so a property
+changed by something else meanwhile, such as `hp` in combat, is not put back.
+Property names may not contain `"`, `\` or control characters.
 
 A `code_hash` key attaches stored code, or detaches it if set to `nil`. It
 is never stored as a property. See [Attaching code](#attaching-code).
@@ -323,9 +331,18 @@ game.move_object("/d/keep/armory/sword", args.actor_id)   -- into a player's inv
 
 Anyone may move an object that isn't `fixed`. Fixed objects can be moved only by wizards+, their owner, or a holder of a path grant covering them.
 
-`move_object` does **not** run `on_enter` or `on_leave` hooks. Moving a
-connected player only changes the database; the player's session stays
-in the old room. Don't use it to teleport players.
+After the script ends, a move:
+
+- moves a connected player's session too: the player is shown the new room
+  and later commands happen there;
+- runs `on_leave` on the old container and `on_enter` on the new one (for
+  any moved object, not only players), with `moved_id` set to the moved
+  object and `moved_by` to the account the script acted as. `actor_id` is
+  **not** set: no player chose to move. Hooks that move things run more
+  hooks: they nest at most 4 deep, and one top-level run causes at most 32
+  move hooks in total; further moves happen but run no hooks.
+- shows a moved player the new room without starting room image
+  generation.
 
 **Returns** `true`. **Raises** an error if the object or destination
 doesn't exist, either belongs to another universe, or the acting user
@@ -364,6 +381,7 @@ takes one `args` table:
 ```lua
 return {
     on_enter = function(args)
+        if not args.actor_id then return end   -- an object was moved in
         game.send(args.actor_id, "Cold air rushes past you.")
     end,
     pull = function(args)
@@ -383,7 +401,9 @@ Code that has no handler for an event is skipped silently.
 Attach stored code by setting `code_hash`:
 
 ```lua
-local h = game.store_code([[return { on_enter = function(a) game.send(a.actor_id, "Welcome!") end }]])
+local h = game.store_code([[return { on_enter = function(a)
+    if a.actor_id then game.send(a.actor_id, "Welcome!") end
+end }]])
 game.update_object("/d/keep/hall", {code_hash = h})   -- attach to an existing object
 game.create_object("/d/keep/bell", "item", "/d/keep/hall", {name = "bell", code_hash = h})   -- or attach at creation
 game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
@@ -397,8 +417,8 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 
 | Handler | Fires when | Runs on | `args` fields (all include `object_id`) |
 |---|---|---|---|
-| `on_enter` | a player walks in, arrives by `goto`, or connects and spawns there | the room | `actor_id`, `room_id`, `from` (`nil` on spawn), `direction` (walking only) |
-| `on_leave` | a player walks out, or leaves by `goto` | the room | `actor_id`, `room_id`, `to`, `direction` (walking only) |
+| `on_enter` | a player walks in, arrives by `goto`, or connects and spawns there; or `game.move_object` moves anything into it | the room (or container) | `moved_id` (what arrived), `room_id`, `from` (`nil` on spawn), `direction` (walking only); `actor_id` when a player moved themselves, `moved_by` for a Lua move |
+| `on_leave` | a player walks out, or leaves by `goto`; or `game.move_object` moves anything out of it | the room (or container) | `moved_id` (what left), `room_id`, `to`, `direction` (walking only); `actor_id` when a player moved themselves, `moved_by` for a Lua move |
 | `on_damage` | the `attack` command hits | the target NPC | `actor_id`, `room_id`, `attacker_id`, `damage` |
 | `on_death` | the `attack` command kills | the target NPC | `actor_id`, `room_id`, `killer_id` |
 | `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
@@ -417,7 +437,9 @@ Hook details:
 - **Combat hooks:** `on_damage` and `on_death` run after the attacker's combat report. A killing blow fires both.
   - By the time `on_death` runs, the dead NPC has been removed from the room (`parent_id = nil`). Use `args.room_id`, not `game.environment`.
 - **Return values:** hook return values are ignored. Errors are logged on the server.
-- **Unwired hooks:** region objects get no hooks. `game.move_object` fires no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
+- **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
+  - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
+- **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
 
 ### `parent(class_name, handler_name, args)`
 
@@ -533,8 +555,6 @@ which one you get is unspecified.
 players, NPCs and their subclasses (including classes made with
 `define_class`).
 
-Connected guests have no player object, so they never appear.
-
 ---
 
 ## Custom verbs
@@ -566,6 +586,14 @@ Where the action is registered depends on the script's context:
 game.add_action("pull", "/d/keep/hall/lever", "pull")
 ```
 
+When several nearby objects offer the verb, the one whose name the player
+typed wins: an exact name first, then a name the words contain (or that
+contains them). The player is the handler's **paying player** (see
+[Credits](#credits)) only if they clearly picked the object: it is the only
+one offering the verb, they typed its exact name, or only one name matched.
+Otherwise the handler runs with no paying player, so a look-alike object
+cannot capture a verb and bill someone.
+
 #### `game.remove_action(verb, object_id)`
 
 Removes the action from the same scope that `add_action` would use in
@@ -589,10 +617,9 @@ this context. It needs the same permission as `add_action`. **Returns**
 7. If nothing matches, the player sees `Unknown command: <verb>`.
 8. If the handler raises an error, players see `Something went wrong.` and wizards+ see the error text.
 
-Actions live **in memory only** and are lost when the server restarts.
-Register them again after a restart, for example from a setup function you
-run with `eval`, or from a room's `on_enter` hook. Registering the same
-room action twice has no effect.
+Actions are stored in the database: they survive restarts (and failovers)
+and are removed with their object, or their room. Registering the same
+action again replaces its method.
 
 ---
 
@@ -636,7 +663,7 @@ callback runs that object's code, as its owner.
 #### `game.call_out(delay_secs, method, args)`
 
 Schedules handler `method` on the current object after `delay_secs`
-seconds. Fractions are allowed.
+seconds (fractions allowed; at least 0.1 s, at most 30 days).
 
 - `args` is an optional **string**. It arrives as `args.args` in the callback. To pass structured data, encode it in a string or store it in a property.
 - The callback receives `{object_id, room_id, args}`, where `room_id` is the object's `parent_id` when the timer fires.
@@ -661,16 +688,19 @@ return {
 
 #### `game.remove_call_out(timer_id)`
 
-Cancels a pending call_out. **Returns** `true` if it was pending.
+Cancels one of the current object's own pending call_outs. **Returns**
+`true` if it was pending, `false` if it was not, belongs to another object,
+or there is no object context.
 
 #### `game.set_heart_beat(interval_ms)`
 
 Calls the current object's `heart_beat` handler every `interval_ms`
-milliseconds. Calling it again replaces the interval.
+milliseconds. Calling it again replaces the interval. **Returns** `true`,
+or `false` without an object context.
 
-- The minimum interval is 100 ms.
+- The interval is clamped to 100 ms through one day.
 - The callback receives `{object_id, room_id, args = nil}`.
-- Heartbeats are **in memory only** and stop when the server restarts.
+- Heartbeats are stored and resume after a server restart (the first beat one interval after startup).
 
 **Returns** `true`. Without an object context it does nothing.
 
@@ -679,9 +709,62 @@ milliseconds. Calling it again replaces the interval.
 Stops the current object's heartbeat. **Returns** `true` if one was
 running.
 
-Pending call_outs are saved to the database and reloaded at startup. Heartbeats are not.
+Pending call_outs and heartbeats are saved to the database and reloaded at startup.
 
 Deleting an object cancels both its call_outs and its heartbeat.
+
+## Status effects
+
+Status effects (poisoned, stunned, bleeding, ...) are stored in the
+`active_effects` table, one row per effect type on an object, so they
+survive a restart. Deleting an object deletes its effects, and a combatant
+killed by `attack` or by its effects loses them.
+
+Effects run on deadlines, not a fixed tick. A plain effect (stunned,
+weakened, ...) is simply in force until its end time. A **periodic** effect
+pulses every `period` seconds until it ends (a pulse due exactly at the end
+still happens): damage over time (`poisoned`, `burning`, `bleeding`, or any
+effect given a damage type) deals its magnitude in damage per pulse, after
+the target's resistances, and `regenerating` heals it (up to `max_hp`).
+Pulses change the target's `hp` property. A player is told each pulse
+(`You take 3 poison damage (poisoned).`) and when an effect ends
+(`You are no longer poisoned.`). Damage that brings HP to 0 kills: an NPC
+leaves the room (onlookers hear `<name> dies.`) and its `on_death` runs, with
+`killer_id` set to whoever applied the effect (an attacker's critical hit
+causes bleeding); a player drops what they carried where they died and
+respawns at once (full HP, at the respawn room, or where they fell if the
+universe has none yet), all in one atomic change. Within one pass, all damage is
+applied before any healing, and healing cannot revive the dead. If the
+server falls behind (or was down), the missed pulses are applied together.
+
+Types: `poisoned`, `stunned`, `blinded`, `burning`, `frozen`, `paralyzed`,
+`slowed`, `hasted`, `strengthened`, `weakened`, `protected`, `exposed`,
+`invisible`, `regenerating`, `silenced`, `bleeding`.
+
+#### `game.apply_effect(target_id, type, duration, magnitude, damage_type, period)`
+
+Adds an effect lasting `duration` seconds (0.1 to 86,400; fractions allowed)
+with strength `magnitude` (-10,000 to 10,000). `damage_type` is optional;
+`poisoned`, `burning` and `bleeding` default to poison, fire and physical.
+`period` (seconds between pulses, 0.5 to 3,600, default 1) applies to
+periodic effects. `duration` and `period` must be finite numbers (`0/0`
+raises an error). Applying a type the target already has keeps the later end
+and the stronger magnitude, and a periodic effect keeps its pulse timing.
+The acting user needs Modify permission on the target.
+
+**Returns** `true`. **Raises** an error for an unknown type or damage type,
+a missing target, or a denied permission.
+
+#### `game.remove_effect(target_id, type)`
+
+**Returns** `true` if the target had the effect, `false` if not. Needs
+Modify permission on the target.
+
+#### `game.get_effects(target_id)`
+
+**Returns** a list of `{type, remaining, magnitude, damage_type, period}`
+tables: `remaining` is whole seconds left, rounded up; `damage_type` and
+`period` are `nil` for effects that do not pulse.
 
 ---
 
@@ -696,7 +779,9 @@ can change objects under their path grants.
 
 Makes later calls in this script act as `account_id`.
 
-- Only **wizards+** may switch, and only to accounts **strictly below** their own level.
+- Only **wizards+** may switch, and only to accounts they **outrank** in this
+  universe; a global admin or owner can be the target only of a higher global
+  level (see [permissions.md](permissions.md#access-levels)).
 - Switching to yourself is always allowed.
 - `nil` clears the override.
 - Ownerless object code can't switch.
@@ -746,16 +831,20 @@ covering `path`.
 
 #### `game.get_access_level(account_id)`
 
-**Returns** `"player"`, `"builder"`, `"wizard"`, `"admin"` or `"owner"`.
-Unknown IDs, including player object paths, return `"player"`.
+**Returns** the account's effective level in this universe (see
+[permissions.md](permissions.md#access-levels)): `"player"`, `"builder"`,
+`"wizard"`, `"admin"` or `"owner"`. Unknown IDs, including player object
+paths, return `"player"`.
 
 #### `game.set_access_level(account_id, level)`
 
-Changes an account's level. The caller must be **admin+**, and the target's
-current level must be **below** the caller's. Only an **owner** may grant
-`admin` or `owner`; owners may set any level.
+Sets an account's member level in this universe. The caller must be
+**admin+**, and the target's current level must be **below** the caller's.
+Only an **owner** may grant `admin`. `owner` is not a member level and is
+always refused.
 
-**Returns** `true` if changed, `false` if refused or `level` is unknown.
+**Returns** `true` if changed, `false` if refused, `level` is unknown or the
+write failed.
 
 #### `game.grant_path(grantee_id, path_prefix, can_delegate)`
 
@@ -783,37 +872,101 @@ same shape as `grant_path`'s result.
 
 ## Credits
 
-The credit functions act on the script's **real user**, which for object
-code is the object's **owner**, not the player. `game.set_actor` doesn't
-change this. Object code can't charge the player who triggered it.
+Balances are per universe and held by an **account** or an **object** (a
+room's repair fund, a shop's till).
+
+- **An object** spends its own balance freely (`"object"`).
+- **A player's** credits move only with their consent: object code asks
+  with `game.request_payment`, the player sees a prompt, and only if they
+  accept does anything move (to the asking object). Code can never take a
+  player's credits directly (`"actor"` is refused as a payer), and only code
+  the player chose to run (a verb they typed, clearly naming the object)
+  can ask: hooks such as `on_enter`, timers, heartbeats and code reached
+  through `game.use_object` cannot.
+
+Nothing can spend from any other account. Amounts are whole numbers from 1
+to 10^12; others raise an error. A spend never overdraws: it either happens
+in full or returns `false` with nothing changed.
+
+#### `game.request_payment(amount, reason, handler, data)`
+
+Asks the player who typed this verb to pay `amount` credits to this object.
+They are shown `Pay <amount> credits for <reason>?` (a dialog in the web
+client; text clients type `yes` or `no`) and have a minute to answer. If they
+accept and can afford it, the credits move to this object and its `handler`
+runs (as the object's owner) with `{payment_id, amount, reason, data,
+actor_id, actor_account}`; its return value is the player's reply. If the handler does
+not exist the payment is refunded; once it has run, the payment stands even
+if it fails part way (it may already have handed something over), so write
+handlers that check first and change things last, and refund with
+`game.transfer_credits("object", args.actor_account, ...)` if needed. Declining, or not answering,
+changes nothing. `data` is an optional string (up to 4096 bytes); `reason`
+is cut to 200 characters; `handler` cannot be private or an engine hook.
+
+**Returns** the request's id at once (the answer comes later). Raises an
+error without a paying player, outside object code, or when the player
+already has 5 unanswered requests.
+
+```lua
+-- A shop: "buy lamp" asks for 3 credits, and hands over a lamp once paid
+buy = function(args)
+  game.request_payment(3, "an oil lamp", "sold", args.actor_id)
+  return nil  -- the prompt is the reply
+end,
+sold = function(args)
+  game.clone_object("/proto/lamp", args.data)
+  return "The shopkeeper hands you a lamp."
+end,
+```
 
 #### `game.get_credits()`
 
-**Returns** the real user's balance in this universe, or `0` if there is
-no user.
+**Returns** the paying player's balance, or `0` if there is none.
 
-#### `game.deduct_credits(amount, reason)`
+#### `game.object_credits()`
 
-Deducts from the real user. **Returns** `true` on success, or `false` if
-funds are insufficient or there is no user.
+**Returns** the running object's balance. Raises an error outside object
+code.
 
-#### `game.admin_grant_credits(account_id, amount)`
+#### `game.deduct_credits(amount, reason, payer)`
 
-Adds credits to `account_id`. Requires **admin+**. **Returns** `true` on
-success, `false` if refused.
+Spends `amount` from the object's own balance (`payer` must be
+`"object"`; `"actor"` raises an error: use `request_payment`). `reason` is
+logged. **Returns** `true`, or `false` if the object has too little.
+
+#### `game.transfer_credits(from, to, amount)`
+
+Moves `amount` from this object (`from` must be `"object"`) to `to`: an
+account id, or an object path in this universe (which must exist). Atomic.
+**Returns** `true`, or `false` if the object has too little.
+
+#### `game.admin_grant_credits(holder, amount)`
+
+Adds credits to `holder`, an account id or an object path that exists.
+Requires **admin+**. **Returns** `true` on success, `false` if refused.
 
 ---
 
 ## Venice AI
 
 These calls need a Venice API key on the server (see [admin](admin.md))
-and count against the Venice limit of 5 calls per execution. Usage is
-billed to the script's real user, which is the owner for object code.
+and count against the Venice limit of 5 calls per execution.
 
-#### `game.llm_chat(messages, tier)`
+Each call costs the universe config's `venice_chat_cost` or
+`venice_image_cost` credits (default 0; an admin sets them with
+`game.update_universe`). A priced call is paid by the object
+(`opts.payer = "object"`); a player cannot be billed directly (charge them
+first with `game.request_payment`). The price is charged before the call and
+refunded if the call fails. A paid call with no
+one to pay, or a payer short of credits, returns `{error = ...}` without
+calling Venice. The rate limit (60 calls a minute) is kept per universe and
+code owner, whoever pays.
+
+#### `game.llm_chat(messages, tier, opts)`
 
 - `messages`: an array of `{role = "system"|"user"|"assistant", content = "..."}`.
 - `tier` (optional): `"fast"`, `"balanced"` (the default) or `"quality"`.
+- `opts` (optional): `{payer = "object"}` for a priced call.
 
 **Returns** the reply text, or `{error = "..."}`.
 
@@ -826,10 +979,11 @@ if type(reply) == "table" then return "The smith ignores you." end
 return "The smith says: " .. reply
 ```
 
-#### `game.llm_image(prompt, style, size)`
+#### `game.llm_image(prompt, style, size, opts)`
 
 - `style`: `"realistic"` (the default), `"anime"`, `"digital"` or `"painterly"`.
 - `size`: `"small"`, `"medium"` (the default) or `"large"`.
+- `opts` (optional): `{payer = "object"}` for a priced call.
 
 **Returns** an image **hash** string, or `{error = "..."}`. The image is
 served at `/images/{hash}`.
@@ -902,8 +1056,9 @@ universe.
 Merges the top-level keys of `config` into the universe config. Requires
 **admin+**. **Returns** `true`, or `false` if refused.
 
-The server reads only one config key, `lib_hashes`, which maps library
-names to code hashes (see [Core library](#core-library)). Other keys are
+The server reads these config keys: `lib_hashes`, which maps library
+names to code hashes (see [Core library](#core-library)), and the Venice
+prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)). Other keys are
 yours to read with `get_universe()`. Use the `setportal` command to set
 the spawn room; config keys don't affect it.
 
@@ -936,9 +1091,7 @@ the onlookers' broadcast excludes the player.
 
 `Commands.take` finds the item with `game.present` and refuses objects
 that are `fixed` or living (`game.is_a(id, "living")`: NPCs, players and
-their subclasses). Because a player object (and so the inventory) is shared
-by every universe the player visits, `Commands.drop` and `Commands.give`
-refuse an item that belongs to another universe; it stays in the pack.
+their subclasses).
 
 The library also defines `Commands.give`, `Commands.look`, `Commands.flee`,
 `Commands.say` and `Commands.use`, but no player command calls them.
@@ -1013,20 +1166,19 @@ All other properties, including `weight`, `value`, `lighting`, `aggro`, `respawn
 The built-in `attack <name>` (or `kill`) command works like this:
 
 - It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`.
-- On the first attack, combat state is created from the NPC's `hp` and `max_hp` properties. After that, HP is tracked in the combat system, not in the property.
-- Each attack is a d20 roll against armor class 10. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit). A natural 1 always misses.
+- HP lives in the objects' properties: `hp`, `max_hp`, `armor_class` (default 10), `attack_bonus` (default 0) and `resistances` (e.g. `{fire = "resistant"}`, also `immune` and `vulnerable`). An attack reads them and writes the target's new `hp` back, as one atomic change.
+- Each attack is a d20 roll plus `attack_bonus` against the target's `armor_class`. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit), then the target's resistances. A natural 1 always misses.
+- Status effects count: a stunned or paralyzed attacker cannot attack; a blinded attacker or an invisible target is -4 to hit, a stunned or paralyzed target +4; `strengthened`/`weakened` on the attacker and `exposed`/`protected` on the target add or subtract their magnitude from the damage roll.
+- A critical hit that does not kill makes the target **bleed**: 2 physical damage per second for 3 seconds.
 - NPCs don't fight back. Write that in Lua (see the [tutorial](langtutor.md)).
 - A hit fires `on_damage`. A kill fires `on_death` and removes the NPC from the room (`parent_id = nil`) without deleting it.
 
 The Rust combat engine knows these damage types: `physical`, `slashing`,
 `piercing`, `bludgeoning`, `fire`, `cold` (alias `ice`), `lightning`,
 `acid`, `poison`, `necrotic`, `radiant` (alias `holy`), `psychic`,
-`force` and `thunder`. Its status effects include poisoned, stunned,
-blinded, burning, frozen, paralyzed, slowed, hasted, strengthened,
-weakened, protected, exposed, invisible, regenerating and silenced.
-
-Lua has **no bindings** to the Rust combat engine. For combat in Lua, use
-the [`Combat`](#combat) library or your own code.
+`force` and `thunder`. Lua applies and inspects status effects with
+[`game.apply_effect`](#status-effects) and friends; for other combat logic,
+use the [`Combat`](#combat) library or your own code.
 
 ---
 
@@ -1038,8 +1190,6 @@ These are not built yet. See the [roadmap](../../docs/roadmap.md).
 - **Unused NPC properties:** `aggro` and `respawn_time` do nothing.
 - **Missing player commands:** there is no `use`, `give` or `flee` command. Add verbs with `game.add_action`.
 - **Combat gaps:** the server has no NPC counter-attacks and no PvP. Lua has no bindings to the combat engine.
-- **Movement from Lua:** `game.move_object` fires no hooks and can't teleport connected players.
-- **Persistence:** custom verbs, heartbeats and classes defined with `define_class` don't survive a restart.
 - **Universe config:** keys such as `pvp_mode` or `spawn_room` are not read by the server.
 
 ---

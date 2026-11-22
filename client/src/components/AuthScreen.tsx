@@ -1,3 +1,4 @@
+import { getDeviceToken, setDeviceToken } from '../deviceToken'
 import React, { useState } from 'react'
 import { useGameStore } from '../store/gameStore'
 
@@ -22,7 +23,11 @@ export function AuthScreen() {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify(
+          mode === 'login'
+            ? { username, password, device_token: getDeviceToken(username) }
+            : { username, password },
+        ),
       })
 
       const data = await response.json()
@@ -31,6 +36,7 @@ export function AuthScreen() {
         throw new Error(data.error || 'Authentication failed')
       }
 
+      setDeviceToken(username, data.device_token)
       login(data.token, username)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred')

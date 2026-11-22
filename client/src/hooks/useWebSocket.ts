@@ -2,6 +2,8 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useGameStore } from '../store/gameStore'
 import type { ServerMessage, ClientMessage } from '../types/messages'
 
+// How long a payment request stays open on the server
+const PAYMENT_DEADLINE_MS = 60_000
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`
 const PING_INTERVAL = 30000
 const RECONNECT_BASE_DELAY = 1000
@@ -12,6 +14,9 @@ export function useWebSocket() {
   const pingIntervalRef = useRef<number | null>(null)
   const reconnectTimeoutRef = useRef<number | null>(null)
   const reconnectDelayRef = useRef(RECONNECT_BASE_DELAY)
+  // Set when the server says a newer connection (another tab or device)
+  // replaced this one: reconnecting would just evict that one in turn
+  const replacedRef = useRef(false)
 
   const {
     token,
@@ -22,6 +27,9 @@ export function useWebSocket() {
     setRoom,
     setPlayerId,
     setThemeId,
+    addPendingPayment,
+    removePendingPayment,
+    clearPendingPayments,
   } = useGameStore()
 
   const cleanup = useCallback(() => {
@@ -71,16 +79,29 @@ export function useWebSocket() {
         case 'echo':
           addMessage(`> ${msg.command}`, 'command')
           break
+
+        case 'replaced':
+          replacedRef.current = true
+          addMessage(msg.message, 'system')
+          break
+
+        case 'confirm':
+          addMessage(msg.text, 'system')
+          addPendingPayment({ id: msg.id, text: msg.text, amount: msg.amount })
+          // The server lets a minute pass before the request expires
+          window.setTimeout(() => removePendingPayment(msg.id), PAYMENT_DEADLINE_MS)
+          break
       }
     } catch (err) {
       console.error('Failed to parse WebSocket message:', err)
     }
-  }, [addMessage, setRoom, setPlayerId, setThemeId])
+  }, [addMessage, setRoom, setPlayerId, setThemeId, addPendingPayment, removePendingPayment])
 
   const connect = useCallback(() => {
     if (!token || !universe || !isAuthenticated) return
 
     cleanup()
+    replacedRef.current = false
     setConnectionStatus('connecting')
 
     const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}&universe=${encodeURIComponent(universe)}`)
@@ -108,10 +129,13 @@ export function useWebSocket() {
 
     ws.onclose = () => {
       setConnectionStatus('disconnected')
+      // Prompts belong to that session
+      clearPendingPayments()
       addMessage('Disconnected from server', 'system')
 
-      // Schedule reconnect with exponential backoff
-      if (isAuthenticated && token && universe) {
+      // Schedule reconnect with exponential backoff, unless another
+      // connection replaced this one
+      if (!replacedRef.current && isAuthenticated && token && universe) {
         reconnectTimeoutRef.current = window.setTimeout(() => {
           reconnectDelayRef.current = Math.min(
             reconnectDelayRef.current * 2,
@@ -121,7 +145,7 @@ export function useWebSocket() {
         }, reconnectDelayRef.current)
       }
     }
-  }, [token, universe, isAuthenticated, cleanup, setConnectionStatus, addMessage, handleMessage])
+  }, [token, universe, isAuthenticated, cleanup, setConnectionStatus, addMessage, handleMessage, clearPendingPayments])
 
   const sendCommand = useCallback((text: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -129,6 +153,15 @@ export function useWebSocket() {
       wsRef.current.send(JSON.stringify(msg))
     }
   }, [])
+
+  /** Answer the payment prompt (the dialog's buttons) */
+  const answerPayment = useCallback((id: string, accept: boolean) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const msg: ClientMessage = { type: 'confirm', id, accept }
+      wsRef.current.send(JSON.stringify(msg))
+    }
+    removePendingPayment(id)
+  }, [removePendingPayment])
 
   const disconnect = useCallback(() => {
     cleanup()
@@ -146,5 +179,5 @@ export function useWebSocket() {
     return cleanup
   }, [isAuthenticated, token, universe, connect, disconnect, cleanup])
 
-  return { sendCommand, disconnect }
+  return { sendCommand, answerPayment, disconnect }
 }

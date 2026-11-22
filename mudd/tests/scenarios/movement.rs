@@ -304,3 +304,318 @@ async fn test_look_shows_contents() {
         room
     );
 }
+
+async fn wizard(server: &TestServer, name: &str) -> crate::harness::TestClient {
+    let mut c = server
+        .connect_as(Role::Wizard {
+            username: name.to_string(),
+        })
+        .await
+        .expect("connect");
+    c.drain().await;
+    c
+}
+
+/// Run `code` with eval and return the output text
+async fn eval(c: &mut crate::harness::TestClient, code: &str) -> String {
+    c.drain().await;
+    c.command(&format!("eval {}", code)).await.unwrap();
+    let _ = c.expect("echo").await;
+    let reply = c.expect_any().await.expect("eval reply");
+    assert_ne!(reply["type"], "error", "eval failed: {}", reply);
+    reply["text"].as_str().unwrap_or_default().to_string()
+}
+
+/// game.move_object on a connected player moves their session too: they get
+/// the new room, and later commands happen there
+#[tokio::test]
+async fn test_lua_move_updates_connected_player() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "moved_player".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    let mut wiz = wizard(&server, "mover_wiz").await;
+    let passage = server.world().passage_id.clone();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.move_object("{}", "{}"))"#,
+            pl.player_id().unwrap(),
+            passage
+        ),
+    )
+    .await;
+
+    let room = pl
+        .expect("room")
+        .await
+        .expect("moved player sees the new room");
+    assert_eq!(room["name"], "Narrow Passage");
+    pl.drain().await;
+    pl.command("look").await.unwrap();
+    let _ = pl.expect("echo").await;
+    let room = pl.expect("room").await.unwrap();
+    assert_eq!(
+        room["name"], "Narrow Passage",
+        "the session is in the new room"
+    );
+}
+
+/// Moving any object fires the rooms' hooks, with moved_id
+#[tokio::test]
+async fn test_lua_move_fires_room_hooks() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "hook_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_enter = function(a) game.broadcast(a.room_id, "arrived:" .. tostring(a.moved_id) .. ":" .. tostring(a.actor_id)) end,
+             on_leave = function(a) game.broadcast(a.to, "left-from-ring:" .. tostring(a.moved_id)) end,
+           }]])
+           game.create_object("/rooms/ring", "room", nil, {name = "Ring", code_hash = h})
+           game.create_object("/rooms/ring/pebble", "item", "/rooms/ring", {name = "pebble"})
+           return "ok""#,
+    )
+    .await;
+    // The wizard stands in the entrance; move the pebble from the ring there
+    // (sent raw: the hooks' broadcasts arrive before eval's own reply)
+    let entrance = server.world().entrance_id.clone();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval return tostring(game.move_object("/rooms/ring/pebble", "{}"))"#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    let heard = wiz
+        .expect_output_containing("left-from-ring:/rooms/ring/pebble")
+        .await
+        .expect("on_leave ran on the old room with moved_id");
+    assert_eq!(heard, "left-from-ring:/rooms/ring/pebble");
+
+    // And into the ring: its on_enter runs (broadcast into the ring, where a
+    // second wizard waits)
+    let mut watcher = wizard(&server, "ring_watcher").await;
+    eval(&mut watcher, r#"return "x""#).await;
+    watcher.command("goto /rooms/ring").await.unwrap();
+    watcher.expect("room").await.unwrap();
+    watcher.drain().await;
+    eval(
+        &mut wiz,
+        r#"return tostring(game.move_object("/rooms/ring/pebble", "/rooms/ring"))"#,
+    )
+    .await;
+    watcher
+        .expect_output_containing("arrived:/rooms/ring/pebble:nil")
+        .await
+        .expect("on_enter ran with moved_id, and no actor_id for a Lua move");
+}
+
+/// Hooks that move the object on (rooms bouncing it back and forth) stop at
+/// the nesting limit instead of looping forever
+#[tokio::test]
+async fn test_move_hooks_are_depth_limited() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "bounce_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local function bouncer(other)
+             return game.store_code(string.format([[return {
+               on_enter = function(a)
+                 local o = game.get_object(a.moved_id)
+                 game.update_object(a.moved_id, {bounces = (o.metadata.bounces or 0) + 1})
+                 game.move_object(a.moved_id, %q)
+               end,
+             }]], other))
+           end
+           game.create_object("/rooms/ping", "room", nil, {name = "Ping", code_hash = bouncer("/rooms/pong")})
+           game.create_object("/rooms/pong", "room", nil, {name = "Pong", code_hash = bouncer("/rooms/ping")})
+           game.create_object("/items/ball", "item", nil, {name = "ball"})
+           return "ok""#,
+    )
+    .await;
+    eval(
+        &mut wiz,
+        r#"return tostring(game.move_object("/items/ball", "/rooms/ping"))"#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let bounces: i64 = eval(
+        &mut wiz,
+        r#"return game.get_object("/items/ball").metadata.bounces"#,
+    )
+    .await
+    .parse()
+    .unwrap_or(0);
+    assert!(
+        (1..=8).contains(&bounces),
+        "hooks ran a bounded number of times, got {}",
+        bounces
+    );
+}
+
+/// Hooks that move several objects each fan out; a total budget per run
+/// bounds the work, not just the nesting depth
+#[tokio::test]
+async fn test_move_hooks_fan_out_is_bounded() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "fan_wiz").await;
+    eval(
+        &mut wiz,
+        r#"game.create_object("/items/counter", "item", nil, {name = "counter", n = 0})
+           local function fan(other)
+             return game.store_code(string.format([[return {
+               on_enter = function(a)
+                 local c = game.get_object("/items/counter")
+                 game.update_object("/items/counter", {n = c.metadata.n + 1})
+                 for i = 1, 5 do game.move_object("/items/ball" .. i, %q) end
+               end,
+             }]], other))
+           end
+           game.create_object("/rooms/fan-a", "room", nil, {name = "A", code_hash = fan("/rooms/fan-b")})
+           game.create_object("/rooms/fan-b", "room", nil, {name = "B", code_hash = fan("/rooms/fan-a")})
+           for i = 1, 5 do game.create_object("/items/ball" .. i, "item", nil, {name = "ball"}) end
+           return "ok""#,
+    )
+    .await;
+    eval(
+        &mut wiz,
+        r#"return tostring(game.move_object("/items/ball1", "/rooms/fan-a"))"#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let n: i64 = eval(
+        &mut wiz,
+        r#"return game.get_object("/items/counter").metadata.n"#,
+    )
+    .await
+    .parse()
+    .unwrap_or(-1);
+    assert!((1..=40).contains(&n), "on_enter ran {} times", n);
+}
+
+/// Moves between containers without code do not use up the run's hook
+/// budget: a later real hook still runs
+#[tokio::test]
+async fn test_codeless_moves_do_not_spend_hook_budget() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "budget_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_enter = function(a) game.broadcast(a.room_id, "hub-entered:" .. a.moved_id) end,
+           }]])
+           game.create_object("/rooms/hub", "room", nil, {name = "Hub", code_hash = h})
+           game.create_object("/rooms/bare-a", "room", nil, {name = "Bare A"})
+           game.create_object("/rooms/bare-b", "room", nil, {name = "Bare B"})
+           game.create_object("/items/token", "item", "/rooms/bare-a", {name = "token"})
+           return "ok""#,
+    )
+    .await;
+    let mut watcher = wizard(&server, "hub_watcher").await;
+    watcher.command("goto /rooms/hub").await.unwrap();
+    watcher.expect("room").await.unwrap();
+    watcher.drain().await;
+    eval(
+        &mut wiz,
+        r#"for i = 1, 20 do
+             game.move_object("/items/token", "/rooms/bare-b")
+             game.move_object("/items/token", "/rooms/bare-a")
+           end
+           game.move_object("/items/token", "/rooms/hub")
+           return "moved""#,
+    )
+    .await;
+    watcher
+        .expect_output_containing("hub-entered:/items/token")
+        .await
+        .expect("the hub's on_enter still ran");
+}
+
+/// A room's on_leave that moves the player elsewhere (a trapdoor) wins over
+/// the walk that triggered it
+#[tokio::test]
+async fn test_on_leave_teleport_is_not_undone_by_the_walk() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "trap_wiz").await;
+    eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_leave = function(a) game.move_object(a.actor_id, "/rooms/dungeon") end,
+           }]])
+           game.create_object("/rooms/beyond", "room", nil, {name = "Beyond"})
+           game.create_object("/rooms/dungeon", "room", nil, {name = "Dungeon"})
+           game.create_object("/rooms/trap", "room", nil,
+             {name = "Trap", exits = {north = "/rooms/beyond"}, code_hash = h})
+           return "ok""#,
+    )
+    .await;
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "trapped".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.move_object("{}", "/rooms/trap"))"#,
+            pl.player_id().unwrap()
+        ),
+    )
+    .await;
+    pl.expect("room").await.unwrap();
+    pl.drain().await;
+
+    pl.command("north").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    pl.drain().await;
+    pl.command("look").await.unwrap();
+    let _ = pl.expect("echo").await;
+    let room = pl.expect("room").await.unwrap();
+    assert_eq!(room["name"], "Dungeon", "the trapdoor wins");
+}
+
+/// A player moved by Lua into a safe room respawns there later
+#[tokio::test]
+async fn test_lua_move_records_safe_location() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "safe_wiz").await;
+    eval(
+        &mut wiz,
+        r#"game.create_object("/rooms/hub", "room", nil, {name = "Hub", is_portal = true})
+           return "ok""#,
+    )
+    .await;
+    let mut pl = server
+        .connect_as(Role::Player {
+            username: "hub_bound".into(),
+        })
+        .await
+        .unwrap();
+    pl.drain().await;
+    let player_id = pl.player_id().unwrap().to_string();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.move_object("{}", "/rooms/hub"))"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect("room").await.unwrap();
+    let safe = eval(
+        &mut wiz,
+        &format!(
+            r#"return tostring(game.get_object("{}").metadata.last_safe_location)"#,
+            player_id
+        ),
+    )
+    .await;
+    assert_eq!(safe, "/rooms/hub");
+}

@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use super::DamageType;
+use crate::objects::ObjectStore;
 
 /// Types of status effects
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -48,6 +49,8 @@ pub enum EffectType {
     Regenerating,
     /// Silenced - cannot cast spells
     Silenced,
+    /// Bleeding - takes physical damage over time (e.g. after a critical hit)
+    Bleeding,
 }
 
 impl FromStr for EffectType {
@@ -70,6 +73,7 @@ impl FromStr for EffectType {
             "invisible" | "invis" => Ok(EffectType::Invisible),
             "regenerating" | "regen" => Ok(EffectType::Regenerating),
             "silenced" | "silence" => Ok(EffectType::Silenced),
+            "bleeding" | "bleed" => Ok(EffectType::Bleeding),
             _ => Err(()),
         }
     }
@@ -95,6 +99,7 @@ impl EffectType {
                 | EffectType::Weakened
                 | EffectType::Exposed
                 | EffectType::Silenced
+                | EffectType::Bleeding
         )
     }
 }
@@ -117,46 +122,76 @@ impl std::fmt::Display for EffectType {
             EffectType::Invisible => "invisible",
             EffectType::Regenerating => "regenerating",
             EffectType::Silenced => "silenced",
+            EffectType::Bleeding => "bleeding",
         };
         write!(f, "{}", s)
     }
 }
 
-/// A status effect instance
-#[derive(Debug, Clone)]
+/// Shortest pulse period: each pulse is a replicated write
+pub const MIN_PERIOD_MS: u64 = 500;
+
+/// Current time in milliseconds since the Unix epoch. Effect deadlines are
+/// absolute times computed on the primary before proposing, so replicas
+/// store the same values.
+pub fn now_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+/// A status effect instance. Times are absolute (Unix ms): a plain effect
+/// costs no writes while it lasts, and a periodic one (damage or healing
+/// over time) one write per pulse.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatusEffect {
     /// Type of effect
     pub effect_type: EffectType,
-    /// Remaining duration in ticks (heartbeats)
-    pub remaining_ticks: u32,
-    /// Magnitude/power of the effect (e.g., damage per tick)
+    /// Damage or healing per pulse, or the strength of a buff/debuff
     pub magnitude: i32,
     /// Source object ID (who applied this effect)
     pub source_id: Option<String>,
-    /// Damage type for DoT effects
+    /// Damage type for damage over time
     pub damage_type: Option<DamageType>,
+    /// When the effect ends
+    pub expires_at: u64,
+    /// Periodic effects: milliseconds between pulses
+    pub period_ms: Option<u64>,
+    /// Periodic effects: when the next pulse is due
+    pub next_pulse_at: Option<u64>,
 }
 
 impl StatusEffect {
-    /// Create a new status effect
-    pub fn new(effect_type: EffectType, duration_ticks: u32, magnitude: i32) -> Self {
+    /// A plain effect lasting `duration_ms` from `now`
+    pub fn new(effect_type: EffectType, now: u64, duration_ms: u64, magnitude: i32) -> Self {
         Self {
             effect_type,
-            remaining_ticks: duration_ticks,
             magnitude,
             source_id: None,
             damage_type: None,
+            expires_at: now.saturating_add(duration_ms),
+            period_ms: None,
+            next_pulse_at: None,
         }
     }
 
-    /// Create a DoT (damage over time) effect
-    pub fn dot(effect_type: EffectType, duration: u32, damage: i32, dtype: DamageType) -> Self {
+    /// A periodic effect: a pulse every `period_ms` until it ends (a pulse
+    /// due exactly at the end still happens)
+    pub fn periodic(
+        effect_type: EffectType,
+        now: u64,
+        duration_ms: u64,
+        period_ms: u64,
+        magnitude: i32,
+        damage_type: Option<DamageType>,
+    ) -> Self {
+        let period_ms = period_ms.max(MIN_PERIOD_MS);
         Self {
             effect_type,
-            remaining_ticks: duration,
-            magnitude: damage,
+            magnitude,
             source_id: None,
-            damage_type: Some(dtype),
+            damage_type,
+            expires_at: now.saturating_add(duration_ms),
+            period_ms: Some(period_ms),
+            next_pulse_at: Some(now.saturating_add(period_ms)),
         }
     }
 
@@ -166,30 +201,32 @@ impl StatusEffect {
         self
     }
 
-    /// Tick the effect, returning damage dealt if applicable
-    pub fn tick(&mut self) -> Option<(i32, DamageType)> {
-        if self.remaining_ticks > 0 {
-            self.remaining_ticks -= 1;
-        }
-
-        // Return damage for DoT effects
-        if self.magnitude > 0 {
-            if let Some(dtype) = self.damage_type {
-                return Some((self.magnitude, dtype));
-            }
-        }
-
-        // Return healing for regen
-        if self.effect_type == EffectType::Regenerating && self.magnitude > 0 {
-            return Some((-self.magnitude, DamageType::Physical)); // Negative = healing
-        }
-
-        None
+    /// Whether the effect is in force at `now`
+    pub fn is_active(&self, now: u64) -> bool {
+        now < self.expires_at
     }
 
-    /// Check if effect has expired
-    pub fn is_expired(&self) -> bool {
-        self.remaining_ticks == 0
+    /// What one pulse does: damage of a type (positive) or healing
+    /// (negative). None for effects that do not pulse.
+    pub fn pulse_amount(&self) -> Option<(i32, DamageType)> {
+        self.period_ms?;
+        // Regenerating always heals, whatever damage type it was given
+        if self.effect_type == EffectType::Regenerating {
+            return (self.magnitude > 0).then_some((-self.magnitude, DamageType::Physical));
+        }
+        let dtype = self.damage_type?;
+        (self.magnitude > 0).then_some((self.magnitude, dtype))
+    }
+
+    /// The next pulse still to come, if any (pulses run up to the end)
+    pub fn pending_pulse(&self) -> Option<u64> {
+        self.next_pulse_at.filter(|t| *t <= self.expires_at)
+    }
+
+    /// When the scheduler next has something to do for this effect: its
+    /// next pulse, or else its end
+    pub fn next_deadline(&self) -> u64 {
+        self.pending_pulse().unwrap_or(self.expires_at)
     }
 }
 
@@ -205,16 +242,26 @@ impl EntityEffects {
         Self::default()
     }
 
-    /// Add an effect (stacks or refreshes based on type)
+    /// Add an effect, or refresh one of the same type: the later end and
+    /// the stronger magnitude win; a periodic effect keeps its pulse clock
     pub fn add(&mut self, effect: StatusEffect) {
-        // For most effects, just refresh duration if already present
         if let Some(existing) = self
             .effects
             .iter_mut()
             .find(|e| e.effect_type == effect.effect_type)
         {
-            existing.remaining_ticks = existing.remaining_ticks.max(effect.remaining_ticks);
+            existing.expires_at = existing.expires_at.max(effect.expires_at);
             existing.magnitude = existing.magnitude.max(effect.magnitude);
+            if existing.period_ms.is_none() {
+                existing.period_ms = effect.period_ms;
+                existing.next_pulse_at = effect.next_pulse_at;
+            }
+            if effect.damage_type.is_some() {
+                existing.damage_type = effect.damage_type;
+            }
+            if effect.source_id.is_some() {
+                existing.source_id = effect.source_id;
+            }
         } else {
             self.effects.push(effect);
         }
@@ -225,295 +272,363 @@ impl EntityEffects {
         self.effects.retain(|e| e.effect_type != effect_type);
     }
 
-    /// Check if entity has a specific effect
-    pub fn has(&self, effect_type: EffectType) -> bool {
-        self.effects
-            .iter()
-            .any(|e| e.effect_type == effect_type && !e.is_expired())
+    /// Whether the entity has an effect in force at `now`
+    pub fn has(&self, effect_type: EffectType, now: u64) -> bool {
+        self.get(effect_type, now).is_some()
     }
 
-    /// Get an effect if present
-    pub fn get(&self, effect_type: EffectType) -> Option<&StatusEffect> {
+    /// An effect in force at `now`
+    pub fn get(&self, effect_type: EffectType, now: u64) -> Option<&StatusEffect> {
         self.effects
             .iter()
-            .find(|e| e.effect_type == effect_type && !e.is_expired())
+            .find(|e| e.effect_type == effect_type && e.is_active(now))
     }
 
-    /// Check if entity can act (not stunned/paralyzed)
-    pub fn can_act(&self) -> bool {
+    /// Whether the entity can act at `now` (not stunned or paralyzed)
+    pub fn can_act(&self, now: u64) -> bool {
         !self
             .effects
             .iter()
-            .any(|e| e.effect_type.prevents_action() && !e.is_expired())
+            .any(|e| e.effect_type.prevents_action() && e.is_active(now))
     }
 
-    /// Tick all effects and return damage/healing to apply
-    pub fn tick_all(&mut self) -> Vec<(i32, DamageType)> {
-        let mut results = Vec::new();
-
-        for effect in &mut self.effects {
-            if let Some(result) = effect.tick() {
-                results.push(result);
-            }
-        }
-
-        // Remove expired effects
-        self.effects.retain(|e| !e.is_expired());
-
-        results
+    /// Every stored effect (including any past its end the scheduler has
+    /// not removed yet)
+    pub fn all(&self) -> &[StatusEffect] {
+        &self.effects
     }
 
-    /// Get all active effects
-    pub fn active_effects(&self) -> Vec<&StatusEffect> {
-        self.effects.iter().filter(|e| !e.is_expired()).collect()
+    /// Effects in force at `now`
+    pub fn active(&self, now: u64) -> Vec<&StatusEffect> {
+        self.effects.iter().filter(|e| e.is_active(now)).collect()
     }
 
-    /// Clear all effects
-    pub fn clear(&mut self) {
-        self.effects.clear();
+    /// Whether nothing is stored
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
     }
 
-    /// Clear only debuffs
-    pub fn clear_debuffs(&mut self) {
-        self.effects.retain(|e| !e.effect_type.is_debuff());
+    /// The earliest deadline among the effects
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.effects.iter().map(StatusEffect::next_deadline).min()
     }
 }
 
-/// Global effect registry for tracking effects on all entities
-#[derive(Debug)]
+/// Effects of every entity, a cache of the `active_effects` table (the
+/// source of truth, written through Raft), keyed by (universe, entity).
+///
+/// Writes go to the table first, as statements that can share an atomic
+/// batch with other changes (an attack, a pulse); the cache is updated only
+/// after the batch commits. `load_from_db` rebuilds the cache at startup.
+/// The effect scheduler sleeps until `next_deadline` or until `changed`.
+#[derive(Debug, Default)]
 pub struct EffectRegistry {
-    entities: RwLock<HashMap<String, EntityEffects>>,
-    db_pool: Option<SqlitePool>,
+    cache: RwLock<HashMap<EntityKey, EntityEffects>>,
+    /// Serializes everything that reads then writes effect rows or HP (the
+    /// scheduler, attacks, apply/remove), so none of them overwrites
+    /// another's change from a stale read
+    writes: tokio::sync::Mutex<()>,
+    /// Wakes the scheduler when a new deadline may be earlier
+    changed: tokio::sync::Notify,
 }
 
-impl Default for EffectRegistry {
-    fn default() -> Self {
-        Self {
-            entities: RwLock::new(HashMap::new()),
-            db_pool: None,
-        }
-    }
+/// (universe_id, entity_id)
+pub type EntityKey = (String, String);
+
+/// An active_effects row, in column order
+type Row = (
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
+fn row_to_effect(row: Row) -> Option<(EntityKey, StatusEffect)> {
+    let (universe_id, entity_id, effect_type, expires, period, next, magnitude, dtype, source) =
+        row;
+    let Ok(effect_type) = EffectType::from_str(&effect_type) else {
+        warn!("Unknown effect type in database: {}", effect_type);
+        return None;
+    };
+    let effect = StatusEffect {
+        effect_type,
+        magnitude: magnitude as i32,
+        source_id: source,
+        damage_type: dtype.and_then(|d| DamageType::from_str(&d).ok()),
+        expires_at: expires.max(0) as u64,
+        period_ms: period.map(|p| (p.max(0) as u64).max(MIN_PERIOD_MS)),
+        next_pulse_at: next.map(|n| n.max(0) as u64),
+    };
+    Some(((universe_id, entity_id), effect))
 }
+
+fn key(universe_id: &str, entity_id: &str) -> EntityKey {
+    (universe_id.to_string(), entity_id.to_string())
+}
+
+type Statement = (String, Vec<serde_json::Value>);
 
 impl EffectRegistry {
-    /// Create a new effect registry
+    /// An empty registry
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a new effect registry with database pool
-    pub fn with_db(pool: SqlitePool) -> Self {
-        Self {
-            entities: RwLock::new(HashMap::new()),
-            db_pool: Some(pool),
-        }
-    }
-
-    /// Create a shared instance
+    /// Wrap in Arc for sharing
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
     }
 
-    /// Create a shared instance with database pool
-    pub fn shared_with_db(pool: SqlitePool) -> Arc<Self> {
-        Arc::new(Self::with_db(pool))
-    }
-
-    /// Add an effect to an entity
-    pub async fn add_effect(&self, entity_id: &str, effect: StatusEffect) {
-        // Persist to database
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) = self.persist_effect(entity_id, &effect, pool).await {
-                warn!("Failed to persist effect for {}: {}", entity_id, e);
-            }
-        }
-
-        let mut entities = self.entities.write().await;
-        entities
-            .entry(entity_id.to_string())
-            .or_default()
-            .add(effect);
-    }
-
-    /// Persist an effect to database
-    async fn persist_effect(
-        &self,
+    /// Statement adding an effect, or refreshing one of the same type (as
+    /// `EntityEffects::add`: later end, stronger magnitude, pulse clock kept)
+    pub fn upsert_statement(
+        universe_id: &str,
         entity_id: &str,
         effect: &StatusEffect,
-        pool: &SqlitePool,
-    ) -> anyhow::Result<()> {
-        let effect_type_str = effect.effect_type.to_string();
-        let damage_type_str = effect.damage_type.map(|dt| format!("{:?}", dt));
-        let id = uuid::Uuid::new_v4().to_string();
-
-        sqlx::query(
-            r#"
-            INSERT INTO active_effects
-            (id, entity_id, effect_type, remaining_ticks, magnitude, damage_type, source_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
+    ) -> Statement {
+        (
+            "INSERT INTO active_effects
+               (universe_id, entity_id, effect_type, expires_at, period_ms, next_pulse_at,
+                magnitude, damage_type, source_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (universe_id, entity_id, effect_type) DO UPDATE SET
+               expires_at = max(active_effects.expires_at, excluded.expires_at),
+               magnitude = max(active_effects.magnitude, excluded.magnitude),
+               period_ms = coalesce(active_effects.period_ms, excluded.period_ms),
+               next_pulse_at = coalesce(active_effects.next_pulse_at, excluded.next_pulse_at),
+               damage_type = coalesce(excluded.damage_type, active_effects.damage_type),
+               source_id = coalesce(excluded.source_id, active_effects.source_id)"
+                .to_string(),
+            vec![
+                serde_json::json!(universe_id),
+                serde_json::json!(entity_id),
+                serde_json::json!(effect.effect_type.to_string()),
+                serde_json::json!(effect.expires_at),
+                serde_json::json!(effect.period_ms),
+                serde_json::json!(effect.next_pulse_at),
+                serde_json::json!(effect.magnitude),
+                serde_json::json!(effect.damage_type.map(|d| d.to_string())),
+                serde_json::json!(effect.source_id),
+            ],
         )
-        .bind(&id)
-        .bind(entity_id)
-        .bind(&effect_type_str)
-        .bind(effect.remaining_ticks as i32)
-        .bind(effect.magnitude)
-        .bind(&damage_type_str)
-        .bind(&effect.source_id)
-        .execute(pool)
-        .await?;
+    }
+
+    /// Statement moving a periodic effect's next pulse (after pulsing)
+    pub fn set_next_pulse_statement(
+        universe_id: &str,
+        entity_id: &str,
+        effect_type: EffectType,
+        next_pulse_at: u64,
+    ) -> Statement {
+        (
+            "UPDATE active_effects SET next_pulse_at = ?
+             WHERE universe_id = ? AND entity_id = ? AND effect_type = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(next_pulse_at),
+                serde_json::json!(universe_id),
+                serde_json::json!(entity_id),
+                serde_json::json!(effect_type.to_string()),
+            ],
+        )
+    }
+
+    /// Statement removing one effect
+    pub fn delete_statement(
+        universe_id: &str,
+        entity_id: &str,
+        effect_type: EffectType,
+    ) -> Statement {
+        (
+            "DELETE FROM active_effects WHERE universe_id = ? AND entity_id = ? AND effect_type = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(universe_id),
+                serde_json::json!(entity_id),
+                serde_json::json!(effect_type.to_string()),
+            ],
+        )
+    }
+
+    /// Statement removing all of an entity's effects (e.g. on death)
+    pub fn clear_statement(universe_id: &str, entity_id: &str) -> Statement {
+        (
+            "DELETE FROM active_effects WHERE universe_id = ? AND entity_id = ?".to_string(),
+            vec![serde_json::json!(universe_id), serde_json::json!(entity_id)],
+        )
+    }
+
+    /// Hold while reading then writing effect rows or HP (see `writes`)
+    pub async fn write_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.writes.lock().await
+    }
+
+    /// Add (or refresh) an effect: write it, then cache it
+    pub async fn apply(
+        &self,
+        store: &ObjectStore,
+        universe_id: &str,
+        entity_id: &str,
+        effect: StatusEffect,
+    ) -> anyhow::Result<()> {
+        let _writes = self.write_guard().await;
+        store
+            .execute_batch(vec![Self::upsert_statement(
+                universe_id,
+                entity_id,
+                &effect,
+            )])
+            .await?;
+        self.cache_add(universe_id, entity_id, effect).await;
         Ok(())
     }
 
-    /// Remove an effect from an entity
-    pub async fn remove_effect(&self, entity_id: &str, effect_type: EffectType) {
-        // Remove from database
-        if let Some(ref pool) = self.db_pool {
-            let effect_type_str = effect_type.to_string();
-            if let Err(e) =
-                sqlx::query("DELETE FROM active_effects WHERE entity_id = ? AND effect_type = ?")
-                    .bind(entity_id)
-                    .bind(&effect_type_str)
-                    .execute(pool)
-                    .await
-            {
-                warn!(
-                    "Failed to remove effect {} for {}: {}",
-                    effect_type, entity_id, e
-                );
-            }
-        }
+    /// Remove an effect: write it, then uncache it
+    pub async fn remove(
+        &self,
+        store: &ObjectStore,
+        universe_id: &str,
+        entity_id: &str,
+        effect_type: EffectType,
+    ) -> anyhow::Result<()> {
+        let _writes = self.write_guard().await;
+        store
+            .execute_batch(vec![Self::delete_statement(
+                universe_id,
+                entity_id,
+                effect_type,
+            )])
+            .await?;
+        self.cache_remove(universe_id, entity_id, effect_type).await;
+        Ok(())
+    }
 
-        let mut entities = self.entities.write().await;
-        if let Some(effects) = entities.get_mut(entity_id) {
+    /// After a committed upsert: cache the effect (and wake the scheduler)
+    pub async fn cache_add(&self, universe_id: &str, entity_id: &str, effect: StatusEffect) {
+        self.cache
+            .write()
+            .await
+            .entry(key(universe_id, entity_id))
+            .or_default()
+            .add(effect);
+        self.changed.notify_one();
+    }
+
+    /// After a committed delete: uncache the effect
+    pub async fn cache_remove(&self, universe_id: &str, entity_id: &str, effect_type: EffectType) {
+        let mut cache = self.cache.write().await;
+        let k = key(universe_id, entity_id);
+        if let Some(effects) = cache.get_mut(&k) {
             effects.remove(effect_type);
+            if effects.is_empty() {
+                cache.remove(&k);
+            }
+        }
+    }
+
+    /// After a committed clear (or when the entity is gone): uncache all
+    pub async fn cache_clear(&self, universe_id: &str, entity_id: &str) {
+        self.cache
+            .write()
+            .await
+            .remove(&key(universe_id, entity_id));
+    }
+
+    /// After a committed scheduler batch: replace an entity's effects
+    pub async fn cache_set(&self, universe_id: &str, entity_id: &str, effects: EntityEffects) {
+        let mut cache = self.cache.write().await;
+        if effects.is_empty() {
+            cache.remove(&key(universe_id, entity_id));
+        } else {
+            cache.insert(key(universe_id, entity_id), effects);
         }
     }
 
-    /// Check if entity has an effect
-    pub async fn has_effect(&self, entity_id: &str, effect_type: EffectType) -> bool {
-        let entities = self.entities.read().await;
-        entities.get(entity_id).is_some_and(|e| e.has(effect_type))
+    /// An entity's stored effects (empty if none)
+    pub async fn get(&self, universe_id: &str, entity_id: &str) -> EntityEffects {
+        self.cache
+            .read()
+            .await
+            .get(&key(universe_id, entity_id))
+            .cloned()
+            .unwrap_or_default()
     }
 
-    /// Check if entity can act
-    pub async fn can_act(&self, entity_id: &str) -> bool {
-        let entities = self.entities.read().await;
-        entities.get(entity_id).is_none_or(|e| e.can_act())
+    /// The earliest deadline of any effect, if there are any
+    pub async fn next_deadline(&self) -> Option<u64> {
+        self.cache
+            .read()
+            .await
+            .values()
+            .filter_map(EntityEffects::next_deadline)
+            .min()
     }
 
-    /// Tick effects for an entity
-    pub async fn tick(&self, entity_id: &str) -> Vec<(i32, DamageType)> {
-        let results = {
-            let mut entities = self.entities.write().await;
-            if let Some(effects) = entities.get_mut(entity_id) {
-                effects.tick_all()
-            } else {
-                Vec::new()
-            }
-        };
+    /// Entities with a deadline at or before `now`, with their effects
+    pub async fn due(&self, now: u64) -> Vec<(EntityKey, EntityEffects)> {
+        self.cache
+            .read()
+            .await
+            .iter()
+            .filter(|(_, e)| e.next_deadline().is_some_and(|t| t <= now))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 
-        // Update remaining ticks in database
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) = self.sync_effects_to_db(entity_id, pool).await {
-                warn!("Failed to sync effects for {}: {}", entity_id, e);
+    /// Resolves when effects change (a new effect may be due sooner)
+    pub async fn changed(&self) {
+        self.changed.notified().await
+    }
+
+    /// One entity's effects as stored in the table (the source of truth)
+    pub async fn load_entity(
+        pool: &SqlitePool,
+        universe_id: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<EntityEffects> {
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT universe_id, entity_id, effect_type, expires_at, period_ms, next_pulse_at,
+                    magnitude, damage_type, source_id
+             FROM active_effects WHERE universe_id = ? AND entity_id = ?",
+        )
+        .bind(universe_id)
+        .bind(entity_id)
+        .fetch_all(pool)
+        .await?;
+        let mut effects = EntityEffects::new();
+        for row in rows {
+            if let Some((_, effect)) = row_to_effect(row) {
+                effects.add(effect);
             }
         }
-
-        results
+        Ok(effects)
     }
 
-    /// Sync effects to database after tick
-    async fn sync_effects_to_db(&self, entity_id: &str, pool: &SqlitePool) -> anyhow::Result<()> {
-        // Delete all effects for entity and re-insert active ones
-        sqlx::query("DELETE FROM active_effects WHERE entity_id = ?")
-            .bind(entity_id)
-            .execute(pool)
-            .await?;
+    /// Rebuild the cache from the table (at startup)
+    pub async fn load_from_db(&self, pool: &SqlitePool) -> anyhow::Result<()> {
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT universe_id, entity_id, effect_type, expires_at, period_ms, next_pulse_at,
+                    magnitude, damage_type, source_id
+             FROM active_effects",
+        )
+        .fetch_all(pool)
+        .await?;
 
-        let entities = self.entities.read().await;
-        if let Some(entity_effects) = entities.get(entity_id) {
-            for effect in entity_effects.active_effects() {
-                self.persist_effect(entity_id, effect, pool).await?;
+        let mut cache = HashMap::<EntityKey, EntityEffects>::new();
+        for row in rows {
+            if let Some((key, effect)) = row_to_effect(row) {
+                cache.entry(key).or_default().add(effect);
             }
         }
+        debug!("Loaded effects for {} entities", cache.len());
+        *self.cache.write().await = cache;
+        self.changed.notify_one();
         Ok(())
-    }
-
-    /// Load effects from database on startup
-    pub async fn load_from_db(&self) -> anyhow::Result<()> {
-        let Some(ref pool) = self.db_pool else {
-            return Ok(());
-        };
-
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, String, i32, i32, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT id, entity_id, effect_type, remaining_ticks, magnitude, damage_type, source_id FROM active_effects",
-            )
-            .fetch_all(pool)
-            .await?;
-
-        let mut entities = self.entities.write().await;
-        for (
-            _id,
-            entity_id,
-            effect_type_str,
-            remaining_ticks,
-            magnitude,
-            damage_type_str,
-            source_id,
-        ) in rows
-        {
-            let effect_type = match EffectType::from_str(&effect_type_str) {
-                Ok(et) => et,
-                Err(_) => continue,
-            };
-
-            let damage_type = damage_type_str.and_then(|s| match s.as_str() {
-                "Physical" => Some(DamageType::Physical),
-                "Slashing" => Some(DamageType::Slashing),
-                "Piercing" => Some(DamageType::Piercing),
-                "Bludgeoning" => Some(DamageType::Bludgeoning),
-                "Fire" => Some(DamageType::Fire),
-                "Cold" => Some(DamageType::Cold),
-                "Lightning" => Some(DamageType::Lightning),
-                "Acid" => Some(DamageType::Acid),
-                "Poison" => Some(DamageType::Poison),
-                "Psychic" => Some(DamageType::Psychic),
-                "Radiant" => Some(DamageType::Radiant),
-                "Necrotic" => Some(DamageType::Necrotic),
-                "Force" => Some(DamageType::Force),
-                "Thunder" => Some(DamageType::Thunder),
-                _ => None,
-            });
-
-            let mut effect = StatusEffect::new(effect_type, remaining_ticks as u32, magnitude);
-            effect.damage_type = damage_type;
-            effect.source_id = source_id;
-
-            entities.entry(entity_id).or_default().add(effect);
-        }
-
-        debug!("Loaded effects for {} entities", entities.len());
-        Ok(())
-    }
-
-    /// Clear effects for an entity
-    pub async fn clear(&self, entity_id: &str) {
-        // Remove from database
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) = sqlx::query("DELETE FROM active_effects WHERE entity_id = ?")
-                .bind(entity_id)
-                .execute(pool)
-                .await
-            {
-                warn!("Failed to clear effects for {}: {}", entity_id, e);
-            }
-        }
-
-        let mut entities = self.entities.write().await;
-        entities.remove(entity_id);
     }
 }
 
@@ -537,89 +652,184 @@ mod tests {
     }
 
     #[test]
-    fn test_effect_tick() {
-        let mut effect = StatusEffect::dot(EffectType::Poisoned, 3, 5, DamageType::Poison);
-
-        // Tick returns damage
-        let result = effect.tick();
-        assert_eq!(result, Some((5, DamageType::Poison)));
-        assert_eq!(effect.remaining_ticks, 2);
-
-        // Tick again
-        effect.tick();
-        assert_eq!(effect.remaining_ticks, 1);
-
-        // Last tick
-        effect.tick();
-        assert!(effect.is_expired());
+    fn test_plain_effect_lasts_until_its_end() {
+        let stun = StatusEffect::new(EffectType::Stunned, 1_000, 2_000, 0);
+        let mut effects = EntityEffects::new();
+        effects.add(stun);
+        assert!(!effects.can_act(1_500));
+        assert!(effects.has(EffectType::Stunned, 2_999));
+        assert!(effects.can_act(3_000), "over at its end time");
+        assert_eq!(effects.next_deadline(), Some(3_000));
+        assert_eq!(
+            StatusEffect::new(EffectType::Stunned, 0, 1, 0).pulse_amount(),
+            None
+        );
     }
 
     #[test]
-    fn test_entity_effects() {
-        let mut effects = EntityEffects::new();
-
-        // Add effect
-        effects.add(StatusEffect::new(EffectType::Stunned, 2, 0));
-        assert!(effects.has(EffectType::Stunned));
-        assert!(!effects.can_act());
-
-        // Tick
-        effects.tick_all();
-        assert!(effects.has(EffectType::Stunned));
-        assert!(!effects.can_act());
-
-        // Tick again - expires
-        effects.tick_all();
-        assert!(!effects.has(EffectType::Stunned));
-        assert!(effects.can_act());
-    }
-
-    #[test]
-    fn test_dot_damage() {
-        let mut effects = EntityEffects::new();
-        effects.add(StatusEffect::dot(
-            EffectType::Burning,
+    fn test_periodic_effect_deadlines() {
+        let poison = StatusEffect::periodic(
+            EffectType::Poisoned,
+            0,
+            3_000,
+            1_000,
             2,
-            10,
-            DamageType::Fire,
-        ));
-
-        let damage = effects.tick_all();
-        assert_eq!(damage.len(), 1);
-        assert_eq!(damage[0], (10, DamageType::Fire));
-
-        let damage2 = effects.tick_all();
-        assert_eq!(damage2.len(), 1); // Last tick still deals damage
-
-        // Effect now expired
-        assert!(!effects.has(EffectType::Burning));
+            Some(DamageType::Poison),
+        );
+        assert_eq!(poison.next_deadline(), 1_000, "first pulse");
+        assert_eq!(poison.pulse_amount(), Some((2, DamageType::Poison)));
+        let regen = StatusEffect::periodic(EffectType::Regenerating, 0, 3_000, 1_000, 4, None);
+        assert_eq!(regen.pulse_amount(), Some((-4, DamageType::Physical)));
+        // Past the last pulse, the deadline is the end
+        let mut late = poison.clone();
+        late.next_pulse_at = Some(4_000);
+        assert_eq!(late.next_deadline(), 3_000);
     }
 
     #[test]
     fn test_effect_refresh() {
         let mut effects = EntityEffects::new();
+        effects.add(StatusEffect::new(EffectType::Stunned, 0, 2_000, 0));
+        effects.add(StatusEffect::new(EffectType::Stunned, 0, 5_000, 1));
+        let stun = effects.get(EffectType::Stunned, 0).unwrap();
+        assert_eq!((stun.expires_at, stun.magnitude), (5_000, 1));
 
-        effects.add(StatusEffect::new(EffectType::Stunned, 2, 0));
-        effects.add(StatusEffect::new(EffectType::Stunned, 5, 0)); // Refresh to longer duration
-
-        let effect = effects.get(EffectType::Stunned).unwrap();
-        assert_eq!(effect.remaining_ticks, 5);
+        // Refreshing a periodic effect keeps its pulse clock
+        effects.add(StatusEffect::periodic(
+            EffectType::Burning,
+            0,
+            2_000,
+            500,
+            3,
+            Some(DamageType::Fire),
+        ));
+        effects.add(StatusEffect::periodic(
+            EffectType::Burning,
+            400,
+            4_000,
+            500,
+            1,
+            Some(DamageType::Fire),
+        ));
+        let burn = effects.get(EffectType::Burning, 0).unwrap();
+        assert_eq!(
+            (burn.expires_at, burn.magnitude, burn.next_pulse_at),
+            (4_400, 3, Some(500))
+        );
     }
 
+    async fn universe_with(pool: &SqlitePool, universe: &str, objects: &[&str]) -> ObjectStore {
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES ('acct', 'acct', 'x', 'admin', '2026-01-01')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let store = ObjectStore::new(pool.clone(), None);
+        store
+            .create_universe(universe, universe, "acct", serde_json::json!({}))
+            .await
+            .unwrap();
+        for id in objects {
+            let obj = crate::objects::Object::new(id, universe, "npc").unwrap();
+            store.create(&obj).await.unwrap();
+        }
+        store
+    }
+
+    /// The table is the truth: effects written through the registry come
+    /// back in a fresh registry loaded from it, per universe
     #[tokio::test]
-    async fn test_effect_registry() {
+    async fn test_effect_registry_persists_per_universe() {
+        let pool = crate::db::test_utils::test_pool().await;
+        let store = universe_with(&pool, "a", &["/npcs/rat"]).await;
+        universe_with(&pool, "b", &["/npcs/rat"]).await;
         let registry = EffectRegistry::new();
 
-        // Add effect
+        let now = 1_000_000;
         registry
-            .add_effect("player1", StatusEffect::new(EffectType::Stunned, 2, 0))
-            .await;
-        assert!(registry.has_effect("player1", EffectType::Stunned).await);
-        assert!(!registry.can_act("player1").await);
+            .apply(
+                &store,
+                "a",
+                "/npcs/rat",
+                StatusEffect::new(EffectType::Stunned, now, 2_000, 0),
+            )
+            .await
+            .unwrap();
+        // Refreshing keeps the later end, the stronger magnitude and the
+        // pulse clock
+        let poison = |start, duration, magnitude| {
+            StatusEffect::periodic(
+                EffectType::Poisoned,
+                start,
+                duration,
+                1_000,
+                magnitude,
+                Some(DamageType::Poison),
+            )
+        };
+        registry
+            .apply(&store, "a", "/npcs/rat", poison(now, 3_000, 2))
+            .await
+            .unwrap();
+        registry
+            .apply(&store, "a", "/npcs/rat", poison(now + 500, 1_000, 5))
+            .await
+            .unwrap();
+        assert!(!registry.get("a", "/npcs/rat").await.can_act(now));
+        assert!(
+            registry.get("b", "/npcs/rat").await.can_act(now),
+            "per universe"
+        );
+        assert_eq!(registry.next_deadline().await, Some(now + 1_000));
 
-        // Remove effect
-        registry.remove_effect("player1", EffectType::Stunned).await;
-        assert!(!registry.has_effect("player1", EffectType::Stunned).await);
-        assert!(registry.can_act("player1").await);
+        let fresh = EffectRegistry::new();
+        fresh.load_from_db(&pool).await.unwrap();
+        let effects = fresh.get("a", "/npcs/rat").await;
+        let poison = effects
+            .get(EffectType::Poisoned, now)
+            .expect("poison persisted");
+        assert_eq!(
+            (poison.expires_at, poison.magnitude, poison.next_pulse_at),
+            (now + 3_000, 5, Some(now + 1_000))
+        );
+        assert_eq!(poison.damage_type, Some(DamageType::Poison));
+        assert!(effects.has(EffectType::Stunned, now));
+        assert!(fresh.get("b", "/npcs/rat").await.is_empty());
+
+        registry
+            .remove(&store, "a", "/npcs/rat", EffectType::Stunned)
+            .await
+            .unwrap();
+        assert!(registry.get("a", "/npcs/rat").await.can_act(now));
+        let fresh = EffectRegistry::new();
+        fresh.load_from_db(&pool).await.unwrap();
+        assert!(!fresh
+            .get("a", "/npcs/rat")
+            .await
+            .has(EffectType::Stunned, now));
+    }
+
+    /// Effects belong to an object: deleting it deletes them
+    #[tokio::test]
+    async fn test_effects_cascade_with_object() {
+        let pool = crate::db::test_utils::test_pool().await;
+        let store = universe_with(&pool, "a", &["/npcs/rat"]).await;
+        EffectRegistry::new()
+            .apply(
+                &store,
+                "a",
+                "/npcs/rat",
+                StatusEffect::new(EffectType::Stunned, 0, 2_000, 0),
+            )
+            .await
+            .unwrap();
+        store.delete("a", "/npcs/rat").await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_effects")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
     }
 }

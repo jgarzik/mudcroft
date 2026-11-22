@@ -33,6 +33,12 @@ struct Args {
     /// Additional Lua library files to store (can be specified multiple times)
     #[arg(long = "lib")]
     libs: Vec<PathBuf>,
+
+    /// Create an empty database for a node that will join a cluster
+    /// (`mudd --join`): the schema only, no admin account and no mudlib;
+    /// everything arrives from the cluster
+    #[arg(long, conflicts_with_all = ["lib_dir", "libs"])]
+    empty: bool,
 }
 
 #[tokio::main]
@@ -53,6 +59,15 @@ async fn main() -> Result<()> {
     if args.force && args.database.exists() {
         tracing::info!("Removing existing database at {}", args.database.display());
         std::fs::remove_file(&args.database)?;
+    }
+
+    if args.empty {
+        mudd::init::init_empty_database(&args.database).await?;
+        println!(
+            "Created empty database {} (join a cluster with mudd --join)",
+            args.database.display()
+        );
+        return Ok(());
     }
 
     // Read admin credentials from environment (only required for new DB)

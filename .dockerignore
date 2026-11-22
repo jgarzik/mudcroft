@@ -45,5 +45,6 @@ tmp/
 temp/
 *.tmp
 
-# Scripts not needed in container
-scripts/
+# Tooling scripts are not needed; Lua scripts (run_script) are
+scripts/*
+!scripts/*.lua

@@ -2,7 +2,7 @@
 //!
 //! Parses and rolls dice notation like "2d6+3", "1d20", "4d6-2"
 
-use rand::Rng;
+use rand::RngExt;
 use std::str::FromStr;
 
 /// A parsed dice roll specification
