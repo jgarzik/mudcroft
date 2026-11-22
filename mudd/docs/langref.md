@@ -1063,8 +1063,10 @@ Merges the top-level keys of `config` into the universe config. Requires
 **admin+**. **Returns** `true`, or `false` if refused.
 
 The server reads these config keys: `lib_hashes`, which maps library
-names to code hashes (see [Core library](#core-library)), and the Venice
-prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)). Other keys are
+names to code hashes (see [Core library](#core-library)), the Venice
+prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)), and the
+combat settings `combat_round_ms`, `player_death`, `npc_death` and `corpse_decay_s` (see
+[Built-in combat](#built-in-combat)). Other keys are
 yours to read with `get_universe()`. Use the `setportal` command to set
 the spawn room; config keys don't affect it.
 
@@ -1160,9 +1162,10 @@ Which properties the server reads:
 | `region_id` (room), `environment_type` (region) | style hint for those generated pictures |
 | `is_portal` (room) | marks a safe room, where returning players respawn |
 | `last_safe_location`, `workroom_id` (player) | where a returning player respawns |
-| `hp`, `max_hp` (npc) | seed the `attack` command's combat state |
+| `hp`, `max_hp`, `armor_class`, `attack_bonus` (npc, player) | built-in combat |
+| `xp_value`, `respawn_seconds`, `home_room` (npc); `xp` (player) | death and respawn (see [Built-in combat](#built-in-combat)) |
 
-All other properties, including `weight`, `value`, `lighting`, `aggro`, `respawn_time`, the weapon and armor fields,
+All other properties, including `weight`, `value`, `lighting`, `aggro`, the weapon and armor fields,
 `capacity` and `locked`, are data for your own scripts.
 
 ---
@@ -1176,8 +1179,12 @@ The built-in `attack <name>` (or `kill`) command works like this:
 - Each attack is a d20 roll plus `attack_bonus` against the target's `armor_class`. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit), then the target's resistances. A natural 1 always misses.
 - Status effects count: a stunned or paralyzed attacker cannot attack; a blinded attacker or an invisible target is -4 to hit, a stunned or paralyzed target +4; `strengthened`/`weakened` on the attacker and `exposed`/`protected` on the target add or subtract their magnitude from the damage roll.
 - A critical hit that does not kill makes the target **bleed**: 2 physical damage per second for 3 seconds.
-- NPCs don't fight back. Write that in Lua (see the [tutorial](langtutor.md)).
-- A hit fires `on_damage`. A kill fires `on_death` and removes the NPC from the room (`parent_id = nil`) without deleting it.
+- **Rounds.** The first blow lands at once; then each fighter strikes again every `combat_round_ms` (universe config, default 3000, 1000 to 10000) until the fight ends, without further commands. The target fights back. A fight ends when either side dies or they are no longer in the same room (walk away to flee); a fighter whose target is gone turns on someone still fighting it. Attacking someone else switches target. A stunned or paralyzed fighter loses its turn.
+- A hit fires `on_damage`. A kill fires `on_death`.
+- **Deaths** follow the universe config:
+  - `player_death`: `corpse` (default: what the player carries is left in a corpse where they died), `keep` (nothing is lost) or `drop` (on the floor). The player respawns at once, at full HP, in their workroom or the universe's spawn room.
+  - `npc_death`: `corpse` (default), `drop` or `destroy` (its belongings are deleted). The NPC leaves the world (`parent_id = nil`, HP restored) and comes back to its `home_room` (default: where it died) after its `respawn_seconds` (default 300; `0` deletes it for good). A player who kills it gains its `xp_value` (default its `max_hp`) in their `xp` property.
+  - Corpses decay after `corpse_decay_s` (universe config, default 300), spilling what is left into the room. `get <item> from corpse` (or `get all from corpse`) takes things out; it works on any container.
 
 The Rust combat engine knows these damage types: `physical`, `slashing`,
 `piercing`, `bludgeoning`, `fire`, `cold` (alias `ice`), `lightning`,

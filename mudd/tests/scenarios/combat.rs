@@ -382,8 +382,17 @@ async fn test_effect_damage_kills() {
         .expect_output_containing("Giant Bat dies")
         .await
         .expect("the room hears the death");
+    // Out of the world, at full HP, until its respawn
     let (hp, parent) = bat_row(&server).await;
-    assert_eq!((hp, parent), (Some(0), None));
+    assert_eq!((hp, parent), (Some(15), None));
+    let respawns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM deadlines WHERE object_id = ? AND kind = 'respawn'",
+    )
+    .bind(&bat)
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(respawns, 1);
 }
 
 /// A player under an effect is told what it does each tick
@@ -713,8 +722,8 @@ async fn test_effect_death_without_respawn_room() {
     );
 }
 
-/// A player killed by an effect drops what they carry in the same atomic
-/// batch that revives them
+/// A player killed by an effect leaves what they carry in a corpse (the
+/// default policy) in the same atomic batch that revives them
 #[tokio::test]
 async fn test_effect_death_drops_inventory_atomically() {
     let server = TestServer::start().await.expect("server");
@@ -738,15 +747,18 @@ async fn test_effect_death_drops_inventory_atomically() {
     pl.expect_output_containing("You have died")
         .await
         .expect("died");
-    let gem_parent: String = sqlx::query_scalar(
-        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/gem'",
+    let (corpse, corpse_room): (String, String) = sqlx::query_as(
+        "SELECT c.id, c.parent_id FROM objects g JOIN objects c
+           ON c.universe_id = g.universe_id AND c.id = g.parent_id
+         WHERE g.universe_id = ? AND g.id = '/items/gem'",
     )
     .bind(server.universe_id())
     .fetch_one(server.pool())
     .await
     .unwrap();
-    assert_eq!(gem_parent, server.world().passage_id);
-    // One Raft entry both revives the player and drops the gem
+    assert!(corpse.starts_with("/corpses/"), "{}", corpse);
+    assert_eq!(corpse_room, server.world().passage_id);
+    // One Raft entry both revives the player and moves the gem
     let entries: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%/items/gem%'
            AND payload LIKE '%SET parent_id%' AND payload LIKE '%json_set%'",
@@ -803,4 +815,195 @@ async fn test_effect_death_with_dangling_portal() {
             .await
             .unwrap();
     assert_eq!(parent, server.world().passage_id);
+}
+
+/// One attack starts a fight that goes on by itself: a round per fighter
+/// every `combat_round_ms` (a universe setting), the target fighting back;
+/// walking away ends it
+#[tokio::test]
+async fn test_combat_rounds_and_retaliation() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "brawler".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"game.update_universe({{combat_round_ms = 1000}})
+               game.create_object("/npcs/ogre", "npc", "{}", {{name = "ogre", hp = 1000, max_hp = 1000, armor_class = 1, attack_bonus = 30}})
+               return "ready""#,
+            entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    let first = attack(&mut adm, "attack ogre").await;
+    assert!(first.contains("ogre"), "{}", first);
+
+    // Without another command: our rounds and the ogre's
+    let heard = adm.outputs_within(Duration::from_millis(3500)).await;
+    let ours = heard
+        .iter()
+        .filter(|t| {
+            t.contains("You hit the ogre")
+                || t.contains("You miss the ogre")
+                || t.contains("You hit ogre")
+                || t.contains("You miss ogre")
+        })
+        .count();
+    let theirs = heard
+        .iter()
+        .filter(|t| t.contains("ogre hits you") || t.contains("ogre misses you"))
+        .count();
+    assert!(ours >= 2, "our rounds went on: {:?}", heard);
+    assert!(theirs >= 2, "the ogre fought back: {:?}", heard);
+    let fighting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM combat")
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+    assert_eq!(fighting, 2, "both fighting");
+
+    // Walking away ends the fight on both sides
+    adm.drain().await;
+    adm.command("north").await.unwrap();
+    adm.expect("room").await.expect("moved");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let fighting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM combat")
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+    assert_eq!(fighting, 0, "the fight ended");
+}
+
+/// Attack until the target dies (a blow can miss)
+async fn attack_until_slain(c: &mut TestClient, cmd: &str, name: &str) {
+    for _ in 0..40 {
+        c.drain().await;
+        c.command(cmd).await.unwrap();
+        let texts = c.outputs_within(Duration::from_millis(300)).await;
+        if texts
+            .iter()
+            .any(|t| t.contains(&format!("{} is slain", name)))
+        {
+            return;
+        }
+        if texts.iter().any(|t| t.contains("You don't see")) {
+            panic!("target gone without being slain: {:?}", texts);
+        }
+    }
+    panic!("{} never slain", name);
+}
+
+/// An NPC's death by the default policy: its belongings in a corpse (which
+/// decays after corpse_decay_s, spilling what is left), its killer gains
+/// xp_value, and it respawns at home after respawn_seconds. Things can be
+/// taken out of a corpse.
+#[tokio::test]
+async fn test_npc_death_corpse_xp_respawn() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "slayer".into(),
+        })
+        .await
+        .unwrap();
+    let me = adm.player_id().unwrap().to_string();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"game.update_universe({{corpse_decay_s = 2}})
+               game.create_object("/npcs/goblin", "npc", "{e}", {{name = "goblin", hp = 1, max_hp = 1, armor_class = 1, xp_value = 7, respawn_seconds = 1}})
+               game.create_object("/items/coin", "item", "/npcs/goblin", {{name = "coin"}})
+               game.create_object("/items/ring", "item", "/npcs/goblin", {{name = "ring"}})
+               return "ready""#,
+            e = entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    attack_until_slain(&mut adm, "attack goblin", "goblin").await;
+
+    let xp: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.xp') FROM objects WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&me)
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(xp, 7);
+    let corpse: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/coin'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(corpse.starts_with("/corpses/"), "{}", corpse);
+
+    // Take the coin out of the corpse
+    adm.drain().await;
+    adm.command("get coin from corpse").await.unwrap();
+    adm.expect_output_containing("You take coin")
+        .await
+        .expect("took it out");
+
+    // The goblin comes back home; the corpse crumbles, the ring spills
+    let heard = adm.outputs_within(Duration::from_millis(3500)).await;
+    assert!(
+        heard.iter().any(|t| t.contains("goblin appears")),
+        "{:?}",
+        heard
+    );
+    assert!(heard.iter().any(|t| t.contains("crumbles")), "{:?}", heard);
+    let (goblin_room, ring_room): (String, String) = sqlx::query_as(
+        "SELECT (SELECT parent_id FROM objects WHERE universe_id = ?1 AND id = '/npcs/goblin'),
+                (SELECT parent_id FROM objects WHERE universe_id = ?1 AND id = '/items/ring')",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(goblin_room, entrance);
+    assert_eq!(ring_room, entrance);
+}
+
+/// A universe can let players keep what they carry when they die
+#[tokio::test]
+async fn test_player_death_keep_policy() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "lucky").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "keeper".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.update_universe({{player_death = "keep"}})
+               game.create_object("/items/amulet", "item", "{p}", {{name = "amulet"}})
+               return game.apply_effect("{p}", "burning", 2, 500)"#,
+            p = player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("died");
+    let parent: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/amulet'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(parent, player_id, "kept");
 }

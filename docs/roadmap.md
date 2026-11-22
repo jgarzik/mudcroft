@@ -102,22 +102,19 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Elemental combat**: `Combat.attack_extended` with weapon elemental dice
   and types, applying immunities, resistances and vulnerabilities, critical
   hits doubling dice, and a weapon `on_hit` handler.
-- **Combat rounds and state**: `in_combat`, `attacking`, `attackers` and a
-  round counter on living objects; heartbeat-driven rounds; auto-retaliation;
-  combat stops when the target dies or leaves; picking a new target.
+- **Combat state for Lua**: rounds, retaliation, retargeting and deaths are
+  built (`mudd/src/api/combat.rs`, the `combat` table); the mudlib's
+  `Combat.initiate` and the suite's `in_combat`/`attackers` view of it are
+  not.
 - **PvP policy enforcement** in `Combat.initiate`/`can_attack`: disabled,
   arena-only (`is_arena` rooms), flagged (`pvp_on`/`pvp_off` commands),
   open. Today the Rust `PvpPolicy` exists but nothing checks it.
-- **Flee ends combat**: `Commands.flee` moves the player but there is no
-  combat state to leave.
 - **Status effects in combat**: stun and paralysis skip turns, stat
   modifiers apply to rolls, effects tick down per round
   (`Combat.process_statuses`).
 - **NPC AI**: `ai_idle_tick` (aggro on sight, wandering) and
   `ai_combat_tick` (flee below `flee_threshold`, assist allies). Class `npc`
   only names these handlers.
-- **Death handling**: player respawn at bind point with optional death
-  penalty; NPC loot drop, XP award and scheduled respawn.
 - **Equipment**: wield/unwield, wear/remove, armor slots.
 - **Region hooks**: `on_enter`/`on_leave` on the region when a player
   crosses region boundaries.

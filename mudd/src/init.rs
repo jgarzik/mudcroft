@@ -331,9 +331,10 @@ mod tests {
 
     /// Upgrades chain: a version 6 database gets the credits holder trigger
     /// (7), the actions table (8), cluster_nodes (9), online_players (10)
-    /// payment_requests (11) and applied_commands (12)
+    /// payment_requests (11), applied_commands (12), combat and deadlines
+    /// (13)
     #[tokio::test]
-    async fn test_upgrade_6_to_12() {
+    async fn test_upgrade_6_to_13() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         init_database(
@@ -367,10 +368,16 @@ mod tests {
                 .execute(db.pool())
                 .await
                 .unwrap();
-            sqlx::query("DROP TABLE applied_commands")
-                .execute(db.pool())
-                .await
-                .unwrap();
+            for sql in [
+                "DROP TABLE applied_commands",
+                "DROP TABLE combat",
+                "DROP TABLE deadlines",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
             sqlx::query("PRAGMA user_version = 6")
                 .execute(db.pool())
                 .await
@@ -379,18 +386,18 @@ mod tests {
         }
         init_database(&db_path, None, None, HashMap::new(), None)
             .await
-            .expect("mudd_init upgrades 6 -> 12");
+            .expect("mudd_init upgrades 6 -> 13");
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 12);
+        assert_eq!(db.schema_version().await.unwrap(), 13);
         let tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('actions', 'cluster_nodes', 'online_players', 'payment_requests',
-                          'applied_commands')",
+                          'applied_commands', 'combat', 'deadlines')",
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(tables, 5);
+        assert_eq!(tables, 7);
         let triggers: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'credits_holder_exists'",
         )
@@ -422,6 +429,8 @@ mod tests {
                 "DROP TABLE online_players",
                 "DROP TABLE payment_requests",
                 "DROP TABLE applied_commands",
+                "DROP TABLE combat",
+                "DROP TABLE deadlines",
                 "PRAGMA user_version = 8",
             ] {
                 sqlx::query(sqlx::AssertSqlSafe(sql))

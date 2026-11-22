@@ -43,6 +43,57 @@ function Commands.take(player_id, item_name)
     return {success = true, message = string.format("You take %s.", name)}
 end
 
+-- Take an item out of a container (a corpse, a chest) in the room or in
+-- the player's inventory. item_name "all" takes everything takeable.
+-- Returns {success: bool, message: string}
+function Commands.take_from(player_id, item_name, container_name)
+    local player = game.get_object(player_id)
+    if not player then
+        return {success = false, message = "Player not found"}
+    end
+    local room_id = player.parent_id
+    if not room_id then
+        return {success = false, message = "You are nowhere"}
+    end
+    local container = game.present(container_name, room_id) or game.present(container_name, player_id)
+    if not container or game.is_a(container.id, "living") then
+        return {success = false, message = "You don't see that here"}
+    end
+    local takeable = function(item)
+        return not (item.metadata and item.metadata.fixed) and not game.is_a(item.id, "living")
+    end
+    local items = {}
+    if item_name == "all" then
+        for _, item in ipairs(game.all_inventory(container.id)) do
+            if takeable(item) then
+                table.insert(items, item)
+            end
+        end
+        if #items == 0 then
+            return {success = false, message = "There is nothing to take"}
+        end
+    else
+        local item = game.present(item_name, container.id)
+        if not item then
+            return {success = false, message = "That isn't in there"}
+        end
+        if not takeable(item) then
+            return {success = false, message = "You can't take that"}
+        end
+        items = {item}
+    end
+    local names = {}
+    for _, item in ipairs(items) do
+        game.move_object(item.id, player_id)
+        table.insert(names, item.name or item_name)
+    end
+    local what = table.concat(names, ", ")
+    local from = container.name or container_name
+    local player_name = player.name or "Someone"
+    game.broadcast(room_id, string.format("%s takes %s from %s.", player_name, what, from), player_id)
+    return {success = true, message = string.format("You take %s from %s.", what, from)}
+end
+
 -- Drop an item from player inventory into the current room
 -- Returns {success: bool, message: string}
 function Commands.drop(player_id, item_name)

@@ -163,9 +163,8 @@ pub fn resolve_attack(
     }
 }
 
-/// The statements that make an attack's outcome durable, to commit as one
-/// batch: the target's new HP and, if it died, its removal from the room
-/// and the end of its status effects
+/// The statements that make an attack's outcome durable: the target's new
+/// HP and any effect it inflicted (a death is handled by api::combat::death)
 pub fn attack_statements(
     universe_id: &str,
     target_id: &str,
@@ -184,13 +183,6 @@ pub fn attack_statements(
             universe_id,
             target_id,
             effect,
-        ));
-    }
-    if outcome.killed {
-        statements.push(remove_from_room_statement(universe_id, target_id));
-        statements.push(super::EffectRegistry::clear_statement(
-            universe_id,
-            target_id,
         ));
     }
     Ok(statements)
@@ -323,13 +315,10 @@ pub fn tick_statements(
     before: &EntityEffects,
     outcome: &TickOutcome,
 ) -> anyhow::Result<Vec<(String, Vec<serde_json::Value>)>> {
+    let _ = is_player;
     let mut statements = Vec::new();
-    if outcome.killed {
-        statements.push(EffectRegistry::clear_statement(universe_id, entity_id));
-        if !is_player {
-            statements.push(remove_from_room_statement(universe_id, entity_id));
-        }
-    } else {
+    // A death (effects cleared, removal or respawn) is api::combat::death's
+    if !outcome.killed {
         for effect in before.all() {
             let after = outcome
                 .effects
@@ -550,13 +539,10 @@ mod tests {
         ));
         let out = process_due(&weak, &lethal, 1_000);
         assert!(out.killed && out.hp == 0);
+        // A death writes only the HP here (api::combat::death does the rest)
         let statements = tick_statements("u", "/npcs/x", false, &lethal, &out).unwrap();
-        assert!(statements
-            .iter()
-            .any(|(sql, _)| sql.contains("DELETE FROM active_effects")));
-        assert!(statements
-            .iter()
-            .any(|(sql, _)| sql.contains("parent_id = NULL")));
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].0.contains("json_set"));
     }
 
     #[test]

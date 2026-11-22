@@ -3,12 +3,12 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 12):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 13):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). The upgrade steps are
 6 -> 7 (adds the `credits_holder_exists` trigger), 7 -> 8 (adds the
 `actions` table), 8 -> 9 (adds `cluster_nodes`), 9 -> 10 (adds `online_players`) and
-10 -> 11 (adds `payment_requests`), 11 -> 12 (adds `applied_commands`); an older database is refused with a "create a new database" error (from
+10 -> 11 (adds `payment_requests`), 11 -> 12 (adds `applied_commands`), 12 -> 13 (adds `combat` and `deadlines`); an older database is refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
@@ -418,6 +418,34 @@ deadline are deleted by later such entries.
 | expires_at | INTEGER NOT NULL | ms since epoch (ten minutes after) |
 
 Primary key `(universe_id, player_id, command_id)`.
+
+### combat
+
+Fights in progress: one row per fighter (`api/combat.rs`).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| entity_id | TEXT NOT NULL | The fighter |
+| target_id | TEXT NOT NULL | Whom it attacks |
+| next_round_at | INTEGER NOT NULL | ms since epoch; index `combat_due` |
+
+Primary key `(universe_id, entity_id)`; foreign key `(universe_id, entity_id)`
+to `objects` ON DELETE CASCADE.
+
+### deadlines
+
+World events due at an absolute time: a corpse decaying, an NPC respawning.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| object_id | TEXT NOT NULL | The corpse or NPC |
+| kind | TEXT NOT NULL | `decay` or `respawn` |
+| due_at | INTEGER NOT NULL | ms since epoch; index `deadlines_due` |
+
+Primary key `(universe_id, object_id, kind)`; foreign key to `objects` ON
+DELETE CASCADE.
 
 ## Startup Validation
 

@@ -188,8 +188,8 @@ after the verb as their argument.
 | `look`, `l` | all | Room description |
 | `north`/`n`, `south`/`s`, `east`/`e`, `west`/`w`, `up`/`u`, `down`/`d` | all | Follow exit; `on_leave` on the old room, `on_enter` on the new one |
 | `say <msg>` | all | `<name> says: ...` to others in the room |
-| `get`/`take <item>`, `drop <item>`, `inventory`/`inv`/`i` | all | Call `Commands.take/drop/inventory` from the mudlib; `take` refuses `fixed` and living objects, and item names match literally (`%`, `_` escaped) |
-| `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`) |
+| `get`/`take <item>`, `drop <item>`, `inventory`/`inv`/`i` | all | Call `Commands.take/drop/inventory` from the mudlib; `take` refuses `fixed` and living objects, and item names match literally (`%`, `_` escaped); `get <item>\|all from <container>` calls `Commands.take_from` |
+| `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`): the first blow, then rounds both ways until the fight ends |
 | `help` | all | Commands for the caller's access level |
 | `create <class> <path> "<name>" ["<desc>"] [key=value ...]` | builder+ | Create an object, path-permission checked |
 | `eval <lua>` | wizard+ | Run Lua as the caller |
@@ -456,15 +456,30 @@ Two layers exist:
   command resolves a round with the pure `resolve_attack` (d20 + attack
   bonus against armor class, natural 20 a critical hit, natural 1 a fumble,
   then 1d6 physical damage, doubled on a critical, then resistances) and
-  commits it as **one atomic batch** (`attack_statements`): the target's new
-  `hp` via `json_set`, and on a kill its removal from the room. Targets must
+  commits it in the command's run (`api::combat::strike`): the target's new
+  `hp` via `json_set` and any bleeding. Targets must
   be `npc`, a class derived from `npc`, or `monster`. Effects change the
   round (`engine::attack_mods`): a stunned or paralyzed attacker cannot act,
   blinded/invisible are -4 to hit, a helpless target +4, and strengthened,
   weakened, exposed and protected adjust damage; a critical that does not
   kill inflicts bleeding, upserted in the round's batch. The attack holds the
-  effect write lock and re-reads the target under it, so it never computes
-  HP from a stale row.
+  effect write lock (inside a run: the write gate) and re-reads the target
+  under it, so it never computes HP from a stale row.
+- **Rounds and deaths** (`src/api/combat.rs`): a fight is rows in `combat`
+  (each fighter's target and the absolute time of its next round,
+  `combat_round_ms` apart, a universe config key). `attack` strikes once and
+  `engage`s both sides; a deadline-driven scheduler (like the effect
+  scheduler, waking on `AppState.combat_changed`) runs every due round as
+  one run: blows, HP, retaliation, deaths, next rounds. A round whose
+  fighters are no longer together (or whose target died) retargets someone
+  still fighting the fighter, or ends. Every death (attack, round, effect)
+  goes through `combat::death`, which applies the universe's policy
+  (`player_death`: corpse, keep, drop; `npc_death`: corpse, drop, destroy),
+  respawns players at once, takes an NPC out of the world until its
+  `respawn_seconds` (a `respawn` row in `deadlines`; 0 deletes it), and
+  credits its killer's `xp`. Corpses are `/corpses/c-...` items with a
+  `decay` row; decaying spills what is left into the room. Messages and the
+  `on_death` hook follow the commit (`report_death`).
 - **Status effects** (`src/combat/effects.rs`, `src/api/effect_scheduler.rs`)
   live in `active_effects`, cached by `EffectRegistry`. They store absolute
   deadlines (`expires_at`; periodic ones also `period_ms`, `next_pulse_at`),
@@ -477,11 +492,10 @@ Two layers exist:
   arithmetically (`engine::process_due`, a pure function). The scheduler
   reloads each due entity's rows from the table before processing (the
   cache only says when to wake), so a deleted or recreated object never
-  receives stale effects; pulse periods are at least 500 ms. A player killed
-  by effects drops their inventory and respawns in the same batch (HP
-  restored, moved; with no workroom or portal yet, revived where they fell),
-  so nobody is left dead at 0 HP; reports, including an NPC's `on_death` hook, run after
-  the commit with the effect lock released.
+  receives stale effects; pulse periods are at least 500 ms. A death by
+  effects goes through `combat::death` in the same batch, so nobody is left
+  dead at 0 HP; reports, including an NPC's `on_death` hook, run after the
+  commit.
 - **Lua mudlib** (`mudd/lib/combat.lua`): `Combat.initiate`, `Combat.attack`,
   `Combat.deal_damage`, `Combat.heal`, effects, working on object
   properties. `Commands.flee` lives in `lib/commands.lua`.

@@ -1,6 +1,7 @@
 //! HTTP API module - REST endpoints and WebSocket
 
 mod auth;
+mod combat;
 mod devices;
 mod effect_scheduler;
 mod gateway;
@@ -71,6 +72,8 @@ pub struct AppState {
     pub image_jobs: crate::images::ImageJobs,
     /// Status effects: a cache of the active_effects table
     pub effects: Arc<crate::combat::EffectRegistry>,
+    /// Wakes the combat scheduler when a fight or deadline is added
+    pub combat_changed: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -161,6 +164,7 @@ pub async fn router(
         auth_user_locks: Arc::new(ratelimit::KeyedLocks::default()),
         devices: Arc::new(devices::DeviceTokens::default()),
         effects,
+        combat_changed: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Timers, heartbeats and status effects run on the primary only. A node

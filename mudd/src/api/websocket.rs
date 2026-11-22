@@ -16,8 +16,6 @@ use tracing::{info, warn};
 use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::Account;
-use crate::combat::engine::{attack_mods, attack_statements, resolve_attack, Combatant};
-use crate::combat::DamageType;
 use crate::images::generate_room_image;
 use crate::permissions::AccessLevel;
 use crate::theme::DEFAULT_THEME_ID;
@@ -1277,7 +1275,7 @@ async fn execute_command(
         "help" => {
             let mut text = String::from(
                 "Commands: look, north/south/east/west/up/down, say <message>, \
-                 get/take <item>, drop <item>, inventory/i, attack/kill <target>, help. \
+                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, help. \
                  Objects may offer their own verbs (e.g. 'pull lever').",
             );
             if access_level >= AccessLevel::Builder {
@@ -1299,6 +1297,22 @@ async fn execute_command(
                     message: "Take what?".to_string(),
                 };
             };
+
+            // "get <item> from <container>" takes out of a container
+            if let Some((item, container)) = item_name.split_once(" from ") {
+                return execute_lua_with_args(
+                    state,
+                    universe_id,
+                    account_id,
+                    "local pid, item, from = ...; return Commands.take_from(pid, item, from).message",
+                    vec![
+                        player_id.to_string(),
+                        item.trim().to_string(),
+                        container.trim().to_string(),
+                    ],
+                )
+                .await;
+            }
 
             // Execute Commands.take() via Lua
             // Arguments are passed as values, never spliced into the source
@@ -1578,9 +1592,8 @@ async fn execute_command(
                 };
             }
 
-            // Serialize with the effect scheduler and effect writes, and
-            // read the target again under the lock: HP must not be computed
-            // from a stale row
+            // Serialized with every HP and effect writer; the target is read
+            // again under it: HP must not be computed from a stale row
             let _writes = state.effects.write_guard().await;
             let Ok(Some(target)) = state.object_store.get(universe_id, &target_id).await else {
                 return ServerMessage::Error {
@@ -1613,73 +1626,56 @@ async fn execute_command(
                     message: "You have no body to fight with.".to_string(),
                 };
             };
-            let attacker = Combatant::from_object(&attacker_obj, 100);
-            let defender = Combatant::from_object(target, 10);
 
-            // Status effects: a stunned or paralyzed attacker cannot act;
-            // others change to-hit and damage
+            // A stunned or paralyzed attacker cannot act
             let now = crate::combat::now_ms();
-            let attacker_effects = state.effects.get(universe_id, player_id).await;
-            let target_effects = state.effects.get(universe_id, &target_id).await;
-            if !attacker_effects.can_act(now) {
+            if !state.effects.get(universe_id, player_id).await.can_act(now) {
                 return ServerMessage::Error {
                     message: "You are stunned and cannot act.".to_string(),
                 };
             }
-            let mods = attack_mods(&attacker_effects, &target_effects, now);
 
-            // Basic 1d6 physical damage, doubled on a critical
-            let d20 = crate::combat::roll_d20();
-            let damage_roll = {
-                use rand::RngExt;
-                rand::rng().random_range(1..=6)
-            };
-            let outcome = resolve_attack(
-                &attacker,
-                &defender,
-                &mods,
-                d20,
-                damage_roll,
-                DamageType::Physical,
-                now,
-            );
-
-            // The round is one atomic batch: new HP, and removal on death
-            match attack_statements(universe_id, &target_id, &outcome) {
-                Ok(statements) if !statements.is_empty() => {
-                    if let Err(e) = state.object_store.execute_batch(statements).await {
+            // The first blow now; then a round each way every
+            // combat_round_ms until the fight ends (api/combat.rs)
+            let blow =
+                match super::combat::strike(state, universe_id, &attacker_obj, target, now).await {
+                    Ok(blow) => blow,
+                    Err(e) => {
                         return ServerMessage::Error {
                             message: format!("Attack failed: {}", e),
-                        };
+                        }
+                    }
+                };
+            let death = if blow.killed {
+                let dead = state
+                    .object_store
+                    .get(universe_id, &target_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| target.clone());
+                match super::combat::death(state, universe_id, &dead, Some(&attacker_obj), now)
+                    .await
+                {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        return ServerMessage::Error {
+                            message: format!("Attack failed: {}", e),
+                        }
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
+            } else {
+                if let Err(e) =
+                    super::combat::engage(state, universe_id, player_id, &target_id, now).await
+                {
                     return ServerMessage::Error {
                         message: format!("Attack failed: {}", e),
                     };
                 }
-            }
-            if outcome.killed {
-                state.effects.cache_clear(universe_id, &target_id).await;
-            }
-            if let Some(ref bleed) = outcome.inflicts {
-                state
-                    .effects
-                    .cache_add(universe_id, &target_id, bleed.clone())
-                    .await;
-            }
-            let attack_result = &outcome.result;
-
-            // Build result message
-            let mut messages = Vec::new();
-
-            if attack_result.hit {
-                let damage = attack_result
-                    .damage
-                    .as_ref()
-                    .map(|d| d.final_damage)
-                    .unwrap_or(0);
+                None
+            };
+            drop(_writes);
+            if let Some(damage) = blow.damage {
                 deferred.push(Hook::new(
                     &target_id,
                     Some(&room_id),
@@ -1687,68 +1683,34 @@ async fn execute_command(
                     player_id,
                     serde_json::json!({ "attacker_id": player_id, "damage": damage }),
                 ));
-                if attack_result.critical {
-                    messages.push(format!(
-                        "CRITICAL HIT! You strike {} for {} damage!",
-                        target_display_name, damage
-                    ));
-                    if outcome.inflicts.is_some() {
-                        messages.push(format!("{} is bleeding!", target_display_name));
-                    }
-                } else {
-                    messages.push(format!(
-                        "You hit {} for {} damage.",
-                        target_display_name, damage
-                    ));
-                }
-
-                if outcome.killed {
-                    messages.push(format!("{} is slain!", target_display_name));
-                    deferred.push(Hook::new(
-                        &target_id,
-                        Some(&room_id),
-                        "on_death",
-                        player_id,
-                        serde_json::json!({ "killer_id": player_id }),
-                    ));
-                } else {
-                    messages.push(format!(
-                        "{} has {} HP remaining.",
-                        target_display_name, outcome.target_hp
-                    ));
-                }
-            } else if attack_result.fumble {
-                messages.push(format!(
-                    "You fumble your attack against {}!",
-                    target_display_name
-                ));
-            } else {
-                messages.push(format!(
-                    "You miss {} (rolled {} vs AC {}).",
-                    target_display_name, attack_result.attack_total, attack_result.target_ac
-                ));
             }
 
-            // Onlookers get a third-person summary; the attacker gets the
-            // detailed result as this command's reply
-            let attacker_name = display_name(state, universe_id, player_id).await;
-            let mut seen = format!("{} attacks {}.", attacker_name, target_display_name);
-            if outcome.killed {
-                seen.push_str(&format!(" {} is slain!", target_display_name));
-            }
+            // Onlookers get a third-person summary; the attacker the details
             state
                 .connections
                 .broadcast_room_except(
                     universe_id,
                     &room_id,
                     Some(player_id),
-                    ServerMessage::Output { text: seen },
+                    ServerMessage::Output {
+                        text: blow.room_text,
+                    },
                 )
                 .await;
-
-            ServerMessage::Output {
-                text: messages.join("\n"),
+            state
+                .connections
+                .send_to_player(
+                    universe_id,
+                    player_id,
+                    ServerMessage::Output {
+                        text: blow.attacker_text,
+                    },
+                )
+                .await;
+            if let Some(ref d) = death {
+                super::combat::report_death(state, universe_id, d).await;
             }
+            ServerMessage::Silent
         }
         "create" => {
             // Builder+ only

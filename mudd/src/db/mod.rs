@@ -14,7 +14,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -72,6 +72,36 @@ pub const APPLIED_COMMANDS_TABLE: &str = r#"
         expires_at INTEGER NOT NULL,
         PRIMARY KEY (universe_id, player_id, command_id)
     )
+"#;
+
+/// Who is fighting whom: one row per fighter (its current target), with the
+/// absolute time of its next round. Goes with the fighter.
+pub const COMBAT_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS combat (
+        universe_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        next_round_at INTEGER NOT NULL,
+        PRIMARY KEY (universe_id, entity_id),
+        FOREIGN KEY (universe_id, entity_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS combat_due ON combat (next_round_at)
+"#;
+
+/// World events due at an absolute time: a corpse decaying, an NPC
+/// respawning. Goes with the object.
+pub const DEADLINES_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS deadlines (
+        universe_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn')),
+        due_at INTEGER NOT NULL,
+        PRIMARY KEY (universe_id, object_id, kind),
+        FOREIGN KEY (universe_id, object_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS deadlines_due ON deadlines (due_at)
 "#;
 
 /// Payments a player has been asked to confirm (game.request_payment):
@@ -202,6 +232,7 @@ impl Database {
     /// - 9 -> 10 (online_players table): in place.
     /// - 10 -> 11 (payment_requests table): in place.
     /// - 11 -> 12 (applied_commands table): in place.
+    /// - 12 -> 13 (combat and deadlines tables): in place.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -266,6 +297,13 @@ impl Database {
                 .await?;
             self.set_schema_version(12).await?;
             info!("Upgraded database schema 11 -> 12");
+            version = 12;
+        }
+        if version == 12 {
+            sqlx::raw_sql(COMBAT_TABLE).execute(&self.pool).await?;
+            sqlx::raw_sql(DEADLINES_TABLE).execute(&self.pool).await?;
+            self.set_schema_version(13).await?;
+            info!("Upgraded database schema 12 -> 13");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -387,6 +425,8 @@ impl Database {
             "online_players",
             "payment_requests",
             "applied_commands",
+            "combat",
+            "deadlines",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -612,6 +652,8 @@ impl Database {
         sqlx::query(APPLIED_COMMANDS_TABLE)
             .execute(&self.pool)
             .await?;
+        sqlx::raw_sql(COMBAT_TABLE).execute(&self.pool).await?;
+        sqlx::raw_sql(DEADLINES_TABLE).execute(&self.pool).await?;
 
         // Path grants table (for path-based permission delegation)
         sqlx::query(
