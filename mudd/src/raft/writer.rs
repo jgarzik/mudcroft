@@ -326,25 +326,42 @@ async fn watch_membership(raft: GameRaft, node_id: NodeId, advertise: String) {
             transport::enable_cluster_timers(&raft);
             timers_on = true;
         }
+        let mut retry = false;
         if !address_checked && leader == Some(node_id) {
             let current = membership
                 .membership()
                 .get_node(&node_id)
                 .map(|n| n.addr.clone());
-            if current.as_deref() != Some(advertise.as_str()) {
+            if current.as_deref() == Some(advertise.as_str()) {
+                address_checked = true;
+            } else {
                 let mut nodes = BTreeMap::new();
                 nodes.insert(node_id, BasicNode::new(advertise.clone()));
                 match raft
                     .change_membership(ChangeMembers::SetNodes(nodes), false)
                     .await
                 {
-                    Ok(_) => info!("cluster: node {} now advertised at {}", node_id, advertise),
-                    Err(e) => warn!("cluster: recording this node's address failed: {}", e),
+                    Ok(_) => {
+                        info!("cluster: node {} now advertised at {}", node_id, advertise);
+                        address_checked = true;
+                    }
+                    // E.g. another membership change in progress: try again
+                    Err(e) => {
+                        warn!(
+                            "cluster: recording this node's address failed (retrying): {}",
+                            e
+                        );
+                        retry = true;
+                    }
                 }
             }
-            address_checked = true;
         }
-        if metrics.changed().await.is_err() {
+        if retry {
+            tokio::select! {
+                changed = metrics.changed() => if changed.is_err() { return },
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        } else if metrics.changed().await.is_err() {
             return;
         }
     }

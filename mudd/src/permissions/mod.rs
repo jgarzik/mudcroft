@@ -725,7 +725,6 @@ impl PermissionManager {
         grants
     }
 
-    /// Load all path grants from database on startup
     /// Drop every cached level and owner and reload the path grants: the
     /// caches are rebuilt from the tables on becoming primary
     pub async fn reset(&self) -> anyhow::Result<()> {
@@ -735,6 +734,7 @@ impl PermissionManager {
         self.load_path_grants().await
     }
 
+    /// Load all path grants from the database (replaces the cache)
     pub async fn load_path_grants(&self) -> anyhow::Result<()> {
         let Some(ref pool) = self.db_pool else {
             return Ok(());
