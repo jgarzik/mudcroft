@@ -57,7 +57,7 @@ rand = "0.10"
 parking_lot = "0.12"
 
 # HTTP client (for Venice AI)
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 
 # Zip file handling
 zip = "9"
