@@ -315,6 +315,48 @@ async fn engage_at(
     Ok(())
 }
 
+/// Whom `id` is fighting, if anyone
+pub async fn current_target(
+    state: &AppState,
+    universe_id: &str,
+    id: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT target_id FROM combat WHERE universe_id = ? AND entity_id = ?")
+            .bind(universe_id)
+            .bind(id)
+            .fetch_optional(&mut *crate::db::run::reader(state.db.pool()).await?)
+            .await?,
+    )
+}
+
+/// Switch a fighter's target (its round keeps its time); the new target
+/// fights back and its allies assist
+pub async fn retarget(
+    state: &AppState,
+    universe_id: &str,
+    id: &str,
+    target: &str,
+    now: u64,
+) -> anyhow::Result<()> {
+    let next = now + settings(state, universe_id).await.round_ms;
+    state
+        .object_store
+        .execute_batch(vec![
+            statement(
+                "UPDATE combat SET target_id = ? WHERE universe_id = ? AND entity_id = ?",
+                vec![json!(target), json!(universe_id), json!(id)],
+            ),
+            statement(
+                "INSERT OR IGNORE INTO combat (universe_id, entity_id, target_id, next_round_at)
+                 VALUES (?, ?, ?, ?)",
+                vec![json!(universe_id), json!(target), json!(id), json!(next)],
+            ),
+        ])
+        .await?;
+    assist(state, universe_id, target, id, now).await
+}
+
 async fn in_combat(state: &AppState, universe_id: &str, id: &str) -> anyhow::Result<bool> {
     let found: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM combat WHERE universe_id = ? AND entity_id = ?")
@@ -486,6 +528,8 @@ pub struct Death {
     pub respawn: Option<String>,
     /// XP the killer gained
     pub xp: Option<i64>,
+    /// on_death already ran (an NPC deleted for good runs it first)
+    pub on_death_done: bool,
 }
 
 /// Move a player (in the current run) and, once it commits, put their
@@ -668,6 +712,7 @@ pub async fn death(
 
     let mut respawn = None;
     let mut xp = None;
+    let mut on_death_done = false;
     if player {
         // Back at full HP, at the respawn room (or where they fell)
         respawn = state
@@ -709,7 +754,17 @@ pub async fn death(
             .unwrap_or(DEFAULT_RESPAWN_S)
             .min(MAX_DELAY_S);
         if respawn_s == 0 {
-            // For good, with whatever it still holds (fixed things)
+            // Its on_death runs while it still exists (its code and owner
+            // go with it), then it goes for good with whatever it holds
+            run_on_death(
+                state,
+                universe_id,
+                id,
+                room.as_deref(),
+                killer.map(|k| k.id.as_str()),
+            )
+            .await;
+            on_death_done = true;
             delete_tree(state, universe_id, id, room.as_deref()).await?;
         } else {
             let home = victim
@@ -719,6 +774,10 @@ pub async fn death(
             let mut props = vec![("hp", json!(fighter.max_hp))];
             if let Some(ref home) = home {
                 props.push(("home_room", json!(home)));
+            }
+            // Fallback if the home room is gone by the respawn
+            if let Some(ref room) = room {
+                props.push(("died_in", json!(room)));
             }
             store
                 .execute_batch(vec![
@@ -748,7 +807,31 @@ pub async fn death(
         room,
         respawn,
         xp,
+        on_death_done,
     })
+}
+
+/// An NPC's on_death (as its owner); failures are logged
+async fn run_on_death(
+    state: &AppState,
+    universe_id: &str,
+    id: &str,
+    room: Option<&str>,
+    killer: Option<&str>,
+) {
+    let args = json!({ "object_id": id, "room_id": room, "killer_id": killer });
+    if let Err(e) = super::scripting::invoke_handler(
+        state,
+        universe_id,
+        id,
+        room.map(str::to_string),
+        "on_death",
+        args,
+    )
+    .await
+    {
+        warn!("on_death of {} failed: {}", id, e);
+    }
 }
 
 /// After the commit: tell everyone about a death, run the NPC's on_death,
@@ -784,18 +867,15 @@ pub async fn report_death(state: &AppState, universe_id: &str, d: &Death) {
         }
     }
     if !is_player(&d.victim) {
-        let args = json!({ "object_id": id, "room_id": d.room, "killer_id": d.killer });
-        if let Err(e) = super::scripting::invoke_handler(
-            state,
-            universe_id,
-            id,
-            d.room.clone(),
-            "on_death",
-            args,
-        )
-        .await
-        {
-            warn!("on_death of {} failed: {}", id, e);
+        if !d.on_death_done {
+            run_on_death(
+                state,
+                universe_id,
+                id,
+                d.room.as_deref(),
+                d.killer.as_deref(),
+            )
+            .await;
         }
         return;
     }
@@ -1210,10 +1290,20 @@ async fn deadline(
                 }
             }
             "respawn" => {
-                let home = obj.get_string("home_room").map(str::to_string);
-                let home = match home {
-                    Some(h) if store.get(&u, &h).await?.is_some() => h,
-                    _ => return Ok(()),
+                // Home, else where it died; with neither left, it stays
+                // out of the world (logged)
+                let mut home = None;
+                for key in ["home_room", "died_in"] {
+                    if let Some(room) = obj.get_string(key) {
+                        if store.get(&u, room).await?.is_some() {
+                            home = Some(room.to_string());
+                            break;
+                        }
+                    }
+                }
+                let Some(home) = home else {
+                    warn!("combat: {} has no room to respawn in", id);
+                    return Ok(());
                 };
                 store.move_object(&u, &id, Some(&home)).await?;
                 notes.push(Note::Room(

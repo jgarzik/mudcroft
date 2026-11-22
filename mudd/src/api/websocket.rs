@@ -1651,6 +1651,40 @@ async fn execute_command(
                 };
             }
 
+            // Already fighting: rounds set the pace, so retyping attack only
+            // switches target (no extra blow)
+            match super::combat::current_target(state, universe_id, player_id).await {
+                Ok(Some(current)) if current == target_id => {
+                    return ServerMessage::Output {
+                        text: format!("You are already fighting {}.", target_display_name),
+                    };
+                }
+                Ok(Some(_)) => {
+                    return match super::combat::retarget(
+                        state,
+                        universe_id,
+                        player_id,
+                        &target_id,
+                        now,
+                    )
+                    .await
+                    {
+                        Ok(()) => ServerMessage::Output {
+                            text: format!("You turn to fight {}.", target_display_name),
+                        },
+                        Err(e) => ServerMessage::Error {
+                            message: format!("Attack failed: {}", e),
+                        },
+                    };
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return ServerMessage::Error {
+                        message: format!("Attack failed: {}", e),
+                    }
+                }
+            }
+
             // The first blow now; then a round each way every
             // combat_round_ms until the fight ends (api/combat.rs)
             let blow =
@@ -1692,13 +1726,19 @@ async fn execute_command(
             };
             drop(_writes);
             if let Some(damage) = blow.damage {
-                deferred.push(Hook::new(
+                let hook = Hook::new(
                     &target_id,
                     Some(&room_id),
                     "on_damage",
                     player_id,
                     serde_json::json!({ "attacker_id": player_id, "damage": damage }),
-                ));
+                );
+                // A killing blow's on_damage runs before on_death
+                if death.is_some() {
+                    run_hook(state, universe_id, hook).await;
+                } else {
+                    deferred.push(hook);
+                }
             }
 
             // Onlookers get a third-person summary; the attacker the details

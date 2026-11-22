@@ -252,35 +252,33 @@ async fn test_multiuser_builder_creates_room() {
     // Phase 9: Combat - attack the goblin until dead
     let mut goblin_dead = false;
 
-    for attack_num in 0..20 {
-        // 10 HP goblin, should take a few hits with 1d6 damage
-        player
-            .command("attack goblin")
-            .await
-            .expect("attack failed");
-        let attack_result = player.expect("output").await.expect("no attack response");
-        let attack_text = attack_result["text"].as_str().unwrap_or("").to_lowercase();
-
-        if attack_num == 0 {
-            // First attack should connect (hit or miss)
-            assert!(
-                attack_text.contains("hit")
-                    || attack_text.contains("miss")
-                    || attack_text.contains("damage")
-                    || attack_text.contains("strike")
-                    || attack_text.contains("fumble"),
-                "First attack should show combat result: {}",
-                attack_text
-            );
-        }
-
-        if attack_text.contains("slain") || attack_text.contains("killed") {
-            goblin_dead = true;
+    // The first blow, then rounds (1 s in the test world) until it dies
+    player
+        .command("attack goblin")
+        .await
+        .expect("attack failed");
+    let attack_result = player.expect("output").await.expect("no attack response");
+    let attack_text = attack_result["text"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        attack_text.contains("hit")
+            || attack_text.contains("miss")
+            || attack_text.contains("damage")
+            || attack_text.contains("strike")
+            || attack_text.contains("fumble"),
+        "First attack should show combat result: {}",
+        attack_text
+    );
+    if attack_text.contains("slain") {
+        goblin_dead = true;
+    }
+    for _ in 0..20 {
+        if goblin_dead {
             break;
         }
-
-        // Drain any extra messages
-        player.drain().await;
+        let heard = player.outputs_within(Duration::from_millis(1000)).await;
+        if heard.iter().any(|t| t.to_lowercase().contains("slain")) {
+            goblin_dead = true;
+        }
     }
 
     // If not dead from combat messages, check if it's gone from room

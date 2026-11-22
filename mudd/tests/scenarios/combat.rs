@@ -25,13 +25,34 @@ async fn player_in_passage(server: &TestServer, name: &str) -> TestClient {
     c
 }
 
-/// Send an attack command and return the reply text
+/// Send an attack command and return the text of the blow it brings: the
+/// first blow of a fight, or, when already fighting (retyping attack adds
+/// no blow), the next round's
 async fn attack(c: &mut TestClient, cmd: &str) -> String {
     c.command(cmd).await.expect("send attack");
     let _ = c.expect("echo").await;
     let reply = c.expect_any().await.expect("attack reply");
     assert_eq!(reply["type"], "output", "attack failed: {}", reply);
-    reply["text"].as_str().unwrap().to_string()
+    let text = reply["text"].as_str().unwrap().to_string();
+    if !(text.contains("already fighting") || text.contains("turn to fight")) {
+        return text;
+    }
+    let ours = |t: &str| {
+        t.starts_with("You hit")
+            || t.starts_with("You miss")
+            || t.starts_with("CRITICAL")
+            || t.starts_with("You fumble")
+    };
+    for _ in 0..20 {
+        let m = c
+            .expect_any_timeout(Duration::from_secs(3))
+            .await
+            .expect("the next round's blow");
+        if m["type"] == "output" && ours(m["text"].as_str().unwrap_or_default()) {
+            return m["text"].as_str().unwrap().to_string();
+        }
+    }
+    panic!("no round blow after {}", cmd);
 }
 
 /// Attacking an NPC reports a hit, miss or fumble against it
@@ -93,16 +114,18 @@ async fn test_kill_npc() {
     let server = TestServer::start().await.expect("Failed to start server");
     let mut alice = player_in_passage(&server, "bat_killer").await;
 
-    let mut slain = false;
-    for _ in 0..60 {
-        let text = attack(&mut alice, "attack bat").await;
-        if text.contains("Giant Bat is slain!") {
-            slain = true;
+    // One attack starts the fight; rounds finish it
+    let mut slain = attack(&mut alice, "attack bat")
+        .await
+        .contains("Giant Bat is slain!");
+    for _ in 0..30 {
+        if slain {
             break;
         }
-        alice.drain().await;
+        let heard = alice.outputs_within(Duration::from_millis(1000)).await;
+        slain = heard.iter().any(|t| t.contains("Giant Bat is slain!"));
     }
-    assert!(slain, "bat should die within 60 attacks");
+    assert!(slain, "bat should die within 30 rounds");
 
     alice.command("look").await.expect("look");
     let room = alice.expect("room").await.expect("room");
@@ -1458,4 +1481,115 @@ async fn test_equipment() {
         eq
     );
     assert!(eq.contains("Armor class: 10"), "{}", eq);
+}
+
+/// Retyping attack during a fight does not add blows: rounds set the pace
+#[tokio::test]
+async fn test_attack_spam_adds_no_blows() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "spammer".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.update_universe({{combat_round_ms = 5000}})
+               game.create_object("/npcs/golem", "npc", "{}", {{name = "golem", hp = 1000, max_hp = 1000}})
+               return "ok""#,
+            entrance
+        ),
+    )
+    .await;
+    adm.drain().await;
+    for _ in 0..5 {
+        adm.command("attack golem").await.unwrap();
+    }
+    let heard = adm.outputs_within(Duration::from_millis(1000)).await;
+    let blows = heard
+        .iter()
+        .filter(|t| {
+            t.starts_with("You hit")
+                || t.starts_with("You miss")
+                || t.starts_with("CRITICAL")
+                || t.starts_with("You fumble")
+        })
+        .count();
+    assert_eq!(blows, 1, "{:?}", heard);
+    assert!(
+        heard.iter().any(|t| t.contains("already fighting")),
+        "{:?}",
+        heard
+    );
+}
+
+/// An NPC deleted for good still runs its on_death (before it goes)
+#[tokio::test]
+async fn test_on_death_runs_for_npc_deleted_for_good() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "bosskiller".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"local h = game.store_code([[return {{ on_death = function(a)
+                 game.create_object("/items/trophy", "item", a.room_id, {{name = "trophy"}})
+               end }}]])
+               game.create_object("/npcs/boss", "npc", "{}", {{name = "boss", hp = 1, max_hp = 1, armor_class = 1, respawn_seconds = 0, code_hash = h}})
+               return "ready""#,
+            entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    attack_until_slain(&mut adm, "attack boss", "boss").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let trophy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE universe_id = ? AND id = '/items/trophy'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(trophy, 1, "on_death dropped its trophy");
+}
+
+/// An NPC whose home room is gone respawns where it died instead
+#[tokio::test]
+async fn test_respawn_without_home_room() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "homeless".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/npcs/imp", "npc", "{}", {{name = "imp", hp = 1, max_hp = 1, armor_class = 1, respawn_seconds = 1, home_room = "/rooms/gone"}})
+               return "ok""#,
+            entrance
+        ),
+    )
+    .await;
+    attack_until_slain(&mut adm, "attack imp", "imp").await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let room: Option<String> = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/npcs/imp'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(room.as_deref(), Some(entrance.as_str()));
 }
