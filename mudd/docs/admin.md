@@ -58,8 +58,9 @@ mudd_init --version
 Creates a new database, or upgrades an existing one in place. Running it again
 on the same database is safe. Schema upgrades live here, never in `mudd`:
 the database records its schema version, `mudd` refuses a mismatch, and
-`mudd_init` upgrades older versions. There are no upgrade steps yet, so a
-database from before versioning is refused (create a new one); otherwise a
+`mudd_init` upgrades older versions where a step exists (today only 6 -> 7);
+anything older, such as a database from before versioning, is refused
+(create a new one); otherwise a
 re-run creates any missing tables and refreshes the core mudlib.
 
 ```
@@ -131,7 +132,9 @@ mudd --database <PATH> [--bind <ADDR>] [--static-dir <DIR>]
 
 SIGTERM (as sent by `docker stop` or systemd) or SIGINT (Ctrl-C) stops
 `mudd` gracefully: it stops accepting connections, lets in-flight HTTP
-requests finish, and exits with status 0.
+requests finish, and exits with status 0. Signals are handled from the
+moment `mudd` starts, so one during startup stops it too; a second signal
+exits at once without waiting.
 
 > **Clustering is not functional yet.** `--node-id`, `--raft-port` and
 > `--peers` are parsed, and a node sends Raft RPCs to

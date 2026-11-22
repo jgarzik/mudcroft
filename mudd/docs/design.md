@@ -508,8 +508,8 @@ key, AI features are off. Chat tiers are fast, balanced and quality. A
 token-bucket rate limiter allows 60 requests per minute per key. Lua calls
 cost the universe config's `venice_chat_cost` / `venice_image_cost` credits
 (default 0), charged to the payer (`"actor"` or `"object"`) before the
-call and refunded if it fails; the rate limit is kept per code owner,
-whoever pays. Room images are the operator's cost and charge nothing.
+call and refunded if it fails; the rate limit is kept per universe and
+code owner, whoever pays. Room images are the operator's cost and charge nothing.
 
 Room images (`images/gen.rs`) use two steps:
 
@@ -523,9 +523,11 @@ Room images (`images/gen.rs`) use two steps:
 `build_room_message` starts this in a background task when a room without
 `image_hash` is shown to an authenticated player and Venice is configured. One job
 runs per room at a time (`ImageJobs`; its guard frees the room however the
-job ends). The result is written in place (`image_hash`, `image_generated_at`
-only, so changes made during generation survive) and only if the room still
-has no image.
+job ends), and the job re-checks the room before paying for anything. A
+room needs an image only when `image_hash` is missing or null
+(`room_needs_image`). The result is written in place (`image_hash`, and
+`image_generated_at` as a Unix timestamp, only, so changes made during
+generation survive) and only if the room still has no image.
 The client fetches `/images/{hash}`. The theme is currently always
 `sierra-retro` (`ThemeRegistry` also has `modern`); its style is the Sierra
 adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,

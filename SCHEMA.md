@@ -3,10 +3,10 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 6):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 7):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
-older one step by step (`Database::upgrade`). There are no upgrade steps yet,
-so an older database is refused with a "create a new database" error (from
+older one step by step (`Database::upgrade`). The only upgrade step is
+6 -> 7 (adds the `credits_holder_exists` trigger); an older database is refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.

@@ -112,7 +112,11 @@ impl VeniceBilling {
         // Rate-limited under the code's owner, whoever pays: the limit
         // guards the operator's Venice bill, and keyed by payer every
         // object (or player) would be a fresh bucket
-        let key = self.owner.clone().unwrap_or_else(|| "anonymous".into());
+        let key = format!(
+            "{}:{}",
+            self.universe_id,
+            self.owner.as_deref().unwrap_or("anonymous")
+        );
         let result = call(key).await;
         if result.is_err() && price > 0 {
             if let Some(ref holder) = holder {
@@ -2904,7 +2908,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(key, "builder");
+            assert_eq!(key, "u:builder");
         }
         let ownerless = VeniceBilling {
             owner: None,
@@ -2916,7 +2920,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(key, "anonymous");
+        assert_eq!(key, "u:anonymous");
     }
 
     #[test]

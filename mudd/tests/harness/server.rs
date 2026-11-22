@@ -154,13 +154,13 @@ impl TestServer {
         self.start_again().await
     }
 
-    /// Stop the server process (the database stays; see start_again)
     /// Send mudd SIGTERM (as `docker stop` or systemd would) and wait up to
     /// `timeout` for it to exit; its exit status, or None if still running
     pub fn terminate(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
         self.child.terminate(timeout).expect("signal mudd")
     }
 
+    /// Stop the server process (the database stays; see start_again)
     pub fn stop(&mut self) {
         self.child.kill();
     }

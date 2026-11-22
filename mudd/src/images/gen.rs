@@ -25,12 +25,21 @@ pub fn store_image_statement(
             ("image_hash", serde_json::json!(image_hash)),
             (
                 "image_generated_at",
-                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                serde_json::json!(chrono::Utc::now().timestamp()),
             ),
         ],
     )?;
     sql.push_str(" AND json_extract(properties, '$.image_hash') IS NULL");
     Ok((sql, params))
+}
+
+/// Whether a room needs a generated image: it has none (missing or null).
+/// Matches the write-back's `IS NULL` guard, so any other value, even a
+/// bad one, never starts a generation that could not be stored.
+pub fn room_needs_image(room: &crate::objects::Object) -> bool {
+    room.properties
+        .get("image_hash")
+        .is_none_or(serde_json::Value::is_null)
 }
 
 /// Generate a room image using the two-step pipeline
@@ -56,6 +65,11 @@ pub async fn generate_room_image(
         .await
         .map_err(|e| format!("Failed to get room: {}", e))?
         .ok_or_else(|| format!("Room not found: {}", room_id))?;
+    // Another job may have finished between the viewer's read and this one
+    // starting: never pay for a second image
+    if !room_needs_image(&room) {
+        return Err(format!("Room {} already has an image", room_id));
+    }
 
     let room_name = room
         .properties
@@ -230,5 +244,23 @@ mod tests {
         );
         assert!(prompt.contains("Sierra"));
         assert!(prompt.contains("256-color"));
+    }
+
+    /// A room needs an image only when it has none (missing or null); any
+    /// other value, even a bad one, counts as an image so nothing regenerates
+    #[test]
+    fn test_room_needs_image() {
+        let mut room = crate::objects::Object::new("/rooms/a", "u", "room").unwrap();
+        assert!(room_needs_image(&room));
+        room.set_property("image_hash", serde_json::Value::Null);
+        assert!(room_needs_image(&room));
+        for v in [
+            serde_json::json!("abc"),
+            serde_json::json!(false),
+            serde_json::json!(0),
+        ] {
+            room.set_property("image_hash", v);
+            assert!(!room_needs_image(&room));
+        }
     }
 }

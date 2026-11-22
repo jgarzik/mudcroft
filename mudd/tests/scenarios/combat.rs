@@ -756,3 +756,51 @@ async fn test_effect_death_drops_inventory_atomically() {
     .unwrap();
     assert_eq!(entries, 1);
 }
+
+/// A portal pointing at a deleted room counts as no respawn room: the
+/// player revives in place, and other effects keep ticking
+#[tokio::test]
+async fn test_effect_death_with_dangling_portal() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "dangling").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    sqlx::query("UPDATE universe_settings SET value = '/rooms/demolished' WHERE universe_id = ? AND key = 'portal_room_id'")
+        .bind(server.universe_id())
+        .execute(server.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE objects SET properties = json_remove(properties, '$.workroom_id')
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "dangle_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "burning", 2, 500)"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("died despite the dangling portal");
+    let parent: String =
+        sqlx::query_scalar("SELECT parent_id FROM objects WHERE universe_id = ? AND id = ?")
+            .bind(server.universe_id())
+            .bind(&player_id)
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(parent, server.world().passage_id);
+}

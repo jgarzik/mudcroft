@@ -140,8 +140,9 @@ impl Server {
         .await
     }
 
-    /// Run the server until shutdown
-    pub async fn run(&self) -> Result<()> {
+    /// Run the server until shutdown (`shutdown()`), or until `stop` turns
+    /// true (see [`shutdown_on_signals`])
+    pub async fn run(&self, mut stop: watch::Receiver<bool>) -> Result<()> {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
         info!("mudd listening on {}", local_addr);
@@ -152,7 +153,7 @@ impl Server {
         let server = axum::serve(listener, router).with_graceful_shutdown(async move {
             tokio::select! {
                 _ = shutdown_rx.changed() => {}
-                signal = termination_signal() => info!("{}: shutting down", signal),
+                _ = stop.wait_for(|stop| *stop) => {}
             }
         });
 
@@ -183,9 +184,24 @@ impl Server {
     }
 }
 
-/// Wait for SIGTERM (docker stop, systemd) or SIGINT (Ctrl-C). Handled, so
-/// mudd shuts down gracefully, also as PID 1 where the kernel would ignore
-/// an unhandled SIGTERM.
+/// Handle SIGTERM (docker stop, systemd) and SIGINT (Ctrl-C) from now on:
+/// the first asks for a graceful shutdown (the receiver turns true), a
+/// second exits at once. Call it first thing, so a signal during startup
+/// works too, also as PID 1, where the kernel ignores an unhandled SIGTERM.
+pub fn shutdown_on_signals() -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let signal = termination_signal().await;
+        info!("{}: shutting down", signal);
+        let _ = tx.send(true);
+        let signal = termination_signal().await;
+        tracing::warn!("{} again: exiting now", signal);
+        std::process::exit(130);
+    });
+    rx
+}
+
+/// Wait for SIGTERM or SIGINT
 async fn termination_signal() -> &'static str {
     #[cfg(unix)]
     {

@@ -308,4 +308,45 @@ mod tests {
             .unwrap();
         assert_eq!(count.0, 1);
     }
+
+    /// The first real upgrade step: a version 6 database gets the credits
+    /// holder trigger and becomes version 7
+    #[tokio::test]
+    async fn test_upgrade_6_to_7_adds_credits_trigger() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            sqlx::query("DROP TRIGGER credits_holder_exists")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA user_version = 6")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.pool().close().await;
+        }
+        init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .expect("mudd_init upgrades 6 -> 7");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), 7);
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'credits_holder_exists'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(triggers, 1);
+    }
 }

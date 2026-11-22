@@ -77,6 +77,11 @@ fn is_overdraft(e: &anyhow::Error) -> bool {
     format!("{:#}", e).contains("CHECK constraint failed")
 }
 
+/// Whether a failed write was the holder trigger (no such account/object)
+fn is_missing_holder(e: &anyhow::Error) -> bool {
+    format!("{:#}", e).contains("credits holder does not exist")
+}
+
 impl CreditManager {
     /// A credit manager over the database: through Raft when a writer is
     /// given (the server), else directly (tests)
@@ -234,7 +239,8 @@ impl CreditManager {
             .await
         {
             Ok(()) => Ok(true),
-            Err(e) if is_overdraft(&e) => Ok(false),
+            // A holder that does not exist has nothing to spend
+            Err(e) if is_overdraft(&e) || is_missing_holder(&e) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -258,6 +264,11 @@ impl CreditManager {
         match self.execute(statements).await {
             Ok(()) => Ok(true),
             Err(e) if is_overdraft(&e) => Ok(false),
+            // A missing payer has nothing to spend; a missing recipient is
+            // the caller's error
+            Err(e) if is_missing_holder(&e) && !self.holder_exists(universe_id, from).await? => {
+                Ok(false)
+            }
             Err(e) => Err(e),
         }
     }
@@ -385,5 +396,15 @@ mod tests {
         let gone = Holder::Object("/shops/gone".into());
         assert!(credits.transfer("u1", &alice(), &gone, 4).await.is_err());
         assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 10);
+    }
+
+    /// Spending from a holder that does not exist (an object deleted
+    /// meanwhile) is "not enough", not an error
+    #[tokio::test]
+    async fn test_deduct_from_missing_holder_is_false() {
+        let credits = manager().await;
+        let gone = Holder::Object("/shops/gone".into());
+        assert!(!credits.deduct("u1", &gone, 1).await.unwrap());
+        assert!(!credits.transfer("u1", &gone, &alice(), 1).await.unwrap());
     }
 }

@@ -142,18 +142,22 @@ pub async fn process(state: &AppState, now: u64) {
                 };
                 match (found, drops) {
                     (Ok(room), Ok(drops)) => {
-                        let room = room.or_else(|| {
-                            warn!("effects: no respawn room for {}; reviving in place", entity);
-                            obj.parent_id.clone()
-                        });
                         entity_statements.extend(drops);
+                        // With no respawn room, revive in place: no move
+                        // (they may have walked on meanwhile)
                         entity_statements.extend(respawn_statements(
                             &universe,
                             &entity,
                             &target,
                             room.as_deref(),
                         ));
-                        respawn = room;
+                        respawn = match room {
+                            Some(room) => Some(room),
+                            None => {
+                                warn!("effects: no respawn room for {}; reviving in place", entity);
+                                state.connections.get_room_id(&universe, &entity).await
+                            }
+                        };
                     }
                     (Err(e), _) | (_, Err(e)) => {
                         warn!("effects: respawn of {} not prepared: {}", entity, e);

@@ -13,7 +13,23 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// A credits balance needs a holder that exists (credits has no foreign
+/// key, as holders are accounts or objects): checked in the same write, so
+/// credits can never land on an object deleted meanwhile
+const CREDITS_HOLDER_TRIGGER: &str = r#"
+            CREATE TRIGGER IF NOT EXISTS credits_holder_exists
+            BEFORE INSERT ON credits
+            WHEN (NEW.holder_kind = 'account'
+                  AND NOT EXISTS (SELECT 1 FROM accounts WHERE id = NEW.holder_id))
+              OR (NEW.holder_kind = 'object'
+                  AND NOT EXISTS (SELECT 1 FROM objects
+                                  WHERE universe_id = NEW.universe_id AND id = NEW.holder_id))
+            BEGIN
+                SELECT RAISE(ABORT, 'credits holder does not exist');
+            END
+            "#;
 
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
@@ -66,7 +82,7 @@ impl Database {
     }
 
     /// Bring an existing database up to SCHEMA_VERSION, one version at a
-    /// time. There are no upgrade steps yet, so anything older is refused:
+    /// time. Versions without an upgrade step are refused:
     /// - 1 -> 2 (argon2id passwords, accounts.salt dropped): old salted
     ///   SHA-256 hashes cannot be converted, so there is no step.
     /// - 2 -> 3 (combat_state dropped: HP lives on the object row;
@@ -76,6 +92,7 @@ impl Database {
     ///   period_ms, next_pulse_at, instead of remaining_ticks).
     /// - 4 -> 5 (heartbeats table; timers cascade with their object).
     /// - 5 -> 6 (credits held by accounts or objects, CHECK balance >= 0).
+    /// - 6 -> 7 (credits_holder_exists trigger): upgraded in place.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -84,6 +101,14 @@ impl Database {
                 version,
                 SCHEMA_VERSION
             );
+        }
+        if version == 6 {
+            sqlx::query(CREDITS_HOLDER_TRIGGER)
+                .execute(&self.pool)
+                .await?;
+            self.set_schema_version(7).await?;
+            info!("Upgraded database schema 6 -> 7");
+            return Ok(());
         }
         if version < SCHEMA_VERSION {
             bail!(
@@ -306,22 +331,9 @@ impl Database {
         // A balance needs a holder that exists (credits has no foreign key,
         // as holders are accounts or objects): checked in the same write,
         // so credits can never land on an object deleted meanwhile
-        sqlx::query(
-            r#"
-            CREATE TRIGGER IF NOT EXISTS credits_holder_exists
-            BEFORE INSERT ON credits
-            WHEN (NEW.holder_kind = 'account'
-                  AND NOT EXISTS (SELECT 1 FROM accounts WHERE id = NEW.holder_id))
-              OR (NEW.holder_kind = 'object'
-                  AND NOT EXISTS (SELECT 1 FROM objects
-                                  WHERE universe_id = NEW.universe_id AND id = NEW.holder_id))
-            BEGIN
-                SELECT RAISE(ABORT, 'credits holder does not exist');
-            END
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(CREDITS_HOLDER_TRIGGER)
+            .execute(&self.pool)
+            .await?;
 
         // Classes defined per universe (built-in classes live in code; a
         // parent may be built-in, so it has no foreign key)

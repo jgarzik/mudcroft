@@ -89,8 +89,13 @@ impl PlayerManager {
             }
         }
 
-        // Fallback to universe portal
-        self.object_store.get_portal(universe_id).await
+        // Fallback to universe portal, if its room still exists
+        match self.object_store.get_portal(universe_id).await? {
+            Some(portal) if self.object_store.get(universe_id, &portal).await?.is_some() => {
+                Ok(Some(portal))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Check if a room is a safe zone.
@@ -264,8 +269,13 @@ impl PlayerManager {
             }
         }
 
-        // Fallback to universe portal
-        self.object_store.get_portal(universe_id).await
+        // Fallback to universe portal, if its room still exists
+        match self.object_store.get_portal(universe_id).await? {
+            Some(portal) if self.object_store.get(universe_id, &portal).await?.is_some() => {
+                Ok(Some(portal))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Statements dropping everything a player carries (but fixed items)
@@ -283,7 +293,15 @@ impl PlayerManager {
         Ok(items
             .iter()
             .filter(|item| !item.get_bool("fixed").unwrap_or(false))
-            .map(|item| ObjectStore::set_parent_statement(universe_id, &item.id, Some(room_id)))
+            .map(|item| {
+                // Only if it is still carried when the batch commits (it may
+                // have been given away meanwhile)
+                let (mut sql, mut params) =
+                    ObjectStore::set_parent_statement(universe_id, &item.id, Some(room_id));
+                sql.push_str(" AND parent_id = ?");
+                params.push(serde_json::json!(player_id));
+                (sql, params)
+            })
             .collect())
     }
 

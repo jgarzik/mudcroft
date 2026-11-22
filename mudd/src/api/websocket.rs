@@ -725,9 +725,11 @@ pub(crate) async fn build_room_message(
 
     // Trigger background image generation if room has no image and Venice is configured
     // (at most one job per room: viewers arriving meanwhile start none)
-    let job = (image_hash.is_none() && state.venice.is_configured() && account_id.is_some())
-        .then(|| state.image_jobs.try_start(universe_id, room_id))
-        .flatten();
+    let job = (crate::images::room_needs_image(&room)
+        && state.venice.is_configured()
+        && account_id.is_some())
+    .then(|| state.image_jobs.try_start(universe_id, room_id))
+    .flatten();
     if let Some(job) = job {
         if let Some(acct_id) = account_id {
             let venice = state.venice.clone();

@@ -61,9 +61,16 @@ async fn main() -> Result<()> {
         static_dir: args.static_dir,
     };
 
-    // Create and run server
-    let server = Server::new(config).await?;
-    server.run().await?;
+    // Signals are handled from here on, startup included
+    let mut stop = mudd::shutdown_on_signals();
+    let server = tokio::select! {
+        server = Server::new(config) => server?,
+        _ = stop.wait_for(|stop| *stop) => {
+            tracing::info!("stopped during startup");
+            return Ok(());
+        }
+    };
+    server.run(stop).await?;
 
     Ok(())
 }
