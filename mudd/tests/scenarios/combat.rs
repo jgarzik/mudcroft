@@ -528,3 +528,28 @@ async fn test_effects_do_not_survive_object_recreation() {
     .unwrap();
     assert_eq!(hp, 20, "the new object takes no poison");
 }
+
+/// A target that is already dead (as a second attacker racing the killing
+/// blow would find it) cannot be killed again: no second death or on_death
+#[tokio::test]
+async fn test_dead_target_is_not_killed_twice() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "late_attacker").await;
+    sqlx::query(
+        "UPDATE objects SET properties = json_set(properties, '$.hp', 0)
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&server.world().bat_id)
+    .execute(server.pool())
+    .await
+    .unwrap();
+    for _ in 0..10 {
+        pl.drain().await;
+        pl.command("attack bat").await.unwrap();
+        let _ = pl.expect("echo").await;
+        let reply = pl.expect_any().await.unwrap();
+        let text = reply["text"].as_str().or(reply["message"].as_str()).unwrap_or_default();
+        assert!(!text.contains("slain"), "killed twice: {}", text);
+    }
+}

@@ -1299,6 +1299,18 @@ async fn execute_command(
                 };
             };
             let target = &target;
+            // It may have died or left since it was picked (another
+            // attacker got there first): nothing to fight
+            let alive = target
+                .properties
+                .get("hp")
+                .and_then(|v| v.as_i64())
+                .is_none_or(|hp| hp > 0);
+            if target.parent_id.as_deref() != Some(room_id.as_str()) || !alive {
+                return ServerMessage::Error {
+                    message: format!("{} is already dead.", target_display_name),
+                };
+            }
 
             // Stats come from the object rows, the single source of truth
             let Ok(Some(attacker_obj)) = state.object_store.get(universe_id, player_id).await
