@@ -194,6 +194,14 @@ impl RaftWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private database path for the Raft config (never a shared fixed
+    /// path: parallel tests would collide)
+    fn test_db_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db").to_string_lossy().to_string();
+        (dir, path)
+    }
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_pool_with_raft_tables() -> SqlitePool {
@@ -252,14 +260,16 @@ mod tests {
     #[tokio::test]
     async fn test_single_node_writer_creation() {
         let pool = test_pool_with_raft_tables().await;
-        let writer = RaftWriter::single_node(pool, 1, 19000, "/tmp/test.db").await;
+        let (_dir, db_path) = test_db_path();
+        let writer = RaftWriter::single_node(pool, 1, 19000, &db_path).await;
         assert!(writer.is_ok());
     }
 
     #[tokio::test]
     async fn test_single_node_write() {
         let pool = test_pool_with_raft_tables().await;
-        let writer = RaftWriter::single_node(pool, 1, 19001, "/tmp/test.db")
+        let (_dir, db_path) = test_db_path();
+        let writer = RaftWriter::single_node(pool, 1, 19001, &db_path)
             .await
             .unwrap();
 
@@ -288,7 +298,8 @@ mod tests {
     #[tokio::test]
     async fn test_is_leader() {
         let pool = test_pool_with_raft_tables().await;
-        let writer = RaftWriter::single_node(pool, 1, 19002, "/tmp/test.db")
+        let (_dir, db_path) = test_db_path();
+        let writer = RaftWriter::single_node(pool, 1, 19002, &db_path)
             .await
             .unwrap();
 
@@ -307,8 +318,9 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_writes() {
         let pool = test_pool_with_raft_tables().await;
+        let (_dir, db_path) = test_db_path();
         let writer = std::sync::Arc::new(
-            RaftWriter::single_node(pool.clone(), 1, 19003, "/tmp/test.db")
+            RaftWriter::single_node(pool.clone(), 1, 19003, &db_path)
                 .await
                 .unwrap(),
         );
@@ -345,7 +357,8 @@ mod tests {
     #[tokio::test]
     async fn test_stopped_resolves_when_core_stops() {
         let pool = test_pool_with_raft_tables().await;
-        let writer = RaftWriter::single_node(pool, 1, 19004, "/tmp/test.db")
+        let (_dir, db_path) = test_db_path();
+        let writer = RaftWriter::single_node(pool, 1, 19004, &db_path)
             .await
             .unwrap();
         writer

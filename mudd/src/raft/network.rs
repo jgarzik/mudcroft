@@ -30,7 +30,23 @@ use super::types::{NodeId, TypeConfig};
 pub struct FullSnapshotRequest {
     pub vote: VoteOf<TypeConfig>,
     pub meta: SnapshotMetaOf<TypeConfig>,
+    /// Base64 in JSON (a byte array would be a list of decimal numbers)
+    #[serde(with = "base64_bytes")]
     pub data: Vec<u8>,
+}
+
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        BASE64.decode(text).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Network configuration for Raft cluster
@@ -235,5 +251,22 @@ mod tests {
     fn test_network_factory_creation() {
         let config = NetworkConfig::default();
         let _factory = RaftNetworkFactoryImpl::new(config);
+    }
+
+    /// Snapshot bytes travel as a base64 string and round-trip exactly
+    #[test]
+    fn test_full_snapshot_request_base64() {
+        let request = FullSnapshotRequest {
+            vote: openraft::impls::Vote::new(1, 1),
+            meta: SnapshotMetaOf::<TypeConfig> {
+                last_log_id: None,
+                last_membership: Default::default(),
+            },
+            data: vec![0, 1, 2, 250, 255],
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["data"], "AAEC+v8=");
+        let back: FullSnapshotRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.data, vec![0, 1, 2, 250, 255]);
     }
 }
