@@ -442,3 +442,33 @@ async fn test_plain_effect_costs_no_writes_while_active() {
     tokio::time::sleep(Duration::from_millis(2000)).await;
     assert_eq!(effect_writes(&server).await - before, 2, "and the end");
 }
+
+/// A stunned attacker cannot act
+#[tokio::test]
+async fn test_stunned_player_cannot_attack() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "dazed_player").await;
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "stunner_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "stunned", 30, 0)"#,
+            pl.player_id().unwrap()
+        ),
+    )
+    .await;
+    pl.drain().await;
+    pl.command("attack bat").await.unwrap();
+    let _ = pl.expect("echo").await;
+    let reply = pl.expect("error").await.expect("refused");
+    assert!(
+        reply["message"].as_str().unwrap().contains("stunned"),
+        "{}",
+        reply
+    );
+}

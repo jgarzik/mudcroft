@@ -440,7 +440,11 @@ Two layers exist:
   then 1d6 physical damage, doubled on a critical, then resistances) and
   commits it as **one atomic batch** (`attack_statements`): the target's new
   `hp` via `json_set`, and on a kill its removal from the room. Targets must
-  be `npc`, a class derived from `npc`, or `monster`. The attack holds the
+  be `npc`, a class derived from `npc`, or `monster`. Effects change the
+  round (`engine::attack_mods`): a stunned or paralyzed attacker cannot act,
+  blinded/invisible are -4 to hit, a helpless target +4, and strengthened,
+  weakened, exposed and protected adjust damage; a critical that does not
+  kill inflicts bleeding, upserted in the round's batch. The attack holds the
   effect write lock and re-reads the target under it, so it never computes
   HP from a stale row.
 - **Status effects** (`src/combat/effects.rs`, `src/api/effect_scheduler.rs`)

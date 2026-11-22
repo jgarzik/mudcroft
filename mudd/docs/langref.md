@@ -1081,20 +1081,19 @@ All other properties, including `weight`, `value`, `lighting`, `aggro`, `respawn
 The built-in `attack <name>` (or `kill`) command works like this:
 
 - It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`.
-- On the first attack, combat state is created from the NPC's `hp` and `max_hp` properties. After that, HP is tracked in the combat system, not in the property.
-- Each attack is a d20 roll against armor class 10. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit). A natural 1 always misses.
+- HP lives in the objects' properties: `hp`, `max_hp`, `armor_class` (default 10), `attack_bonus` (default 0) and `resistances` (e.g. `{fire = "resistant"}`, also `immune` and `vulnerable`). An attack reads them and writes the target's new `hp` back, as one atomic change.
+- Each attack is a d20 roll plus `attack_bonus` against the target's `armor_class`. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit), then the target's resistances. A natural 1 always misses.
+- Status effects count: a stunned or paralyzed attacker cannot attack; a blinded attacker or an invisible target is -4 to hit, a stunned or paralyzed target +4; `strengthened`/`weakened` on the attacker and `exposed`/`protected` on the target add or subtract their magnitude from the damage roll.
+- A critical hit that does not kill makes the target **bleed**: 2 physical damage per second for 3 seconds.
 - NPCs don't fight back. Write that in Lua (see the [tutorial](langtutor.md)).
 - A hit fires `on_damage`. A kill fires `on_death` and removes the NPC from the room (`parent_id = nil`) without deleting it.
 
 The Rust combat engine knows these damage types: `physical`, `slashing`,
 `piercing`, `bludgeoning`, `fire`, `cold` (alias `ice`), `lightning`,
 `acid`, `poison`, `necrotic`, `radiant` (alias `holy`), `psychic`,
-`force` and `thunder`. Its status effects include poisoned, stunned,
-blinded, burning, frozen, paralyzed, slowed, hasted, strengthened,
-weakened, protected, exposed, invisible, regenerating and silenced.
-
-Lua has **no bindings** to the Rust combat engine. For combat in Lua, use
-the [`Combat`](#combat) library or your own code.
+`force` and `thunder`. Lua applies and inspects status effects with
+[`game.apply_effect`](#status-effects) and friends; for other combat logic,
+use the [`Combat`](#combat) library or your own code.
 
 ---
 

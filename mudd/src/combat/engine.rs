@@ -8,7 +8,7 @@
 use std::str::FromStr;
 
 use super::damage::{DamageModifier, DamageProfile};
-use super::{AttackResult, DamageType, EffectRegistry, EffectType, EntityEffects};
+use super::{AttackResult, DamageType, EffectRegistry, EffectType, EntityEffects, StatusEffect};
 use crate::objects::{Object, ObjectStore};
 
 /// Largest HP (and max HP) a combatant can have
@@ -77,6 +77,44 @@ pub struct AttackOutcome {
     /// The target's HP afterwards (never below 0)
     pub target_hp: i32,
     pub killed: bool,
+    /// An effect the hit inflicts on the target (bleeding on a critical)
+    pub inflicts: Option<StatusEffect>,
+}
+
+/// Bleeding from a critical hit: damage per second, and how long it lasts
+pub const BLEED_DAMAGE: i32 = 2;
+pub const BLEED_MS: u64 = 3_000;
+
+/// How status effects change an attack
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttackMods {
+    /// Added to the d20 roll
+    pub to_hit: i32,
+    /// Added to the damage roll (before criticals and resistances)
+    pub damage: i32,
+}
+
+/// The attack modifiers from both sides' effects in force at `now`:
+/// blinded attacker -4 to hit, invisible target -4, helpless (stunned or
+/// paralyzed) target +4; strengthened/weakened attacker and exposed/
+/// protected target add or subtract their magnitude from the damage
+pub fn attack_mods(attacker: &EntityEffects, target: &EntityEffects, now: u64) -> AttackMods {
+    let magnitude = |effects: &EntityEffects, t| effects.get(t, now).map_or(0, |e| e.magnitude);
+    let mut mods = AttackMods::default();
+    if attacker.has(EffectType::Blinded, now) {
+        mods.to_hit -= 4;
+    }
+    if target.has(EffectType::Invisible, now) {
+        mods.to_hit -= 4;
+    }
+    if !target.can_act(now) {
+        mods.to_hit += 4;
+    }
+    mods.damage = magnitude(attacker, EffectType::Strengthened)
+        .saturating_sub(magnitude(attacker, EffectType::Weakened))
+        .saturating_add(magnitude(target, EffectType::Exposed))
+        .saturating_sub(magnitude(target, EffectType::Protected));
+    mods
 }
 
 /// Resolve one attack: `d20` to hit against the target's armor class, and
@@ -85,23 +123,42 @@ pub struct AttackOutcome {
 pub fn resolve_attack(
     attacker: &Combatant,
     target: &Combatant,
+    mods: &AttackMods,
     d20: u32,
     damage_roll: i32,
     dtype: DamageType,
+    now: u64,
 ) -> AttackOutcome {
-    let mut result = AttackResult::new(d20, attacker.attack_bonus, target.armor_class);
+    let mut result = AttackResult::new(
+        d20,
+        attacker.attack_bonus.saturating_add(mods.to_hit),
+        target.armor_class,
+    );
     let mut target_hp = target.hp;
     if result.hit {
+        let base = damage_roll.saturating_add(mods.damage).max(0);
         let damage = target
             .profile
-            .calculate_damage(damage_roll, dtype, result.critical);
+            .calculate_damage(base, dtype, result.critical);
         target_hp = target_hp.saturating_sub(damage.final_damage).max(0);
         result = result.with_damage(damage);
     }
+    let killed = result.hit && target_hp <= 0;
+    let inflicts = (result.critical && !killed).then(|| {
+        StatusEffect::periodic(
+            EffectType::Bleeding,
+            now,
+            BLEED_MS,
+            1_000,
+            BLEED_DAMAGE,
+            Some(DamageType::Physical),
+        )
+    });
     AttackOutcome {
-        killed: result.hit && target_hp <= 0,
+        killed,
         result,
         target_hp,
+        inflicts,
     }
 }
 
@@ -120,6 +177,13 @@ pub fn attack_statements(
             target_id,
             &[("hp", serde_json::json!(outcome.target_hp))],
         )?);
+    }
+    if let Some(ref effect) = outcome.inflicts {
+        statements.push(EffectRegistry::upsert_statement(
+            universe_id,
+            target_id,
+            effect,
+        ));
     }
     if outcome.killed {
         statements.push(remove_from_room_statement(universe_id, target_id));
@@ -316,23 +380,55 @@ mod tests {
         let attacker = combatant(serde_json::json!({"attack_bonus": 0}));
         let target = combatant(serde_json::json!({"hp": 5, "armor_class": 10}));
 
-        let miss = resolve_attack(&attacker, &target, 5, 4, DamageType::Physical);
+        let miss = resolve_attack(
+            &attacker,
+            &target,
+            &AttackMods::default(),
+            5,
+            4,
+            DamageType::Physical,
+            0,
+        );
         assert!(!miss.result.hit);
         assert_eq!(miss.target_hp, 5);
 
-        let hit = resolve_attack(&attacker, &target, 12, 3, DamageType::Physical);
+        let hit = resolve_attack(
+            &attacker,
+            &target,
+            &AttackMods::default(),
+            12,
+            3,
+            DamageType::Physical,
+            0,
+        );
         assert!(hit.result.hit && !hit.killed);
         assert_eq!(hit.target_hp, 2);
 
         // A natural 20 doubles the damage and kills; HP floors at 0
-        let crit = resolve_attack(&attacker, &target, 20, 4, DamageType::Physical);
+        let crit = resolve_attack(
+            &attacker,
+            &target,
+            &AttackMods::default(),
+            20,
+            4,
+            DamageType::Physical,
+            0,
+        );
         assert!(crit.result.critical && crit.killed);
         assert_eq!(crit.target_hp, 0);
 
         // Resistance halves fire damage
         let resistant =
             combatant(serde_json::json!({"hp": 10, "resistances": {"fire": "resistant"}}));
-        let fire = resolve_attack(&attacker, &resistant, 15, 4, DamageType::Fire);
+        let fire = resolve_attack(
+            &attacker,
+            &resistant,
+            &AttackMods::default(),
+            15,
+            4,
+            DamageType::Fire,
+            0,
+        );
         assert_eq!(fire.target_hp, 8);
     }
 
@@ -352,7 +448,15 @@ mod tests {
         let attacker = combatant(serde_json::json!({"attack_bonus": i64::MAX}));
         let target = combatant(serde_json::json!({"hp": i64::MIN}));
         assert_eq!(target.hp, 0);
-        let outcome = resolve_attack(&attacker, &target, 20, i32::MAX, DamageType::Physical);
+        let outcome = resolve_attack(
+            &attacker,
+            &target,
+            &AttackMods::default(),
+            20,
+            i32::MAX,
+            DamageType::Physical,
+            0,
+        );
         assert_eq!(outcome.target_hp, 0);
     }
 
@@ -434,5 +538,74 @@ mod tests {
         assert!(statements
             .iter()
             .any(|(sql, _)| sql.contains("parent_id = NULL")));
+    }
+
+    #[test]
+    fn test_attack_mods_from_effects() {
+        use crate::combat::StatusEffect;
+        let now = 10_000;
+        let mut attacker = EntityEffects::new();
+        attacker.add(StatusEffect::new(EffectType::Blinded, 0, 60_000, 0));
+        attacker.add(StatusEffect::new(EffectType::Strengthened, 0, 60_000, 3));
+        let mut target = EntityEffects::new();
+        target.add(StatusEffect::new(EffectType::Stunned, 0, 60_000, 0));
+        target.add(StatusEffect::new(EffectType::Protected, 0, 60_000, 1));
+        // An effect that has ended does nothing
+        target.add(StatusEffect::new(EffectType::Invisible, 0, 5_000, 0));
+        let mods = attack_mods(&attacker, &target, now);
+        assert_eq!(
+            mods,
+            AttackMods {
+                to_hit: -4 + 4,
+                damage: 3 - 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_with_mods_and_bleed() {
+        let attacker = combatant(serde_json::json!({}));
+        let target = combatant(serde_json::json!({"hp": 30, "armor_class": 12}));
+        let now = 1_000;
+
+        // +2 to hit turns an 11 into a hit; +3 damage on a roll of 2
+        let mods = AttackMods {
+            to_hit: 2,
+            damage: 3,
+        };
+        let out = resolve_attack(&attacker, &target, &mods, 11, 2, DamageType::Physical, now);
+        assert!(out.result.hit);
+        assert_eq!(out.target_hp, 25);
+        assert!(out.inflicts.is_none(), "no bleed without a critical");
+
+        // Damage modifiers never make damage negative
+        let weak = AttackMods {
+            to_hit: 0,
+            damage: -10,
+        };
+        let out = resolve_attack(&attacker, &target, &weak, 15, 2, DamageType::Physical, now);
+        assert_eq!(out.target_hp, 30);
+
+        // A critical that does not kill makes the target bleed, in the
+        // same batch as the hit
+        let out = resolve_attack(
+            &attacker,
+            &target,
+            &AttackMods::default(),
+            20,
+            3,
+            DamageType::Physical,
+            now,
+        );
+        let bleed = out.inflicts.clone().expect("bleeding");
+        assert_eq!(bleed.effect_type, EffectType::Bleeding);
+        assert_eq!(
+            bleed.pulse_amount(),
+            Some((BLEED_DAMAGE, DamageType::Physical))
+        );
+        let statements = attack_statements("u", "/npcs/x", &out).unwrap();
+        assert!(statements
+            .iter()
+            .any(|(sql, _)| sql.contains("INSERT INTO active_effects")));
     }
 }

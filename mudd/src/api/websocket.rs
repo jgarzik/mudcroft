@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::Account;
-use crate::combat::engine::{attack_statements, resolve_attack, Combatant};
+use crate::combat::engine::{attack_mods, attack_statements, resolve_attack, Combatant};
 use crate::combat::DamageType;
 use crate::images::generate_room_image;
 use crate::permissions::AccessLevel;
@@ -1310,14 +1310,33 @@ async fn execute_command(
             let attacker = Combatant::from_object(&attacker_obj, 100);
             let defender = Combatant::from_object(target, 10);
 
+            // Status effects: a stunned or paralyzed attacker cannot act;
+            // others change to-hit and damage
+            let now = crate::combat::now_ms();
+            let attacker_effects = state.effects.get(universe_id, player_id).await;
+            let target_effects = state.effects.get(universe_id, &target_id).await;
+            if !attacker_effects.can_act(now) {
+                return ServerMessage::Error {
+                    message: "You are stunned and cannot act.".to_string(),
+                };
+            }
+            let mods = attack_mods(&attacker_effects, &target_effects, now);
+
             // Basic 1d6 physical damage, doubled on a critical
             let d20 = crate::combat::roll_d20();
             let damage_roll = {
                 use rand::RngExt;
                 rand::rng().random_range(1..=6)
             };
-            let outcome =
-                resolve_attack(&attacker, &defender, d20, damage_roll, DamageType::Physical);
+            let outcome = resolve_attack(
+                &attacker,
+                &defender,
+                &mods,
+                d20,
+                damage_roll,
+                DamageType::Physical,
+                now,
+            );
 
             // The round is one atomic batch: new HP, and removal on death
             match attack_statements(universe_id, &target_id, &outcome) {
@@ -1337,6 +1356,12 @@ async fn execute_command(
             }
             if outcome.killed {
                 state.effects.cache_clear(universe_id, &target_id).await;
+            }
+            if let Some(ref bleed) = outcome.inflicts {
+                state
+                    .effects
+                    .cache_add(universe_id, &target_id, bleed.clone())
+                    .await;
             }
             let attack_result = &outcome.result;
 
@@ -1361,6 +1386,9 @@ async fn execute_command(
                         "CRITICAL HIT! You strike {} for {} damage!",
                         target_display_name, damage
                     ));
+                    if outcome.inflicts.is_some() {
+                        messages.push(format!("{} is bleeding!", target_display_name));
+                    }
                 } else {
                     messages.push(format!(
                         "You hit {} for {} damage.",
