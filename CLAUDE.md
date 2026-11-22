@@ -10,7 +10,7 @@ Mudcroft is a multi-user dungeon (MUD) game server in Rust (`mudd/`) with a Reac
 - WebSocket-based multiplayer gameplay
 - Raft (openraft) log over SQLite; single-node today, multi-node planned
 
-Design it as what it is: a specialized database server. The tables (written only through Raft) are the source of truth; in-memory maps are caches derived from them, never a second copy of state. One logical change (a combat round, an effect tick) is one atomic batch. State that lives only in memory (heartbeats, custom verbs today) is a flaw to fix.
+Design it as what it is: a specialized database server. The tables (written only through Raft) are the source of truth; in-memory maps are caches derived from them, never a second copy of state. One logical change (a combat round, an effect tick) is one atomic batch. State that lives only in memory (custom verbs today) is a flaw to fix. Prefer absolute deadlines and event-driven work to periodic sweeps: write only when something happens.
 
 ## Build & Test Commands
 
@@ -72,7 +72,7 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
   - `messaging.rs` - MessageQueue
 - **combat/** - dice, damage types, status effects, `engine` (attack resolution over object rows: HP lives in the object's `hp` property), PvP policies
 - **raft/** - openraft storage/state machine (log entries are SQL requests), network, RaftWriter
-- **timers/** - call_out (one-shot, persisted) and heartbeat (recurring, in memory)
+- **timers/** - call_out (one-shot) and heartbeat (recurring), both persisted (`timers`, `heartbeats`)
 - **permissions/** - LPMud-style path-based access control
   - Access levels: player < builder < wizard < admin < owner, per universe (`universe_members`); global admin/owner apply everywhere; a universe's `owner_id` is owner inside it
   - Path grants: `/d/forest` grants access to all objects under that prefix

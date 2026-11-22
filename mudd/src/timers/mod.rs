@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -79,8 +78,9 @@ pub struct HeartBeat {
     pub universe_id: String,
     /// Interval between beats in milliseconds
     pub interval_ms: u64,
-    /// Last time the heartbeat fired
-    pub last_fired: Instant,
+    /// When the next beat is due (Unix ms; not stored: after a restart the
+    /// next beat is one interval away)
+    pub next_due: i64,
     /// Method to call (defaults to "heart_beat")
     pub method: String,
 }
@@ -92,19 +92,20 @@ impl HeartBeat {
             object_id: object_id.to_string(),
             universe_id: universe_id.to_string(),
             interval_ms,
-            last_fired: Instant::now(),
+            next_due: chrono::Utc::now().timestamp_millis() + interval_ms as i64,
             method: "heart_beat".to_string(),
         }
     }
 
     /// Check if heartbeat is due to fire
     pub fn is_due(&self) -> bool {
-        self.last_fired.elapsed() >= Duration::from_millis(self.interval_ms)
+        chrono::Utc::now().timestamp_millis() >= self.next_due
     }
 
-    /// Reset the heartbeat timer after firing
+    /// After a beat: the next is one interval from now (a late server does
+    /// not fire a burst of missed beats)
     pub fn reset(&mut self) {
-        self.last_fired = Instant::now();
+        self.next_due = chrono::Utc::now().timestamp_millis() + self.interval_ms as i64;
     }
 }
 
@@ -127,7 +128,8 @@ pub const MIN_HEARTBEAT_MS: u64 = 100;
 pub struct TimerManager {
     /// One-shot timers (in memory)
     timers: RwLock<BTreeMap<String, Timer>>,
-    /// Heartbeats keyed by (universe, object) (in memory only, not persisted)
+    /// Heartbeats keyed by (universe, object): a cache of the heartbeats
+    /// table
     heartbeats: RwLock<BTreeMap<(String, String), HeartBeat>>,
     /// Database pool for persistence
     pool: Option<SqlitePool>,
@@ -160,35 +162,42 @@ impl TimerManager {
         Arc::new(Self::new(pool, raft_writer))
     }
 
-    /// Add a one-shot timer
-    pub async fn add_timer(&self, timer: Timer) -> String {
-        let id = timer.id.clone();
-
-        // Persist via Raft if available, otherwise direct SQL
+    /// Run one write: through Raft when available, else directly (tests)
+    async fn write(&self, sql: &'static str, params: Vec<serde_json::Value>) -> anyhow::Result<()> {
         if let Some(ref raft_writer) = self.raft_writer {
-            if let Err(e) = self.persist_timer(&timer, raft_writer).await {
-                warn!("Failed to persist timer: {}", e);
-            }
+            raft_writer.execute(sql, params).await?;
         } else if let Some(ref pool) = self.pool {
-            // Direct SQL fallback (for tests)
-            if let Err(e) = sqlx::query(
-                "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&timer.id)
-            .bind(&timer.universe_id)
-            .bind(&timer.object_id)
-            .bind(&timer.method)
-            .bind(timer.fire_at)
-            .bind(&timer.args)
-            .execute(pool)
-            .await
-            {
-                warn!("Failed to persist timer: {}", e);
+            let mut query = sqlx::query(sql);
+            for param in params {
+                query = match param {
+                    serde_json::Value::String(v) => query.bind(v),
+                    serde_json::Value::Number(n) => query.bind(n.as_i64()),
+                    serde_json::Value::Null => query.bind(Option::<String>::None),
+                    other => query.bind(other.to_string()),
+                };
             }
+            query.execute(pool).await?;
         }
+        Ok(())
+    }
 
+    /// Add a one-shot timer: stored first, cached only once stored
+    pub async fn add_timer(&self, timer: Timer) -> anyhow::Result<String> {
+        self.write(
+            "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
+            vec![
+                serde_json::json!(&timer.id),
+                serde_json::json!(&timer.universe_id),
+                serde_json::json!(&timer.object_id),
+                serde_json::json!(&timer.method),
+                serde_json::json!(timer.fire_at),
+                serde_json::json!(&timer.args),
+            ],
+        )
+        .await?;
+        let id = timer.id.clone();
         self.timers.write().await.insert(id.clone(), timer);
-        id
+        Ok(id)
     }
 
     /// Add a one-shot timer unless its object already has
@@ -208,7 +217,13 @@ impl TimerManager {
             );
             return None;
         }
-        Some(self.add_timer(timer).await)
+        match self.add_timer(timer).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!("Failed to store timer: {}", e);
+                None
+            }
+        }
     }
 
     /// Remove a timer only if it belongs to `object_id` in `universe_id`
@@ -277,20 +292,44 @@ impl TimerManager {
         }
     }
 
-    /// Set a heartbeat for an object (interval clamped to [`MIN_HEARTBEAT_MS`])
-    pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) {
+    /// Set a heartbeat for an object (interval clamped to
+    /// [`MIN_HEARTBEAT_MS`]): stored first (one write; beats themselves
+    /// write nothing), cached only once stored
+    pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) -> anyhow::Result<()> {
         heartbeat.interval_ms = heartbeat.interval_ms.max(MIN_HEARTBEAT_MS);
+        heartbeat.reset();
+        self.write(
+            "INSERT INTO heartbeats (universe_id, object_id, interval_ms) VALUES (?, ?, ?)
+             ON CONFLICT (universe_id, object_id) DO UPDATE SET interval_ms = excluded.interval_ms",
+            vec![
+                serde_json::json!(&heartbeat.universe_id),
+                serde_json::json!(&heartbeat.object_id),
+                serde_json::json!(heartbeat.interval_ms),
+            ],
+        )
+        .await?;
         let key = (heartbeat.universe_id.clone(), heartbeat.object_id.clone());
         self.heartbeats.write().await.insert(key, heartbeat);
+        Ok(())
     }
 
-    /// Remove the heartbeat for an object in a universe
+    /// Remove the heartbeat for an object in a universe; true if it had one
     pub async fn remove_heartbeat(&self, universe_id: &str, object_id: &str) -> bool {
-        self.heartbeats
-            .write()
+        let key = (universe_id.to_string(), object_id.to_string());
+        if !self.heartbeats.read().await.contains_key(&key) {
+            return false;
+        }
+        if let Err(e) = self
+            .write(
+                "DELETE FROM heartbeats WHERE universe_id = ? AND object_id = ?",
+                vec![serde_json::json!(universe_id), serde_json::json!(object_id)],
+            )
             .await
-            .remove(&(universe_id.to_string(), object_id.to_string()))
-            .is_some()
+        {
+            warn!("Failed to delete heartbeat of {}: {}", object_id, e);
+            return false;
+        }
+        self.heartbeats.write().await.remove(&key).is_some()
     }
 
     /// Check for due timers and heartbeats, returning fired callbacks
@@ -359,25 +398,19 @@ impl TimerManager {
         }
 
         debug!("Loaded {} timers from database", timers.len());
-        Ok(())
-    }
+        drop(timers);
 
-    /// Persist a timer to database via Raft
-    async fn persist_timer(&self, timer: &Timer, raft_writer: &RaftWriter) -> anyhow::Result<()> {
-        raft_writer
-            .execute(
-                "INSERT OR REPLACE INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
-                vec![
-                    serde_json::json!(&timer.id),
-                    serde_json::json!(&timer.universe_id),
-                    serde_json::json!(&timer.object_id),
-                    serde_json::json!(&timer.method),
-                    serde_json::json!(timer.fire_at),
-                    serde_json::json!(&timer.args),
-                ],
-            )
-            .await?;
-
+        // Heartbeats: the next beat is one interval from now
+        let rows: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT universe_id, object_id, interval_ms FROM heartbeats")
+                .fetch_all(pool)
+                .await?;
+        let mut heartbeats = self.heartbeats.write().await;
+        for (universe_id, object_id, interval_ms) in rows {
+            let hb = HeartBeat::new(&universe_id, &object_id, interval_ms.max(0) as u64);
+            heartbeats.insert((universe_id, object_id), hb);
+        }
+        debug!("Loaded {} heartbeats from database", heartbeats.len());
         Ok(())
     }
 
@@ -431,8 +464,12 @@ mod tests {
     #[tokio::test]
     async fn test_timers_are_per_universe() {
         let mgr = TimerManager::new(None, None);
-        mgr.set_heartbeat(HeartBeat::new("a", "/clock", 1000)).await;
-        mgr.set_heartbeat(HeartBeat::new("b", "/clock", 1000)).await;
+        mgr.set_heartbeat(HeartBeat::new("a", "/clock", 1000))
+            .await
+            .unwrap();
+        mgr.set_heartbeat(HeartBeat::new("b", "/clock", 1000))
+            .await
+            .unwrap();
         assert_eq!(mgr.heartbeat_count().await, 2, "one heartbeat per universe");
 
         for _ in 0..MAX_TIMERS_PER_OBJECT {
@@ -482,7 +519,7 @@ mod tests {
         let manager = TimerManager::new(None, None);
 
         let timer = Timer::new("u1", "obj1", "test_method", 10000, None);
-        let id = manager.add_timer(timer).await;
+        let id = manager.add_timer(timer).await.unwrap();
 
         assert_eq!(manager.timer_count().await, 1);
 
@@ -496,7 +533,7 @@ mod tests {
         let manager = TimerManager::new(None, None);
 
         let hb = HeartBeat::new("u1", "obj1", 100);
-        manager.set_heartbeat(hb).await;
+        manager.set_heartbeat(hb).await.unwrap();
 
         assert_eq!(manager.heartbeat_count().await, 1);
 
@@ -512,7 +549,7 @@ mod tests {
         // Create a timer that's already due
         let mut timer = Timer::new("u1", "obj1", "on_fire", 0, Some("test_arg".to_string()));
         timer.fire_at = chrono::Utc::now().timestamp_millis() - 100;
-        manager.add_timer(timer).await;
+        manager.add_timer(timer).await.unwrap();
 
         let fired = manager.tick().await;
         assert_eq!(fired.len(), 1);
@@ -530,13 +567,16 @@ mod tests {
 
         manager
             .add_timer(Timer::new("u1", "obj1", "m1", 10000, None))
-            .await;
+            .await
+            .unwrap();
         manager
             .add_timer(Timer::new("u1", "obj1", "m2", 10000, None))
-            .await;
+            .await
+            .unwrap();
         manager
             .add_timer(Timer::new("u1", "obj2", "m1", 10000, None))
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(manager.timer_count().await, 3);
 

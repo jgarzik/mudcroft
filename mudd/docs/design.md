@@ -346,8 +346,8 @@ contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; th
 `run_timer_loop` ticks every 100 ms. Each due `call_out` or heartbeat runs
 its method on the object's code (as the owner) with `{object_id, room_id,
 args}`. A heartbeat whose object no longer exists is removed. One-shot timers
-are persisted in `timers` and reloaded at startup; heartbeats live in memory
-only. An object may have at most 32 pending timers; heartbeat intervals are
+are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
+remove; beats write nothing), both reloaded at startup. An object may have at most 32 pending timers; heartbeat intervals are
 at least 100 ms. `game.delete_object` cancels the object's timers and
 heartbeat and clears its actions.
 
@@ -564,6 +564,6 @@ Multi-node operation is not working yet: see
 5. **Non-blocking delivery**: bounded per-client queues with `try_send`.
 6. **SQL-level replication**: Raft replicates the SQL a write performs, so
    followers never run Lua.
-7. **Timers**: one-shot timers survive restart; heartbeats and registered
+7. **Timers**: one-shot timers and heartbeats survive restart; registered
    verbs are in memory and must be re-registered.
 8. **WebSocket JSON**: messages tagged by a `type` field.

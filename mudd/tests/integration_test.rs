@@ -993,6 +993,17 @@ async fn test_timer_persistence() {
         .execute(&pool)
         .await
         .expect("Failed to create timers table");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS heartbeats (
+                universe_id TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                interval_ms INTEGER NOT NULL,
+                PRIMARY KEY (universe_id, object_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create heartbeats table");
 
         let timer_mgr = TimerManager::new(Some(pool.clone()), None);
         let timer = Timer::new(
@@ -1002,7 +1013,7 @@ async fn test_timer_persistence() {
             60000,
             Some("test_args".to_string()),
         );
-        timer_mgr.add_timer(timer).await;
+        timer_mgr.add_timer(timer).await.expect("timer stored");
 
         assert_eq!(timer_mgr.timer_count().await, 1);
         // Pool dropped here

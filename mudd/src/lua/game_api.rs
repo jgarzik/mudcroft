@@ -1982,12 +1982,11 @@ impl GameApi {
                 return Ok(false);
             };
 
-            block_now(async {
+            let stored = block_now(async {
                 let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
-                timers.set_heartbeat(hb).await;
+                timers.set_heartbeat(hb).await
             });
-
-            Ok(true)
+            Ok(stored.is_ok())
         })?;
         game.set("set_heart_beat", set_heart_beat)?;
 

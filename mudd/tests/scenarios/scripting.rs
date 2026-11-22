@@ -587,3 +587,31 @@ async fn test_timer_functions_need_an_object() {
     let out = wiz.expect("output").await.expect("eval output");
     assert_eq!(out["text"], "false:false");
 }
+
+/// A heartbeat is stored, so it keeps beating after a restart
+#[tokio::test]
+async fn test_heartbeat_survives_restart() {
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "beat_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local h = game.store_code([[return {{
+                 wind = function(a) return tostring(game.set_heart_beat(300)) end,
+                 heart_beat = function(a) game.broadcast(a.room_id, "Tick-tock.") end,
+               }}]])
+               game.create_object("/items/metronome", "item", "{room}", {{name = "metronome", code_hash = h}})
+               return game.use_object("/items/metronome", "x", "wind")"#,
+            room = entrance
+        ),
+    )
+    .await;
+    server.restart().await.expect("restart");
+
+    let mut alice = player(&server, "beat_listener").await;
+    alice
+        .expect_output_containing("Tick-tock.")
+        .await
+        .expect("the heartbeat came back after the restart");
+}

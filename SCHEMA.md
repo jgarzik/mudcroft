@@ -3,7 +3,7 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 4):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 5):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). There are no upgrade steps yet,
 so an older database is refused with a "create a new database" error (from
@@ -248,20 +248,35 @@ deleting an object deletes its effects.
 
 ### timers
 
-Pending one-shot `game.call_out` timers. Heartbeats (`game.set_heart_beat`)
-are kept in memory only and have no table.
+Pending one-shot `game.call_out` timers.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | TEXT PRIMARY KEY | UUID |
 | universe_id | TEXT NOT NULL REFERENCES universes(id) | |
-| object_id | TEXT NOT NULL | Object whose handler is called. No foreign key. |
+| object_id | TEXT NOT NULL | Object whose handler is called |
 | method | TEXT NOT NULL | Handler name |
-| fire_at | INTEGER NOT NULL | Unix time |
+| fire_at | INTEGER NOT NULL | Unix time (ms) |
 | args | TEXT | JSON |
 | created_at | TEXT NOT NULL DEFAULT (datetime('now')) | |
 
-Index: `idx_timers_fire_at (fire_at)`.
+Foreign key `(universe_id, object_id)` to `objects(universe_id, id)` ON DELETE
+CASCADE. Index: `idx_timers_fire_at (fire_at)`.
+
+### heartbeats
+
+Recurring `game.set_heart_beat` heartbeats, one per object. Setting or
+removing one is a write; a beat is not (after a restart the next beat is one
+interval away).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| object_id | TEXT NOT NULL | Object whose `heart_beat` handler is called |
+| interval_ms | INTEGER NOT NULL | At least 100 |
+
+Primary key: `(universe_id, object_id)`. Foreign key to `objects` ON DELETE
+CASCADE.
 
 ## Raft
 

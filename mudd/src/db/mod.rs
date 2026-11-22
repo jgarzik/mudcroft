@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
@@ -74,6 +74,7 @@ impl Database {
     ///   object).
     /// - 3 -> 4 (active_effects stores absolute deadlines: expires_at,
     ///   period_ms, next_pulse_at, instead of remaining_ticks).
+    /// - 4 -> 5 (heartbeats table; timers cascade with their object).
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -363,7 +364,25 @@ impl Database {
                 method TEXT NOT NULL,
                 fire_at INTEGER NOT NULL,
                 args TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (universe_id, object_id)
+                    REFERENCES objects(universe_id, id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Heartbeats (recurring): one row per object; a beat writes nothing
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS heartbeats (
+                universe_id TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                interval_ms INTEGER NOT NULL,
+                PRIMARY KEY (universe_id, object_id),
+                FOREIGN KEY (universe_id, object_id)
+                    REFERENCES objects(universe_id, id) ON DELETE CASCADE
             )
             "#,
         )

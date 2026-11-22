@@ -189,8 +189,7 @@ for features that do not exist yet; see its `SKIP` table. Planned:
   verbs ("get sword", "wield sword") and remove them on `on_move`.
 - **More lifecycle handlers**: `on_create`, `on_destroy`, `on_move`,
   `on_reset` (room respawn timer), `on_disconnect`.
-- **Persistent heartbeats and actions**: heartbeats and registered verbs are
-  in memory and lost on restart.
+- **Persistent actions**: registered verbs are in memory and lost on restart.
 - **High-occupancy rooms**: above about 100 occupants, send an aggregated
   view (count, notable entities, sampled chat).
 - **Player commands**: `who`, `quit`, `give`/`use` as server commands (the

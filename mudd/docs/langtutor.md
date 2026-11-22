@@ -845,7 +845,6 @@ The actual numbers depend on the dice.
 | `only the owner or a superior may attach code` | You tried to set `code_hash` on an object owned by someone of your level or higher. |
 | `database query limit exceeded (101 > 100)` | Object code may make 100 `game.*` database calls per run. Loop less, or cache results in locals. |
 | Verbs answer `Unknown command` after a restart | Actions are memory-only. Run your registration function again (`crypt_verbs()`). |
-| A heartbeat stopped after a restart | Heartbeats are memory-only. Restart them from a hook, as the lair rooms do. |
 | `attack` says "You can't attack ..." | The target's class is neither `npc` (or a class derived from it) nor `monster`. |
 | `game.environment(id)` is `nil` in `on_death` | The dead NPC was already removed from the room. Use `args.room_id`. |
 
@@ -871,7 +870,7 @@ Don't build on them yet:
 - **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
 - **NPC behaviour:** `aggro` and `respawn_time` do nothing, and NPCs don't fight back in the built-in combat. Script it as in Part B.
 - **Commands and combat:** there are no `use`, `give` or `flee` player commands (add verbs instead), no PvP, and no Lua access to the combat engine's damage types and effects.
-- **Persistence:** custom verbs, heartbeats and classes defined with `define_class` don't survive a restart.
+- **Persistence:** custom verbs don't survive a restart.
 - **Universe config:** keys like `pvp_mode` or `spawn_room` have no effect. Use `setportal` for the spawn room.
 
 ---

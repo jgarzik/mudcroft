@@ -687,7 +687,7 @@ or `false` without an object context.
 
 - The minimum interval is 100 ms.
 - The callback receives `{object_id, room_id, args = nil}`.
-- Heartbeats are **in memory only** and stop when the server restarts.
+- Heartbeats are stored and resume after a server restart (the first beat one interval after startup).
 
 **Returns** `true`. Without an object context it does nothing.
 
@@ -696,7 +696,7 @@ or `false` without an object context.
 Stops the current object's heartbeat. **Returns** `true` if one was
 running.
 
-Pending call_outs are saved to the database and reloaded at startup. Heartbeats are not.
+Pending call_outs and heartbeats are saved to the database and reloaded at startup.
 
 Deleting an object cancels both its call_outs and its heartbeat.
 
@@ -1106,7 +1106,7 @@ These are not built yet. See the [roadmap](../../docs/roadmap.md).
 - **Unused NPC properties:** `aggro` and `respawn_time` do nothing.
 - **Missing player commands:** there is no `use`, `give` or `flee` command. Add verbs with `game.add_action`.
 - **Combat gaps:** the server has no NPC counter-attacks and no PvP. Lua has no bindings to the combat engine.
-- **Persistence:** custom verbs and heartbeats don't survive a restart.
+- **Persistence:** custom verbs don't survive a restart.
 - **Universe config:** keys such as `pvp_mode` or `spawn_room` are not read by the server.
 
 ---
