@@ -58,7 +58,11 @@ pub trait Committer: Send + Sync {
 
 /// One logical change in progress
 pub struct Run {
-    conn: Arc<Mutex<PoolConnection<Sqlite>>>,
+    /// Taken from the pool at the first write (with the gate held) and
+    /// given back when the local transaction ends: a run waiting for the
+    /// gate holds no connection (Raft's log and apply need them)
+    conn: Arc<Mutex<Slot>>,
+    pool: SqlitePool,
     committer: Arc<dyn Committer>,
     gate: Mutex<Option<MutexGuard<'static, ()>>>,
     /// A local transaction is open (since the last checkpoint)
@@ -86,6 +90,26 @@ pub struct Run {
     after: std::sync::Mutex<Vec<AfterCommit>>,
 }
 
+/// A run's connection, present while its local transaction is open
+pub struct Slot(Option<PoolConnection<Sqlite>>);
+
+impl std::ops::Deref for Slot {
+    type Target = PoolConnection<Sqlite>;
+    fn deref(&self) -> &PoolConnection<Sqlite> {
+        self.0
+            .as_ref()
+            .expect("a run's connection is present while it writes")
+    }
+}
+
+impl std::ops::DerefMut for Slot {
+    fn deref_mut(&mut self) -> &mut PoolConnection<Sqlite> {
+        self.0
+            .as_mut()
+            .expect("a run's connection is present while it writes")
+    }
+}
+
 fn take<T>(m: &std::sync::Mutex<Vec<T>>) -> Vec<T> {
     std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()))
 }
@@ -111,32 +135,39 @@ impl Run {
         }
         let mut conn = self.conn.lock().await;
         if !self.began.load(Ordering::SeqCst) {
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut **conn).await?;
+            if conn.0.is_none() {
+                conn.0 = Some(self.pool.acquire().await?);
+            }
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut ***conn).await?;
             self.began.store(true, Ordering::SeqCst);
         }
         self.dirty.store(true, Ordering::SeqCst);
         sqlx::query("SAVEPOINT run_call")
-            .execute(&mut **conn)
+            .execute(&mut ***conn)
             .await?;
         let mut rows = 0;
         for (sql, params) in statements {
             // Statements are built from literals in this crate, values bound
             let query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             match crate::raft::storage::bind_params(query, params)
-                .execute(&mut **conn)
+                .execute(&mut ***conn)
                 .await
             {
                 Ok(done) => rows += done.rows_affected(),
                 Err(e) => {
                     sqlx::query("ROLLBACK TO run_call")
-                        .execute(&mut **conn)
+                        .execute(&mut ***conn)
                         .await?;
-                    sqlx::query("RELEASE run_call").execute(&mut **conn).await?;
+                    sqlx::query("RELEASE run_call")
+                        .execute(&mut ***conn)
+                        .await?;
                     return Err(e.into());
                 }
             }
         }
-        sqlx::query("RELEASE run_call").execute(&mut **conn).await?;
+        sqlx::query("RELEASE run_call")
+            .execute(&mut ***conn)
+            .await?;
         self.statements
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -160,7 +191,15 @@ impl Run {
     async fn end_local(&self) -> Result<()> {
         if self.began.swap(false, Ordering::SeqCst) {
             let mut conn = self.conn.lock().await;
-            sqlx::query("ROLLBACK").execute(&mut **conn).await?;
+            let rolled_back = sqlx::query("ROLLBACK").execute(&mut ***conn).await;
+            // Back to the pool (a connection that failed to roll back is
+            // closed instead, which rolls back)
+            if let Some(c) = conn.0.take() {
+                if rolled_back.is_err() {
+                    drop(c.detach());
+                }
+            }
+            rolled_back?;
         }
         Ok(())
     }
@@ -229,7 +268,7 @@ impl Run {
         if had_txn {
             let mut conn = self.conn.lock().await;
             sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {}", savepoint)))
-                .execute(&mut **conn)
+                .execute(&mut ***conn)
                 .await?;
         }
         let marks = (
@@ -253,7 +292,7 @@ impl Run {
             if had_txn && same_txn {
                 let mut conn = self.conn.lock().await;
                 sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE {}", savepoint)))
-                    .execute(&mut **conn)
+                    .execute(&mut ***conn)
                     .await?;
             }
             self.dirty.store(dirty_before || wrote, Ordering::SeqCst);
@@ -264,15 +303,21 @@ impl Run {
         if had_txn && same_txn {
             let mut conn = self.conn.lock().await;
             sqlx::query(sqlx::AssertSqlSafe(format!("ROLLBACK TO {}", savepoint)))
-                .execute(&mut **conn)
+                .execute(&mut ***conn)
                 .await?;
             sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE {}", savepoint)))
-                .execute(&mut **conn)
+                .execute(&mut ***conn)
                 .await?;
         } else if self.began.swap(false, Ordering::SeqCst) {
             // Everything in the open transaction is this part's
             let mut conn = self.conn.lock().await;
-            sqlx::query("ROLLBACK").execute(&mut **conn).await?;
+            let rolled_back = sqlx::query("ROLLBACK").execute(&mut ***conn).await;
+            if let Some(c) = conn.0.take() {
+                if rolled_back.is_err() {
+                    drop(c.detach());
+                }
+            }
+            rolled_back?;
         }
         self.statements
             .lock()
@@ -358,7 +403,7 @@ impl Run {
 /// A connection for reading: the run's (so it sees the run's writes), or
 /// one from the pool outside a run
 pub enum Reader {
-    Run(OwnedMutexGuard<PoolConnection<Sqlite>>),
+    Run(OwnedMutexGuard<Slot>),
     Pool(PoolConnection<Sqlite>),
 }
 
@@ -384,8 +429,12 @@ impl std::ops::DerefMut for Reader {
 /// A connection to read with (see [`Reader`])
 pub async fn reader(pool: &SqlitePool) -> Result<Reader> {
     match current() {
-        Some(run) => Ok(Reader::Run(run.conn.clone().lock_owned().await)),
-        None => Ok(Reader::Pool(pool.acquire().await?)),
+        // Before its first write a run has nothing pending: the pool's view
+        // is the run's
+        Some(run) if run.began.load(Ordering::SeqCst) => {
+            Ok(Reader::Run(run.conn.clone().lock_owned().await))
+        }
+        _ => Ok(Reader::Pool(pool.acquire().await?)),
     }
 }
 
@@ -457,7 +506,8 @@ where
         return run.nested(f, on_abort).await;
     }
     let run = Arc::new(Run {
-        conn: Arc::new(Mutex::new(pool.acquire().await?)),
+        conn: Arc::new(Mutex::new(Slot(None))),
+        pool: pool.clone(),
         committer,
         gate: Mutex::new(None),
         began: AtomicBool::new(false),
@@ -755,5 +805,48 @@ mod tests {
         );
         assert!(aborted.load(Ordering::SeqCst), "caches rebuilt");
         assert!(rows(&pool).await.is_empty());
+    }
+
+    /// Many runs waiting for the gate must not use up the pool: the commit
+    /// of the run holding it needs a connection too (Raft's log and apply)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_waiting_runs_hold_no_connection() {
+        let (pool, direct) = setup().await;
+        let mut tasks = Vec::new();
+        for i in 0..40 {
+            let pool = pool.clone();
+            let inner = pool.clone();
+            let direct = direct.clone();
+            tasks.push(tokio::spawn(async move {
+                let r: std::result::Result<(), ()> = scope(
+                    &pool,
+                    direct,
+                    Vec::new(),
+                    async move {
+                        let mut conn = reader(&inner).await.unwrap();
+                        let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+                            .fetch_one(&mut *conn)
+                            .await
+                            .unwrap();
+                        drop(conn);
+                        current().unwrap().execute(&[insert(i)]).await.unwrap();
+                        Ok(())
+                    },
+                    || async {},
+                )
+                .await
+                .unwrap();
+                r
+            }));
+        }
+        let all = async {
+            for t in tasks {
+                t.await.unwrap().unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), all)
+            .await
+            .expect("no deadlock");
+        assert_eq!(rows(&pool).await.len(), 40);
     }
 }

@@ -758,3 +758,95 @@ async fn test_failed_run_keeps_nothing() {
         .await
         .expect("a run sees its own writes");
 }
+
+/// `clients` wizards each send writing commands (read a counter, write it
+/// back) as fast as replies come, for `secs`: (commands done, errors seen)
+async fn concurrent_writes(server: &TestServer, clients: usize, secs: u64) -> (u64, Vec<String>) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let entrance = server.world().entrance_id.clone();
+    let mut handles = Vec::new();
+    for _ in 0..clients {
+        let c = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut wiz = server
+            .connect_as(Role::Wizard {
+                username: format!("writer{}", c),
+            })
+            .await
+            .unwrap();
+        wiz.drain().await;
+        wiz.command(&format!(
+            r#"eval game.create_object("/items/ctr{c}", "item", "{e}", {{name = "ctr", n = 0}}) return "made""#,
+            c = c,
+            e = entrance
+        ))
+        .await
+        .unwrap();
+        wiz.expect_output_containing("made").await.unwrap();
+        handles.push(tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let mut done = 0u64;
+            let mut errors = Vec::new();
+            while tokio::time::Instant::now() < deadline {
+                wiz.command(&format!(
+                    r#"eval local o = game.get_object("/items/ctr{c}") game.update_object("/items/ctr{c}", {{n = (o.n or (o.properties or {{}}).n or 0) + 1}}) return "k""#,
+                    c = c
+                ))
+                .await
+                .unwrap();
+                loop {
+                    let m = wiz.expect_any().await.unwrap();
+                    if m["type"] == "output" && m["text"] == "k" {
+                        done += 1;
+                        break;
+                    }
+                    if m["type"] == "error" {
+                        errors.push(m.to_string());
+                        break;
+                    }
+                }
+            }
+            (done, errors)
+        }));
+    }
+    let mut total = 0;
+    let mut errors = Vec::new();
+    for h in handles {
+        let (done, errs) = h.await.unwrap();
+        total += done;
+        errors.extend(errs);
+    }
+    (total, errors)
+}
+
+/// Many players writing at once: every command succeeds (no "database is
+/// locked" from SQLite's shared cache, no pool exhaustion while runs wait
+/// for the write gate)
+#[tokio::test]
+async fn test_concurrent_writing_commands() {
+    let server = TestServer::start().await.expect("server");
+    let (done, errors) = concurrent_writes(&server, 32, 2).await;
+    assert!(
+        errors.is_empty(),
+        "{} errors, e.g. {:?}",
+        errors.len(),
+        errors.first()
+    );
+    assert!(done > 32, "progress: {}", done);
+}
+
+/// Throughput of writing commands from concurrent clients (manual:
+/// `cargo test --release --test integration_test bench_writes -- --ignored --nocapture`)
+#[tokio::test]
+#[ignore]
+async fn bench_writes() {
+    let server = TestServer::start().await.expect("server");
+    for clients in [1, 8, 32] {
+        let (done, errors) = concurrent_writes(&server, clients, 3).await;
+        println!(
+            "BENCH {} clients: {}/s writing commands, {} errors",
+            clients,
+            done / 3,
+            errors.len()
+        );
+    }
+}

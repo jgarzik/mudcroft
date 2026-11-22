@@ -334,7 +334,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         // openraft hands over every entry it has ready at once (concurrent
         // client writes batched together): one transaction for all of them
         let pool = self.pool.read().await;
-        let mut tx = pool.begin().await.map_err(io::Error::other)?;
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(io::Error::other)?;
         for entry in entries {
             let (entry_type, payload) = match &entry.payload {
                 EntryPayload::Blank => ("blank", None),
@@ -378,7 +381,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
     async fn purge(&mut self, log_id: LogId) -> io::Result<()> {
         let pool = self.pool.read().await;
-        let mut tx = pool.begin().await.map_err(io::Error::other)?;
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(io::Error::other)?;
         sqlx::query("DELETE FROM raft_log WHERE log_index <= ?")
             .bind(log_id.index as i64)
             .execute(&mut *tx)
@@ -735,7 +741,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         // Not synced: the log entry already is (see relaxed_sync)
         let mut conn = RelaxedConn::acquire(&pool).await?;
         let applied = async {
-            let mut tx = sqlx::Connection::begin(conn.conn())
+            let mut tx = sqlx::Connection::begin_with(conn.conn(), "BEGIN IMMEDIATE")
                 .await
                 .map_err(io::Error::other)?;
             for (entry, responder) in batch {
@@ -826,7 +832,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         .map_err(io::Error::other)?;
         let result = async {
             let tables = snapshot_tables(&mut conn).await?;
-            let mut tx = sqlx::Connection::begin(&mut *conn)
+            let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
                 .await
                 .map_err(io::Error::other)?;
             sqlx::query("PRAGMA defer_foreign_keys = ON")

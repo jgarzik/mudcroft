@@ -321,8 +321,11 @@ impl Database {
             .create_if_missing(false)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(30))
-            .shared_cache(true);
+            // No shared cache: under it SQLite skips the busy handler while
+            // another connection of the cache is in a transaction, so
+            // concurrent writers (runs, Raft's log and apply) fail at once
+            // with "database is locked" instead of waiting
+            .busy_timeout(std::time::Duration::from_secs(30));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(10)
