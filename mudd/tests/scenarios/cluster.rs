@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::harness::TestCluster;
+use crate::harness::{ClusterPlayer, TestCluster};
 
 async fn register(cluster: &TestCluster, node: usize, username: &str) -> reqwest::StatusCode {
     cluster
@@ -266,4 +266,132 @@ return game.use_object("/items/bell", "", "arm")
         "exactly one survivor took over: {:?}",
         primaries
     );
+}
+
+/// A player connected to a gateway (not the primary) plays normally: their
+/// account is registered through the gateway (forwarded), their session
+/// runs on the primary, and they hear and are heard by a player connected
+/// to the primary itself
+#[tokio::test]
+async fn test_gateway_play() {
+    let cluster = TestCluster::start(3).await.expect("cluster");
+    cluster.seed_world(0, "gw-world").await.expect("seed");
+
+    let (_, gw_token) = cluster
+        .register(1, "via_gateway")
+        .await
+        .expect("register via gateway");
+    let (_, pr_token) = cluster.register(0, "on_primary").await.expect("register");
+    let limit = Duration::from_secs(10);
+    let mut far = ClusterPlayer::connect(&cluster.nodes[1], "gw-world", &gw_token)
+        .await
+        .expect("connect to gateway");
+    far.wait_for("Cave Entrance", limit)
+        .await
+        .expect("spawned via gateway");
+    let mut near = ClusterPlayer::connect(&cluster.nodes[0], "gw-world", &pr_token)
+        .await
+        .expect("connect to primary");
+    near.wait_for("Cave Entrance", limit)
+        .await
+        .expect("spawned");
+
+    far.command("say hello from the gateway").await.unwrap();
+    near.wait_for("hello from the gateway", limit)
+        .await
+        .expect("heard on the primary");
+    near.command("say hello from the primary").await.unwrap();
+    far.wait_for("hello from the primary", limit)
+        .await
+        .expect("heard on the gateway");
+    assert_eq!(
+        cluster.primaries(),
+        vec![0],
+        "the gateway ran nothing itself"
+    );
+
+    // Leaving through the gateway ends the session on the primary too
+    drop(far);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut ended = false;
+    while tokio::time::Instant::now() < deadline && !ended {
+        let log = std::fs::read_to_string(&cluster.nodes[0].log_path).unwrap_or_default();
+        ended = log.lines().any(|l| l.contains("WebSocket disconnected"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        ended,
+        "the primary saw the player leave\n{}",
+        cluster.logs()
+    );
+}
+
+/// When the primary dies, a player on a gateway is told, lands in the world
+/// again on the new primary, and keeps playing
+#[tokio::test]
+async fn test_gateway_follows_failover() {
+    let mut cluster = TestCluster::start(3).await.expect("cluster");
+    cluster.seed_world(0, "fo-world").await.expect("seed");
+    let (_, token) = cluster.register(1, "survivor").await.expect("register");
+    let limit = Duration::from_secs(10);
+    let mut player = ClusterPlayer::connect(&cluster.nodes[1], "fo-world", &token)
+        .await
+        .expect("connect to gateway");
+    player
+        .wait_for("Cave Entrance", limit)
+        .await
+        .expect("spawned");
+
+    cluster.stop(0);
+    player
+        .wait_for("change hands", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| panic!("{}\n{}", e, cluster.logs()));
+    player
+        .wait_for("Cave Entrance", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| panic!("back in the world: {}\n{}", e, cluster.logs()));
+    player.command("look").await.unwrap();
+    player
+        .wait_for("Cave Entrance", limit)
+        .await
+        .expect("commands work after the failover");
+}
+
+/// A primary that steps down while still running (here: removed from the
+/// cluster) hands its sessions on: a player on a gateway is moved to the
+/// new primary rather than disconnected
+#[tokio::test]
+async fn test_gateway_follows_live_step_down() {
+    let cluster = TestCluster::start(3).await.expect("cluster");
+    cluster.seed_world(0, "sd-world").await.expect("seed");
+    let (_, token) = cluster.register(1, "moved_on").await.expect("register");
+    let limit = Duration::from_secs(10);
+    let mut player = ClusterPlayer::connect(&cluster.nodes[1], "sd-world", &token)
+        .await
+        .expect("connect to gateway");
+    player
+        .wait_for("Cave Entrance", limit)
+        .await
+        .expect("spawned");
+    // All three are voters before the primary removes itself
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let (_, out) = cluster.admin(0, &["status"]).unwrap();
+        if members(&out) == vec![(1, true), (2, true), (3, true)] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let (ok, out) = cluster.admin(1, &["remove", "1"]).unwrap();
+    assert!(ok, "{}", out);
+    player
+        .wait_for("change hands", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| panic!("{}\n{}", e, cluster.logs()));
+    player
+        .wait_for("Cave Entrance", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| panic!("back in the world: {}\n{}", e, cluster.logs()));
 }

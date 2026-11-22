@@ -17,6 +17,62 @@ use tempfile::TempDir;
 
 use super::server::{die_with_parent, find_binary_path, log_tail, spawn_mudd, ChildGuard};
 
+/// A player's game connection to one node
+pub struct ClusterPlayer {
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+}
+
+impl ClusterPlayer {
+    pub async fn connect(node: &ClusterNode, universe: &str, token: &str) -> Result<Self> {
+        let url = format!(
+            "ws://{}/ws?universe={}&token={}",
+            node.http, universe, token
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+        Ok(Self { ws })
+    }
+
+    pub async fn command(&mut self, text: &str) -> Result<()> {
+        use futures_util::SinkExt;
+        let msg = serde_json::json!({"type": "command", "text": text}).to_string();
+        self.ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+            .await?;
+        Ok(())
+    }
+
+    /// Read messages until one mentions `needle` (anywhere in its JSON);
+    /// that message
+    pub async fn wait_for(&mut self, needle: &str, limit: Duration) -> Result<serde_json::Value> {
+        use futures_util::StreamExt;
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut seen = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let next = tokio::time::timeout(left, self.ws.next()).await;
+            match next {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                    if text.contains(needle) {
+                        return Ok(serde_json::from_str(&text)?);
+                    }
+                    seen.push(text.to_string());
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(e))) => anyhow::bail!("connection error: {} (seen: {:?})", e, seen),
+                Ok(None) => anyhow::bail!("connection closed (seen: {:?})", seen),
+                Err(_) => anyhow::bail!(
+                    "no message with {:?} within {:?} (seen: {:?})",
+                    needle,
+                    limit,
+                    seen
+                ),
+            }
+        }
+    }
+}
+
 /// One cluster member
 pub struct ClusterNode {
     pub http: SocketAddr,
@@ -286,6 +342,71 @@ impl TestCluster {
         let dir = self.dir.path().join("scripts");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join(name), source)?;
+        Ok(())
+    }
+
+    /// Register an account through node `i`: (account id, token)
+    pub async fn register(&self, i: usize, username: &str) -> Result<(String, String)> {
+        let resp = self
+            .client
+            .post(format!("{}/auth/register", self.nodes[i].base_url()))
+            .json(&serde_json::json!({"username": username, "password": "testpass123"}))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("register via node {}: {} {}", i + 1, status, body);
+        }
+        Ok((
+            body["account_id"].as_str().unwrap_or_default().to_string(),
+            body["token"].as_str().unwrap_or_default().to_string(),
+        ))
+    }
+
+    /// Create universe `id` through node `i` with the cave adventure loaded
+    /// and the portal set (as the cluster admin)
+    pub async fn seed_world(&self, i: usize, id: &str) -> Result<()> {
+        let cave = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/cave_adventure.lua"),
+        )?;
+        self.add_script("cave.lua", &cave)?;
+        let base = self.nodes[i].base_url();
+        let login: serde_json::Value = self
+            .client
+            .post(format!("{}/auth/login", base))
+            .json(&serde_json::json!({"username": "cluster_admin", "password": "testpass123"}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let token = login["token"].as_str().unwrap_or_default().to_string();
+        let calls = [
+            (
+                "/universe/create".to_string(),
+                serde_json::json!({"id": id, "name": id, "owner_id": login["account_id"]}),
+            ),
+            (
+                format!("/universe/{}/run_script", id),
+                serde_json::json!({"script": "cave.lua"}),
+            ),
+            (
+                format!("/universe/{}/portal", id),
+                serde_json::json!({"room_id": "/rooms/cave-entrance"}),
+            ),
+        ];
+        for (path, body) in calls {
+            let resp = self
+                .client
+                .post(format!("{}{}", base, path))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("{}: {} {}", path, resp.status(), resp.text().await?);
+            }
+        }
         Ok(())
     }
 

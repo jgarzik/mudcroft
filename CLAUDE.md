@@ -8,7 +8,7 @@ Mudcroft is a multi-user dungeon (MUD) game server in Rust (`mudd/`) with a Reac
 - Sandboxed Lua scripting for programmable game mechanics
 - LPC-style object system with path-based IDs and class inheritance
 - WebSocket-based multiplayer gameplay
-- Raft (openraft) log over SQLite; single node by default, clusters join over a TLS cluster port (gateways and primary-only schedulers still to build; `docs/cluster-design.md`)
+- Raft (openraft) log over SQLite; single node by default; clusters join over a TLS cluster port, the leader (primary) runs the game and other nodes are gateways (`docs/cluster-design.md`)
 
 Design it as what it is: a specialized database server. The tables (written only through Raft) are the source of truth; in-memory maps are caches derived from them, never a second copy of state. One logical change (a combat round, an effect tick) is one atomic batch. State that lives only in memory (custom verbs today) is a flaw to fix. Prefer absolute deadlines and event-driven work to periodic sweeps: write only when something happens.
 
@@ -55,6 +55,7 @@ scripts/testsrv.py start             # manual play-test server with a seeded wor
   - `auth.rs` - /auth/* endpoints (register, login, logout, validate)
   - `universe.rs` - /universe/* endpoints (list, create, upload, run_script)
   - `images.rs` - /images/{hash}
+  - `gateway.rs` - on a non-primary node: forwards /auth and /universe to the primary, relays game sessions (follows failover)
   - `primary.rs` - primary lifecycle: only the Raft leader runs the timer loop and effect scheduler; caches rebuilt from tables on becoming primary
   - `scripting.rs` - script runner: per-execution sandbox + MessageQueue, hooks, verbs, timer loop, message delivery
   - `websocket.rs` - /ws endpoint, ConnectionManager, PlayerSession, command dispatch

@@ -25,7 +25,7 @@ pub async fn run(state: AppState, activations: watch::Sender<u64>) {
     let mut metrics = raft.metrics();
     loop {
         // Wait to be the leader
-        while metrics.borrow_watched().current_leader != Some(me) {
+        while !leading(&metrics.borrow_watched(), me) {
             if metrics.changed().await.is_err() {
                 return;
             }
@@ -49,7 +49,7 @@ pub async fn run(state: AppState, activations: watch::Sender<u64>) {
 
         // Serve until another node leads (or the core stops)
         let mut stopped = false;
-        while metrics.borrow_watched().current_leader == Some(me) {
+        while leading(&metrics.borrow_watched(), me) {
             if metrics.changed().await.is_err() {
                 stopped = true;
                 break;
@@ -58,11 +58,21 @@ pub async fn run(state: AppState, activations: watch::Sender<u64>) {
         timer_loop.abort();
         effect_loop.abort();
         state.actions.clear_all().await;
+        // Sessions move to the new primary (directly connected players
+        // reconnect; gateways relaying sessions follow)
+        state.connections.close_all().await;
         info!("primary: node {} stepped down (schedulers stopped)", me);
         if stopped {
             return;
         }
     }
+}
+
+/// Whether this node leads: its server state, not just current_leader (a
+/// leader that steps down, e.g. removed from the cluster, can still name
+/// itself there)
+fn leading(m: &openraft::RaftMetrics<crate::raft::TypeConfig>, me: crate::raft::NodeId) -> bool {
+    m.state == openraft::ServerState::Leader && m.current_leader == Some(me)
 }
 
 /// Rebuild every cache game logic reads from its table

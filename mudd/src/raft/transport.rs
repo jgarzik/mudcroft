@@ -30,7 +30,8 @@ use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::v2::RaftNetworkV2;
 use openraft::network::{RPCOption, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest,
+    TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, ChangeMembers, OptionalSend};
 use serde::de::DeserializeOwned;
@@ -71,7 +72,20 @@ enum Kind {
     Join = 6,
     Status = 7,
     Remove = 8,
+    /// Forward an HTTP API request to the primary
+    Http = 9,
+    /// Open a player's game session on the primary; the connection then
+    /// carries only that session's frames
+    GameOpen = 10,
+    /// A stepping-down leader hands leadership to a chosen voter
+    TransferLeader = 11,
 }
+
+/// Frame tags on a game-session connection (after GameOpen)
+const GAME_TEXT: u8 = 0x20;
+/// Sent by the primary when it ends the session on purpose (the player was
+/// replaced, refused, ...); a connection that drops without it is a failover
+const GAME_END: u8 = 0x21;
 
 impl Kind {
     fn from_u8(v: u8) -> Option<Self> {
@@ -84,6 +98,9 @@ impl Kind {
             6 => Kind::Join,
             7 => Kind::Status,
             8 => Kind::Remove,
+            9 => Kind::Http,
+            10 => Kind::GameOpen,
+            11 => Kind::TransferLeader,
             _ => return None,
         })
     }
@@ -147,6 +164,125 @@ pub enum RemoveReply {
     Removed,
     NotLeader { leader: Option<String> },
     Refused(String),
+}
+
+/// An HTTP API request forwarded from a gateway to the primary
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HttpRequest {
+    pub method: String,
+    /// Path and query
+    pub uri: String,
+    /// The headers the API reads (authorization, content-type)
+    pub headers: Vec<(String, String)>,
+    /// Body, base64
+    pub body: String,
+}
+
+/// The primary's response to a forwarded request
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    /// Body, base64
+    pub body: String,
+}
+
+/// Opens a player's session on the primary
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GameOpen {
+    pub universe: String,
+    pub token: String,
+}
+
+type BoxFuture<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// Serves forwarded HTTP requests (installed by the API layer)
+pub type HttpHook = Arc<dyn Fn(HttpRequest) -> BoxFuture<HttpResponse> + Send + Sync>;
+/// Serves a forwarded game session until it ends (installed by the API layer)
+pub type GameHook = Arc<dyn Fn(GameOpen, GameStream) -> BoxFuture<()> + Send + Sync>;
+
+/// A game session's frames over a cluster connection, from either end.
+/// Received text arrives through a channel filled by a reader task, so
+/// `recv` is cancel-safe (usable in `select!`).
+pub struct GameStream {
+    incoming: tokio::sync::mpsc::Receiver<GameFrame>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    /// Holds the read half: aborted on drop, so dropping the stream closes
+    /// the connection (the other end then sees it end)
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for GameStream {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// What the other end sent
+#[derive(Debug)]
+pub enum GameFrame {
+    Text(String),
+    /// Ended on purpose (with the reason)
+    End(String),
+}
+
+impl GameStream {
+    fn new<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: S) -> Self {
+        let (mut reader, writer) = tokio::io::split(stream);
+        let (tx, incoming) = tokio::sync::mpsc::channel(64);
+        let reader = tokio::spawn(async move {
+            loop {
+                let frame = match read_frame(&mut reader, MAX_FRAME).await {
+                    Ok((GAME_TEXT, body)) => {
+                        GameFrame::Text(String::from_utf8_lossy(&body).into_owned())
+                    }
+                    Ok((GAME_END, body)) => {
+                        let _ = tx
+                            .send(GameFrame::End(String::from_utf8_lossy(&body).into_owned()))
+                            .await;
+                        return;
+                    }
+                    Ok(_) | Err(_) => return,
+                };
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            incoming,
+            writer: Box::new(writer),
+            reader,
+        }
+    }
+
+    /// The next frame; None when the connection dropped
+    pub async fn recv(&mut self) -> Option<GameFrame> {
+        self.incoming.recv().await
+    }
+
+    /// Send text; false if the connection is gone
+    pub async fn send(&mut self, text: &str) -> bool {
+        write_frame(&mut self.writer, GAME_TEXT, text.as_bytes())
+            .await
+            .is_ok()
+    }
+
+    /// End the session on purpose
+    pub async fn end(&mut self, reason: &str) {
+        let _ = write_frame(&mut self.writer, GAME_END, reason.as_bytes()).await;
+    }
+}
+
+/// Open a player's game session on the node at `addr` (the primary)
+pub async fn open_game_session(
+    addr: &str,
+    security: &ClusterSecurity,
+    open: &GameOpen,
+) -> io::Result<GameStream> {
+    let mut stream = connect(addr, security).await?;
+    write_frame(&mut stream, Kind::GameOpen as u8, &encode(open)?).await?;
+    Ok(GameStream::new(stream))
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +570,13 @@ impl PeerClient {
         .await
     }
 
+    /// Forward an HTTP request
+    pub async fn http(&self, request: &HttpRequest) -> Result<HttpResponse, String> {
+        // A script run can take a while
+        self.request(Kind::Http, request, Duration::from_secs(120))
+            .await
+    }
+
     /// This node's view of the cluster
     pub async fn status(&self) -> Result<ClusterStatus, String> {
         self.request(Kind::Status, &(), CONTROL_TIMEOUT).await
@@ -566,6 +709,18 @@ impl RaftNetworkV2<TypeConfig> for PeerNetwork {
             .map_err(|e| RPCError::Unreachable(Unreachable::from_string(e)))
     }
 
+    async fn transfer_leader(
+        &mut self,
+        rpc: TransferLeaderRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
+        let client = self.client().map_err(RPCError::Unreachable)?;
+        client
+            .request(Kind::TransferLeader, &rpc, option.soft_ttl())
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::from_string(e)))
+    }
+
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<TypeConfig>,
@@ -593,6 +748,9 @@ impl RaftNetworkV2<TypeConfig> for PeerNetwork {
 /// What the cluster port serves
 pub struct ClusterService {
     raft: GameRaft,
+    /// Installed by the API layer once its router exists
+    http: std::sync::OnceLock<HttpHook>,
+    game: std::sync::OnceLock<GameHook>,
     /// One snapshot received at a time
     receiving_snapshot: Mutex<()>,
     /// Joins are admitted one at a time; ids handed out but not yet members
@@ -603,9 +761,22 @@ impl ClusterService {
     pub fn new(raft: GameRaft) -> Arc<Self> {
         Arc::new(Self {
             raft,
+            http: std::sync::OnceLock::new(),
+            game: std::sync::OnceLock::new(),
             receiving_snapshot: Mutex::new(()),
             joining: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Install the handlers for forwarded HTTP requests and game sessions
+    pub fn set_hooks(&self, http: HttpHook, game: GameHook) {
+        let _ = self.http.set(http);
+        let _ = self.game.set(game);
+    }
+
+    /// The leader's cluster address, if known and not this node
+    pub fn leader_addr(&self) -> Option<String> {
+        self.not_leader().flatten()
     }
 
     fn status(&self) -> ClusterStatus {
@@ -838,7 +1009,23 @@ impl ClusterService {
                 }
                 Err(e) => Err(e.to_string()),
             },
-            Kind::Hello | Kind::SnapshotChunk => Err(format!("unexpected {:?}", kind)),
+            Kind::TransferLeader => match decode::<TransferLeaderRequest<TypeConfig>>(&body) {
+                Ok(rpc) => match self.raft.handle_transfer_leader(rpc).await {
+                    Ok(r) => encode(&r).map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            },
+            Kind::Http => match (decode::<HttpRequest>(&body), self.http.get()) {
+                (Ok(request), Some(hook)) => {
+                    encode(&hook(request).await).map_err(|e| e.to_string())
+                }
+                (Err(e), _) => Err(e.to_string()),
+                (_, None) => Err("this node is not serving yet".to_string()),
+            },
+            Kind::Hello | Kind::SnapshotChunk | Kind::GameOpen => {
+                Err(format!("unexpected {:?}", kind))
+            }
         };
         match reply {
             Ok(body) => write_frame(stream, 0, &body).await,
@@ -963,6 +1150,16 @@ async fn serve_connection(
             write_frame(&mut stream, 1, b"unknown request").await?;
             continue;
         };
+        if kind == Kind::GameOpen {
+            // The connection now belongs to this game session
+            let open: GameOpen = decode(&body)?;
+            let Some(hook) = service.game.get().cloned() else {
+                let _ = write_frame(&mut stream, GAME_END, b"this node is not serving yet").await;
+                return Ok(());
+            };
+            hook(open, GameStream::new(stream)).await;
+            return Ok(());
+        }
         service.handle(&mut stream, kind, body).await?;
     }
 }

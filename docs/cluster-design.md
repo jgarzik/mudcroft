@@ -71,6 +71,10 @@ Players may connect to any node. On a gateway:
   - primary to gateway: `Deliver { session, ServerMessage }`,
     `SessionEnded { session, reason }`
 
+  (Built with one cluster connection per relayed player rather than one
+  multiplexed stream per gateway: simpler, at the cost of a TLS connection
+  per remote player.)
+
   On the primary, `ConnectionManager` sessions get a sink that is either a
   local WebSocket or a remote session (gateway stream + session id). All game
   code is unchanged: `send_to_player` and room broadcasts just write to the

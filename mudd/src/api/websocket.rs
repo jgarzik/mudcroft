@@ -135,6 +135,13 @@ impl ConnectionManager {
         }
     }
 
+    /// End every session (this node stopped being the primary): dropping
+    /// their senders ends their loops. Players reconnect, through this node
+    /// as a gateway or to the new primary.
+    pub async fn close_all(&self) {
+        self.sessions.write().await.clear();
+    }
+
     /// Remove a player session, but only if it is still `conn_id`'s.
     /// Returns false if a newer connection had replaced it.
     pub async fn unregister(&self, universe_id: &str, player_id: &str, conn_id: u64) -> bool {
@@ -322,72 +329,154 @@ pub struct WsParams {
     pub universe: Option<String>,
 }
 
+/// Check a connection's universe and token: the account and the normalized
+/// universe id, or the HTTP status and reason to refuse it with
+async fn admit(
+    state: &AppState,
+    universe: Option<&str>,
+    token: Option<&str>,
+) -> Result<(Account, String), (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    let universe_id = match universe {
+        Some(id) => validate_universe_id(id).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid universe ID: {}", e),
+            )
+        })?,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Universe ID required in query param: ?universe=<id>".to_string(),
+            ))
+        }
+    };
+    match state.object_store.universe_exists(&universe_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Universe not found: {}", universe_id),
+            ))
+        }
+        Err(e) => {
+            warn!("Error checking universe: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to verify universe".to_string(),
+            ));
+        }
+    }
+    // A valid token is required: there are no guests
+    let account = match token {
+        Some(token) => state.accounts().validate_token(token).await.ok().flatten(),
+        None => None,
+    };
+    let Some(account) = account else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "A valid token is required: ?token=<token>".to_string(),
+        ));
+    };
+    Ok((account, universe_id))
+}
+
 /// Handle WebSocket upgrade with optional token authentication
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<WsParams>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // Validate universe ID (required)
-    let universe_id = match &params.universe {
-        Some(id) => match validate_universe_id(id) {
-            Ok(validated) => validated,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    format!("Invalid universe ID: {}", e),
+    // A node that is not the primary is a gateway: the session runs on the
+    // primary, and this node relays it (and follows a failover)
+    if !state.raft_writer.is_leader() && state.raft_writer.cluster().is_some() {
+        return super::gateway::ws_upgrade(ws, params, state).await;
+    }
+    match admit(&state, params.universe.as_deref(), params.token.as_deref()).await {
+        Ok((account, universe_id)) => ws
+            .on_upgrade(move |socket| {
+                handle_socket(
+                    SessionIo::Local(Box::new(socket)),
+                    state,
+                    account,
+                    universe_id,
                 )
-                    .into_response();
-            }
-        },
-        None => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                "Universe ID required in query param: ?universe=<id>",
-            )
-                .into_response();
-        }
-    };
+            })
+            .into_response(),
+        Err((status, reason)) => (status, reason).into_response(),
+    }
+}
 
-    // Verify universe exists
-    match state.object_store.universe_exists(&universe_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                format!("Universe not found: {}", universe_id),
-            )
-                .into_response();
+/// A game session forwarded by a gateway (runs on the primary): the same
+/// checks as a direct connection, then the same session
+pub async fn serve_remote_session(
+    state: AppState,
+    open: crate::raft::transport::GameOpen,
+    mut stream: crate::raft::transport::GameStream,
+) {
+    if !state.raft_writer.is_leader() {
+        // The gateway reconnects to the primary
+        return;
+    }
+    match admit(&state, Some(&open.universe), Some(&open.token)).await {
+        Ok((account, universe_id)) => {
+            handle_socket(SessionIo::Remote(stream), state, account, universe_id).await
         }
-        Err(e) => {
-            warn!("Error checking universe: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to verify universe",
-            )
-                .into_response();
+        Err((_, reason)) => {
+            let msg = ServerMessage::Error { message: reason };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                stream.send(&json).await;
+            }
+            stream.end("refused").await;
+        }
+    }
+}
+
+/// A player's connection: a local WebSocket, or a session a gateway relays
+/// over the cluster port
+pub enum SessionIo {
+    Local(Box<WebSocket>),
+    Remote(crate::raft::transport::GameStream),
+}
+
+impl SessionIo {
+    /// Send a message's JSON; false when the connection is gone
+    async fn send(&mut self, text: String) -> bool {
+        match self {
+            SessionIo::Local(ws) => ws.send(Message::Text(text.into())).await.is_ok(),
+            SessionIo::Remote(stream) => stream.send(&text).await,
         }
     }
 
-    // A valid token is required: there are no guests
-    let account = match params.token {
-        Some(token) => state.accounts().validate_token(&token).await.ok().flatten(),
-        None => None,
-    };
-    let Some(account) = account else {
-        return (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "A valid token is required: ?token=<token>",
-        )
-            .into_response();
-    };
+    /// The next message: Some(Some(text)), Some(None) for anything to
+    /// ignore, None once the connection is closed. Cancel-safe.
+    async fn recv(&mut self) -> Option<Option<String>> {
+        use crate::raft::transport::GameFrame;
+        match self {
+            SessionIo::Local(ws) => match ws.recv().await {
+                Some(Ok(Message::Text(text))) => Some(Some(text.to_string())),
+                Some(Ok(Message::Close(_))) | None => None,
+                _ => Some(None),
+            },
+            SessionIo::Remote(stream) => match stream.recv().await {
+                Some(GameFrame::Text(text)) => Some(Some(text)),
+                Some(GameFrame::End(_)) | None => None,
+            },
+        }
+    }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, account, universe_id))
+    /// The session ends on purpose (a gateway must not take it for a
+    /// failover)
+    async fn finish(&mut self) {
+        if let SessionIo::Remote(stream) = self {
+            stream.end("session ended").await;
+        }
+    }
 }
 
 /// Handle an individual WebSocket connection
 async fn handle_socket(
-    mut socket: WebSocket,
+    mut socket: SessionIo,
     state: AppState,
     account: Account,
     universe_id: String,
@@ -463,7 +552,7 @@ async fn handle_socket(
         theme_id,
     };
     if let Ok(json) = serde_json::to_string(&welcome) {
-        let _ = socket.send(Message::Text(json.into())).await;
+        let _ = socket.send(json).await;
     }
 
     // Move player to spawn room and send room description
@@ -482,7 +571,7 @@ async fn handle_socket(
             build_room_message(&state, &universe_id, &room_id, Some(&account_id)).await
         {
             if let Ok(json) = serde_json::to_string(&room_msg) {
-                let _ = socket.send(Message::Text(json.into())).await;
+                let _ = socket.send(json).await;
             }
         }
 
@@ -505,7 +594,7 @@ async fn handle_socket(
             text: "Universe not initialized. Wizards: use 'setportal' command.".to_string(),
         };
         if let Ok(json) = serde_json::to_string(&msg) {
-            let _ = socket.send(Message::Text(json.into())).await;
+            let _ = socket.send(json).await;
         }
     }
 
@@ -517,7 +606,7 @@ async fn handle_socket(
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
                 if let Ok(json) = serde_json::to_string(&msg) {
-                    if socket.send(Message::Text(json.into())).await.is_err() {
+                    if !socket.send(json).await {
                         break;
                     }
                 }
@@ -525,7 +614,7 @@ async fn handle_socket(
             // Handle incoming messages from WebSocket
             result = socket.recv() => {
                 match result {
-                    Some(Ok(Message::Text(text))) => {
+                    Some(Some(text)) => {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                             // Read the level per command: a promotion or
                             // demotion applies to this open session at once
@@ -533,11 +622,16 @@ async fn handle_socket(
                             handle_client_message(&state, &universe_id, &player_id, &account_id, access_level, client_msg).await;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    _ => {}
+                    None => break,
+                    Some(None) => {}
                 }
             }
         }
+    }
+    // Ended here on purpose, unless this node stepped down: then a gateway
+    // relaying the session must take it for a failover and move it on
+    if state.raft_writer.is_leader() {
+        socket.finish().await;
     }
 
     // Unregister session immediately (stops message delivery). A connection

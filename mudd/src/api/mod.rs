@@ -2,6 +2,7 @@
 
 mod auth;
 mod effect_scheduler;
+mod gateway;
 mod images;
 mod primary;
 pub mod scripting;
@@ -136,18 +137,22 @@ pub async fn router(
         .route("/health", get(health_check))
         .route("/ws", get(websocket::ws_handler))
         .nest("/images", images::router())
-        .merge(auth::router())
-        .merge(universe::router());
+        // On a gateway these are forwarded to the primary
+        .merge(auth::router().merge(universe::router()).route_layer(
+            axum::middleware::from_fn_with_state(state.clone(), gateway::forward_to_primary),
+        ));
 
     let app = match static_dir {
         Some(dir) => {
             let index = tower_http::services::ServeFile::new(dir.join("index.html"));
             let files = tower_http::services::ServeDir::new(dir).fallback(index);
-            api.fallback_service(files).with_state(state)
+            api.fallback_service(files).with_state(state.clone())
         }
-        None => api.route("/", get(root)).with_state(state),
+        None => api.route("/", get(root)).with_state(state.clone()),
     };
-    with_web_layers(app)
+    let app = with_web_layers(app);
+    gateway::install_hooks(&state, &app);
+    app
 }
 
 /// What a front-end proxy would otherwise add: gzip for text (images and

@@ -16,20 +16,19 @@ affected feature.
 
 ### Multi-node coherence
 
-Nodes join and replicate over the cluster transport
-(`mudd/src/raft/transport.rs`); the rest of `docs/cluster-design.md` is
-still to be built:
+Clusters work as described in `docs/cluster-design.md` (joining, the
+primary lifecycle, gateways, failover), with these gaps:
 
-- **No gateways yet.** A command or HTTP write sent to a node that is not
-  the leader fails (only the leader can write); play through the leader.
 - **Custom verbs are lost on failover.** They live only in the primary's
   memory (`ActionRegistry`) until Phase 6 persists them.
-- **A former primary keeps its game sessions.** After a failover, players
-  still connected to the old primary get "not the primary" errors until they
-  reconnect to the new one (gateways will move them).
-- **Snapshots are held in memory whole.** A snapshot is built and sent as
-  one in-memory buffer (the whole game database); streaming it in chunks
-  comes with the cluster transport (`docs/cluster-design.md`).
+- **Commands are not exactly-once across a failover.** A command in flight
+  when the primary dies may or may not have taken effect; the player is told
+  and nothing is retried (one batch per command and command ids would fix
+  it).
+- **Snapshots are held in memory whole.** A snapshot travels in 1 MiB
+  chunks, but is built, sent and installed from one in-memory buffer (the
+  whole game database) on each side (`mudd/src/raft/storage.rs`,
+  `transport.rs`).
 
 ### Lua runtime
 

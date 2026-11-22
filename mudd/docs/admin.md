@@ -147,10 +147,9 @@ requests finish, and exits with status 0. Signals are handled from the
 moment `mudd` starts, so one during startup stops it too; a second signal
 exits at once without waiting.
 
-> **Clusters are partly built.** Nodes join and replicate, and only the
-> leader (the primary) runs timers and status effects, taking over on
-> failover. Gateways do not yet forward commands to the primary: play
-> through the leader only. See
+> **Clusters.** Players may connect to any node: the leader (the primary)
+> runs the game, and the other nodes relay to it. Known gaps (custom verbs
+> are lost on failover until Phase 6) are in docs/roadmap.md. See
 > [Clusters](#clusters) and [docs/cluster-design.md](../../docs/cluster-design.md).
 
 | Environment variable | Description |
@@ -345,6 +344,18 @@ nodes so they stop counting toward the majority. A removed node refuses to
 start again with its old id, even if it was down during the removal (it
 asks the members it knows); to bring the machine back, start it from an
 empty database (`mudd_init --empty`) with `--join`, as a new node.
+
+**Players and API clients may use any node.** The Raft leader is the
+primary: it runs Lua, timers and status effects. Every other node is a
+gateway: it serves the web client and images itself, forwards `/auth/*` and
+`/universe/*` to the primary, and relays each game connection to a session
+on the primary. When the primary fails (or steps down), a new one is
+elected, rebuilds its caches from the tables and takes over timers and
+effects; players on gateways see "The world shimmers as the servers change
+hands" and land back in the world within about a second; players connected
+to the old primary itself reconnect. A command in flight at that moment may
+or may not have taken effect (it is never retried). Put a load balancer in
+front of all nodes' HTTP ports.
 
 Raft timing: heartbeat 100 ms, election timeout 400-800 ms once the cluster
 has more than one member.

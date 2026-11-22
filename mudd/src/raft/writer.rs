@@ -39,6 +39,8 @@ pub struct RaftWriter {
     raft: GameRaft,
     node_id: NodeId,
     db_path: String,
+    /// The cluster port's service and security (None for a single node)
+    cluster: Option<(Arc<ClusterService>, Arc<ClusterSecurity>)>,
 }
 
 impl RaftWriter {
@@ -143,8 +145,10 @@ impl RaftWriter {
             raft.initialize(members).await?;
         }
 
+        let mut serving = None;
         if let Some(cluster) = cluster {
             let service = ClusterService::new(raft.clone());
+            serving = Some((service.clone(), cluster.security.clone()));
             tokio::spawn(transport::serve(
                 cluster.listener,
                 cluster.security,
@@ -159,7 +163,13 @@ impl RaftWriter {
             raft,
             node_id,
             db_path: db_path.to_string(),
+            cluster: serving,
         })
+    }
+
+    /// The cluster port's service and security (None for a single node)
+    pub fn cluster(&self) -> Option<&(Arc<ClusterService>, Arc<ClusterSecurity>)> {
+        self.cluster.as_ref()
     }
 
     /// Execute a single SQL write via Raft consensus
@@ -257,8 +267,11 @@ impl RaftWriter {
 
     /// Check if this node is currently the leader
     pub fn is_leader(&self) -> bool {
+        // The server state, not just current_leader: a leader that steps
+        // down (e.g. removed from the cluster) can still name itself there
         let metrics = self.raft.metrics().borrow_watched().clone();
-        metrics.current_leader == Some(self.node_id)
+        metrics.state == openraft::ServerState::Leader
+            && metrics.current_leader == Some(self.node_id)
     }
 
     /// Get the current leader's node ID (if known)

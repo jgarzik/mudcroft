@@ -598,9 +598,26 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   As leader, a node records its own advertised address in the membership if
   it changed (e.g. a single-node database given cluster flags).
 
-Still to build (gateways, primary-only schedulers): see
-[docs/cluster-design.md](../../docs/cluster-design.md) and
-[docs/roadmap.md](../../docs/roadmap.md).
+- **Gateways** (`api/gateway.rs`): on a node that is not the primary,
+  `/auth/*` and `/universe/*` go through middleware that forwards the
+  request over the cluster port (`Http` frame: method, path, the
+  `authorization` and `content-type` headers, base64 body) to the primary,
+  which runs it through its own router (marked `x-mudd-forwarded`, so a node
+  that is no longer primary answers 503 instead of forwarding again). `/ws`
+  checks the token with the primary (this node's copy may lack a
+  just-registered account), then relays the connection to a session on the
+  primary over a dedicated cluster connection (`GameOpen`, then text
+  frames). The primary runs that session exactly like a local one
+  (`SessionIo::Remote`) and ends it on purpose with an end frame; a
+  connection that drops without one is a failover, and the gateway tells
+  the player and reopens the session on whichever node is primary now
+  (retrying for up to 30 s). A primary that steps down closes its sessions
+  without the end frame, so they move too.
+- **Leadership** is the server state being Leader (a leader that steps down
+  can still name itself as `current_leader`). A removed leader hands over
+  with `transfer_leader`.
+
+Known gaps: [docs/roadmap.md](../../docs/roadmap.md).
 
 ## Key Design Decisions
 

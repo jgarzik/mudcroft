@@ -26,6 +26,10 @@ For access levels, see [permissions.md](permissions.md#access-levels).
   - Requests the framework rejects before a handler runs: a missing or wrong
     `Content-Type` (415), malformed or incomplete JSON (400 or 422), or a
     missing required query parameter (400)
+- **Clusters:** any node answers. A node that is not the primary forwards
+  `/auth/*` and `/universe/*` to it and relays game connections; it answers
+  `503` (plain text) when there is no primary at the moment, and `502` when
+  the primary did not answer. Retry either.
 - **Every response** carries `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: SAMEORIGIN` and
   `Referrer-Policy: strict-origin-when-cross-origin`, and text bodies are
