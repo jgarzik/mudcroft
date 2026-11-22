@@ -506,13 +506,8 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         }
         tx.commit().await.map_err(io::Error::other)?;
 
-        // Make the commit visible to readers on other connections
-        if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-            .execute(&*pool)
-            .await
-        {
-            debug!("WAL checkpoint failed (non-fatal): {}", e);
-        }
+        // No checkpoint here: in WAL mode a committed transaction is visible
+        // to every connection at once, and SQLite checkpoints on its own
         drop(pool);
 
         {
