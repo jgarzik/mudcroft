@@ -242,6 +242,16 @@ impl PlayerManager {
     /// Get respawn location for death.
     /// Priority: workroom > universe portal
     pub async fn get_respawn_location(&self, player: &Object, universe_id: &str) -> Result<String> {
+        self.respawn_room(player, universe_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("No respawn location found for universe {}", universe_id)
+            })
+    }
+
+    /// Where a player respawns: their workroom if it exists, else the
+    /// universe portal; None if there is neither (an error is a failed read)
+    pub async fn respawn_room(&self, player: &Object, universe_id: &str) -> Result<Option<String>> {
         // Check workroom
         if let Some(workroom_id) = player.get_string("workroom_id") {
             if self
@@ -250,19 +260,31 @@ impl PlayerManager {
                 .await?
                 .is_some()
             {
-                return Ok(workroom_id.to_string());
+                return Ok(Some(workroom_id.to_string()));
             }
         }
 
         // Fallback to universe portal
-        if let Some(portal_id) = self.object_store.get_portal(universe_id).await? {
-            return Ok(portal_id);
-        }
+        self.object_store.get_portal(universe_id).await
+    }
 
-        Err(anyhow::anyhow!(
-            "No respawn location found for universe {}",
-            universe_id
-        ))
+    /// Statements dropping everything a player carries (but fixed items)
+    /// into `room_id`, for an atomic batch
+    pub async fn drop_statements(
+        &self,
+        universe_id: &str,
+        player_id: &str,
+        room_id: &str,
+    ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        let items = self
+            .object_store
+            .get_contents(universe_id, player_id)
+            .await?;
+        Ok(items
+            .iter()
+            .filter(|item| !item.get_bool("fixed").unwrap_or(false))
+            .map(|item| ObjectStore::set_parent_statement(universe_id, &item.id, Some(room_id)))
+            .collect())
     }
 
     /// Drop all inventory items from a player to a room.
@@ -272,23 +294,15 @@ impl PlayerManager {
         player_id: &str,
         room_id: &str,
     ) -> Result<()> {
-        let items = self
-            .object_store
-            .get_contents(universe_id, player_id)
+        // All of it or none, in one batch
+        let statements = self
+            .drop_statements(universe_id, player_id, room_id)
             .await?;
-
-        for item in items {
-            // Skip items that shouldn't be dropped (though they shouldn't be in inventory anyway)
-            if item.get_bool("fixed").unwrap_or(false) {
-                continue;
-            }
-
-            self.object_store
-                .move_object(universe_id, &item.id, Some(room_id))
-                .await?;
-            info!("Dropped {} from {} to {}", item.id, player_id, room_id);
+        if !statements.is_empty() {
+            let count = statements.len();
+            self.object_store.execute_batch(statements).await?;
+            info!("Dropped {} items from {} in {}", count, player_id, room_id);
         }
-
         Ok(())
     }
 

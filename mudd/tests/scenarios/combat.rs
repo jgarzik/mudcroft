@@ -657,3 +657,102 @@ async fn test_player_killed_by_effect_respawns() {
         (100, server.world().entrance_id.as_str())
     );
 }
+
+/// With no respawn room (no workroom, no portal yet) a player killed by an
+/// effect still dies once and revives where they fell, instead of the
+/// lethal pulse being retried forever
+#[tokio::test]
+async fn test_effect_death_without_respawn_room() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "portalless").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    sqlx::query("DELETE FROM universe_settings WHERE universe_id = ? AND key = 'portal_room_id'")
+        .bind(server.universe_id())
+        .execute(server.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE objects SET properties = json_remove(properties, '$.workroom_id')
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .execute(server.pool())
+    .await
+    .unwrap();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "nowhere_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "burning", 2, 500)"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("died");
+    let (hp, parent, effects): (i64, String, i64) = sqlx::query_as(
+        "SELECT json_extract(properties, '$.hp'), parent_id,
+                (SELECT COUNT(*) FROM active_effects e WHERE e.universe_id = o.universe_id AND e.entity_id = o.id)
+         FROM objects o WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (hp, parent.as_str(), effects),
+        (100, server.world().passage_id.as_str(), 0)
+    );
+}
+
+/// A player killed by an effect drops what they carry in the same atomic
+/// batch that revives them
+#[tokio::test]
+async fn test_effect_death_drops_inventory_atomically() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "gem_carrier").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "gem_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"game.create_object("/items/gem", "item", "{p}", {{name = "gem"}})
+               return game.apply_effect("{p}", "burning", 2, 500)"#,
+            p = player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("died");
+    let gem_parent: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/gem'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(gem_parent, server.world().passage_id);
+    // One Raft entry both revives the player and drops the gem
+    let entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%/items/gem%'
+           AND payload LIKE '%SET parent_id%' AND payload LIKE '%json_set%'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(entries, 1);
+}

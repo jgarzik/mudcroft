@@ -125,22 +125,38 @@ pub async fn process(state: &AppState, now: u64) {
                     .and_then(|e| e.source_id.clone()),
                 _ => None,
             });
-            // A player who dies respawns in the same batch: HP restored and
-            // moved, so they are never left dead at 0 HP
+            // A player who dies drops what they carry and respawns in the
+            // same batch: HP restored and moved (or, with no respawn room
+            // yet, revived where they fell), never left dead at 0 HP
             let mut respawn = None;
             if outcome.killed && is_player {
-                match state
-                    .player_manager
-                    .get_respawn_location(&obj, &universe)
-                    .await
-                {
-                    Ok(room) => {
-                        entity_statements
-                            .extend(respawn_statements(&universe, &entity, &target, &room));
-                        respawn = Some(room);
+                let found = state.player_manager.respawn_room(&obj, &universe).await;
+                let drops = match obj.parent_id.as_deref() {
+                    Some(room) => {
+                        state
+                            .player_manager
+                            .drop_statements(&universe, &entity, room)
+                            .await
                     }
-                    Err(e) => {
-                        warn!("effects: no respawn for {}: {}", entity, e);
+                    None => Ok(Vec::new()),
+                };
+                match (found, drops) {
+                    (Ok(room), Ok(drops)) => {
+                        let room = room.or_else(|| {
+                            warn!("effects: no respawn room for {}; reviving in place", entity);
+                            obj.parent_id.clone()
+                        });
+                        entity_statements.extend(drops);
+                        entity_statements.extend(respawn_statements(
+                            &universe,
+                            &entity,
+                            &target,
+                            room.as_deref(),
+                        ));
+                        respawn = room;
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        warn!("effects: respawn of {} not prepared: {}", entity, e);
                         had_errors = true;
                         continue;
                     }
@@ -192,7 +208,7 @@ fn respawn_statements(
     universe: &str,
     entity: &str,
     target: &Combatant,
-    room: &str,
+    room: Option<&str>,
 ) -> Vec<(String, Vec<serde_json::Value>)> {
     let mut statements = Vec::new();
     if let Ok(hp) = crate::objects::ObjectStore::set_properties_statement(
@@ -202,11 +218,13 @@ fn respawn_statements(
     ) {
         statements.push(hp);
     }
-    statements.push(crate::objects::ObjectStore::set_parent_statement(
-        universe,
-        entity,
-        Some(room),
-    ));
+    if let Some(room) = room {
+        statements.push(crate::objects::ObjectStore::set_parent_statement(
+            universe,
+            entity,
+            Some(room),
+        ));
+    }
     statements
 }
 
@@ -277,8 +295,8 @@ async fn report(state: &AppState, p: &Processed) {
         return;
     }
 
-    // A player: already respawned (committed above). Drop what they carried
-    // where they died, then show them where they are.
+    // A player: inventory dropped and respawned (committed above). Show them
+    // where they are.
     state
         .connections
         .send_to_player(
@@ -289,15 +307,6 @@ async fn report(state: &AppState, p: &Processed) {
             },
         )
         .await;
-    if let Some(ref room) = death_room {
-        if let Err(e) = state
-            .player_manager
-            .drop_inventory(universe, entity, room)
-            .await
-        {
-            warn!("dropping inventory of {} failed: {}", entity, e);
-        }
-    }
     if let Some(ref respawn) = p.respawn {
         state
             .connections
