@@ -59,14 +59,16 @@ struct Processed {
 /// Commit everything due at `now`
 pub async fn process(state: &AppState, now: u64) {
     let mut had_errors = false;
-    let processed = {
+    // One run: everything due commits as one batch (hooks and messages
+    // follow the commit)
+    let processed = super::scripting::in_run(state, async {
         // Serializes against attacks and effect writes, which also read
         // and write HP and effect rows. Released before reporting: hooks
         // that run then may write effects themselves.
         let _writes = state.effects.write_guard().await;
         let due = state.effects.due(now).await;
         if due.is_empty() {
-            return;
+            return Ok(Vec::new());
         }
 
         let mut statements = Vec::new();
@@ -178,12 +180,11 @@ pub async fn process(state: &AppState, now: u64) {
             });
         }
         if !statements.is_empty() {
-            if let Err(e) = state.object_store.execute_batch(statements).await {
-                warn!("due effects not committed (retrying): {}", e);
-                drop(_writes);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                return;
-            }
+            state
+                .object_store
+                .execute_batch(statements)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         for p in &processed {
             if p.outcome.killed {
@@ -195,7 +196,16 @@ pub async fn process(state: &AppState, now: u64) {
                     .await;
             }
         }
-        processed
+        Ok::<_, String>(processed)
+    })
+    .await;
+    let processed = match processed {
+        Ok(processed) => processed,
+        Err(e) => {
+            warn!("due effects not committed (retrying): {}", e);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            return;
+        }
     };
 
     for p in &processed {

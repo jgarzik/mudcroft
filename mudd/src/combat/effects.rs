@@ -463,9 +463,17 @@ impl EffectRegistry {
         )
     }
 
-    /// Hold while reading then writing effect rows or HP (see `writes`)
-    pub async fn write_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.writes.lock().await
+    /// Hold while reading then writing effect rows or HP (see `writes`).
+    /// Inside a run this takes the run's write gate instead (which every
+    /// writing run takes): one lock order, no lock held across another's
+    pub async fn write_guard(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if let Some(run) = crate::db::run::current() {
+            if let Err(e) = run.lock_writes().await {
+                tracing::warn!("effects: taking the write gate: {}", e);
+            }
+            return None;
+        }
+        Some(self.writes.lock().await)
     }
 
     /// Add (or refresh) an effect: write it, then cache it

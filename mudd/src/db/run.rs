@@ -124,23 +124,8 @@ impl Run {
     /// reads) and capture them. All or none: a failing statement undoes the
     /// others in this call. Returns the rows affected.
     pub async fn execute(&self, statements: &[Statement]) -> Result<u64> {
-        if self.poisoned.load(Ordering::SeqCst) {
-            anyhow::bail!("an earlier save in this run failed; nothing more is saved");
-        }
-        {
-            let mut gate = self.gate.lock().await;
-            if gate.is_none() {
-                *gate = Some(WRITE_GATE.lock().await);
-            }
-        }
+        self.lock_writes().await?;
         let mut conn = self.conn.lock().await;
-        if !self.began.load(Ordering::SeqCst) {
-            if conn.0.is_none() {
-                conn.0 = Some(self.pool.acquire().await?);
-            }
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut ***conn).await?;
-            self.began.store(true, Ordering::SeqCst);
-        }
         self.dirty.store(true, Ordering::SeqCst);
         sqlx::query("SAVEPOINT run_call")
             .execute(&mut ***conn)
@@ -173,6 +158,30 @@ impl Run {
             .unwrap_or_else(|e| e.into_inner())
             .extend(statements.iter().cloned());
         Ok(rows)
+    }
+
+    /// Take the write gate and open the local transaction now, if not yet:
+    /// from here on the run's reads and writes are serialized with every
+    /// other writer (for a read-then-write, such as HP)
+    pub async fn lock_writes(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            anyhow::bail!("an earlier save in this run failed; nothing more is saved");
+        }
+        {
+            let mut gate = self.gate.lock().await;
+            if gate.is_none() {
+                *gate = Some(WRITE_GATE.lock().await);
+            }
+        }
+        let mut conn = self.conn.lock().await;
+        if !self.began.load(Ordering::SeqCst) {
+            if conn.0.is_none() {
+                conn.0 = Some(self.pool.acquire().await?);
+            }
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut ***conn).await?;
+            self.began.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Like [`Run::execute`], but the statements stand even if the run
