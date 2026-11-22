@@ -143,12 +143,14 @@ async fn login(
         .unwrap_or("internal");
     let username = req.username.to_lowercase();
     let user_key = format!("{}|{}", username, client);
-    if let Err(retry) = state
-        .auth_by_user
-        .peek(&user_key)
-        .and_then(|()| state.auth_by_user_global.peek(&username))
-    {
+    if let Err(retry) = state.auth_by_user.peek(&user_key) {
         return super::ratelimit::too_many(retry);
+    }
+    // Many failures for this name from many clients: slow every attempt
+    // down rather than refuse, so the owner can still log in (a hard block
+    // here would let anyone lock the account)
+    if state.auth_by_user_global.peek(&username).is_err() {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     let service = state.accounts();
 
