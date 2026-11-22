@@ -296,28 +296,31 @@ struct SnapshotPayload {
 /// Tables that belong to this node's Raft log store, never to a snapshot
 const RAFT_TABLES: [&str; 3] = ["raft_log", "raft_vote", "raft_meta"];
 
-/// A temp file path for snapshot work, next to the database when known
-fn snapshot_temp_path(db_path: Option<&str>) -> std::path::PathBuf {
-    let dir = db_path
-        .and_then(|p| std::path::Path::new(p).parent())
-        .filter(|d| !d.as_os_str().is_empty())
-        .map(|d| d.to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
-    dir.join(format!(
-        ".mudd-snapshot-{}-{}.db",
-        std::process::id(),
-        SNAPSHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
-}
+/// A private scratch directory for snapshot files (random name, mode 0700,
+/// removed with everything in it when dropped), next to the database when
+/// its path is known. Nobody else can create or swap files in it, so the
+/// fixed file name inside is safe.
+struct SnapshotScratch(tempfile::TempDir);
 
-static SNAPSHOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+impl SnapshotScratch {
+    fn new(db_path: Option<&str>) -> io::Result<Self> {
+        let builder = {
+            let mut b = tempfile::Builder::new();
+            b.prefix(".mudd-snapshot-");
+            b
+        };
+        let dir = db_path
+            .and_then(|p| std::path::Path::new(p).parent())
+            .filter(|d| !d.as_os_str().is_empty());
+        Ok(Self(match dir {
+            Some(dir) => builder.tempdir_in(dir)?,
+            None => builder.tempdir()?,
+        }))
+    }
 
-/// Removes a temp file when dropped (any exit path)
-struct TempFile(std::path::PathBuf);
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+    /// The snapshot file's path (not created yet)
+    fn file(&self) -> std::path::PathBuf {
+        self.0.path().join("snapshot.db")
     }
 }
 
@@ -493,12 +496,13 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
         // A consistent copy (VACUUM INTO reads in one transaction while
         // writes go on). Its position is the one recorded inside the copy,
         // not the in-memory one: openraft builds snapshots while applying.
-        let tmp = TempFile(snapshot_temp_path(self.db_path.as_deref()));
+        let scratch = SnapshotScratch::new(self.db_path.as_deref())?;
+        let file = scratch.file();
         {
             let pool = self.pool.read().await;
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "VACUUM INTO {}",
-                sql_literal(&tmp.0)
+                sql_literal(&file)
             )))
             .execute(&*pool)
             .await
@@ -508,7 +512,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
             .max_connections(1)
             .connect_with(
                 sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(&tmp.0)
+                    .filename(&file)
                     .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete),
             )
             .await
@@ -540,7 +544,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
             .await
             .map_err(io::Error::other)?;
         copy.close().await;
-        let db_snapshot = tokio::fs::read(&tmp.0).await?;
+        let db_snapshot = tokio::fs::read(&file).await?;
 
         let bytes = serde_json::to_vec(&SnapshotPayload {
             last_applied_log: last_applied,
@@ -660,8 +664,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             "Installing snapshot database ({} bytes)",
             payload.db_snapshot.len()
         );
-        let tmp = TempFile(snapshot_temp_path(self.db_path.as_deref()));
-        tokio::fs::write(&tmp.0, &payload.db_snapshot).await?;
+        let scratch = SnapshotScratch::new(self.db_path.as_deref())?;
+        let file = scratch.file();
+        tokio::fs::write(&file, &payload.db_snapshot).await?;
 
         // Replace the game tables in one transaction on the live database:
         // the node holds the old state or the new, never a mix, and no
@@ -671,7 +676,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         let mut conn = pool.acquire().await.map_err(io::Error::other)?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "ATTACH DATABASE {} AS snap",
-            sql_literal(&tmp.0)
+            sql_literal(&file)
         )))
         .execute(&mut *conn)
         .await
@@ -970,5 +975,25 @@ mod tests {
             .is_err());
         let (last_applied, _) = follower.applied_state().await.unwrap();
         assert!(last_applied.is_none(), "nothing recorded");
+    }
+
+    /// Snapshot files live in a fresh private directory (mode 0700) next to
+    /// the database, removed afterwards: nothing in a shared temp dir
+    #[test]
+    fn test_snapshot_scratch_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("game.db");
+        let scratch = SnapshotScratch::new(Some(db.to_str().unwrap())).unwrap();
+        let path = scratch.0.path().to_path_buf();
+        assert_eq!(path.parent(), Some(dir.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        assert!(!scratch.file().exists());
+        drop(scratch);
+        assert!(!path.exists(), "removed when done");
     }
 }

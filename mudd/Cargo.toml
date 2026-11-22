@@ -71,9 +71,10 @@ base64 = "0.23"
 # Regex for validation
 regex = "1"
 
+tempfile = "3"
+
 [dev-dependencies]
 tokio-tungstenite = "0.30"
-tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"

@@ -43,6 +43,7 @@ pub async fn create_raft_node(
     pool: SqlitePool,
     network_config: NetworkConfig,
     single_node: bool,
+    db_path: Option<String>,
 ) -> anyhow::Result<(GameRaft, SqlitePool)> {
     info!("Creating Raft node {}", node_id);
 
@@ -50,7 +51,8 @@ pub async fn create_raft_node(
     let read_pool = pool.clone();
     let shared: SharedPool = Arc::new(RwLock::new(pool));
     let log_store = LogStore::new(shared.clone());
-    let state_machine = StateMachine::new(shared, None).await?;
+    // The path places snapshot scratch files next to the database
+    let state_machine = StateMachine::new(shared, db_path).await?;
     let network = RaftNetworkFactoryImpl::new(network_config);
 
     let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;

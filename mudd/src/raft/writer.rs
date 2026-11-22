@@ -36,7 +36,14 @@ impl RaftWriter {
         let config = RaftNodeConfig::single(node_id, port).with_db_path(db_path);
         let network_config = NetworkConfig::from_raft_config(&config);
 
-        let (raft, _read_pool) = create_raft_node(node_id, pool, network_config, true).await?;
+        let (raft, _read_pool) = create_raft_node(
+            node_id,
+            pool,
+            network_config,
+            true,
+            Some(db_path.to_string()),
+        )
+        .await?;
 
         // Initialize as a single-node cluster the first time only: on a
         // database this node has served before, the Raft state (vote, log)
@@ -66,7 +73,14 @@ impl RaftWriter {
         let node_id = config.node_id;
         let network_config = NetworkConfig::from_raft_config(&config);
 
-        let (raft, _read_pool) = create_raft_node(node_id, pool, network_config, false).await?;
+        let (raft, _read_pool) = create_raft_node(
+            node_id,
+            pool,
+            network_config,
+            false,
+            Some(db_path.to_string()),
+        )
+        .await?;
 
         // Build initial membership from peers
         let members: std::collections::BTreeMap<NodeId, BasicNode> = config
