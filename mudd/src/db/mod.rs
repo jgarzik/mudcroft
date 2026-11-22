@@ -56,9 +56,12 @@ impl Database {
 
     async fn set_schema_version(&self, version: i64) -> Result<()> {
         // PRAGMA takes no bound parameters; version is our own integer
-        sqlx::query(&format!("PRAGMA user_version = {}", version))
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA user_version = {}",
+            version
+        )))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

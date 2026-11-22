@@ -26,7 +26,7 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 
 # Lua scripting
 mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize"] }

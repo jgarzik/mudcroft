@@ -478,7 +478,8 @@ impl ClassPersister {
             // Direct SQL fallback (unit tests without Raft), also atomic
             let mut tx = pool.begin().await?;
             for (sql, params) in &statements {
-                let mut query = sqlx::query(sql);
+                // The statements above are SQL literals; all values are bound
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                 for param in params {
                     query = match param {
                         serde_json::Value::Null => query.bind(Option::<String>::None),

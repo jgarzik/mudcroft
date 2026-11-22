@@ -22,7 +22,11 @@ impl ObjectStore {
     }
 
     /// Execute a write operation either through Raft (if available) or directly
-    async fn execute_write(&self, sql: &str, params: Vec<serde_json::Value>) -> Result<u64> {
+    async fn execute_write(
+        &self,
+        sql: &'static str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<u64> {
         if let Some(ref raft_writer) = self.raft_writer {
             let result = raft_writer.execute(sql, params).await?;
             Ok(result.rows_affected)

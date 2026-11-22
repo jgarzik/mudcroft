@@ -261,7 +261,7 @@ impl CombatManager {
     }
 
     /// Run one write, through Raft when available
-    async fn write(&self, sql: &str, params: Vec<serde_json::Value>) -> anyhow::Result<()> {
+    async fn write(&self, sql: &'static str, params: Vec<serde_json::Value>) -> anyhow::Result<()> {
         if let Some(ref raft_writer) = self.raft_writer {
             raft_writer.execute(sql, params).await?;
         } else if let Some(ref pool) = self.db_pool {

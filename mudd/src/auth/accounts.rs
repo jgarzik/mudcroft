@@ -68,7 +68,7 @@ impl AccountService {
     }
 
     /// Run one write, through Raft when available; returns rows affected
-    async fn write(&self, sql: &str, params: Vec<Value>) -> Result<u64, AuthError> {
+    async fn write(&self, sql: &'static str, params: Vec<Value>) -> Result<u64, AuthError> {
         if let Some(ref raft_writer) = self.raft_writer {
             return raft_writer
                 .execute(sql, params)

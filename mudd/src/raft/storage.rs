@@ -342,7 +342,10 @@ impl StateMachine {
         let mut rows = 0;
         for statement in &request.statements {
             debug!("Executing SQL: {}", statement.sql);
-            match bind_params(sqlx::query(&statement.sql), &statement.params)
+            // Requests are built only from SQL literals in this crate, with
+            // every value bound as a parameter (see RaftWriter::execute)
+            let query = sqlx::query(sqlx::AssertSqlSafe(statement.sql.as_str()));
+            match bind_params(query, &statement.params)
                 .execute(&mut *conn)
                 .await
             {
@@ -372,9 +375,9 @@ impl StateMachine {
 /// Bind JSON parameters to a query. Strings prefixed `blob:` carry base64
 /// binary data.
 fn bind_params<'q>(
-    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    params: &'q [serde_json::Value],
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+    params: &[serde_json::Value],
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     for param in params {
         query = match param {
