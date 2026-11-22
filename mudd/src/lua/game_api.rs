@@ -972,27 +972,38 @@ impl GameApi {
 
                 // An existing class may be replaced only by whoever defined
                 // it, or by an admin
+                // Defines are serialized by the define lock. The registry lock
+                // is held only briefly: a read lock to check the definer, and
+                // the write lock to insert. The Raft write happens with no
+                // registry lock held, so it never stalls class lookups.
                 let replaced: Result<(), String> = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        let mut registry = classes.write().await;
-                        if let Some(existing) = registry.get_class(&class_universe, &name) {
-                            if existing.defined_by != caller && !is_admin {
-                                return Err(format!(
-                                    "define_class: {} is already defined by another account",
-                                    name
-                                ));
+                        let define_lock = classes.read().await.define_lock();
+                        let _defining = define_lock.lock().await;
+                        let persister = {
+                            let registry = classes.read().await;
+                            if let Some(existing) = registry.get_class(&class_universe, &name) {
+                                if existing.defined_by != caller && !is_admin {
+                                    return Err(format!(
+                                        "define_class: {} is already defined by another account",
+                                        name
+                                    ));
+                                }
                             }
-                        }
-                        registry
-                            .define_class(
-                                &class_universe,
-                                &name,
-                                parent.as_deref(),
-                                props_map,
-                                caller.as_deref(),
-                            )
+                            registry.persister()
+                        };
+                        let class = crate::objects::ClassRegistry::build_class(
+                            &name,
+                            parent.as_deref(),
+                            props_map,
+                            caller.as_deref(),
+                        );
+                        persister
+                            .persist(&class_universe, &class)
                             .await
-                            .map_err(|e| format!("define_class: {}", e))
+                            .map_err(|e| format!("define_class: {}", e))?;
+                        classes.write().await.insert(&class_universe, class);
+                        Ok(())
                     })
                 });
                 replaced.map_err(mlua::Error::runtime)?;

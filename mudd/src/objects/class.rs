@@ -68,6 +68,8 @@ pub struct ClassRegistry {
     universe_classes: HashMap<(String, String), ClassDef>,
     db_pool: Option<SqlitePool>,
     raft_writer: Option<Arc<RaftWriter>>,
+    /// Serializes defines (check, persist, insert) without blocking lookups
+    define_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for ClassRegistry {
@@ -84,6 +86,7 @@ impl ClassRegistry {
             universe_classes: HashMap::new(),
             db_pool: None,
             raft_writer: None,
+            define_lock: Arc::default(),
         };
         registry.register_base_classes();
         registry
@@ -96,6 +99,7 @@ impl ClassRegistry {
             universe_classes: HashMap::new(),
             db_pool: Some(pool),
             raft_writer: Some(raft_writer),
+            define_lock: Arc::default(),
         };
         registry.register_base_classes();
         registry
@@ -289,11 +293,10 @@ impl ClassRegistry {
         self.get_chain(universe_id, name)
     }
 
-    /// Define (or redefine) a class in a universe from Lua.
-    /// props_map contains (property_name -> (type_name, default_value)).
-    ///
-    /// The class is persisted first (one atomic Raft batch); only then does
-    /// it become visible, so a failed write leaves nothing half-defined.
+    /// Define (or redefine) a class in a universe: persist it, then make it
+    /// visible. Callers sharing the registry behind a lock should instead
+    /// persist without holding the lock (`build_class`, `persister`,
+    /// `ClassPersister::persist`, then `insert`), as game.define_class does.
     pub async fn define_class(
         &mut self,
         universe_id: &str,
@@ -302,80 +305,46 @@ impl ClassRegistry {
         props_map: std::collections::HashMap<String, (String, serde_json::Value)>,
         defined_by: Option<&str>,
     ) -> anyhow::Result<()> {
+        let class = Self::build_class(name, parent, props_map, defined_by);
+        self.persister().persist(universe_id, &class).await?;
+        self.insert(universe_id, class);
+        Ok(())
+    }
+
+    /// Build a class definition from Lua's typed properties.
+    /// props_map contains (property_name -> (type_name, default_value)).
+    pub fn build_class(
+        name: &str,
+        parent: Option<&str>,
+        props_map: std::collections::HashMap<String, (String, serde_json::Value)>,
+        defined_by: Option<&str>,
+    ) -> ClassDef {
         let mut class = ClassDef::new(name, parent);
         class.defined_by = defined_by.map(str::to_string);
-        for (prop_name, (_type_name, default_val)) in props_map.iter() {
-            class.set_property(prop_name, default_val.clone());
+        for (prop_name, (_type_name, default_val)) in props_map {
+            class.set_property(&prop_name, default_val);
         }
+        class
+    }
 
-        let mut statements: Vec<(String, Vec<serde_json::Value>)> = vec![
-            (
-                "INSERT OR REPLACE INTO classes (universe_id, name, parent, code_hash, defined_by)
-                 VALUES (?, ?, ?, ?, ?)"
-                    .to_string(),
-                vec![
-                    serde_json::json!(universe_id),
-                    serde_json::json!(name),
-                    serde_json::json!(parent),
-                    serde_json::json!(class.code_hash),
-                    serde_json::json!(defined_by),
-                ],
-            ),
-            (
-                "DELETE FROM class_properties WHERE universe_id = ? AND class_name = ?".to_string(),
-                vec![serde_json::json!(universe_id), serde_json::json!(name)],
-            ),
-            (
-                "DELETE FROM class_handlers WHERE universe_id = ? AND class_name = ?".to_string(),
-                vec![serde_json::json!(universe_id), serde_json::json!(name)],
-            ),
-        ];
-        for (key, value) in &class.properties {
-            statements.push((
-                "INSERT INTO class_properties (universe_id, class_name, key, value) VALUES (?, ?, ?, ?)"
-                    .to_string(),
-                vec![
-                    serde_json::json!(universe_id),
-                    serde_json::json!(name),
-                    serde_json::json!(key),
-                    serde_json::json!(serde_json::to_string(value)?),
-                ],
-            ));
-        }
-        for handler in &class.handlers {
-            statements.push((
-                "INSERT INTO class_handlers (universe_id, class_name, handler) VALUES (?, ?, ?)"
-                    .to_string(),
-                vec![
-                    serde_json::json!(universe_id),
-                    serde_json::json!(name),
-                    serde_json::json!(handler),
-                ],
-            ));
-        }
+    /// Lock held across a whole define (check, persist, insert) so defines
+    /// cannot interleave; lookups only use the registry's own lock
+    pub fn define_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.define_lock.clone()
+    }
 
-        if let Some(ref raft_writer) = self.raft_writer {
-            raft_writer.execute_batch(statements).await?;
-        } else if let Some(ref pool) = self.db_pool {
-            // Direct SQL fallback (unit tests without Raft), also atomic
-            let mut tx = pool.begin().await?;
-            for (sql, params) in &statements {
-                let mut query = sqlx::query(sql);
-                for param in params {
-                    query = match param {
-                        serde_json::Value::Null => query.bind(Option::<String>::None),
-                        serde_json::Value::String(v) => query.bind(v.clone()),
-                        other => query.bind(other.to_string()),
-                    };
-                }
-                query.execute(&mut *tx).await?;
-            }
-            tx.commit().await?;
+    /// A handle that persists classes without borrowing the registry
+    pub fn persister(&self) -> ClassPersister {
+        ClassPersister {
+            db_pool: self.db_pool.clone(),
+            raft_writer: self.raft_writer.clone(),
         }
+    }
 
+    /// Make a (persisted) class visible in its universe
+    pub fn insert(&mut self, universe_id: &str, class: ClassDef) {
         self.universe_classes
-            .insert((universe_id.to_string(), name.to_string()), class);
-        Ok(())
+            .insert((universe_id.to_string(), class.name.clone()), class);
     }
 
     /// Load universe-defined classes from database on startup
@@ -442,6 +411,85 @@ impl ClassRegistry {
             "Loaded {} universe classes from database",
             self.universe_classes.len()
         );
+        Ok(())
+    }
+}
+
+/// Persists class definitions (one atomic Raft batch per class)
+pub struct ClassPersister {
+    db_pool: Option<SqlitePool>,
+    raft_writer: Option<Arc<RaftWriter>>,
+}
+
+impl ClassPersister {
+    /// Write a class and its properties and handlers, replacing any earlier
+    /// definition, all or nothing
+    pub async fn persist(&self, universe_id: &str, class: &ClassDef) -> anyhow::Result<()> {
+        let name = &class.name;
+        let mut statements: Vec<(String, Vec<serde_json::Value>)> = vec![
+            (
+                "INSERT OR REPLACE INTO classes (universe_id, name, parent, code_hash, defined_by)
+                 VALUES (?, ?, ?, ?, ?)"
+                    .to_string(),
+                vec![
+                    serde_json::json!(universe_id),
+                    serde_json::json!(name),
+                    serde_json::json!(class.parent),
+                    serde_json::json!(class.code_hash),
+                    serde_json::json!(class.defined_by),
+                ],
+            ),
+            (
+                "DELETE FROM class_properties WHERE universe_id = ? AND class_name = ?".to_string(),
+                vec![serde_json::json!(universe_id), serde_json::json!(name)],
+            ),
+            (
+                "DELETE FROM class_handlers WHERE universe_id = ? AND class_name = ?".to_string(),
+                vec![serde_json::json!(universe_id), serde_json::json!(name)],
+            ),
+        ];
+        for (key, value) in &class.properties {
+            statements.push((
+                "INSERT INTO class_properties (universe_id, class_name, key, value) VALUES (?, ?, ?, ?)"
+                    .to_string(),
+                vec![
+                    serde_json::json!(universe_id),
+                    serde_json::json!(name),
+                    serde_json::json!(key),
+                    serde_json::json!(serde_json::to_string(value)?),
+                ],
+            ));
+        }
+        for handler in &class.handlers {
+            statements.push((
+                "INSERT INTO class_handlers (universe_id, class_name, handler) VALUES (?, ?, ?)"
+                    .to_string(),
+                vec![
+                    serde_json::json!(universe_id),
+                    serde_json::json!(name),
+                    serde_json::json!(handler),
+                ],
+            ));
+        }
+
+        if let Some(ref raft_writer) = self.raft_writer {
+            raft_writer.execute_batch(statements).await?;
+        } else if let Some(ref pool) = self.db_pool {
+            // Direct SQL fallback (unit tests without Raft), also atomic
+            let mut tx = pool.begin().await?;
+            for (sql, params) in &statements {
+                let mut query = sqlx::query(sql);
+                for param in params {
+                    query = match param {
+                        serde_json::Value::Null => query.bind(Option::<String>::None),
+                        serde_json::Value::String(v) => query.bind(v.clone()),
+                        other => query.bind(other.to_string()),
+                    };
+                }
+                query.execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+        }
         Ok(())
     }
 }
