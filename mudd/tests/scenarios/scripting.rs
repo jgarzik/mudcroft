@@ -1033,3 +1033,51 @@ async fn test_no_containment_cycles() {
     .unwrap();
     assert_eq!(parent, entrance);
 }
+
+/// Lifecycle hooks: an object's on_create runs when it is created (or
+/// cloned) with code, its on_destroy before it is deleted; a creating chain
+/// (on_create creating more of itself) is bounded
+#[tokio::test]
+async fn test_lifecycle_create_destroy() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "lifecycle_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/ledger", "item", "{e}", {{name = "ledger", log = ""}})
+           local h = game.store_code([[
+             local function note(w) local l = game.get_object("/items/ledger") game.update_object("/items/ledger", {{log = l.metadata.log .. w}}) end
+             return {{
+               on_create = function(a) note("C") end,
+               on_destroy = function(a) note("D") end,
+             }}]])
+           game.create_object("/items/egg", "item", "{e}", {{name = "egg", code_hash = h}})
+           game.clone_object("/items/egg", "/items/egg-two", "{e}")
+           game.delete_object("/items/egg")
+           local breeder = game.store_code([[return {{ on_create = function(a)
+             local n = (tonumber(string.match(a.object_id, "(%d+)$")) or 0) + 1
+             game.create_object("/items/rabbit-" .. n, "item", nil, {{name = "rabbit", code_hash = game.get_object(a.object_id).code_hash}})
+           end }}]])
+           game.create_object("/items/rabbit-0", "item", nil, {{name = "rabbit", code_hash = breeder}})
+           return game.get_object("/items/ledger").metadata.log"#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("CCD")
+        .await
+        .expect("created, cloned, destroyed");
+    let rabbits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE universe_id = ? AND id LIKE '/items/rabbit-%'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!((2..=40).contains(&rabbits), "a bounded chain: {}", rabbits);
+}

@@ -663,8 +663,9 @@ async fn arrival_inner(
     Ok(())
 }
 
-/// Deepest nesting of AI handlers (an AI handler's move triggering another
-/// arrival's handler, ...) and most AI handler calls per top-level action
+/// Deepest nesting of engine-invoked handlers (AI and lifecycle: a
+/// handler's move or create setting off another handler, ...) and most
+/// such calls per top-level action
 const MAX_AI_DEPTH: u32 = 4;
 const MAX_AI_CALLS: u32 = 32;
 
@@ -686,7 +687,7 @@ async fn with_ai_budget<F: std::future::Future>(f: F) -> F::Output {
 
 /// Run an NPC's AI handler (as its owner): true if it handled the moment
 /// (returned something other than nil), false to use the built-in
-/// behaviour (no code, no such handler, nil, or an error, which is logged)
+/// behaviour (no code, no such handler, nil, an error, or the budget spent)
 async fn ai_override(
     state: &AppState,
     universe_id: &str,
@@ -696,12 +697,29 @@ async fn ai_override(
     mut args: serde_json::Value,
 ) -> bool {
     if let Some(map) = args.as_object_mut() {
-        map.insert("object_id".into(), npc.into());
         map.insert("room_id".into(), room.clone().into());
     }
-    // Bounded: AI handlers whose moves trigger more AI handlers stop at
-    // MAX_AI_DEPTH deep or MAX_AI_CALLS in all (the built-in behaviour
-    // applies beyond)
+    engine_hook(state, universe_id, npc, room, handler, args)
+        .await
+        .is_some_and(|reply| reply != "nil" && !reply.is_empty())
+}
+
+/// Run an engine-invoked handler (AI, lifecycle) of `object`'s code as its
+/// owner, within the action's hook budget: at most MAX_AI_DEPTH deep (a
+/// handler's doing setting off more handlers) and MAX_AI_CALLS in all.
+/// Returns the handler's reply; None if it did not run (no code or
+/// handler, the budget spent) or failed (logged).
+pub async fn engine_hook(
+    state: &AppState,
+    universe_id: &str,
+    object: &str,
+    room: Option<String>,
+    handler: &str,
+    mut args: serde_json::Value,
+) -> Option<String> {
+    if let Some(map) = args.as_object_mut() {
+        map.insert("object_id".into(), object.into());
+    }
     let (depth, left) = AI_BUDGET
         .try_with(|(d, left)| (*d, left.clone()))
         .unwrap_or_else(|_| {
@@ -719,16 +737,18 @@ async fn ai_override(
             )
             .is_ok();
     if !allowed {
-        warn!("{} of {} not run: AI handler budget spent", handler, npc);
-        return false;
+        warn!(
+            "{} of {} not run: engine hook budget spent",
+            handler, object
+        );
+        return None;
     }
-    let call = super::scripting::invoke_handler(state, universe_id, npc, room, handler, args);
+    let call = super::scripting::invoke_handler(state, universe_id, object, room, handler, args);
     match AI_BUDGET.scope((depth + 1, left), call).await {
-        Ok(Some(reply)) => reply != "nil" && !reply.is_empty(),
-        Ok(None) => false,
+        Ok(reply) => reply,
         Err(e) => {
-            warn!("{} of {} failed: {}", handler, npc, e);
-            false
+            warn!("{} of {} failed: {}", handler, object, e);
+            None
         }
     }
 }
@@ -916,6 +936,20 @@ pub async fn delete_tree(
         i += 1;
     }
     for victim in order.iter().rev() {
+        // Its own code's on_destroy first, while it still exists
+        if let Some(obj) = store.get(universe_id, victim).await? {
+            if obj.code_hash.is_some() {
+                engine_hook(
+                    state,
+                    universe_id,
+                    victim,
+                    obj.parent_id.clone(),
+                    "on_destroy",
+                    json!({}),
+                )
+                .await;
+            }
+        }
         store.delete(universe_id, victim).await?;
     }
     Ok(())
@@ -2051,6 +2085,26 @@ impl Engine for CombatEngine {
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(hp)
+        })
+    }
+
+    fn hook<'a>(
+        &'a self,
+        universe_id: &'a str,
+        object: &'a str,
+        handler: &'a str,
+        args: serde_json::Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let room = self
+                .state
+                .object_store
+                .get(universe_id, object)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|o| o.parent_id);
+            engine_hook(&self.state, universe_id, object, room, handler, args).await;
         })
     }
 

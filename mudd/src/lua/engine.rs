@@ -88,6 +88,16 @@ pub trait Engine: Send + Sync {
     /// fighters stopped
     fn stop<'a>(&'a self, universe_id: &'a str, id: &'a str) -> BoxFuture<'a, Result<u64, String>>;
 
+    /// Run an engine hook (on_create, on_destroy) of `object`'s own code, as
+    /// its owner, within the action's hook budget; failures are logged
+    fn hook<'a>(
+        &'a self,
+        universe_id: &'a str,
+        object: &'a str,
+        handler: &'a str,
+        args: serde_json::Value,
+    ) -> BoxFuture<'a, ()>;
+
     /// Leave through a random exit, ending fights; returns the direction
     fn flee<'a>(
         &'a self,

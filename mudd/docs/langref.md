@@ -437,6 +437,8 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 | `on_damage` | the `attack` command hits | the target NPC | `actor_id`, `room_id`, `attacker_id`, `damage` |
 | `on_death` | the `attack` command kills | the target NPC | `actor_id`, `room_id`, `killer_id` |
 | `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
+| `on_create` | the object is created (`game.create_object`) or cloned (`game.clone_object`) with code attached | the new object | `room_id` |
+| `on_destroy` | the object is about to be deleted (`game.delete_object`, a death that deletes it, a decaying corpse) | the object, still there | `room_id` |
 | any name | a `call_out` is due | the object | `room_id`, `args` (the string given to `call_out`, or `nil`) |
 | any name | a custom verb is typed | the verb's object | `actor_id`, `room_id`, `verb`, `args` (the rest of the line) |
 | any name | `game.use_object` is called | the used object | `actor_id`, `verb`, `target_id`, `code_hash` |
@@ -454,7 +456,8 @@ Hook details:
 - **Return values:** hook return values are ignored. Errors are logged on the server.
 - **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
   - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
-- **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move` and `on_use` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`. `ai_idle_tick` and `ai_combat_tick` are fired for NPCs (see [Built-in combat](#built-in-combat)).
+- **Engine-invoked hooks** (`on_create`, `on_destroy`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action: at most 4 deep (a hook's doing setting off another) and 32 calls; beyond it they are skipped (and logged).
+- **Unwired hooks:** region objects get no hooks. The class handler names `on_init`, `on_move` and `on_use` are **never fired by the server**; you can call them with `game.use_object`. `ai_idle_tick` and `ai_combat_tick` are fired for NPCs (see [Built-in combat](#built-in-combat)).
 
 ### `parent(class_name, handler_name, args)`
 
@@ -1286,7 +1289,7 @@ use the [`Combat`](#combat) library or your own code.
 
 These are not built yet. See the [roadmap](../../docs/roadmap.md).
 
-- **Unfired handlers:** `on_create`, `on_destroy`, `on_init`, `on_move` and `on_use` never fire on their own. Call the ones other than `on_create` and `on_destroy` with `game.use_object` (which refuses engine hooks), or start a heartbeat yourself.
+- **Unfired handlers:** `on_init`, `on_move` and `on_use` never fire on their own. Call them with `game.use_object`, or start a heartbeat yourself.
 - **Missing player commands:** there is no `use` or `give` command. Add verbs with `game.add_action`.
 - **Universe config:** keys such as `spawn_room` are not read by the server; use `setportal`.
 

@@ -108,8 +108,8 @@ for features that do not exist yet; see its `SKIP` table. Planned:
   runs the containers' `on_leave`/`on_enter`; add `on_init` between
   the newcomer and each object present, so objects can offer contextual
   verbs ("get sword", "wield sword") and remove them on `on_move`.
-- **More lifecycle handlers**: `on_create`, `on_destroy`, `on_move`,
-  `on_reset` (room respawn timer), `on_disconnect`.
+- **More lifecycle handlers**: `on_move`, `on_reset` (room respawn
+  timer), `on_disconnect` (`on_create` and `on_destroy` fire).
 - **Persistent actions**: registered verbs are in memory and lost on restart.
 - **High-occupancy rooms**: above about 100 occupants, send an aggregated
   view (count, notable entities, sampled chat).

@@ -257,11 +257,13 @@ Two rules follow from this:
 The first four hooks also get `object_id`, `actor_id` and `room_id`.
 `heart_beat` gets `object_id`, `room_id` and `args` (always `nil`).
 
-These handler names **never fire on their own**: `on_create`,
-`on_destroy`, `on_init`, `on_move` and `on_use`. (`ai_idle_tick` and
+`on_create` runs when an object with code is created or cloned, and
+`on_destroy` just before it is deleted. These handler names **never fire
+on their own**: `on_init`, `on_move` and `on_use`. (`ai_idle_tick` and
 `ai_combat_tick` fire for NPCs: see [Built-in
-combat](langref.md#built-in-combat).) Engine hooks (the table above, plus `on_create` and
-`on_destroy`) can't be triggered with `game.use_object` either. Other
+combat](langref.md#built-in-combat).) Engine hooks (the table above, plus
+`on_create`, `on_destroy` and the `ai_` handlers) can't be triggered with
+`game.use_object`. Other
 limits:
 
 - `game.move_object` runs the old and new rooms' `on_leave`/`on_enter`
@@ -811,7 +813,7 @@ See [Sandbox limits](langref.md#sandbox-limits).
 These are planned or partial; see the [roadmap](../../docs/roadmap.md).
 Don't build on them yet:
 
-- **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move` and `on_use`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
+- **Handlers that never fire on their own:** `on_init`, `on_move` and `on_use`. Call them with `game.use_object` if you need them.
 - **Commands:** there are no `use` or `give` player commands (add verbs instead).
 - **Universe config:** a key like `spawn_room` has no effect. Use `setportal` for the spawn room.
 

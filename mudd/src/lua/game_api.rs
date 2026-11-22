@@ -519,6 +519,7 @@ impl GameApi {
         let user_clone = current_user.clone();
         let permissions_clone = permissions.clone();
         let classes_clone = self.classes.clone();
+        let create_engine = self.engine.clone();
         let create_object = lua.create_function(
             move |lua,
                   (path, class, parent_id, props): (
@@ -619,7 +620,21 @@ impl GameApi {
                                     return Ok(Err(format!("unknown code_hash {}", hash)));
                                 }
                             }
-                            store.create(&obj_clone).await.map(Ok)
+                            store.create(&obj_clone).await?;
+                            // Its own code's on_create (as its owner)
+                            if obj_clone.code_hash.is_some() {
+                                if let Some(ref engine) = create_engine {
+                                    engine
+                                        .hook(
+                                            &universe_id,
+                                            &obj_clone.id,
+                                            "on_create",
+                                            serde_json::json!({}),
+                                        )
+                                        .await;
+                                }
+                            }
+                            Ok(Ok(()))
                         })
                     });
 
@@ -779,6 +794,7 @@ impl GameApi {
             self.actions.clone(),
             self.effects.clone(),
         );
+        let delete_engine = self.engine.clone();
         let delete_object = lua.create_function(move |lua, id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
@@ -801,6 +817,14 @@ impl GameApi {
                     .await
                     {
                         return Ok(Err(reason));
+                    }
+                    // Its own code's on_destroy first, while it still exists
+                    if obj.code_hash.is_some() {
+                        if let Some(ref engine) = delete_engine {
+                            engine
+                                .hook(&universe_id, &id, "on_destroy", serde_json::json!({}))
+                                .await;
+                        }
                     }
                     // The object and its balance go together, atomically
                     // (credits has no foreign key: holders may be accounts)
@@ -906,6 +930,7 @@ impl GameApi {
             universe_id.clone(),
             permissions.clone(),
         );
+        let clone_engine = self.engine.clone();
         let clone_object = lua.create_function(
             move |lua, (id, new_path, new_parent_id): (String, String, Option<String>)| {
                 charge_db(lua)?;
@@ -963,6 +988,18 @@ impl GameApi {
                                     cloned.created_at = chrono::Utc::now().to_rfc3339();
                                     cloned.updated_at = cloned.created_at.clone();
                                     store.create(&cloned).await?;
+                                    if cloned.code_hash.is_some() {
+                                        if let Some(ref engine) = clone_engine {
+                                            engine
+                                                .hook(
+                                                    &universe_id,
+                                                    &cloned.id,
+                                                    "on_create",
+                                                    serde_json::json!({}),
+                                                )
+                                                .await;
+                                        }
+                                    }
                                     Ok(Ok(Some(cloned)))
                                 }
                                 None => Ok(Ok(None)),
