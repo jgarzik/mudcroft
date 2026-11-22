@@ -71,9 +71,6 @@ affected feature.
 
 ### Accounts and permissions
 
-- **Weak password hashing.** One salted SHA-256 round compared with `==`
-  (`mudd/src/auth/mod.rs`). Needs a slow KDF (argon2 or bcrypt) and a
-  constant-time compare.
 - A session's access level is fixed at connect (`mudd/src/api/websocket.rs`);
   promotions and demotions apply after the player reconnects.
 

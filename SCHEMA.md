@@ -3,11 +3,12 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 1):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 2):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). There are no upgrade steps yet,
-so a database older than version 1 is refused with a "create a new database"
-error; at version 1 a re-run creates any missing tables and refreshes the
+so an older database is refused with a "create a new database" error (from
+version 1 there is none: its SHA-256 password hashes cannot become argon2id);
+at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
 The schema is defined in `mudd/src/db/mod.rs` (`run_migrations`). This file
 mirrors it.
@@ -39,8 +40,7 @@ Conventions used below:
 |--------|------|-------|
 | id | TEXT PRIMARY KEY | UUID |
 | username | TEXT UNIQUE NOT NULL | Login name (case-sensitive) |
-| password_hash | TEXT | Hex SHA-256 of `salt` + password |
-| salt | TEXT | 16 random bytes, hex |
+| password_hash | TEXT | argon2id PHC string (`$argon2id$v=19$...`, default parameters, random salt) |
 | token | TEXT | Current session token: 64 hex characters, opaque, not a JWT. `NULL` after logout. A new login replaces it. |
 | access_level | TEXT NOT NULL DEFAULT 'player' | Global level. Only `admin` and `owner` have an effect (in every universe); per-universe levels are in `universe_members`. See [permissions.md](mudd/docs/permissions.md#access-levels). |
 | created_at | TEXT NOT NULL DEFAULT (datetime('now')) | |

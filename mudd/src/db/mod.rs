@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
@@ -66,8 +66,9 @@ impl Database {
     }
 
     /// Bring an existing database up to SCHEMA_VERSION, one version at a
-    /// time. There are no upgrade steps yet: version 1 is the first schema
-    /// with a version, so anything older is refused.
+    /// time. There are no upgrade steps yet, so anything older is refused:
+    /// - 1 -> 2 (argon2id passwords, accounts.salt dropped): old salted
+    ///   SHA-256 hashes cannot be converted, so there is no step.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -222,7 +223,6 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT,
-                salt TEXT,
                 token TEXT,
                 access_level TEXT NOT NULL DEFAULT 'player',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))

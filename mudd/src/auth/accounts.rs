@@ -13,7 +13,35 @@ use thiserror::Error;
 
 use crate::raft::RaftWriter;
 
-use super::{generate_salt, generate_token, hash_password, verify_password};
+use super::{generate_token, hash_password, verify_password};
+
+/// Hash a password off the async executor (argon2 is CPU-heavy)
+async fn hash_blocking(password: &str) -> Result<String, AuthError> {
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| AuthError::Write(e.to_string()))?
+        .map_err(|e| AuthError::Write(format!("password hashing failed: {}", e)))
+}
+
+/// Verify a password off the async executor. With no stored hash (unknown
+/// user) it still runs a verification against a dummy hash, so the time
+/// taken does not reveal whether the account exists.
+async fn verify_blocking(password: &str, stored: Option<String>) -> bool {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || {
+        let found = stored.is_some();
+        let hash = stored.unwrap_or_else(|| {
+            DUMMY
+                .get_or_init(|| hash_password("dummy password").unwrap_or_default())
+                .clone()
+        });
+        verify_password(&password, &hash) && found
+    })
+    .await
+    .unwrap_or(false)
+}
 
 /// Account data
 #[derive(Debug, Clone)]
@@ -106,21 +134,19 @@ impl AccountService {
 
         // Generate credentials
         let id = uuid::Uuid::new_v4().to_string();
-        let salt = generate_salt();
-        let password_hash = hash_password(password, &salt);
+        let password_hash = hash_blocking(password).await?;
         let token = generate_token();
         let now = chrono::Utc::now().to_rfc3339();
 
         // Insert account (a concurrent registration of the same name loses
         // on the UNIQUE constraint)
         self.write(
-            "INSERT INTO accounts (id, username, password_hash, salt, token, access_level, created_at)
-             VALUES (?, ?, ?, ?, ?, 'player', ?)",
+            "INSERT INTO accounts (id, username, password_hash, token, access_level, created_at)
+             VALUES (?, ?, ?, ?, 'player', ?)",
             vec![
                 json!(id),
                 json!(username),
                 json!(password_hash),
-                json!(salt),
                 json!(token),
                 json!(now),
             ],
@@ -151,20 +177,19 @@ impl AccountService {
         password: &str,
     ) -> Result<(Account, String), AuthError> {
         // Get account with password info
-        let row: Option<(String, String, String, String, String)> = sqlx::query_as(
-            "SELECT id, password_hash, salt, access_level, created_at FROM accounts WHERE username = ?",
+        let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
+            "SELECT id, password_hash, access_level, created_at FROM accounts WHERE username = ?",
         )
         .bind(username)
         .fetch_optional(&self.pool)
         .await?;
 
-        let (id, stored_hash, salt, access_level, created_at) =
-            row.ok_or(AuthError::InvalidCredentials)?;
-
-        // Verify password
-        if !verify_password(password, &salt, &stored_hash) {
+        // Verify even when the account does not exist (constant work)
+        let stored_hash = row.as_ref().and_then(|r| r.1.clone());
+        if !verify_blocking(password, stored_hash).await {
             return Err(AuthError::InvalidCredentials);
         }
+        let (id, _, access_level, created_at) = row.ok_or(AuthError::InvalidCredentials)?;
 
         // Generate new token
         let token = generate_token();
@@ -289,6 +314,15 @@ mod tests {
         assert_eq!(account.username, "testuser");
         assert_eq!(account.access_level, "player");
         assert!(!token.is_empty());
+
+        // The password is stored as an argon2id PHC string, never in clear
+        let stored: String = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = ?")
+            .bind(&account.id)
+            .fetch_one(&service.pool)
+            .await
+            .unwrap();
+        assert!(stored.starts_with("$argon2id$"), "{}", stored);
+        assert!(!stored.contains("password123"));
     }
 
     #[tokio::test]

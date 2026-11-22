@@ -15,7 +15,9 @@ For access levels, see [permissions.md](permissions.md#access-levels).
 - **Tokens** are opaque: 64 random hex characters stored on the account row.
   They are not JWTs and do not expire. Each account has one token at a time:
   a new login replaces it, and logout clears it.
-- **Passwords** are stored as salted SHA-256 hashes.
+- **Passwords** are stored as argon2id hashes (PHC strings with a random
+  salt) and verified in constant time; a login for an unknown username takes
+  as long as one with a wrong password.
 - **Errors** are JSON `{"error": "<message>"}`, with these exceptions, which
   return plain text:
   - `GET /images/{hash}` failures
