@@ -241,7 +241,7 @@ impl PlayerManager {
 
     /// Get respawn location for death.
     /// Priority: workroom > universe portal
-    async fn get_respawn_location(&self, player: &Object, universe_id: &str) -> Result<String> {
+    pub async fn get_respawn_location(&self, player: &Object, universe_id: &str) -> Result<String> {
         // Check workroom
         if let Some(workroom_id) = player.get_string("workroom_id") {
             if self
@@ -266,7 +266,7 @@ impl PlayerManager {
     }
 
     /// Drop all inventory items from a player to a room.
-    async fn drop_inventory(
+    pub async fn drop_inventory(
         &self,
         universe_id: &str,
         player_id: &str,

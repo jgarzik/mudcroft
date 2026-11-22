@@ -1953,7 +1953,7 @@ impl GameApi {
                 let universe_id = universe_clone.clone();
                 let object_id = object_clone.clone();
 
-                // Negative/NaN delays fire on the next tick
+                // Negative/NaN delays fire after the 100 ms minimum (MIN_TIMER_DELAY_MS)
                 let delay_ms = (delay_secs.max(0.0) * 1000.0) as u64;
 
                 let timer_id = block_now(async {

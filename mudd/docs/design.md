@@ -461,7 +461,10 @@ Two layers exist:
   arithmetically (`engine::process_due`, a pure function). The scheduler
   reloads each due entity's rows from the table before processing (the
   cache only says when to wake), so a deleted or recreated object never
-  receives stale effects; pulse periods are at least 500 ms.
+  receives stale effects; pulse periods are at least 500 ms. A player killed
+  by effects respawns in the same batch (HP restored, moved), so nobody is
+  left dead at 0 HP; reports, including an NPC's `on_death` hook, run after
+  the commit with the effect lock released.
 - **Lua mudlib** (`mudd/lib/combat.lua`): `Combat.initiate`, `Combat.attack`,
   `Combat.deal_damage`, `Combat.heal`, effects, working on object
   properties. `Commands.flee` lives in `lib/commands.lua`.

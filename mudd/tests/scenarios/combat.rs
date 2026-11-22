@@ -586,3 +586,74 @@ async fn test_update_object_writes_only_given_properties() {
     assert!(payload.contains("json_set"), "{}", payload);
     assert!(!payload.contains("hp"), "hp was rewritten: {}", payload);
 }
+
+/// An NPC killed by an effect fires on_death like a kill by attack, with
+/// the effect's source as killer
+#[tokio::test]
+async fn test_effect_death_fires_on_death() {
+    let server = TestServer::start().await.expect("server");
+    let mut watcher = player_in_passage(&server, "death_watcher").await;
+    let passage = server.world().passage_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "doom_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"local h = game.store_code([[return {{
+                 on_death = function(a) game.broadcast("{room}", "rat on_death fired") end,
+               }}]])
+               game.create_object("/npcs/rat", "npc", "{room}", {{name = "rat", hp = 3, code_hash = h}})
+               return game.apply_effect("/npcs/rat", "burning", 2, 50)"#,
+            room = passage
+        ),
+    )
+    .await;
+    watcher
+        .expect_output_containing("rat on_death fired")
+        .await
+        .expect("on_death ran for the effect kill");
+}
+
+/// A player killed by an effect respawns at once (HP restored, moved to the
+/// respawn room) and is shown the new room
+#[tokio::test]
+async fn test_player_killed_by_effect_respawns() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "doomed_player").await;
+    let player_id = pl.player_id().unwrap().to_string();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "reaper_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "burning", 2, 500)"#,
+            player_id
+        ),
+    )
+    .await;
+    pl.expect_output_containing("You have died")
+        .await
+        .expect("death message");
+    let room = pl.expect("room").await.expect("shown the respawn room");
+    assert_eq!(room["name"], "Cave Entrance");
+    let (hp, parent): (i64, String) = sqlx::query_as(
+        "SELECT json_extract(properties, '$.hp'), parent_id FROM objects WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&player_id)
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (hp, parent.as_str()),
+        (100, server.world().entrance_id.as_str())
+    );
+}

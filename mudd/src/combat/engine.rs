@@ -153,6 +153,7 @@ pub fn resolve_attack(
             BLEED_DAMAGE,
             Some(DamageType::Physical),
         )
+        .with_source(&attacker.id)
     });
     AttackOutcome {
         killed,

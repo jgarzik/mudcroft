@@ -719,7 +719,11 @@ the target's resistances, and `regenerating` heals it (up to `max_hp`).
 Pulses change the target's `hp` property. A player is told each pulse
 (`You take 3 poison damage (poisoned).`) and when an effect ends
 (`You are no longer poisoned.`). Damage that brings HP to 0 kills: an NPC
-leaves the room (onlookers hear `<name> dies.`), a player respawns. If the
+leaves the room (onlookers hear `<name> dies.`) and its `on_death` runs, with
+`killer_id` set to whoever applied the effect (an attacker's critical hit
+causes bleeding); a player respawns at once (full HP, at the respawn room)
+and drops what they carried where they died. Within one pass, all damage is
+applied before any healing, and healing cannot revive the dead. If the
 server falls behind (or was down), the missed pulses are applied together.
 
 Types: `poisoned`, `stunned`, `blinded`, `burning`, `frozen`, `paralyzed`,
