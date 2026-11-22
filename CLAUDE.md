@@ -115,7 +115,7 @@ Scenario tests live in `mudd/tests/scenarios/`; the Lua game-logic suite is `mud
 ## Key Design Documents
 
 - `mudd/docs/design.md` - Server architecture (current state)
-- `docs/` - Roadmap and known issues (`docs/roadmap.md`), parked blockchain design, research
+- `docs/` - Roadmap and known issues (`docs/roadmap.md`), multi-node design proposal (`docs/cluster-design.md`), parked blockchain design, research
 - `mudd/README.md` - Server build and CLI
 - `SCHEMA.md` - Database schema
 - `playtest.md` - Manual play-testing
