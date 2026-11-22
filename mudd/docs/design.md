@@ -229,8 +229,8 @@ redefined:
 ```
 thing (name, description)
 ├── item (weight, value, fixed)
-│   ├── weapon (damage_dice, damage_bonus, damage_type)
-│   ├── armor (armor_value, slot)
+│   ├── weapon (slot, damage, damage_type)
+│   ├── armor (armor_class, slot)
 │   └── container (capacity, locked)
 ├── living (hp, max_hp, attack_bonus, armor_class, in_combat)
 │   ├── player (access_level)

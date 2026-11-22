@@ -2244,3 +2244,56 @@ async fn test_engine_binding_rules() {
     .unwrap();
     assert_eq!(statue_fights, 0, "an aggro non-creature does not attack");
 }
+
+/// Phase 2 review: fleeing from a dead end keeps the fight; an NPC kept out
+/// of the world on purpose (not respawning) can be healed and damaged;
+/// living-derived classes fight
+#[tokio::test]
+async fn test_engine_edges_after_review() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "edgecase".into(),
+        })
+        .await
+        .unwrap();
+    let me = adm.player_id().unwrap().to_string();
+    let out = eval_as(
+        &mut adm,
+        r#"game.create_object("/rooms/deadend", "room", nil, {name = "Dead End"})
+           game.create_object("/rooms/deadend/orc", "npc", "/rooms/deadend", {name = "orc", hp = 500, max_hp = 500})
+           game.create_object("/npcs/limbo-boss", "npc", nil, {name = "boss", hp = 50, max_hp = 100})
+           local healed, why = game.heal("/npcs/limbo-boss", 10)
+           game.define_class("golem", {parent = "living"})
+           game.create_object("/rooms/deadend/golem", "golem", "/rooms/deadend", {name = "golem", hp = 50})
+           local ok, why2 = game.can_attack("/rooms/deadend/golem", "/rooms/deadend/orc")
+           return tostring(healed) .. "|" .. tostring(why) .. "|" .. tostring(ok) .. "|" .. tostring(why2)"#,
+    )
+    .await;
+    let text = out["text"].as_str().unwrap_or_default().to_string();
+    assert!(text.starts_with("60|nil|true|"), "{}", out);
+
+    adm.drain().await;
+    adm.command("goto /rooms/deadend").await.unwrap();
+    adm.expect("room").await.unwrap();
+    adm.drain().await;
+    adm.command("attack orc").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    adm.drain().await;
+    adm.command("flee").await.unwrap();
+    adm.expect_output_containing("nowhere to run")
+        .await
+        .unwrap();
+    let target: Option<String> =
+        sqlx::query_scalar("SELECT target_id FROM combat WHERE universe_id = ? AND entity_id = ?")
+            .bind(server.universe_id())
+            .bind(&me)
+            .fetch_optional(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        target.as_deref(),
+        Some("/rooms/deadend/orc"),
+        "still fighting"
+    );
+}

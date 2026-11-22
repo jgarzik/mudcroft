@@ -167,14 +167,33 @@ pub fn weapon_dice(notation: &str) -> Option<crate::combat::DiceRoll> {
     })
 }
 
-/// A creature: an npc, a class derived from it, or a monster
+/// A creature: anything living that is not a player (an npc, a class
+/// derived from npc or living), or a monster
 pub async fn is_creature(state: &AppState, universe_id: &str, obj: &Object) -> bool {
     obj.class == "monster"
-        || state
-            .classes
-            .read()
+        || (!is_player(obj)
+            && state
+                .classes
+                .read()
+                .await
+                .is_a(universe_id, &obj.class, "living"))
+}
+
+/// A dead NPC waiting to respawn (or to be deleted): not in play
+async fn awaiting_respawn(state: &AppState, universe_id: &str, id: &str) -> Result<bool, String> {
+    let row: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM deadlines WHERE universe_id = ? AND object_id = ? AND kind IN ('respawn', 'delete')",
+    )
+    .bind(universe_id)
+    .bind(id)
+    .fetch_optional(
+        &mut *crate::db::run::reader(state.db.pool())
             .await
-            .is_a(universe_id, &obj.class, "npc")
+            .map_err(|e| e.to_string())?,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(row.is_some())
 }
 
 /// Whether `attacker` may fight `target` now: the universe allows fighting
@@ -296,11 +315,12 @@ pub async fn strike(
                         .get("dice")
                         .and_then(|d| d.as_str())
                         .and_then(weapon_dice)?;
-                    let t = p
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .and_then(|t| t.parse::<DamageType>().ok())
-                        .unwrap_or(DamageType::Physical);
+                    // No type: physical; a type that is not one is dropped
+                    // (as bad dice are), never silently physical
+                    let t = match p.get("type").and_then(|t| t.as_str()) {
+                        None => DamageType::Physical,
+                        Some(name) => name.parse::<DamageType>().ok()?,
+                    };
                     Some((Some(dice), t))
                 })
                 .collect()
@@ -345,14 +365,12 @@ pub async fn strike(
         let shares: Vec<String> = parts
             .iter()
             .map(|p| {
-                if p.applied == 0 && p.rolled > 0 {
-                    format!("{}: {} is immune", p.dtype, tn)
-                } else if p.applied < p.rolled {
-                    format!("{} {}, resisted", p.applied, p.dtype)
-                } else if p.applied > p.rolled {
-                    format!("{} {}, vulnerable", p.applied, p.dtype)
-                } else {
-                    format!("{} {}", p.applied, p.dtype)
+                use crate::combat::DamageModifier;
+                match p.modifier {
+                    DamageModifier::Immune => format!("{}: {} is immune", p.dtype, tn),
+                    DamageModifier::Resistant => format!("{} {}, resisted", p.applied, p.dtype),
+                    DamageModifier::Vulnerable => format!("{} {}, vulnerable", p.applied, p.dtype),
+                    _ => format!("{} {}", p.applied, p.dtype),
                 }
             })
             .collect();
@@ -746,6 +764,21 @@ async fn leave_randomly(
     verb: &str,
     notes: &mut Vec<Note>,
 ) -> anyhow::Result<Option<String>> {
+    let Some((dir, to)) = pick_exit(state, universe_id, who, same_region).await? else {
+        return Ok(None);
+    };
+    leave_via(state, universe_id, who, &dir, &to, verb, notes).await?;
+    Ok(Some(dir))
+}
+
+/// A random usable exit of `who`'s room (`same_region`: only into rooms of
+/// the same region): (direction, destination)
+async fn pick_exit(
+    state: &AppState,
+    universe_id: &str,
+    who: &Object,
+    same_region: bool,
+) -> anyhow::Result<Option<(String, String)>> {
     let store = &state.object_store;
     let Some(ref from) = who.parent_id else {
         return Ok(None);
@@ -764,7 +797,24 @@ async fn leave_randomly(
     if choices.is_empty() {
         return Ok(None);
     }
-    let (dir, to) = choices.swap_remove(rand::rng().random_range(0..choices.len()));
+    Ok(Some(
+        choices.swap_remove(rand::rng().random_range(0..choices.len())),
+    ))
+}
+
+/// Move `who` out through exit `dir` to `to`, telling both rooms
+async fn leave_via(
+    state: &AppState,
+    universe_id: &str,
+    who: &Object,
+    dir: &str,
+    to: &str,
+    verb: &str,
+    notes: &mut Vec<Note>,
+) -> anyhow::Result<()> {
+    let store = &state.object_store;
+    let from = who.parent_id.clone().unwrap_or_default();
+    let to = to.to_string();
     if is_player(who) {
         move_player(state, universe_id, &who.id, Some(&to)).await?;
     } else {
@@ -785,7 +835,7 @@ async fn leave_randomly(
     ));
     // An aggressive NPC arriving attacks a player there (in this run)
     arrival(state, universe_id, &who.id, &to).await;
-    Ok(Some(dir))
+    Ok(())
 }
 
 /// What a death did, for the messages and hooks after the commit
@@ -1238,8 +1288,7 @@ enum Note {
 
 /// Run every round and deadline due at `now`, as one run
 pub async fn process(state: &AppState, now: u64) {
-    // One AI handler budget for the whole pass
-    let notes = with_ai_budget(super::scripting::in_run(state, async {
+    let notes = super::scripting::in_run(state, async {
         // HP and effects are read then written: serialized with every writer
         let _writes = state.effects.write_guard().await;
         let mut notes = Vec::new();
@@ -1250,7 +1299,7 @@ pub async fn process(state: &AppState, now: u64) {
             .await
             .map_err(|e| e.to_string())?;
         Ok::<_, String>(notes)
-    }))
+    })
     .await;
     let notes = match notes {
         Ok(notes) => notes,
@@ -1309,11 +1358,12 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
         // Each round is a nested part: one that fails (a bad object) is
         // undone and its fight ended, and the other rounds go on
         let mut mine = Vec::new();
-        let done = super::scripting::in_run(state, async {
+        // Each fighter's turn has its own AI handler budget
+        let done = with_ai_budget(super::scripting::in_run(state, async {
             round(state, now, u.clone(), entity.clone(), &mut mine)
                 .await
                 .map_err(|e| e.to_string())
-        })
+        }))
         .await;
         match done {
             Ok(()) => notes.extend(mine),
@@ -1537,11 +1587,11 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
     for (u, id, kind) in due {
         // Isolated like rounds: a failing one is dropped, the rest go on
         let mut mine = Vec::new();
-        let done = super::scripting::in_run(state, async {
+        let done = with_ai_budget(super::scripting::in_run(state, async {
             deadline(state, now, u.clone(), id.clone(), kind.clone(), &mut mine)
                 .await
                 .map_err(|e| e.to_string())
-        })
+        }))
         .await;
         match done {
             Ok(()) => notes.extend(mine),
@@ -1823,8 +1873,8 @@ impl CombatEngine {
         let state = &self.state;
         let _writes = state.effects.write_guard().await;
         let target = self.object(u, target_id).await?;
-        // A dead NPC waiting to respawn is out of the world: not again
-        if target.parent_id.is_none() {
+        // A dead NPC waiting to respawn: not again
+        if awaiting_respawn(state, u, target_id).await? {
             return Err(format!("{} is not in the world", name_of(&target)));
         }
         let dtype = damage_type
@@ -1883,8 +1933,14 @@ impl CombatEngine {
         if fail > 0 && rand::rng().random_range(0..100) < fail {
             return Err("You try to flee but fail to get away!".to_string());
         }
-        // Its own fight ends first (so a fight it walks into can start);
-        // its attackers' end on their next round (no longer together)
+        // An exit first (nowhere to run: the fight goes on); then its own
+        // fight ends (so a fight it walks into can start) and it moves, in
+        // this run; its attackers' end on their next round (no longer
+        // together)
+        let (dir, to) = pick_exit(state, u, &who, false)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "There is nowhere to run.".to_string())?;
         state
             .object_store
             .execute_batch(vec![statement(
@@ -1894,10 +1950,9 @@ impl CombatEngine {
             .await
             .map_err(|e| e.to_string())?;
         let mut notes = Vec::new();
-        let dir = leave_randomly(state, u, &who, false, "flees", &mut notes)
+        leave_via(state, u, &who, &dir, &to, "flees", &mut notes)
             .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "There is nowhere to run.".to_string())?;
+            .map_err(|e| e.to_string())?;
         self.after(notes, None).await;
         Ok(dir)
     }
@@ -1978,7 +2033,7 @@ impl Engine for CombatEngine {
         Box::pin(async move {
             let _writes = self.state.effects.write_guard().await;
             let t = self.object(universe_id, target).await?;
-            if t.parent_id.is_none() {
+            if awaiting_respawn(&self.state, universe_id, target).await? {
                 return Err(format!("{} is not in the world", name_of(&t)));
             }
             let who = Combatant::from_object(&t, if is_player(&t) { 100 } else { 10 });

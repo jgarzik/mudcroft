@@ -170,6 +170,8 @@ pub struct DamagePart {
     pub dtype: DamageType,
     pub rolled: i32,
     pub applied: i32,
+    /// The target's resistance to this type
+    pub modifier: super::DamageModifier,
 }
 
 /// A weapon's further damage parts (after the first, which resolve_attack
@@ -196,6 +198,7 @@ pub fn add_damage_parts(
             dmg.base_damage
         },
         applied: dmg.final_damage,
+        modifier: dmg.modifier,
     });
     for &(roll, dtype) in extra {
         let d = target.profile.calculate_damage(roll.max(0), dtype, crit);
@@ -207,6 +210,7 @@ pub fn add_damage_parts(
                 roll.max(0)
             },
             applied: d.final_damage,
+            modifier: d.modifier,
         });
         outcome.target_hp = outcome.target_hp.saturating_sub(d.final_damage).max(0);
     }
@@ -768,5 +772,32 @@ mod tests {
             &[(10, DamageType::Fire)],
         );
         assert!(out.killed && out.target_hp == 0 && out.inflicts.is_none());
+    }
+
+    /// A part halved to 0 is resisted, not immune: the part carries its
+    /// modifier
+    #[test]
+    fn test_damage_part_modifier() {
+        let attacker = combatant(serde_json::json!({}));
+        let target = combatant(serde_json::json!({
+            "hp": 40, "armor_class": 1, "resistances": {"fire": "resistant"}
+        }));
+        let mut out = resolve_attack(
+            &attacker,
+            &target,
+            &AttackMods::default(),
+            10,
+            4,
+            DamageType::Slashing,
+            0,
+        );
+        let parts = add_damage_parts(
+            &mut out,
+            &target,
+            DamageType::Slashing,
+            &[(1, DamageType::Fire)],
+        );
+        assert_eq!(parts[1].applied, 0);
+        assert_eq!(parts[1].modifier, crate::combat::DamageModifier::Resistant);
     }
 }
