@@ -50,7 +50,7 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9"
@@ -61,7 +61,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 
 # Zip file handling
 zip = "2.2"
-base64 = "0.22.1"
+base64 = "0.23"
 
 # Regex for validation
 regex = "1"
