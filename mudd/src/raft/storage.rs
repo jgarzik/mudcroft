@@ -543,28 +543,37 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         let data = snapshot.into_inner();
         let payload: SnapshotPayload = serde_json::from_slice(&data).map_err(io::Error::other)?;
 
-        // Replace the database file when the snapshot carries one
-        if !payload.db_snapshot.is_empty() {
-            if let Some(ref db_path) = self.db_path {
-                debug!(
-                    "Installing snapshot database ({} bytes)",
-                    payload.db_snapshot.len()
-                );
-                self.pool.read().await.close().await;
-                tokio::fs::write(db_path, &payload.db_snapshot).await?;
-                let options =
-                    SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rw", db_path))
-                        .map_err(io::Error::other)?
-                        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                        .foreign_keys(true);
-                let new_pool = SqlitePoolOptions::new()
-                    .max_connections(10)
-                    .connect_with(options)
-                    .await
-                    .map_err(io::Error::other)?;
-                *self.pool.write().await = new_pool;
-            }
+        // A snapshot is only usable with its database file: recording the
+        // position without the data would skip every entry it covers
+        let Some(db_path) = self.db_path.clone() else {
+            return Err(io::Error::other(
+                "cannot install a snapshot: this state machine has no database path",
+            ));
+        };
+        if payload.db_snapshot.is_empty() {
+            return Err(io::Error::other(
+                "cannot install a snapshot that carries no database",
+            ));
         }
+
+        debug!(
+            "Installing snapshot database ({} bytes)",
+            payload.db_snapshot.len()
+        );
+        // NOTE: this closes the shared pool, including clones the
+        // application reads through (see docs/roadmap.md, Snapshots)
+        self.pool.read().await.close().await;
+        tokio::fs::write(&db_path, &payload.db_snapshot).await?;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rw", db_path))
+            .map_err(io::Error::other)?
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let new_pool = SqlitePoolOptions::new()
+            .max_connections(10)
+            .connect_with(options)
+            .await
+            .map_err(io::Error::other)?;
+        *self.pool.write().await = new_pool;
 
         // Persist the position so a restart resumes from it
         {
@@ -698,5 +707,30 @@ mod tests {
         let mut resumed = StateMachine::new(shared(pool), None).await.unwrap();
         let (last_applied, _) = resumed.applied_state().await.unwrap();
         assert_eq!(last_applied.unwrap().index, 3);
+    }
+
+    /// A snapshot without the database file cannot be installed: recording
+    /// its position would skip every entry it covers with none of their data
+    #[tokio::test]
+    async fn test_install_refuses_snapshot_without_data() {
+        let pool = test_pool().await;
+        let mut leader = StateMachine::new(shared(pool.clone()), None).await.unwrap();
+        apply(&mut leader, vec![normal(7, Request::simple("SELECT 1"))]).await;
+        let snapshot = leader
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let mut follower = StateMachine::new(shared(test_pool().await), None)
+            .await
+            .unwrap();
+        assert!(follower
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .is_err());
+        let (last_applied, _) = follower.applied_state().await.unwrap();
+        assert!(last_applied.is_none(), "nothing recorded");
     }
 }

@@ -505,10 +505,11 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   `raft_vote` (vote and committed index), `raft_meta` (`last_applied`,
   `last_purged`, `last_membership`). Persisting the membership lets a
   restarted single node elect itself again.
-- **Snapshots**: after 1,000 log entries. A snapshot records the applied
-  position and membership; it would also carry the database file (after a
-  `PRAGMA wal_checkpoint(TRUNCATE)`) if the state machine were given its
-  path, which it is not yet.
+- **Snapshots**: after 1,000 log entries, so a single node can purge its
+  log. A snapshot records the applied position and membership; it would also
+  carry the database file (after a `PRAGMA wal_checkpoint(TRUNCATE)`) if the
+  state machine were given its path, which it is not yet. Installing a
+  snapshot without the database file is refused.
 - **Timing**: heartbeat 500 ms, election timeout 1.5-3 s.
 - **Network**: `raft/network.rs` (`RaftNetworkV2`) sends RPCs as HTTP POSTs
   to `http://<peer>/raft/<endpoint>` (`append_entries`, `vote`, and
