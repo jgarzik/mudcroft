@@ -281,6 +281,24 @@ pub struct Death {
     pub xp: Option<i64>,
 }
 
+/// Delete an object and everything inside it, deepest first (an object
+/// that still contains anything cannot be deleted)
+pub async fn delete_tree(state: &AppState, universe_id: &str, id: &str) -> anyhow::Result<()> {
+    let store = &state.object_store;
+    let mut order = vec![id.to_string()];
+    let mut i = 0;
+    while i < order.len() {
+        for child in store.get_contents(universe_id, &order[i]).await? {
+            order.push(child.id);
+        }
+        i += 1;
+    }
+    for victim in order.iter().rev() {
+        store.delete(universe_id, victim).await?;
+    }
+    Ok(())
+}
+
 fn statement(sql: &str, params: Vec<serde_json::Value>) -> crate::db::run::Statement {
     (sql.to_string(), params)
 }
@@ -373,7 +391,7 @@ pub async fn death(
             }
             ("destroy", _) => {
                 for item in &items {
-                    store.delete(universe_id, &item.id).await?;
+                    delete_tree(state, universe_id, &item.id).await?;
                 }
             }
             ("keep", _) => {}
@@ -429,7 +447,8 @@ pub async fn death(
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_RESPAWN_S);
         if respawn_s == 0 {
-            store.delete(universe_id, id).await?;
+            // For good, with whatever it still holds (fixed things)
+            delete_tree(state, universe_id, id).await?;
         } else {
             let home = victim
                 .get_string("home_room")
@@ -652,8 +671,43 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
     .bind(now as i64)
     .fetch_all(&mut *crate::db::run::reader(state.db.pool()).await?)
     .await?;
-    let store = &state.object_store;
     for (u, entity, _) in due {
+        // Each round is a nested part: one that fails (a bad object) is
+        // undone and its fight ended, and the other rounds go on
+        let mut mine = Vec::new();
+        let done = super::scripting::in_run(state, async {
+            round(state, now, u.clone(), entity.clone(), &mut mine)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        match done {
+            Ok(()) => notes.extend(mine),
+            Err(e) => {
+                warn!("combat: a round of {} failed (fight ended): {}", entity, e);
+                state
+                    .object_store
+                    .execute_batch(vec![statement(
+                        "DELETE FROM combat WHERE universe_id = ? AND entity_id = ?",
+                        vec![json!(u), json!(entity)],
+                    )])
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One fighter's round
+async fn round(
+    state: &AppState,
+    now: u64,
+    u: String,
+    entity: String,
+    notes: &mut Vec<Note>,
+) -> anyhow::Result<()> {
+    let store = &state.object_store;
+    {
         // Read again: an earlier round in this batch may have ended this
         // fight (a death removes its rows)
         let still: Option<String> = sqlx::query_scalar(
@@ -664,7 +718,7 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
         .fetch_optional(&mut *crate::db::run::reader(state.db.pool()).await?)
         .await?;
         let Some(mut target_id) = still else {
-            continue;
+            return Ok(());
         };
         let end = |u: &str, e: &str| {
             statement(
@@ -673,11 +727,11 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
             )
         };
         let Some(attacker) = store.get(&u, &entity).await? else {
-            continue;
+            return Ok(());
         };
         if !alive(&attacker) || attacker.parent_id.is_none() {
             store.execute_batch(vec![end(&u, &entity)]).await?;
-            continue;
+            return Ok(());
         }
         // The target must still be here and alive; else someone still
         // fighting us, or the fight is over
@@ -712,7 +766,7 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
                         "You stop fighting.".into(),
                     ));
                 }
-                continue;
+                return Ok(());
             }
         }
         let target = target.expect("found above");
@@ -727,7 +781,7 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
                     "You stop fighting.".into(),
                 ));
             }
-            continue;
+            return Ok(());
         }
         let round_ms = settings(state, &u).await.round_ms;
         store
@@ -745,7 +799,7 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
                     "You are stunned and cannot act.".into(),
                 ));
             }
-            continue;
+            return Ok(());
         }
         let blow = strike(state, &u, &attacker, &target, now).await?;
         let room = attacker.parent_id.clone().expect("checked above");
@@ -795,7 +849,7 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
             .await?;
         if blow.killed {
             let Some(dead) = store.get(&u, &target_id).await? else {
-                continue;
+                return Ok(());
             };
             let d = death(state, &u, &dead, Some(&attacker), now).await?;
             notes.push(Note::Death(u.clone(), Box::new(d)));
@@ -813,6 +867,40 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
     .await?;
     let store = &state.object_store;
     for (u, id, kind) in due {
+        // Isolated like rounds: a failing one is dropped, the rest go on
+        let mut mine = Vec::new();
+        let done = super::scripting::in_run(state, async {
+            deadline(state, u.clone(), id.clone(), kind.clone(), &mut mine)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        match done {
+            Ok(()) => notes.extend(mine),
+            Err(e) => {
+                warn!("combat: {} of {} failed (dropped): {}", kind, id, e);
+                store
+                    .execute_batch(vec![statement(
+                        "DELETE FROM deadlines WHERE universe_id = ? AND object_id = ? AND kind = ?",
+                        vec![json!(u), json!(id), json!(kind)],
+                    )])
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One due deadline
+async fn deadline(
+    state: &AppState,
+    u: String,
+    id: String,
+    kind: String,
+    notes: &mut Vec<Note>,
+) -> anyhow::Result<()> {
+    let store = &state.object_store;
+    {
         store
             .execute_batch(vec![statement(
                 "DELETE FROM deadlines WHERE universe_id = ? AND object_id = ? AND kind = ?",
@@ -820,7 +908,7 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
             )])
             .await?;
         let Some(obj) = store.get(&u, &id).await? else {
-            continue;
+            return Ok(());
         };
         match kind.as_str() {
             "decay" => {
@@ -829,7 +917,7 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
                 for item in store.get_contents(&u, &id).await? {
                     store.move_object(&u, &item.id, room.as_deref()).await?;
                 }
-                store.delete(&u, &id).await?;
+                delete_tree(state, &u, &id).await?;
                 if let Some(room) = room {
                     notes.push(Note::Room(
                         u.clone(),
@@ -843,7 +931,7 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
                 let home = obj.get_string("home_room").map(str::to_string);
                 let home = match home {
                     Some(h) if store.get(&u, &h).await?.is_some() => h,
-                    _ => continue,
+                    _ => return Ok(()),
                 };
                 store.move_object(&u, &id, Some(&home)).await?;
                 notes.push(Note::Room(

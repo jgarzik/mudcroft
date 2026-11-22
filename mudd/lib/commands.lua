@@ -59,6 +59,14 @@ function Commands.take_from(player_id, item_name, container_name)
     if not container or game.is_a(container.id, "living") then
         return {success = false, message = "You don't see that here"}
     end
+    -- Containers and corpses only (or an object that opts in), never locked
+    local meta = container.metadata or {}
+    if not (game.is_a(container.id, "container") or meta.corpse or meta.open_container) then
+        return {success = false, message = "You can't take things out of that"}
+    end
+    if meta.locked then
+        return {success = false, message = string.format("The %s is locked", container.name or container_name)}
+    end
     local takeable = function(item)
         return not (item.metadata and item.metadata.fixed) and not game.is_a(item.id, "living")
     end

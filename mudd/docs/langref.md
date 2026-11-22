@@ -1183,8 +1183,8 @@ The built-in `attack <name>` (or `kill`) command works like this:
 - A hit fires `on_damage`. A kill fires `on_death`.
 - **Deaths** follow the universe config:
   - `player_death`: `corpse` (default: what the player carries is left in a corpse where they died), `keep` (nothing is lost) or `drop` (on the floor). The player respawns at once, at full HP, in their workroom or the universe's spawn room.
-  - `npc_death`: `corpse` (default), `drop` or `destroy` (its belongings are deleted). The NPC leaves the world (`parent_id = nil`, HP restored) and comes back to its `home_room` (default: where it died) after its `respawn_seconds` (default 300; `0` deletes it for good). A player who kills it gains its `xp_value` (default its `max_hp`) in their `xp` property.
-  - Corpses decay after `corpse_decay_s` (universe config, default 300), spilling what is left into the room. `get <item> from corpse` (or `get all from corpse`) takes things out; it works on any container.
+  - `npc_death`: `corpse` (default), `drop` or `destroy` (its belongings are deleted). The NPC leaves the world (`parent_id = nil`, HP restored) and comes back to its `home_room` (default: where it died) after its `respawn_seconds` (default 300; `0` deletes it for good, with everything it still holds). A player who kills it gains its `xp_value` (default its `max_hp`) in their `xp` property.
+  - Corpses decay after `corpse_decay_s` (universe config, default 300), spilling what is left into the room. `get <item> from corpse` (or `get all from corpse`) takes things out. It works on corpses, objects of class `container` (or derived from it) and objects with `open_container = true`, never while their `locked` is true.
 
 The Rust combat engine knows these damage types: `physical`, `slashing`,
 `piercing`, `bludgeoning`, `fire`, `cold` (alias `ice`), `lightning`,

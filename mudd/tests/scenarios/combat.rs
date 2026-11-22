@@ -1097,3 +1097,94 @@ async fn test_pvp_policy() {
     let t = try_attack(&mut duelist).await;
     assert!(!refused(&t) && t.contains("rival"), "{}", t);
 }
+
+/// An NPC that never respawns is deleted on death with everything it still
+/// holds, fixed things and nested contents included (a death must never
+/// fail on what an object contains)
+#[tokio::test]
+async fn test_npc_deleted_with_fixed_contents() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "exterminator".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/npcs/slime", "npc", "{e}", {{name = "slime", hp = 1, max_hp = 1, armor_class = 1, respawn_seconds = 0}})
+               game.create_object("/items/core", "item", "/npcs/slime", {{name = "core", fixed = true}})
+               game.create_object("/items/pouch", "container", "/npcs/slime", {{name = "pouch"}})
+               game.create_object("/items/pebble", "item", "/items/pouch", {{name = "pebble"}})
+               return "ready""#,
+            e = entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    attack_until_slain(&mut adm, "attack slime", "slime").await;
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE universe_id = ? AND id IN ('/npcs/slime', '/items/core')",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "the slime and its fixed core are gone");
+    // Its loose belongings went to a corpse, nested contents and all
+    let pebble_in: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/pebble'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(pebble_in, "/items/pouch");
+}
+
+/// Only containers and corpses can be emptied, and never a locked one
+#[tokio::test]
+async fn test_take_from_respects_containers() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "looter".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/items/chest", "container", "{e}", {{name = "chest", fixed = true, locked = true}})
+               game.create_object("/items/gold", "item", "/items/chest", {{name = "gold"}})
+               game.create_object("/items/statue", "item", "{e}", {{name = "statue", fixed = true}})
+               game.create_object("/items/gem", "item", "/items/statue", {{name = "gem"}})
+               return "ok""#,
+            e = entrance
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("get gold from chest").await.unwrap();
+    adm.expect_output_containing("locked")
+        .await
+        .expect("locked");
+    adm.drain().await;
+    adm.command("get gem from statue").await.unwrap();
+    adm.expect_output_containing("can't take things out")
+        .await
+        .expect("not a container");
+    eval_as(
+        &mut adm,
+        r#"game.update_object("/items/chest", {locked = false}) return "ok""#,
+    )
+    .await;
+    adm.drain().await;
+    adm.command("get gold from chest").await.unwrap();
+    adm.expect_output_containing("You take gold")
+        .await
+        .expect("unlocked");
+}
