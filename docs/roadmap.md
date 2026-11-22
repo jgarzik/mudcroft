@@ -29,9 +29,12 @@ primary lifecycle, gateways, failover), with these gaps:
   a handler failing part way keeps both its writes and the payment. One
   batch per Lua run (below) would make them one change.
 - **Device tokens can run out.** The in-memory store holds 200,000 (10 per
-  account). Registering about 20,000 accounts fills it: no token is ever
-  evicted, but new devices are then not remembered (they log in normally,
-  without the fast lane during an attack on their name). Accepted as is
+  account). Registering about 20,000 accounts fills it. Live tokens are
+  never evicted (expired ones are swept out when room is needed, and an
+  expired token is never accepted), so new devices are then not remembered
+  (they log in normally, without the fast lane during an attack on their
+  name) until tokens expire: to keep the store full an attacker must log
+  every account in again within each 30 days. Accepted as is
   (`mudd/src/api/devices.rs`).
 - **Snapshots are held in memory whole.** A snapshot travels in 1 MiB
   chunks, but is built, sent and installed from one in-memory buffer (the
