@@ -37,9 +37,9 @@ Client and end-to-end:
 ```bash
 cd client && npm run lint            # eslint, zero warnings
 cd client && npm run build           # tsc + vite build into client/dist
-scripts/e2e.sh                       # builds mudd + client, runs Playwright (headless Chromium)
+scripts/e2e.py                       # builds mudd + client, runs Playwright (headless Chromium)
 cd client && npm run test:e2e        # Playwright only (needs built binaries and client/dist)
-scripts/start-testsrv.sh             # manual play-test server with a seeded world
+scripts/testsrv.py start             # manual play-test server with a seeded world
 ```
 
 ## Architecture

@@ -34,12 +34,12 @@ it. The server, `mudd`, is written in Rust; the client is React.
 | [client/](client/) | React + TypeScript + Vite web client and Playwright end-to-end tests |
 | [scripts/](scripts/) | Play-test server scripts, e2e runner, sample world (`cave_adventure.lua`) |
 | [docs/](docs/) | Roadmap, known issues and parked designs |
-| [docker/](docker/), [Dockerfile](Dockerfile) | Single-container image (nginx + mudd) |
+| [docker/](docker/), [Dockerfile](Dockerfile) | Single-container image (mudd serving the client) |
 
 ## Quick Start
 
-Prerequisites: a Rust toolchain, Node.js 22+ (the play-test script uses its
-built-in `WebSocket`), and for the play-test script `curl` and `jq`.
+Prerequisites: a Rust toolchain, Node.js 22+ with npm, and Python 3.10+
+(standard library only) for the scripts in `scripts/`.
 
 The fastest way to play is the play-test script. It creates a throwaway
 database, starts `mudd` serving the client, creates a universe and loads the
@@ -48,7 +48,7 @@ sample cave adventure:
 ```bash
 (cd mudd && cargo build --release)
 (cd client && npm ci && npm run build)
-scripts/start-testsrv.sh        # prints the URL and admin login; Ctrl+C stops it
+scripts/testsrv.py start        # prints the URL and admin login; Ctrl+C stops it
 ```
 
 To run a server by hand:
@@ -71,7 +71,7 @@ admin over HTTP, create one with `POST /universe/create`, optionally load a
 world with `POST /universe/{id}/run_script`, then connect as a wizard and set
 the spawn room with `setportal`. [playtest.md](playtest.md) and
 [mudd/docs/admin.md](mudd/docs/admin.md) walk through this, and
-`scripts/start-testsrv.sh` shows it end to end.
+`scripts/testsrv.py start` shows it end to end.
 
 ## Tests
 
@@ -80,7 +80,7 @@ cd mudd
 cargo test --release            # unit, integration and Lua game-logic tests
 cargo clippy --all-targets
 
-scripts/e2e.sh                  # builds everything, runs headless Chromium tests
+scripts/e2e.py                  # builds everything, runs headless Chromium tests
 (cd client && npm run lint)
 ```
 

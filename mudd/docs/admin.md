@@ -176,7 +176,7 @@ cd ..   # repository root, so run_script finds scripts/
 Open `http://<host>:8080/` for the web client.
 
 For a throwaway local server with a world already loaded, use
-`scripts/start-testsrv.sh` (see [playtest.md](../../playtest.md)).
+`scripts/testsrv.py start` (see [playtest.md](../../playtest.md)).
 
 ### systemd
 

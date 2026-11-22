@@ -7,7 +7,7 @@ import { defineConfig, devices } from '@playwright/test'
  * e2e/global-setup.ts builds a throwaway server (temp dir, fresh database,
  * seeded universe) and exports its URL; e2e/global-teardown.ts stops it and
  * deletes the temp dir. Run via `npm run test:e2e` (after building mudd and
- * the client) or `scripts/e2e.sh` from the repo root, which builds both.
+ * the client) or `scripts/e2e.py` from the repo root, which builds both.
  */
 export default defineConfig({
   testDir: './e2e',
