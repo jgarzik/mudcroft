@@ -560,10 +560,14 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   `last_purged`, `last_membership`). Persisting the membership lets a
   restarted single node elect itself again.
 - **Snapshots**: after 1,000 log entries, so a single node can purge its
-  log. A snapshot records the applied position and membership; it would also
-  carry the database file (after a `PRAGMA wal_checkpoint(TRUNCATE)`) if the
-  state machine were given its path, which it is not yet. Installing a
-  snapshot without the database file is refused.
+  log. A snapshot is a consistent copy of the game tables (`VACUUM INTO` a
+  temp file, which reads in one transaction while writes go on; the Raft
+  tables are dropped from the copy) with the applied position and
+  membership recorded inside that copy, plus its schema version. Installing
+  one (same schema version only) attaches the copy and replaces every game
+  table's rows in one transaction, with foreign keys deferred, then records
+  the position: the node has the old state or the new, its own Raft log and
+  vote stay, and no connection the application holds is closed.
 - **Timing**: heartbeat 500 ms, election timeout 1.5-3 s in a cluster. A
   single node turns its tick, heartbeat and election timers off (no peers).
 - **Network**: `raft/network.rs` (`RaftNetworkV2`) sends RPCs as HTTP POSTs

@@ -29,12 +29,9 @@ affected feature.
 - **Per-node caches are never invalidated.** Access levels
   (`PermissionManager`, `mudd/src/permissions/mod.rs`) are cached per node
   and not updated when Raft applies another node's write.
-- **Snapshots.** The state machine is created without the database path,
-  so snapshots carry no data and a follower refuses to install them (a
-  lagging follower cannot catch up by snapshot). Installing one that did
-  carry the file would overwrite the live database and close the pool the
-  application reads through, which shares connections with the Raft pool
-  (`mudd/src/raft/storage.rs`, `install_snapshot`).
+- **Snapshots are held in memory whole.** A snapshot is built and sent as
+  one in-memory buffer (the whole game database); streaming it in chunks
+  comes with the cluster transport (`docs/cluster-design.md`).
 - **No Raft RPC server.** `raft/network.rs` posts to `/raft/*` on peers, but
   no route serves those endpoints.
 

@@ -7,7 +7,9 @@
 //!   the same transaction, so every entry is applied exactly once even across
 //!   a crash.
 //!
-//! Both share one pool, which a snapshot install replaces.
+//! Both share one pool. A snapshot is a consistent copy of the game tables
+//! only (`VACUUM INTO`, Raft tables dropped), installed by replacing the
+//! game tables' rows in one transaction, so no connection is closed.
 
 use std::io;
 use std::io::Cursor;
@@ -33,8 +35,7 @@ type StoredMembership = StoredMembershipOf<TypeConfig>;
 type SnapshotMeta = SnapshotMetaOf<TypeConfig>;
 type Snapshot = SnapshotOf<TypeConfig, Cursor<Vec<u8>>>;
 
-/// The database pool, shared by the log store and the state machine (a
-/// snapshot install replaces it)
+/// The database pool, shared by the log store and the state machine
 pub type SharedPool = Arc<RwLock<SqlitePool>>;
 
 /// A log id from its stored parts: (term, leader node, index)
@@ -285,8 +286,73 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 struct SnapshotPayload {
     last_applied_log: Option<LogId>,
     last_membership: StoredMembership,
-    /// The database file, when the state machine knows its path
+    /// Schema version of the game tables (only the same version installs)
+    schema_version: i64,
+    /// A SQLite database file holding the game tables (no Raft tables) as
+    /// of `last_applied_log`
     db_snapshot: Vec<u8>,
+}
+
+/// Tables that belong to this node's Raft log store, never to a snapshot
+const RAFT_TABLES: [&str; 3] = ["raft_log", "raft_vote", "raft_meta"];
+
+/// A temp file path for snapshot work, next to the database when known
+fn snapshot_temp_path(db_path: Option<&str>) -> std::path::PathBuf {
+    let dir = db_path
+        .and_then(|p| std::path::Path::new(p).parent())
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!(
+        ".mudd-snapshot-{}-{}.db",
+        std::process::id(),
+        SNAPSHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+static SNAPSHOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Removes a temp file when dropped (any exit path)
+struct TempFile(std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A file URI as a SQLite string literal (ATTACH and VACUUM INTO take no
+/// bound file name). Explicitly a writable file: a database opened by URI
+/// (the in-memory test pool: `mode=memory`) would otherwise pass its mode on.
+fn sql_literal(path: &std::path::Path) -> String {
+    let uri = format!(
+        "file:{}?mode=rwc",
+        path.to_string_lossy()
+            .replace('%', "%25")
+            .replace('?', "%3f")
+            .replace('#', "%23")
+    );
+    format!("'{}'", uri.replace('\'', "''"))
+}
+
+/// Game tables in the attached snapshot, ordered so that inserts satisfy
+/// the credits holder trigger (credits after accounts and objects)
+async fn snapshot_tables(conn: &mut SqliteConnection) -> io::Result<Vec<String>> {
+    let mut tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM snap.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(io::Error::other)?;
+    tables.retain(|t| !RAFT_TABLES.contains(&t.as_str()));
+    tables.sort_by_key(|t| t == "credits");
+    Ok(tables)
+}
+
+/// An SQL identifier, quoted
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 struct SmState {
@@ -424,27 +490,62 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
     type SnapshotData = Cursor<Vec<u8>>;
 
     async fn build_snapshot(&mut self) -> io::Result<Snapshot> {
-        let (last_applied, membership) = {
-            let state = self.state.read().await;
-            (state.last_applied, state.membership.clone())
-        };
-
-        // The database file, if the path is known
-        let db_snapshot = if let Some(ref db_path) = self.db_path {
+        // A consistent copy (VACUUM INTO reads in one transaction while
+        // writes go on). Its position is the one recorded inside the copy,
+        // not the in-memory one: openraft builds snapshots while applying.
+        let tmp = TempFile(snapshot_temp_path(self.db_path.as_deref()));
+        {
             let pool = self.pool.read().await;
-            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .execute(&*pool)
-                .await
-                .map_err(io::Error::other)?;
-            drop(pool);
-            tokio::fs::read(db_path).await?
-        } else {
-            vec![]
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "VACUUM INTO {}",
+                sql_literal(&tmp.0)
+            )))
+            .execute(&*pool)
+            .await
+            .map_err(io::Error::other)?;
+        }
+        let copy = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&tmp.0)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete),
+            )
+            .await
+            .map_err(io::Error::other)?;
+        let last_applied: Option<LogId> = match read_meta(&copy, "last_applied").await? {
+            Some(json) => serde_json::from_str(&json).map_err(io::Error::other)?,
+            None => None,
         };
+        let membership: StoredMembership = match read_meta(&copy, "last_membership").await? {
+            Some(json) => serde_json::from_str(&json).map_err(io::Error::other)?,
+            None => StoredMembership::default(),
+        };
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&copy)
+            .await
+            .map_err(io::Error::other)?;
+        // Only the game tables travel: this node's log and vote stay here
+        for table in RAFT_TABLES {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP TABLE IF EXISTS {}",
+                ident(table)
+            )))
+            .execute(&copy)
+            .await
+            .map_err(io::Error::other)?;
+        }
+        sqlx::query("VACUUM")
+            .execute(&copy)
+            .await
+            .map_err(io::Error::other)?;
+        copy.close().await;
+        let db_snapshot = tokio::fs::read(&tmp.0).await?;
 
         let bytes = serde_json::to_vec(&SnapshotPayload {
             last_applied_log: last_applied,
             last_membership: membership.clone(),
+            schema_version,
             db_snapshot,
         })
         .map_err(io::Error::other)?;
@@ -541,52 +642,80 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         meta: &SnapshotMeta,
         snapshot: Cursor<Vec<u8>>,
     ) -> io::Result<()> {
-        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-        use std::str::FromStr;
-
         let data = snapshot.into_inner();
         let payload: SnapshotPayload = serde_json::from_slice(&data).map_err(io::Error::other)?;
-
-        // A snapshot is only usable with its database file: recording the
-        // position without the data would skip every entry it covers
-        let Some(db_path) = self.db_path.clone() else {
-            return Err(io::Error::other(
-                "cannot install a snapshot: this state machine has no database path",
-            ));
-        };
+        if payload.schema_version != crate::db::SCHEMA_VERSION {
+            return Err(io::Error::other(format!(
+                "cannot install a snapshot of schema version {} (this node has {})",
+                payload.schema_version,
+                crate::db::SCHEMA_VERSION
+            )));
+        }
         if payload.db_snapshot.is_empty() {
             return Err(io::Error::other(
                 "cannot install a snapshot that carries no database",
             ));
         }
-
         debug!(
             "Installing snapshot database ({} bytes)",
             payload.db_snapshot.len()
         );
-        // NOTE: this closes the shared pool, including clones the
-        // application reads through (see docs/roadmap.md, Snapshots)
-        self.pool.read().await.close().await;
-        tokio::fs::write(&db_path, &payload.db_snapshot).await?;
-        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rw", db_path))
-            .map_err(io::Error::other)?
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .foreign_keys(true);
-        let new_pool = SqlitePoolOptions::new()
-            .max_connections(10)
-            .connect_with(options)
-            .await
-            .map_err(io::Error::other)?;
-        *self.pool.write().await = new_pool;
+        let tmp = TempFile(snapshot_temp_path(self.db_path.as_deref()));
+        tokio::fs::write(&tmp.0, &payload.db_snapshot).await?;
 
-        // Persist the position so a restart resumes from it
-        {
-            let pool = self.pool.read().await;
-            let mut tx = pool.begin().await.map_err(io::Error::other)?;
+        // Replace the game tables in one transaction on the live database:
+        // the node holds the old state or the new, never a mix, and no
+        // connection the application holds is closed. ATTACH cannot run
+        // inside a transaction, so it comes first, on a dedicated connection.
+        let pool = self.pool.read().await;
+        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ATTACH DATABASE {} AS snap",
+            sql_literal(&tmp.0)
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(io::Error::other)?;
+        let result = async {
+            let tables = snapshot_tables(&mut conn).await?;
+            let mut tx = sqlx::Connection::begin(&mut *conn)
+                .await
+                .map_err(io::Error::other)?;
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .map_err(io::Error::other)?;
+            for table in &tables {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM main.{}",
+                    ident(table)
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(io::Error::other)?;
+            }
+            for table in &tables {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO main.{t} SELECT * FROM snap.{t}",
+                    t = ident(table)
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(io::Error::other)?;
+            }
             write_meta(&mut tx, "last_applied", &payload.last_applied_log).await?;
             write_meta(&mut tx, "last_membership", &payload.last_membership).await?;
-            tx.commit().await.map_err(io::Error::other)?;
+            tx.commit().await.map_err(io::Error::other)
         }
+        .await;
+        let detached = sqlx::query("DETACH DATABASE snap")
+            .execute(&mut *conn)
+            .await
+            .map_err(io::Error::other);
+        drop(conn);
+        drop(pool);
+        result?;
+        detached?;
 
         let mut state = self.state.write().await;
         state.last_applied = payload.last_applied_log;
@@ -713,12 +842,113 @@ mod tests {
         assert_eq!(last_applied.unwrap().index, 3);
     }
 
-    /// A snapshot without the database file cannot be installed: recording
-    /// its position would skip every entry it covers with none of their data
+    async fn seed_account(pool: &SqlitePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES (?, ?, 'x', 'player', '2026-01-01')",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn accounts(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM accounts ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn vote_term(pool: &SqlitePool) -> Option<i64> {
+        sqlx::query_scalar("SELECT term FROM raft_vote WHERE id = 1")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A snapshot carries the game tables as of its position, never the
+    /// sender's Raft log or vote; installing it replaces the receiver's game
+    /// tables in one step, keeps its own Raft state, and leaves the pool the
+    /// application holds working
     #[tokio::test]
-    async fn test_install_refuses_snapshot_without_data() {
-        let pool = test_pool().await;
-        let mut leader = StateMachine::new(shared(pool.clone()), None).await.unwrap();
+    async fn test_snapshot_round_trip() {
+        // The leader on a database file, as in mudd (opened without a URI)
+        let leader_dir = tempfile::tempdir().unwrap();
+        let leader_db = leader_dir.path().join("leader.db");
+        let leader_pool = crate::db::Database::new(Some(leader_db.to_str().unwrap()))
+            .await
+            .unwrap()
+            .pool()
+            .clone();
+        seed_account(&leader_pool, "alice").await;
+        seed_account(&leader_pool, "bob").await;
+        let mut leader_log = LogStore::new(shared(leader_pool.clone()));
+        leader_log.save_vote(&Vote::new(3, 1)).await.unwrap();
+        let mut leader = StateMachine::new(shared(leader_pool.clone()), None)
+            .await
+            .unwrap();
+        apply(&mut leader, vec![normal(5, Request::simple("SELECT 1"))]).await;
+        let snapshot = leader
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.meta.last_log_id.unwrap().index, 5);
+        // The temp copy went to a real file, not one named "file:..."
+        let stray = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("file:"));
+        assert!(!stray, "VACUUM INTO took the URI literally");
+
+        // The payload's database has no Raft tables
+        let payload: SnapshotPayload = serde_json::from_slice(snapshot.snapshot.get_ref()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("snap.db");
+        std::fs::write(&file, &payload.db_snapshot).unwrap();
+        let snap_pool = SqlitePool::connect(&format!("sqlite:{}", file.display()))
+            .await
+            .unwrap();
+        let raft_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'raft_%'",
+        )
+        .fetch_one(&snap_pool)
+        .await
+        .unwrap();
+        assert_eq!(raft_tables, 0);
+        snap_pool.close().await;
+
+        let follower_pool = test_pool().await;
+        seed_account(&follower_pool, "stranger").await;
+        let mut follower_log = LogStore::new(shared(follower_pool.clone()));
+        follower_log.save_vote(&Vote::new(9, 2)).await.unwrap();
+        let app_handle = follower_pool.clone();
+        let mut follower = StateMachine::new(shared(follower_pool.clone()), None)
+            .await
+            .unwrap();
+        follower
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(accounts(&app_handle).await, vec!["alice", "bob"]);
+        assert_eq!(vote_term(&follower_pool).await, Some(9), "own vote kept");
+        let mut resumed = StateMachine::new(shared(follower_pool), None)
+            .await
+            .unwrap();
+        let (last_applied, _) = resumed.applied_state().await.unwrap();
+        assert_eq!(last_applied.unwrap().index, 5);
+    }
+
+    /// A snapshot from another schema version cannot be installed
+    #[tokio::test]
+    async fn test_install_refuses_other_schema_version() {
+        let mut leader = StateMachine::new(shared(test_pool().await), None)
+            .await
+            .unwrap();
         apply(&mut leader, vec![normal(7, Request::simple("SELECT 1"))]).await;
         let snapshot = leader
             .get_snapshot_builder()
@@ -726,12 +956,16 @@ mod tests {
             .build_snapshot()
             .await
             .unwrap();
+        let mut payload: SnapshotPayload =
+            serde_json::from_slice(snapshot.snapshot.get_ref()).unwrap();
+        payload.schema_version += 1;
+        let data = serde_json::to_vec(&payload).unwrap();
 
         let mut follower = StateMachine::new(shared(test_pool().await), None)
             .await
             .unwrap();
         assert!(follower
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .install_snapshot(&snapshot.meta, Cursor::new(data))
             .await
             .is_err());
         let (last_applied, _) = follower.applied_state().await.unwrap();
