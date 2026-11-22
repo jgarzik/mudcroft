@@ -118,6 +118,78 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// One statement that sets some properties of an object in place
+    /// (`json_set`), leaving the rest of the row untouched: unlike `update`
+    /// it cannot lose a concurrent change to other properties, and it can
+    /// go into an atomic batch with other statements.
+    ///
+    /// Property names must be plain identifiers (letters, digits, `_`).
+    pub fn set_properties_statement(
+        universe_id: &str,
+        id: &str,
+        props: &[(&str, serde_json::Value)],
+    ) -> Result<(String, Vec<serde_json::Value>)> {
+        let mut sql = String::from("UPDATE objects SET properties = json_set(properties");
+        let mut params = Vec::with_capacity(props.len() * 2 + 3);
+        for (key, value) in props {
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                anyhow::bail!("invalid property name {:?}", key);
+            }
+            // The path is a literal built from the checked name; the value
+            // is bound, as JSON text decoded by json()
+            sql.push_str(&format!(", '$.{}', json(?)", key));
+            params.push(serde_json::json!(value.to_string()));
+        }
+        sql.push_str("), updated_at = ? WHERE universe_id = ? AND id = ?");
+        params.push(serde_json::json!(chrono::Utc::now().to_rfc3339()));
+        params.push(serde_json::json!(universe_id));
+        params.push(serde_json::json!(id));
+        Ok((sql, params))
+    }
+
+    /// Set some properties of an object in place (see
+    /// set_properties_statement)
+    pub async fn set_properties(
+        &self,
+        universe_id: &str,
+        id: &str,
+        props: &[(&str, serde_json::Value)],
+    ) -> Result<()> {
+        let statement = Self::set_properties_statement(universe_id, id, props)?;
+        self.execute_batch(vec![statement]).await
+    }
+
+    /// Run statements atomically: one Raft batch, or one transaction
+    /// without Raft (tests)
+    pub async fn execute_batch(
+        &self,
+        statements: Vec<(String, Vec<serde_json::Value>)>,
+    ) -> Result<()> {
+        if let Some(ref raft_writer) = self.raft_writer {
+            return raft_writer.execute_batch(statements).await;
+        }
+        let mut tx = self.pool.begin().await?;
+        for (sql, params) in &statements {
+            // Statements come from builders in this crate, values bound
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+            for param in params {
+                query = match param {
+                    serde_json::Value::String(s) => query.bind(s.clone()),
+                    serde_json::Value::Number(n) => match n.as_i64() {
+                        Some(i) => query.bind(i),
+                        None => query.bind(n.as_f64()),
+                    },
+                    serde_json::Value::Bool(b) => query.bind(*b),
+                    serde_json::Value::Null => query.bind(Option::<String>::None),
+                    other => query.bind(other.to_string()),
+                };
+            }
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Delete an object
     pub async fn delete(&self, universe_id: &str, id: &str) -> Result<bool> {
         let rows = self
@@ -601,5 +673,53 @@ mod tests {
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
         assert_eq!(hash1.len(), 64); // SHA-256 = 64 hex chars
+    }
+
+    /// set_properties changes only the named properties, in place
+    #[tokio::test]
+    async fn test_set_properties_in_place() {
+        let pool = crate::db::test_utils::test_pool().await;
+        sqlx::query(
+            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES ('acct', 'acct', 'x', 'admin', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectStore::new(pool, None);
+        store
+            .create_universe("u", "U", "acct", serde_json::json!({}))
+            .await
+            .unwrap();
+        let mut obj = Object::new("/npcs/rat", "u", "npc").unwrap();
+        obj.set_property("name", serde_json::json!("rat"));
+        obj.set_property("hp", serde_json::json!(10));
+        store.create(&obj).await.unwrap();
+
+        store
+            .set_properties(
+                "u",
+                "/npcs/rat",
+                &[
+                    ("hp", serde_json::json!(3)),
+                    ("angry", serde_json::json!(true)),
+                ],
+            )
+            .await
+            .unwrap();
+        let rat = store.get("u", "/npcs/rat").await.unwrap().unwrap();
+        assert_eq!(rat.properties["hp"], 3);
+        assert_eq!(rat.properties["angry"], true);
+        assert_eq!(rat.properties["name"], "rat", "other properties untouched");
+
+        // Names are spliced into the JSON path, so only identifiers pass
+        for bad in ["", "a.b", "x') --", "q\"r"] {
+            assert!(ObjectStore::set_properties_statement(
+                "u",
+                "/npcs/rat",
+                &[(bad, serde_json::json!(1))]
+            )
+            .is_err());
+        }
     }
 }
