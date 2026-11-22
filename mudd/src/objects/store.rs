@@ -278,6 +278,16 @@ impl ObjectStore {
         id: &str,
         new_parent_id: Option<&str>,
     ) -> Result<()> {
+        // Never into itself: walk up from the destination (bounded)
+        let mut at = new_parent_id.map(str::to_string);
+        for _ in 0..1000 {
+            let Some(cur) = at else { break };
+            if cur == id {
+                anyhow::bail!("{} cannot be put inside itself", id);
+            }
+            at = self.get(universe_id, &cur).await?.and_then(|o| o.parent_id);
+        }
+
         // Pre-compute timestamp for deterministic replication
         let updated_at = chrono::Utc::now().to_rfc3339();
 

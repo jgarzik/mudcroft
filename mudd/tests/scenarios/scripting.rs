@@ -996,3 +996,40 @@ async fn test_command_ids_are_per_player() {
         .await
         .expect("b's command ran despite a's id");
 }
+
+/// An object can never end up inside itself (directly or through what it
+/// contains): such a move is refused
+#[tokio::test]
+async fn test_no_containment_cycles() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "cycle_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/outer", "container", "{e}", {{name = "outer"}})
+           game.create_object("/items/inner", "container", "/items/outer", {{name = "inner"}})
+           local ok1 = pcall(game.move_object, "/items/outer", "/items/inner")
+           local ok2 = pcall(game.move_object, "/items/outer", "/items/outer")
+           local ok3 = pcall(game.update_object, "/items/outer", {{parent_id = "/items/inner"}})
+           return tostring(ok1) .. tostring(ok2) .. tostring(ok3)"#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("falsefalse")
+        .await
+        .expect("moves into itself refused");
+    let parent: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/outer'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(parent, entrance);
+}

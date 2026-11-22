@@ -330,6 +330,8 @@ error if the acting user lacks Delete permission.
 #### `game.move_object(id, new_parent_id)`
 
 Sets the object's container. Pass `nil` to take it out of any container.
+An object can never be put inside itself, directly or through what it
+contains: such a move raises an error.
 
 ```lua
 game.move_object("/d/keep/armory/sword", args.actor_id)   -- into a player's inventory
