@@ -1720,6 +1720,14 @@ async fn execute_command(
                 }
             }
 
+            // Paced: a full round since the last blow (fleeing and coming
+            // back cannot add blows)
+            if !super::combat::ready_to_strike(state, universe_id, &attacker_obj, now).await {
+                return ServerMessage::Output {
+                    text: "You are not ready to strike again.".to_string(),
+                };
+            }
+
             // The first blow now; then a round each way every
             // combat_round_ms until the fight ends (api/combat.rs)
             let blow =

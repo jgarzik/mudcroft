@@ -108,12 +108,14 @@ end
 -- object id (body, for moving and inspecting the player in the world).
 local function setup_test_world()
     act_as(ACCOUNTS.wizard)
+    -- (last_blow_at: tests strike back to back within one script; real
+    -- fights wait a round between a fighter's blows)
     game.update_object(ACCOUNTS.player_body, {
         hp = 50,
         armor_class = 10,
         carry_weight = 0,
         max_carry = 100,
-        in_combat = false,
+        last_blow_at = 0,
     })
     return {
         wizard = ACCOUNTS.wizard,

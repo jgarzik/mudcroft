@@ -202,6 +202,22 @@ pub async fn fight_allowed(
     Ok(())
 }
 
+/// Whether `attacker` may open a fight with a blow now: a full round since
+/// its last blow (stopping and restarting a fight cannot add blows)
+pub async fn ready_to_strike(
+    state: &AppState,
+    universe_id: &str,
+    attacker: &Object,
+    now: u64,
+) -> bool {
+    let last = attacker
+        .properties
+        .get("last_blow_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    now >= last.saturating_add(settings(state, universe_id).await.round_ms)
+}
+
 /// What one blow did, and what each party is told
 pub struct Blow {
     pub killed: bool,
@@ -255,10 +271,15 @@ pub async fn strike(
         None => rand::rng().random_range(1..=6),
     };
     let outcome = resolve_attack(&a, &d, &mods, d20, damage_roll, dtype, now);
-    let statements = attack_statements(universe_id, &target.id, &outcome)?;
-    if !statements.is_empty() {
-        state.object_store.execute_batch(statements).await?;
-    }
+    let mut statements = attack_statements(universe_id, &target.id, &outcome)?;
+    // When it last struck: a fight's first blow waits a full round after
+    // the last one, whatever happened to the fight meanwhile
+    statements.push(crate::objects::ObjectStore::set_properties_statement(
+        universe_id,
+        &attacker.id,
+        &[("last_blow_at", json!(now))],
+    )?);
+    state.object_store.execute_batch(statements).await?;
     if let Some(ref bleed) = outcome.inflicts {
         state
             .effects
@@ -539,6 +560,17 @@ async fn arrival_inner(
     Ok(())
 }
 
+/// Deepest nesting of AI handlers (an AI handler's move triggering another
+/// arrival's handler, ...) and most AI handler calls per top-level action
+const MAX_AI_DEPTH: u32 = 4;
+const MAX_AI_CALLS: u32 = 32;
+
+tokio::task_local! {
+    /// The AI handler budget of the action being processed: (depth, calls
+    /// left). Task-scoped, so it follows nested scripts and their moves.
+    static AI_BUDGET: (u32, std::sync::Arc<std::sync::atomic::AtomicU32>);
+}
+
 /// Run an NPC's AI handler (as its owner): true if it handled the moment
 /// (returned something other than nil), false to use the built-in
 /// behaviour (no code, no such handler, nil, or an error, which is logged)
@@ -554,7 +586,31 @@ async fn ai_override(
         map.insert("object_id".into(), npc.into());
         map.insert("room_id".into(), room.clone().into());
     }
-    match super::scripting::invoke_handler(state, universe_id, npc, room, handler, args).await {
+    // Bounded: AI handlers whose moves trigger more AI handlers stop at
+    // MAX_AI_DEPTH deep or MAX_AI_CALLS in all (the built-in behaviour
+    // applies beyond)
+    let (depth, left) = AI_BUDGET
+        .try_with(|(d, left)| (*d, left.clone()))
+        .unwrap_or_else(|_| {
+            (
+                0,
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(MAX_AI_CALLS)),
+            )
+        });
+    let allowed = depth < MAX_AI_DEPTH
+        && left
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok();
+    if !allowed {
+        warn!("{} of {} not run: AI handler budget spent", handler, npc);
+        return false;
+    }
+    let call = super::scripting::invoke_handler(state, universe_id, npc, room, handler, args);
+    match AI_BUDGET.scope((depth + 1, left), call).await {
         Ok(Some(reply)) => reply != "nil" && !reply.is_empty(),
         Ok(None) => false,
         Err(e) => {
@@ -1569,6 +1625,12 @@ impl CombatEngine {
                 });
             }
             None => {}
+        }
+        if !ready_to_strike(state, u, &attacker, now).await {
+            return Err(format!(
+                "{} is not ready to strike again",
+                name_of(&attacker)
+            ));
         }
         let blow = strike(state, u, &attacker, &target, now)
             .await

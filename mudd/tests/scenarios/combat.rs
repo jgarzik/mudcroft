@@ -43,22 +43,32 @@ async fn try_attack(c: &mut TestClient, cmd: &str) -> Result<String, String> {
             || t.starts_with("CRITICAL")
             || t.starts_with("You fumble")
     };
-    c.command(cmd).await.expect("send attack");
-    let _ = c.expect("echo").await;
     // Skip unrelated messages (an NPC's blows, effect ticks) until the
-    // attack's own reply
-    let text = loop {
-        let reply = c.expect_any().await.expect("attack reply");
-        if reply["type"] == "error" {
-            return Err(reply.to_string());
+    // attack's own reply; within a round of the last blow, wait and retry
+    let mut text = String::new();
+    for _ in 0..5 {
+        c.command(cmd).await.expect("send attack");
+        let _ = c.expect("echo").await;
+        text = loop {
+            let reply = c.expect_any().await.expect("attack reply");
+            if reply["type"] == "error" {
+                return Err(reply.to_string());
+            }
+            let text = reply["text"].as_str().unwrap_or_default().to_string();
+            if reply["type"] == "output"
+                && (ours(&text)
+                    || text.contains("already fighting")
+                    || text.contains("turn to fight")
+                    || text.contains("not ready"))
+            {
+                break text;
+            }
+        };
+        if !text.contains("not ready") {
+            break;
         }
-        let text = reply["text"].as_str().unwrap_or_default().to_string();
-        if reply["type"] == "output"
-            && (ours(&text) || text.contains("already fighting") || text.contains("turn to fight"))
-        {
-            break text;
-        }
-    };
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
     if ours(&text) {
         return Ok(text);
     }
@@ -2039,4 +2049,82 @@ async fn test_tutorial_crypt_plays() {
     wiz.expect_output_containing("You feel better")
         .await
         .expect("drank it");
+}
+
+/// Blows are paced even across stop_combat: a script cannot land blow
+/// after blow by stopping and restarting a fight
+#[tokio::test]
+async fn test_blow_pacing_survives_stop() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "pacer".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"game.update_universe({{combat_round_ms = 5000}})
+               game.create_object("/npcs/brawler", "npc", "{e}", {{name = "brawler", hp = 1000, max_hp = 1000}})
+               game.create_object("/npcs/bag", "npc", "{e}", {{name = "bag", hp = 1000, max_hp = 1000}})
+               local first = game.attack("/npcs/brawler", "/npcs/bag")
+               game.stop_combat("/npcs/brawler")
+               local second, why = game.attack("/npcs/brawler", "/npcs/bag")
+               return tostring(first ~= nil) .. "|" .. tostring(second ~= nil) .. "|" .. tostring(why)"#,
+            e = entrance
+        ),
+    )
+    .await;
+    let text = out["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("true|false|"), "{}", out);
+    assert!(text.contains("not ready"), "{}", out);
+}
+
+/// AI handlers that move people around cannot chain without end: an NPC
+/// in each of two rooms that bounces arrivals to the other room stops
+/// after a bounded number of bounces, and the server stays responsive
+#[tokio::test]
+async fn test_ai_hooks_are_bounded() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "pinball".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut adm,
+        r#"local h = game.store_code([[return { ai_idle_tick = function(a)
+             if a.reason ~= "arrival" then return nil end
+             local me = game.get_object(a.object_id)
+             local c = game.get_object("/items/counter")
+             game.update_object("/items/counter", {n = c.metadata.n + 1})
+             game.move_object(a.arrived_id, me.metadata.other)
+             return "bounced"
+           end }]])
+           game.create_object("/rooms/ping", "room", nil, {name = "Ping", exits = {east = "/rooms/pong"}})
+           game.create_object("/rooms/pong", "room", nil, {name = "Pong", exits = {west = "/rooms/ping"}})
+           game.create_object("/items/counter", "item", nil, {name = "counter", n = 0})
+           game.create_object("/rooms/ping/bouncer", "npc", "/rooms/ping", {name = "bouncer", other = "/rooms/pong", code_hash = h})
+           game.create_object("/rooms/pong/bouncer", "npc", "/rooms/pong", {name = "bouncer", other = "/rooms/ping", code_hash = h})
+           return "ready""#,
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    adm.drain().await;
+    adm.command("goto /rooms/ping").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    adm.drain().await;
+    adm.command("look").await.unwrap();
+    adm.expect("room").await.expect("still responsive");
+    let n: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.n') FROM objects WHERE universe_id = ? AND id = '/items/counter'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!((1..=40).contains(&n), "bounded bounces: {}", n);
 }
