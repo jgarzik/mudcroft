@@ -141,8 +141,13 @@ async fn login(
         .get(super::ratelimit::CLIENT_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("internal");
-    let user_key = format!("{}|{}", req.username.to_lowercase(), client);
-    if let Err(retry) = state.auth_by_user.peek(&user_key) {
+    let username = req.username.to_lowercase();
+    let user_key = format!("{}|{}", username, client);
+    if let Err(retry) = state
+        .auth_by_user
+        .peek(&user_key)
+        .and_then(|()| state.auth_by_user_global.peek(&username))
+    {
         return super::ratelimit::too_many(retry);
     }
     let service = state.accounts();
@@ -160,6 +165,7 @@ async fn login(
             .into_response(),
         Err(AuthError::InvalidCredentials) => {
             state.auth_by_user.charge(&user_key);
+            state.auth_by_user_global.charge(&username);
             invalid()
         }
         Err(e) => (

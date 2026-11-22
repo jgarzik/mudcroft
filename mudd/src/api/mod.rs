@@ -50,6 +50,10 @@ pub struct AppState {
     /// rate) and per username (login; the configured rate)
     pub auth_by_ip: Arc<ratelimit::RateLimiter>,
     pub auth_by_user: Arc<ratelimit::RateLimiter>,
+    /// Failed logins per username across all clients (ten times the
+    /// configured rate): a distributed guesser cannot multiply its budget by
+    /// using many addresses, and one client alone cannot exhaust it
+    pub auth_by_user_global: Arc<ratelimit::RateLimiter>,
     /// True while this node is the active primary: leader, caches rebuilt,
     /// schedulers running (set by api/primary.rs). Game traffic is served
     /// locally only then.
@@ -143,6 +147,7 @@ pub async fn router(
         primary: primary_rx,
         auth_by_ip: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(2))),
         auth_by_user: Arc::new(ratelimit::RateLimiter::new(auth_limit)),
+        auth_by_user_global: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(10))),
         effects,
     };
 
