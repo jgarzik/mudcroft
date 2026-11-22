@@ -155,6 +155,12 @@ impl TestServer {
     }
 
     /// Stop the server process (the database stays; see start_again)
+    /// Send mudd SIGTERM (as `docker stop` or systemd would) and wait up to
+    /// `timeout` for it to exit; its exit status, or None if still running
+    pub fn terminate(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        self.child.terminate(timeout).expect("signal mudd")
+    }
+
     pub fn stop(&mut self) {
         self.child.kill();
     }
@@ -565,6 +571,30 @@ impl ChildGuard {
             Some(child) => child.try_wait(),
             None => Ok(None),
         }
+    }
+
+    /// Send SIGTERM and wait up to `timeout` for the process to exit;
+    /// its exit status, or None if it is still running
+    fn terminate(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.0.as_mut() else {
+            return Ok(None);
+        };
+        // SAFETY: kill(2) on our own child's pid
+        if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                self.0 = None;
+                return Ok(Some(status));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(None)
     }
 
     /// Kill and reap the process (idempotent)

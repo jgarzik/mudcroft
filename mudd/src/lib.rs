@@ -150,7 +150,10 @@ impl Server {
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-            shutdown_rx.changed().await.ok();
+            tokio::select! {
+                _ = shutdown_rx.changed() => {}
+                signal = termination_signal() => info!("{}: shutting down", signal),
+            }
         });
 
         // A stopped Raft core (e.g. a storage failure while applying) means
@@ -177,5 +180,31 @@ impl Server {
     /// Get the configured bind address
     pub fn bind_addr(&self) -> SocketAddr {
         self.config.bind_addr
+    }
+}
+
+/// Wait for SIGTERM (docker stop, systemd) or SIGINT (Ctrl-C). Handled, so
+/// mudd shuts down gracefully, also as PID 1 where the kernel would ignore
+/// an unhandled SIGTERM.
+async fn termination_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+            },
+            Err(e) => {
+                tracing::warn!("cannot handle SIGTERM: {}", e);
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
     }
 }

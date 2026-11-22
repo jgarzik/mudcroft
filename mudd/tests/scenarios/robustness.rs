@@ -536,3 +536,23 @@ async fn test_mudd_admin_set_level() {
     let out = adm.expect_any().await.unwrap();
     assert_eq!(out["text"], "admin here", "{}", out);
 }
+
+/// SIGTERM (docker stop, systemd) shuts mudd down gracefully and promptly,
+/// with a clean exit, even as PID 1 where unhandled SIGTERM is ignored
+#[tokio::test]
+async fn test_sigterm_shuts_down_gracefully() {
+    let mut server = TestServer::start().await.expect("server");
+    // An open game connection must not hold the shutdown up
+    let _player = server
+        .connect_as(crate::harness::Role::Player {
+            username: "lingering".into(),
+        })
+        .await
+        .expect("connect");
+    let status = server
+        .terminate(std::time::Duration::from_secs(5))
+        .expect("mudd exits on SIGTERM");
+    assert!(status.success(), "exit status {:?}", status);
+    let log = std::fs::read_to_string(&server.log_path).unwrap();
+    assert!(log.contains("mudd shutdown complete"), "{}", log);
+}

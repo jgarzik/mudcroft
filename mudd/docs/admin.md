@@ -129,6 +129,10 @@ mudd --database <PATH> [--bind <ADDR>] [--static-dir <DIR>]
 | `--peers <LIST>` | (none) | Cluster peers, `1=host1:9000,2=host2:9001`. Omit it for single-node mode. |
 | `-V`, `--version` | | Print the version |
 
+SIGTERM (as sent by `docker stop` or systemd) or SIGINT (Ctrl-C) stops
+`mudd` gracefully: it stops accepting connections, lets in-flight HTTP
+requests finish, and exits with status 0.
+
 > **Clustering is not functional yet.** `--node-id`, `--raft-port` and
 > `--peers` are parsed, and a node sends Raft RPCs to
 > `http://<peer>/raft/...`. But no server listens for those RPCs: nothing binds
