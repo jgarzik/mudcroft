@@ -60,17 +60,26 @@ impl RaftWriter {
         cluster: Option<ClusterSetup>,
     ) -> Result<Self> {
         let stored = read_node_id(&pool).await?;
+        let has_state = super::storage::has_raft_state(&pool).await?;
         let security = cluster.as_ref().map(|c| c.security.clone());
-        let joining = stored.is_none() && cluster.as_ref().is_some_and(|c| !c.join.is_empty());
-        let node_id = match (&cluster, stored) {
-            (_, Some(id)) => id,
-            (Some(c), None) if joining => {
+        let join_flag = cluster.as_ref().is_some_and(|c| !c.join.is_empty());
+        // Join when new, or when an id came from a join that never got as
+        // far as any Raft state (a crash right after the leader answered)
+        let joining = join_flag && !has_state && stored != Some(1);
+        let node_id = match &cluster {
+            Some(c) if joining => {
                 transport::join_cluster(&c.join, &c.advertise, c.security.clone(), JOIN_LIMIT)
                     .await?
             }
-            _ => 1,
+            _ => stored.unwrap_or(1),
         };
-        if stored.is_none() {
+        if !joining && !has_state && node_id != 1 {
+            bail!(
+                "this node (id {}) joined a cluster but has no Raft state yet; start it with --join",
+                node_id
+            );
+        }
+        if stored != Some(node_id) {
             write_node_id(&pool, node_id).await?;
         }
         info!(
@@ -85,7 +94,7 @@ impl RaftWriter {
 
         let raft = create_raft_node(
             node_id,
-            pool,
+            pool.clone(),
             ClusterNetwork::new(security.clone()),
             Some(db_path.to_string()),
         )
@@ -139,7 +148,8 @@ impl RaftWriter {
         // on a database this node has served before, the Raft state (vote,
         // log) is already persisted and initialize() is refused. A joining
         // node is brought in by the leader instead.
-        if !joining && !raft.is_initialized().await? {
+        // Only node 1 ever starts a cluster
+        if !joining && node_id == 1 && !raft.is_initialized().await? {
             let mut members = BTreeMap::new();
             members.insert(node_id, BasicNode::new(advertise.clone()));
             raft.initialize(members).await?;
@@ -147,7 +157,7 @@ impl RaftWriter {
 
         let mut serving = None;
         if let Some(cluster) = cluster {
-            let service = ClusterService::new(raft.clone());
+            let service = ClusterService::new(raft.clone(), pool.clone());
             serving = Some((service.clone(), cluster.security.clone()));
             tokio::spawn(transport::serve(
                 cluster.listener,

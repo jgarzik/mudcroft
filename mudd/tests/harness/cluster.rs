@@ -329,8 +329,29 @@ impl TestCluster {
         certs: Option<&ClusterCerts>,
         secret: Option<&Path>,
     ) -> Result<usize> {
+        self.add_joiner_full(certs, secret, None).await
+    }
+
+    /// Start a new empty node joining node 1, running `sql` on its database
+    /// first (to simulate a node that crashed part way through joining)
+    pub async fn add_joiner_after_sql(&mut self, sql: &str) -> Result<usize> {
+        self.add_joiner_full(None, None, Some(sql)).await
+    }
+
+    async fn add_joiner_full(
+        &mut self,
+        certs: Option<&ClusterCerts>,
+        secret: Option<&Path>,
+        sql: Option<&str>,
+    ) -> Result<usize> {
         let name = format!("node{}", self.nodes.len() + 1);
-        self.run_init(&self.dir.path().join(format!("{}.db", name)), true)?;
+        let db = self.dir.path().join(format!("{}.db", name));
+        self.run_init(&db, true)?;
+        if let Some(sql) = sql {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.display())).await?;
+            sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&pool).await?;
+            pool.close().await;
+        }
         let port = free_port()?;
         let mut args = self.cluster_args_with(port, certs.unwrap_or(&self.certs), secret);
         args.push("--join".into());

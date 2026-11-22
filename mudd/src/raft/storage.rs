@@ -58,6 +58,21 @@ pub async fn read_node_id(pool: &SqlitePool) -> io::Result<Option<super::types::
     }
 }
 
+/// Whether this node has any Raft state yet (a vote, log entries, or an
+/// applied position): a node that was given an id but crashed before any
+/// of these must join again rather than start a cluster of its own
+pub async fn has_raft_state(pool: &SqlitePool) -> io::Result<bool> {
+    let vote: Option<i64> = sqlx::query_scalar("SELECT 1 FROM raft_vote LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(io::Error::other)?;
+    let log: Option<i64> = sqlx::query_scalar("SELECT 1 FROM raft_log LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(io::Error::other)?;
+    Ok(vote.is_some() || log.is_some() || read_meta(pool, "last_applied").await?.is_some())
+}
+
 /// Record this node's id
 pub async fn write_node_id(pool: &SqlitePool, node_id: super::types::NodeId) -> io::Result<()> {
     let mut conn = pool.acquire().await.map_err(io::Error::other)?;

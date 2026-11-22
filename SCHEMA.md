@@ -3,11 +3,12 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 8):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 9):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). The upgrade steps are
-6 -> 7 (adds the `credits_holder_exists` trigger) and 7 -> 8 (adds the
-`actions` table); an older database is refused with a "create a new database" error (from
+6 -> 7 (adds the `credits_holder_exists` trigger), 7 -> 8 (adds the
+`actions` table) and 8 -> 9 (adds `cluster_nodes`); an older database is
+refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
@@ -350,6 +351,19 @@ Keys:
 | `last_purged` | Last log id removed from `raft_log` by log compaction |
 | `last_membership` | Last applied cluster membership (also written on snapshot install). Reloaded at startup so a restarted node still has its voters. |
 
+
+### cluster_nodes
+
+Every node ever admitted to the cluster, written by the leader through Raft
+before it answers a join (so it travels in snapshots and survives
+failover). New ids are above every id recorded here: a removed node's id is
+never reused, so it cannot come back as a newer member.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| node_id | INTEGER PRIMARY KEY | |
+| addr | TEXT NOT NULL | The cluster address it joined with |
+| added_at | TEXT NOT NULL | RFC 3339 |
 ## Startup Validation
 
 `mudd` opens an existing database only. It does not create the database or

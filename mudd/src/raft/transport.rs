@@ -752,6 +752,8 @@ impl RaftNetworkV2<TypeConfig> for PeerNetwork {
 /// What the cluster port serves
 pub struct ClusterService {
     raft: GameRaft,
+    /// This node's database (reads: cluster_nodes)
+    pool: sqlx::SqlitePool,
     /// Installed by the API layer once its router exists
     http: std::sync::OnceLock<HttpHook>,
     game: std::sync::OnceLock<GameHook>,
@@ -762,9 +764,10 @@ pub struct ClusterService {
 }
 
 impl ClusterService {
-    pub fn new(raft: GameRaft) -> Arc<Self> {
+    pub fn new(raft: GameRaft, pool: sqlx::SqlitePool) -> Arc<Self> {
         Arc::new(Self {
             raft,
+            pool,
             http: std::sync::OnceLock::new(),
             game: std::sync::OnceLock::new(),
             receiving_snapshot: Mutex::new(()),
@@ -888,14 +891,46 @@ impl ClusterService {
         let node_id = match joining.get(&request.advertise) {
             Some(id) => *id,
             None => {
+                // Above every id ever handed out (cluster_nodes), every
+                // member and every join in progress: never reused
+                let recorded = match self.highest_recorded_id().await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!("cluster: reading cluster_nodes failed: {}", e);
+                        return JoinReply::NotLeader { leader: None };
+                    }
+                };
                 let highest = membership
                     .membership()
                     .nodes()
                     .map(|(id, _)| *id)
                     .chain(joining.values().copied())
+                    .chain(std::iter::once(recorded))
                     .max()
                     .unwrap_or(0);
-                highest + 1
+                let id = highest + 1;
+                // Recorded through Raft before the answer, so even after a
+                // failover nobody hands the id out again
+                let record = super::Request::batch(vec![(
+                    "INSERT INTO cluster_nodes (node_id, addr, added_at) VALUES (?, ?, ?)"
+                        .to_string(),
+                    vec![
+                        serde_json::json!(id),
+                        serde_json::json!(request.advertise),
+                        serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )]);
+                match self.raft.client_write(record).await {
+                    Ok(r) if r.data.success => id,
+                    Ok(r) => {
+                        warn!("cluster: recording node {} failed: {:?}", id, r.data.error);
+                        return JoinReply::NotLeader { leader: None };
+                    }
+                    Err(e) => {
+                        warn!("cluster: recording node {} failed: {}", id, e);
+                        return JoinReply::NotLeader { leader: None };
+                    }
+                }
             }
         };
         joining.insert(request.advertise.clone(), node_id);
@@ -913,6 +948,14 @@ impl ClusterService {
             service.joining.lock().await.remove(&request.advertise);
         });
         JoinReply::Joined { node_id }
+    }
+
+    /// The highest node id ever recorded (0 if none)
+    async fn highest_recorded_id(&self) -> anyhow::Result<NodeId> {
+        let highest: Option<i64> = sqlx::query_scalar("SELECT MAX(node_id) FROM cluster_nodes")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(highest.unwrap_or(0).max(0) as NodeId)
     }
 
     /// Bring a new node in: snapshot and purge (node 1's initial data was

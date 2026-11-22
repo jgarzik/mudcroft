@@ -460,3 +460,65 @@ async fn test_gateway_refuses_bad_token() {
         assert!(err.to_string().contains("401"), "node {}: {}", node_no, err);
     }
 }
+
+/// Node ids are never reused: after node 3 is removed, the next node to
+/// join gets 4 (a returning old node 3 could otherwise pass for it)
+#[tokio::test]
+async fn test_cluster_node_ids_not_reused() {
+    let mut cluster = TestCluster::start(3).await.expect("cluster");
+    let voters = |cluster: &TestCluster| {
+        let (_, out) = cluster.admin(0, &["status"]).unwrap();
+        members(&out)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline && voters(&cluster).len() < 3 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (ok, out) = cluster.admin(0, &["remove", "3"]).unwrap();
+    assert!(ok, "{}", out);
+    cluster.stop(2);
+    cluster.add_joiner(None).await.expect("join");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut ids = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        ids = voters(&cluster)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        if ids.len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(ids, vec![1, 2, 4]);
+}
+
+/// A node that crashed after being given an id, before it had any Raft
+/// state, joins again on restart instead of forming a cluster of its own
+#[tokio::test]
+async fn test_cluster_half_joined_node_joins_again() {
+    let mut cluster = TestCluster::start(1).await.expect("cluster");
+    cluster
+        .add_joiner_after_sql("INSERT INTO raft_meta (key, value) VALUES ('node_id', '7')")
+        .await
+        .expect("joins");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut status = String::new();
+    while tokio::time::Instant::now() < deadline {
+        status = cluster.admin(1, &["status"]).unwrap().1;
+        let v: serde_json::Value = serde_json::from_str(&status).unwrap_or_default();
+        if v["leader"] == 1 && v["members"].as_array().is_some_and(|m| m.len() == 2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let v: serde_json::Value = serde_json::from_str(&status).expect(&status);
+    assert_eq!(v["leader"], 1, "{}", status);
+    assert_eq!(v["members"].as_array().unwrap().len(), 2, "{}", status);
+    assert_eq!(
+        cluster.primaries(),
+        vec![0],
+        "no second primary\n{}",
+        cluster.logs()
+    );
+}

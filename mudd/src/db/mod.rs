@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -31,6 +31,17 @@ const ACTIONS_TABLE: &str = r#"
             REFERENCES objects(universe_id, id) ON DELETE CASCADE,
         FOREIGN KEY (universe_id, scope_id)
             REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    )
+"#;
+
+/// Every node ever admitted to the cluster (replicated, so it travels in
+/// snapshots): node ids are never reused, so a removed node returning with
+/// its old database cannot pass for a newer member
+const CLUSTER_NODES_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS cluster_nodes (
+        node_id INTEGER PRIMARY KEY,
+        addr TEXT NOT NULL,
+        added_at TEXT NOT NULL
     )
 "#;
 
@@ -113,6 +124,7 @@ impl Database {
     /// - 5 -> 6 (credits held by accounts or objects, CHECK balance >= 0).
     /// - 6 -> 7 (credits_holder_exists trigger): upgraded in place.
     /// - 7 -> 8 (actions table: custom verbs persisted): upgraded in place.
+    /// - 8 -> 9 (cluster_nodes table: node ids never reused): in place.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -135,6 +147,12 @@ impl Database {
             sqlx::query(ACTIONS_TABLE).execute(&self.pool).await?;
             self.set_schema_version(8).await?;
             info!("Upgraded database schema 7 -> 8");
+            version = 8;
+        }
+        if version == 8 {
+            sqlx::query(CLUSTER_NODES_TABLE).execute(&self.pool).await?;
+            self.set_schema_version(9).await?;
+            info!("Upgraded database schema 8 -> 9");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -249,6 +267,7 @@ impl Database {
             "timers",
             "universe_members",
             "actions",
+            "cluster_nodes",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -464,6 +483,7 @@ impl Database {
         .await?;
 
         sqlx::query(ACTIONS_TABLE).execute(&self.pool).await?;
+        sqlx::query(CLUSTER_NODES_TABLE).execute(&self.pool).await?;
 
         // Path grants table (for path-based permission delegation)
         sqlx::query(

@@ -58,7 +58,7 @@ mudd_init --version
 Creates a new database, or upgrades an existing one in place. Running it again
 on the same database is safe. Schema upgrades live here, never in `mudd`:
 the database records its schema version, `mudd` refuses a mismatch, and
-`mudd_init` upgrades older versions where a step exists (today 6 -> 7 -> 8);
+`mudd_init` upgrades older versions where a step exists (today 6 -> 7 -> 8 -> 9);
 anything older, such as a database from before versioning, is refused
 (create a new one); otherwise a
 re-run creates any missing tables and refreshes the core mudlib.
@@ -324,6 +324,9 @@ The leader assigns it an id, sends it a snapshot of the game data, adds it
 as a learner and promotes it to voter once it has caught up. A member that
 is not the leader points the newcomer at the leader. Once joined, the node
 remembers its id, so a restart needs no `--join` (it is ignored). A node
+that stopped right after being given an id, before receiving anything,
+joins again on restart (keep `--join` on its command line); only node 1 ever
+starts a cluster of its own. Ids are never reused. A node
 with the wrong secret, or whose CA does not match the cluster's, is refused
 and exits at once. Keep an odd number of voters (3 or 5): writes need a
 majority.

@@ -330,9 +330,9 @@ mod tests {
     }
 
     /// Upgrades chain: a version 6 database gets the credits holder trigger
-    /// (7) and the actions table (8)
+    /// (7), the actions table (8) and the cluster_nodes table (9)
     #[tokio::test]
-    async fn test_upgrade_6_to_8() {
+    async fn test_upgrade_6_to_9() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         init_database(
@@ -354,6 +354,10 @@ mod tests {
                 .execute(db.pool())
                 .await
                 .unwrap();
+            sqlx::query("DROP TABLE cluster_nodes")
+                .execute(db.pool())
+                .await
+                .unwrap();
             sqlx::query("PRAGMA user_version = 6")
                 .execute(db.pool())
                 .await
@@ -362,16 +366,17 @@ mod tests {
         }
         init_database(&db_path, None, None, HashMap::new(), None)
             .await
-            .expect("mudd_init upgrades 6 -> 8");
+            .expect("mudd_init upgrades 6 -> 9");
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 8);
+        assert_eq!(db.schema_version().await.unwrap(), 9);
         let tables: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('actions', 'cluster_nodes')",
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(tables, 1);
+        assert_eq!(tables, 2);
         let triggers: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'credits_holder_exists'",
         )
