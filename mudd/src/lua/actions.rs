@@ -84,7 +84,7 @@ impl ActionRegistry {
         let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
             "SELECT universe_id, scope, scope_id, verb, object_id, method FROM actions",
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *crate::db::run::reader(pool).await?)
         .await?;
         let mut rooms: BTreeMap<Key, BTreeMap<String, Vec<Action>>> = BTreeMap::new();
         let mut objects: BTreeMap<Key, BTreeMap<String, Action>> = BTreeMap::new();

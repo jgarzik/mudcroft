@@ -616,7 +616,7 @@ impl EffectRegistry {
                     magnitude, damage_type, source_id
              FROM active_effects",
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *crate::db::run::reader(pool).await?)
         .await?;
 
         let mut cache = HashMap::<EntityKey, EntityEffects>::new();

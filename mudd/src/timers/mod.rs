@@ -417,7 +417,7 @@ impl TimerManager {
 
         let rows: Vec<(String, String, String, String, i64, Option<String>)> =
             sqlx::query_as("SELECT id, universe_id, object_id, method, fire_at, args FROM timers")
-                .fetch_all(pool)
+                .fetch_all(&mut *crate::db::run::reader(pool).await?)
                 .await?;
 
         // Replaces the cache: also used to rebuild it on becoming primary
@@ -441,7 +441,7 @@ impl TimerManager {
         // Heartbeats: the next beat is one interval from now
         let rows: Vec<(String, String, i64)> =
             sqlx::query_as("SELECT universe_id, object_id, interval_ms FROM heartbeats")
-                .fetch_all(pool)
+                .fetch_all(&mut *crate::db::run::reader(pool).await?)
                 .await?;
         // A heartbeat already scheduled keeps its next beat (rebuilds after
         // a failed run must not shift every heartbeat)

@@ -743,7 +743,7 @@ impl PermissionManager {
         let rows: Vec<PathGrantRow> = sqlx::query_as(
             "SELECT id, universe_id, grantee_id, path_prefix, can_delegate, granted_by, granted_at FROM path_grants",
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *crate::db::run::reader(pool).await?)
         .await?;
 
         // Replaces the cache

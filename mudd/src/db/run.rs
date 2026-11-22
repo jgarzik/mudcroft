@@ -27,7 +27,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -66,6 +66,13 @@ pub struct Run {
     /// Caches may hold changes not in the tables (written since the last
     /// successful checkpoint): undoing the run must rebuild them
     dirty: AtomicBool,
+    /// A checkpoint failed to save: writes made before it are lost, so the
+    /// run must fail as a whole (later writes are refused)
+    poisoned: AtomicBool,
+    /// Bumped by each checkpoint (which ends the savepoints of nested runs)
+    generation: AtomicU64,
+    /// Nesting depth (names nested runs' savepoints)
+    depth: AtomicU64,
     /// Leads the first batch committed (e.g. a command id marker)
     prefix: std::sync::Mutex<Vec<Statement>>,
     statements: std::sync::Mutex<Vec<Statement>>,
@@ -89,6 +96,9 @@ impl Run {
     /// reads) and capture them. All or none: a failing statement undoes the
     /// others in this call. Returns the rows affected.
     pub async fn execute(&self, statements: &[Statement]) -> Result<u64> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            anyhow::bail!("an earlier save in this run failed; nothing more is saved");
+        }
         {
             let mut gate = self.gate.lock().await;
             if gate.is_none() {
@@ -167,19 +177,122 @@ impl Run {
     /// lock and gate; the run continues as a new change. For before
     /// something slow outside the database.
     pub async fn checkpoint(&self) -> Result<()> {
-        self.end_local().await?;
+        if self.poisoned.load(Ordering::SeqCst) {
+            anyhow::bail!("an earlier save in this run failed");
+        }
+        if let Err(e) = self.end_local().await {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
         let batch = self.batch();
-        take(&self.kept);
+        let kept = take(&self.kept);
         if !batch.is_empty() {
-            // On failure `dirty` stays set: undoing the run rebuilds caches
-            self.committer.commit(batch).await?;
+            if let Err(e) = self.committer.commit(batch).await {
+                // The run fails as a whole (settle undoes it: `dirty` stays
+                // set, so the caches are rebuilt); kept writes still stand
+                self.poisoned.store(true, Ordering::SeqCst);
+                take(&self.after);
+                *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = kept;
+                return Err(e);
+            }
         }
         self.dirty.store(false, Ordering::SeqCst);
         for f in take(&self.after) {
             f().await;
         }
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.gate.lock().await.take();
         Ok(())
+    }
+
+    /// Run `f` nested in this run: if it fails, only its own writes are
+    /// undone (its kept ones stand) and `on_abort` rebuilds the caches,
+    /// reading through this run (so the outer run's pending changes stay)
+    async fn nested<T, E, Fut, A, AFut>(
+        self: Arc<Self>,
+        f: Fut,
+        on_abort: A,
+    ) -> Result<std::result::Result<T, E>>
+    where
+        Fut: Future<Output = std::result::Result<T, E>>,
+        A: FnOnce() -> AFut,
+        AFut: Future<Output = ()>,
+    {
+        let generation = self.generation.load(Ordering::SeqCst);
+        let depth = self.depth.fetch_add(1, Ordering::SeqCst) + 1;
+        let savepoint = format!("run_nested_{}", depth);
+        let had_txn = self.began.load(Ordering::SeqCst);
+        if had_txn {
+            let mut conn = self.conn.lock().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {}", savepoint)))
+                .execute(&mut **conn)
+                .await?;
+        }
+        let marks = (
+            self.statements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            self.kept.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            self.after.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        );
+        let dirty_before = self.dirty.swap(false, Ordering::SeqCst);
+
+        let result = f.await;
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+        let wrote = self.dirty.load(Ordering::SeqCst);
+        // A checkpoint inside committed (and ended) everything before it
+        let same_txn = self.generation.load(Ordering::SeqCst) == generation;
+        let marks = if same_txn { marks } else { (0, 0, 0) };
+
+        if result.is_ok() {
+            if had_txn && same_txn {
+                let mut conn = self.conn.lock().await;
+                sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE {}", savepoint)))
+                    .execute(&mut **conn)
+                    .await?;
+            }
+            self.dirty.store(dirty_before || wrote, Ordering::SeqCst);
+            return Ok(result);
+        }
+
+        // Undo this part: locally, and in what will be committed
+        if had_txn && same_txn {
+            let mut conn = self.conn.lock().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!("ROLLBACK TO {}", savepoint)))
+                .execute(&mut **conn)
+                .await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE {}", savepoint)))
+                .execute(&mut **conn)
+                .await?;
+        } else if self.began.swap(false, Ordering::SeqCst) {
+            // Everything in the open transaction is this part's
+            let mut conn = self.conn.lock().await;
+            sqlx::query("ROLLBACK").execute(&mut **conn).await?;
+        }
+        self.statements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .truncate(marks.0);
+        let kept: Vec<Statement> = self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .split_off(marks.1);
+        self.after
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .truncate(marks.2);
+        // Kept writes stand: redo them in the run
+        if !kept.is_empty() {
+            self.execute_kept(&kept).await?;
+        }
+        if wrote {
+            on_abort().await;
+        }
+        self.dirty
+            .store(dirty_before || !kept.is_empty(), Ordering::SeqCst);
+        Ok(result)
     }
 
     /// Commit (or, `failed`, undo) the run, then release the gate. Returns
@@ -206,6 +319,9 @@ impl Run {
         let outcome = if let Err(e) = ended {
             undo(kept).await;
             Err(e)
+        } else if self.poisoned.load(Ordering::SeqCst) {
+            undo(kept).await;
+            Err(anyhow::anyhow!("a save in this run failed"))
         } else if failed {
             undo(kept).await;
             Ok(())
@@ -304,8 +420,8 @@ where
 }
 
 /// Run `f` as one change: its writes are proposed as one batch when it
-/// succeeds, discarded when it fails. Inside a run already, `f` simply joins
-/// it. `prefix` statements (e.g. a command's id marker) lead the batch.
+/// succeeds, discarded when it fails. Inside a run already, `f` is a nested
+/// part of it: if `f` fails, only its own writes are undone. `prefix` statements (e.g. a command's id marker) lead the batch.
 /// When writes are discarded (`f` failed, or committing did), `on_abort`
 /// runs before the write gate is released: it rebuilds the caches.
 ///
@@ -323,8 +439,8 @@ where
     A: FnOnce() -> AFut + Send + 'static,
     AFut: Future<Output = ()> + Send + 'static,
 {
-    if current().is_some() {
-        return Ok(f.await);
+    if let Some(run) = current() {
+        return run.nested(f, on_abort).await;
     }
     let run = Arc::new(Run {
         conn: Arc::new(Mutex::new(pool.acquire().await?)),
@@ -332,6 +448,9 @@ where
         gate: Mutex::new(None),
         began: AtomicBool::new(false),
         dirty: AtomicBool::new(false),
+        poisoned: AtomicBool::new(false),
+        generation: AtomicU64::new(0),
+        depth: AtomicU64::new(0),
         prefix: std::sync::Mutex::new(prefix),
         statements: std::sync::Mutex::new(Vec::new()),
         kept: std::sync::Mutex::new(Vec::new()),
@@ -525,5 +644,94 @@ mod tests {
         }
         assert!(aborted.load(Ordering::SeqCst), "caches rebuilt");
         assert_eq!(rows(&pool).await, vec![2]);
+    }
+
+    /// A nested run that fails undoes only its own writes (its kept ones
+    /// stand) and rebuilds the caches; the outer run goes on and commits
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_nested_run_failure() {
+        let (pool, direct) = setup().await;
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+        let inner_pool = pool.clone();
+        let inner_direct = direct.clone();
+        let result: std::result::Result<(), ()> = scope(
+            &pool,
+            direct.clone(),
+            Vec::new(),
+            async move {
+                let run = current().unwrap();
+                run.execute(&[insert(1)]).await.unwrap();
+                let inner: std::result::Result<(), &str> = scope(
+                    &inner_pool,
+                    inner_direct,
+                    Vec::new(),
+                    async {
+                        let run = current().unwrap();
+                        run.execute(&[insert(2)]).await.unwrap();
+                        run.execute_kept(&[insert(5)]).await.unwrap();
+                        Err("inner failed")
+                    },
+                    move || async move { flag.store(true, Ordering::SeqCst) },
+                )
+                .await
+                .unwrap();
+                assert!(inner.is_err());
+                run.execute(&[insert(3)]).await.unwrap();
+                Ok(())
+            },
+            || async {},
+        )
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "the inner run rebuilt caches"
+        );
+        assert_eq!(rows(&pool).await, vec![1, 3, 5]);
+    }
+
+    /// Refuses every commit (a node that lost leadership)
+    struct Refuse;
+
+    impl Committer for Refuse {
+        fn commit<'a>(
+            &'a self,
+            _statements: Vec<Statement>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async { anyhow::bail!("not the primary") })
+        }
+    }
+
+    /// A checkpoint that fails to save poisons the run: later writes fail,
+    /// the run counts as failed even if its code carried on, and the caches
+    /// are rebuilt
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_failed_checkpoint_poisons_run() {
+        let (pool, _) = setup().await;
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+        let result: Result<std::result::Result<(), ()>> = scope(
+            &pool,
+            Arc::new(Refuse),
+            Vec::new(),
+            async {
+                let run = current().unwrap();
+                run.execute(&[insert(1)]).await.unwrap();
+                assert!(run.checkpoint().await.is_err());
+                // Code that catches the error and carries on
+                assert!(run.execute(&[insert(2)]).await.is_err(), "poisoned");
+                Ok(())
+            },
+            move || async move { flag.store(true, Ordering::SeqCst) },
+        )
+        .await;
+        assert!(
+            result.is_err() || result.unwrap().is_err(),
+            "the run failed"
+        );
+        assert!(aborted.load(Ordering::SeqCst), "caches rebuilt");
+        assert!(rows(&pool).await.is_empty());
     }
 }
