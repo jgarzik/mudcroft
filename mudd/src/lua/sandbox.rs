@@ -140,7 +140,7 @@ impl Sandbox {
                     Ok(VmState::Continue)
                 }
             },
-        );
+        )?;
 
         lua.set_app_data(CallBudget {
             max_db_queries: config.max_db_queries,

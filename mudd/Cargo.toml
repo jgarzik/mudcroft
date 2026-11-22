@@ -29,7 +29,7 @@ tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 
 # Lua scripting
-mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize"] }
+mlua = { version = "0.12", features = ["lua54", "vendored", "async", "serialize"] }
 
 # Consensus (Raft)
 openraft = { version = "0.10", features = ["serde", "type-alias"] }
