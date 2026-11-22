@@ -431,7 +431,9 @@ Two layers exist:
 - **Rust** (`src/combat/engine.rs`): HP and combat stats have one home, the
   combatant's object row: properties `hp`, `max_hp`, `armor_class`
   (default 10), `attack_bonus` (default 0) and `resistances` (e.g.
-  `{fire = "resistant"}`), the same ones Lua reads and writes. The `attack`
+  `{fire = "resistant"}`), the same ones Lua reads and writes. Values are
+  clamped when read (HP to 0..1,000,000, armor class and attack bonus to
+  ±1,000) and damage math saturates, so builder-set extremes cannot wrap. The `attack`
   command resolves a round with the pure `resolve_attack` (d20 + attack
   bonus against armor class, natural 20 a critical hit, natural 1 a fumble,
   then 1d6 physical damage, doubled on a critical, then resistances) and

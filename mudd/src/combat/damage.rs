@@ -131,7 +131,7 @@ impl DamageModifier {
             DamageModifier::Immune => 0,
             DamageModifier::Resistant => damage / 2,
             DamageModifier::Normal => damage,
-            DamageModifier::Vulnerable => damage * 2,
+            DamageModifier::Vulnerable => damage.saturating_mul(2),
         }
     }
 
@@ -164,7 +164,7 @@ pub struct DamageResult {
 impl DamageResult {
     /// Create a new damage result
     pub fn new(base: i32, dtype: DamageType, modifier: DamageModifier, is_crit: bool) -> Self {
-        let crit_damage = if is_crit { base * 2 } else { base };
+        let crit_damage = if is_crit { base.saturating_mul(2) } else { base };
         let final_damage = modifier.apply(crit_damage);
 
         Self {

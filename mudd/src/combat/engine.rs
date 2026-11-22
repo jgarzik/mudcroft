@@ -11,6 +11,11 @@ use super::damage::{DamageModifier, DamageProfile};
 use super::{AttackResult, DamageType};
 use crate::objects::{Object, ObjectStore};
 
+/// Largest HP (and max HP) a combatant can have
+pub const MAX_HP: i32 = 1_000_000;
+/// Bound on armor class and attack bonus, either sign
+pub const MAX_STAT: i32 = 1_000;
+
 /// A combatant's stats, read from its object row
 #[derive(Debug, Clone)]
 pub struct Combatant {
@@ -27,8 +32,14 @@ impl Combatant {
     /// `resistances` maps a damage type to "immune", "resistant" or
     /// "vulnerable", e.g. `{fire = "resistant"}`.
     pub fn from_object(obj: &Object, default_hp: i32) -> Self {
-        let int = |key: &str| obj.properties.get(key).and_then(|v| v.as_i64());
-        let hp = int("hp").unwrap_or(default_hp as i64) as i32;
+        // Properties are builder-set and unbounded: clamp before narrowing
+        let int = |key: &str, lo: i32, hi: i32| {
+            obj.properties
+                .get(key)
+                .and_then(|v| v.as_i64())
+                .map(|v| v.clamp(lo as i64, hi as i64) as i32)
+        };
+        let hp = int("hp", 0, MAX_HP).unwrap_or(default_hp.clamp(0, MAX_HP));
         let mut profile = DamageProfile::new();
         if let Some(map) = obj
             .properties
@@ -51,9 +62,9 @@ impl Combatant {
         Self {
             id: obj.id.clone(),
             hp,
-            max_hp: int("max_hp").map(|v| v as i32).unwrap_or(hp.max(1)),
-            armor_class: int("armor_class").unwrap_or(10) as i32,
-            attack_bonus: int("attack_bonus").unwrap_or(0) as i32,
+            max_hp: int("max_hp", 1, MAX_HP).unwrap_or(hp.max(1)),
+            armor_class: int("armor_class", -MAX_STAT, MAX_STAT).unwrap_or(10),
+            attack_bonus: int("attack_bonus", -MAX_STAT, MAX_STAT).unwrap_or(0),
             profile,
         }
     }
@@ -84,7 +95,7 @@ pub fn resolve_attack(
         let damage = target
             .profile
             .calculate_damage(damage_roll, dtype, result.critical);
-        target_hp = (target_hp - damage.final_damage).max(0);
+        target_hp = target_hp.saturating_sub(damage.final_damage).max(0);
         result = result.with_damage(damage);
     }
     AttackOutcome {
@@ -184,5 +195,25 @@ mod tests {
             combatant(serde_json::json!({"hp": 10, "resistances": {"fire": "resistant"}}));
         let fire = resolve_attack(&attacker, &resistant, 15, 4, DamageType::Fire);
         assert_eq!(fire.target_hp, 8);
+    }
+
+    /// Builder-set stats are clamped: huge values neither wrap when
+    /// narrowed nor overflow in resolution
+    #[test]
+    fn test_stats_are_clamped() {
+        let c = combatant(serde_json::json!({
+            "hp": 9_000_000_000_000i64, "max_hp": -5,
+            "armor_class": 99_999_999_999i64, "attack_bonus": -99_999_999_999i64
+        }));
+        assert_eq!(c.hp, MAX_HP);
+        assert_eq!(c.max_hp, 1);
+        assert_eq!(c.armor_class, MAX_STAT);
+        assert_eq!(c.attack_bonus, -MAX_STAT);
+
+        let attacker = combatant(serde_json::json!({"attack_bonus": i64::MAX}));
+        let target = combatant(serde_json::json!({"hp": i64::MIN}));
+        assert_eq!(target.hp, 0);
+        let outcome = resolve_attack(&attacker, &target, 20, i32::MAX, DamageType::Physical);
+        assert_eq!(outcome.target_hp, 0);
     }
 }
