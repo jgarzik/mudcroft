@@ -36,6 +36,96 @@ where
     block_now(fut)
 }
 
+/// Who pays for a Venice call, and what it costs (universe config
+/// `venice_chat_cost` / `venice_image_cost`, default 0)
+#[derive(Clone)]
+struct VeniceBilling {
+    store: Arc<ObjectStore>,
+    credits: Arc<CreditManager>,
+    universe_id: String,
+    owner: Option<String>,
+    payer: Option<String>,
+    object: Option<String>,
+}
+
+impl VeniceBilling {
+    /// The holder `opts.payer` names: "actor" (default; None when nobody
+    /// chose to run this code) or "object"
+    fn payer_holder(&self, opts: Option<&Table>) -> LuaResult<Option<crate::credits::Holder>> {
+        use crate::credits::Holder;
+        let which: Option<String> = match opts {
+            Some(t) => t.get("payer")?,
+            None => None,
+        };
+        match which.as_deref().unwrap_or("actor") {
+            "actor" => Ok(self.payer.clone().map(Holder::Account)),
+            "object" => self
+                .object
+                .clone()
+                .map(|o| Some(Holder::Object(o)))
+                .ok_or_else(|| mlua::Error::runtime("no object here")),
+            _ => Err(mlua::Error::runtime(
+                "payer must be \"actor\" or \"object\"",
+            )),
+        }
+    }
+
+    /// Charge the price under `price_key` to `holder`, run `call` (given the
+    /// rate-limit key: the payer, else the owner), and refund if it fails
+    async fn paid<T, F, Fut>(
+        &self,
+        holder: Option<crate::credits::Holder>,
+        price_key: &str,
+        call: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let config = self
+            .store
+            .get_universe(&self.universe_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|u| u.config)
+            .unwrap_or_default();
+        let price = match config.get(price_key) {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => v
+                .as_i64()
+                .filter(|p| (0..=crate::credits::MAX_AMOUNT).contains(p))
+                .ok_or_else(|| format!("universe config {} is not a valid price", price_key))?,
+        };
+        if price > 0 {
+            let Some(ref holder) = holder else {
+                return Err("no paying player here (only a verb, eval or script has one)".into());
+            };
+            if !self
+                .credits
+                .deduct(&self.universe_id, holder, price)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                return Err(format!("not enough credits (costs {})", price));
+            }
+        }
+        let key = match holder {
+            Some(crate::credits::Holder::Account(ref id))
+            | Some(crate::credits::Holder::Object(ref id)) => id.clone(),
+            None => self.owner.clone().unwrap_or_else(|| "anonymous".into()),
+        };
+        let result = call(key).await;
+        if result.is_err() && price > 0 {
+            if let Some(ref holder) = holder {
+                if let Err(e) = self.credits.grant(&self.universe_id, holder, price).await {
+                    tracing::warn!("venice refund of {} to {:?} failed: {}", price, holder, e);
+                }
+            }
+        }
+        result
+    }
+}
+
 /// Run a future to completion from synchronous Lua callback code, on the
 /// current (multi-threaded) runtime. Cheap, unlike spawning a thread with
 /// its own runtime per call, which made a few dozen game.* calls blow the
@@ -2183,22 +2273,26 @@ impl GameApi {
     fn register_venice_functions(&self, lua: &Lua, game: &Table) -> LuaResult<()> {
         let venice = self.venice.clone();
         let image_store = self.image_store.clone();
-        let current_user = self.current_user_id.clone();
+        let billing = VeniceBilling {
+            store: self.store.clone(),
+            credits: self.credits.clone(),
+            universe_id: self.universe_id.clone(),
+            owner: self.current_user_id.clone(),
+            payer: self.payer.clone(),
+            object: self.current_object_id.clone(),
+        };
 
-        // game.llm_chat(messages, tier)
-        // Send a chat completion request to Venice AI
-        // messages: array of {role, content} tables
-        // tier: "fast", "balanced", or "quality"
-        // Returns response text or nil on error
-        let venice_clone = venice.clone();
-        let user_clone = current_user.clone();
+        // game.llm_chat(messages, tier?, opts?)
+        // messages: array of {role, content}; tier: "fast", "balanced" or
+        // "quality"; opts.payer: "actor" (default) or "object".
+        // Returns the response text, or {error = ...}
+        let (venice_clone, bill) = (venice.clone(), billing.clone());
         let llm_chat = lua.create_function(
-            move |lua, (messages_table, tier_str): (Table, Option<String>)| {
+            move |lua, (messages_table, tier_str, opts): (Table, Option<String>, Option<Table>)| {
                 charge_venice(lua)?;
                 let venice = venice_clone.clone();
-                let user_id = user_clone.clone();
+                let holder = bill.payer_holder(opts.as_ref())?;
 
-                // Parse messages from Lua table
                 let mut messages = Vec::new();
                 for pair in messages_table.sequence_values::<Table>() {
                     let msg_table = pair?;
@@ -2206,22 +2300,17 @@ impl GameApi {
                     let content: String = msg_table.get("content")?;
                     messages.push(ChatMessage { role, content });
                 }
-
-                // Parse tier
                 let tier = tier_str
                     .as_deref()
                     .and_then(ModelTier::parse)
                     .unwrap_or(ModelTier::Balanced);
 
-                let result = block_now(async {
-                    let account_id = user_id.as_deref().unwrap_or("anonymous");
-                    venice.chat(account_id, messages, tier).await
-                });
-
+                let result = block_now(bill.paid(holder, "venice_chat_cost", |key| async move {
+                    venice.chat(&key, messages, tier).await
+                }));
                 match result {
                     Ok(response) => Ok(Value::String(lua.create_string(&response)?)),
                     Err(e) => {
-                        // Return nil and error message
                         let result = lua.create_table()?;
                         result.set("error", e)?;
                         Ok(Value::Table(result))
@@ -2231,21 +2320,22 @@ impl GameApi {
         )?;
         game.set("llm_chat", llm_chat)?;
 
-        // game.llm_image(prompt, style, size)
-        // Generate an image using Venice AI
-        // prompt: text description
-        // style: "realistic", "anime", "digital", "painterly"
-        // size: "small", "medium", "large"
-        // Returns image hash string (for use with /images/{hash}) or error table
-        let user_clone = current_user;
+        // game.llm_image(prompt, style?, size?, opts?)
+        // style: "realistic", "anime", "digital", "painterly"; size: "small",
+        // "medium", "large"; opts.payer as for llm_chat.
+        // Returns an image hash (for /images/{hash}), or {error = ...}
         let llm_image = lua.create_function(
-            move |lua, (prompt, style_str, size_str): (String, Option<String>, Option<String>)| {
+            move |lua,
+                  (prompt, style_str, size_str, opts): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<Table>,
+            )| {
                 charge_venice(lua)?;
                 let venice = venice.clone();
                 let image_store = image_store.clone();
-                let user_id = user_clone.clone();
-
-                // Parse style and size
+                let holder = billing.payer_holder(opts.as_ref())?;
                 let style = style_str
                     .as_deref()
                     .and_then(ImageStyle::parse)
@@ -2255,22 +2345,16 @@ impl GameApi {
                     .and_then(ImageSize::parse)
                     .unwrap_or(ImageSize::Medium);
 
-                let result = block_now(async {
-                    let account_id = user_id.as_deref().unwrap_or("anonymous");
-                    // Generate image (returns raw binary bytes)
-                    let image_bytes = venice
-                        .generate_image(account_id, &prompt, style, size)
-                        .await?;
-                    // Store binary data and get hash
-                    image_store
-                        .store(&image_bytes, "image/png", "llm_image")
-                        .await
-                });
-
+                let result =
+                    block_now(billing.paid(holder, "venice_image_cost", |key| async move {
+                        let image_bytes = venice.generate_image(&key, &prompt, style, size).await?;
+                        image_store
+                            .store(&image_bytes, "image/png", "llm_image")
+                            .await
+                    }));
                 match result {
                     Ok(hash) => Ok(Value::String(lua.create_string(&hash)?)),
                     Err(e) => {
-                        // Return nil and error message
                         let result = lua.create_table()?;
                         result.set("error", e)?;
                         Ok(Value::Table(result))

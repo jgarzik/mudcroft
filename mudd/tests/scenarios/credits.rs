@@ -208,3 +208,118 @@ async fn test_nested_use_object_cannot_bill_the_player() {
     assert_eq!(verb(&mut pl, "press button").await, "false");
     assert_eq!(balance(&server, "account", &pl_id).await, 30);
 }
+
+/// Venice calls cost what the universe config says, charged to the payer
+/// before the call and refunded when it fails (here: no API key in tests)
+#[tokio::test]
+async fn test_venice_calls_charge_the_payer() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = connect(
+        &server,
+        Role::Admin {
+            username: "oracle_admin".into(),
+        },
+    )
+    .await;
+    let pl = connect(
+        &server,
+        Role::Player {
+            username: "seeker".into(),
+        },
+    )
+    .await;
+    let pl_id = pl.account_id().to_string();
+    let mut pl = pl;
+    let out = eval(
+        &mut adm,
+        &format!(
+            r#"game.update_universe({{venice_chat_cost = 5, venice_image_cost = 8}})
+               game.admin_grant_credits("{p}", 7)
+               local h = game.store_code([[
+                 local function show(r) return type(r) == "table" and r.error or tostring(r) end
+                 local msgs = {{{{role = "user", content = "hi"}}}}
+                 return {{
+                   ask = function(a) return show(game.llm_chat(msgs)) end,
+                   paint = function(a) return show(game.llm_image("a cave")) end,
+                   ask_house = function(a) return show(game.llm_chat(msgs, nil, {{payer = "object"}})) end,
+                 }}]])
+               game.create_object("/items/oracle", "item", "{room}", {{name = "oracle", fixed = true, code_hash = h}})
+               for _, v in ipairs({{"ask", "paint", "ask_house"}}) do
+                 game.add_action(v, "/items/oracle", v)
+               end
+               return "ok""#,
+            p = pl_id,
+            room = entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ok", "{}", out);
+
+    // Affordable: charged, then refunded because the call failed
+    let reply = verb(&mut pl, "ask oracle").await;
+    assert!(reply.contains("not configured"), "{}", reply);
+    assert_eq!(balance(&server, "account", &pl_id).await, 7);
+    // Too dear: refused before calling
+    let reply = verb(&mut pl, "paint oracle").await;
+    assert!(reply.contains("not enough credits"), "{}", reply);
+    assert_eq!(balance(&server, "account", &pl_id).await, 7);
+    // The object pays when asked to, and it has nothing
+    let reply = verb(&mut pl, "ask_house oracle").await;
+    assert!(reply.contains("not enough credits"), "{}", reply);
+}
+
+/// A verb bills the player only when they clearly picked the object: the
+/// only one offering the verb, or named exactly / unambiguously. Another
+/// builder's look-alike object cannot capture the verb and the player's
+/// wallet.
+#[tokio::test]
+async fn test_ambiguous_verb_target_gets_no_wallet() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = connect(
+        &server,
+        Role::Admin {
+            username: "verb_admin".into(),
+        },
+    )
+    .await;
+    let pl = connect(
+        &server,
+        Role::Player {
+            username: "careful".into(),
+        },
+    )
+    .await;
+    let pl_id = pl.account_id().to_string();
+    let mut pl = pl;
+    let out = eval(
+        &mut adm,
+        &format!(
+            r#"game.admin_grant_credits("{p}", 50)
+               local h = game.store_code([[return {{
+                 donate = function(a)
+                   local ok, r = pcall(game.transfer_credits, "actor", "object", 5)
+                   return ok and tostring(r) or "no wallet"
+                 end,
+               }}]])
+               -- The planted one is listed first and its name is in almost anything
+               game.create_object("/items/c", "item", "{room}", {{name = "c", fixed = true, code_hash = h}})
+               game.create_object("/items/chest", "item", "{room}", {{name = "chest", fixed = true, code_hash = h}})
+               game.add_action("donate", "/items/c", "donate")
+               game.add_action("donate", "/items/chest", "donate")
+               return "ok""#,
+            p = pl_id,
+            room = entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ok", "{}", out);
+
+    assert_eq!(verb(&mut pl, "donate chest").await, "true");
+    assert_eq!(verb(&mut pl, "donate ches").await, "no wallet");
+    assert_eq!(verb(&mut pl, "donate").await, "no wallet");
+    assert_eq!(balance(&server, "object", "/items/chest").await, 5);
+    assert_eq!(balance(&server, "object", "/items/c").await, 0);
+    assert_eq!(balance(&server, "account", &pl_id).await, 45);
+}

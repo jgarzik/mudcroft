@@ -1558,9 +1558,11 @@ async fn dispatch_custom_verb(
         return None;
     }
 
-    // Prefer the candidate the player named
-    let wanted = args.to_lowercase();
-    let mut chosen = candidates[0].clone();
+    // Prefer the candidate the player named: an exact name first, else one
+    // whose name the words contain (or that contains them)
+    let wanted = args.trim().to_lowercase();
+    let mut exact = Vec::new();
+    let mut fuzzy = Vec::new();
     if !wanted.is_empty() {
         for action in &candidates {
             if let Ok(Some(obj)) = state.object_store.get(universe_id, &action.object_id).await {
@@ -1570,13 +1572,37 @@ async fn dispatch_custom_verb(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_lowercase();
-                if !name.is_empty() && (wanted.contains(&name) || name.contains(&wanted)) {
-                    chosen = action.clone();
-                    break;
+                if name.is_empty() {
+                    continue;
+                }
+                if name == wanted {
+                    exact.push(action.clone());
+                } else if wanted.contains(&name) || name.contains(&wanted) {
+                    fuzzy.push(action.clone());
                 }
             }
         }
     }
+    let objects = |list: &[crate::lua::Action]| {
+        let mut ids: Vec<&str> = list.iter().map(|a| a.object_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    // The player's wallet goes only to an object they clearly picked: the
+    // only one offering the verb, their exact name for it, or the single
+    // match. Otherwise another builder's look-alike could capture the verb
+    // and bill them; the handler still runs, with no paying player.
+    let (chosen, picked) = if objects(&candidates) == 1 {
+        (candidates[0].clone(), true)
+    } else if objects(&exact) == 1 {
+        (exact[0].clone(), true)
+    } else if exact.is_empty() && objects(&fuzzy) == 1 {
+        (fuzzy[0].clone(), true)
+    } else {
+        let first = exact.first().or(fuzzy.first()).unwrap_or(&candidates[0]);
+        (first.clone(), false)
+    };
 
     let handler_args = serde_json::json!({
         "verb": verb,
@@ -1593,7 +1619,7 @@ async fn dispatch_custom_verb(
         room_id,
         &chosen.method,
         handler_args,
-        player_account,
+        picked.then_some(player_account),
     )
     .await;
     Some(match result {

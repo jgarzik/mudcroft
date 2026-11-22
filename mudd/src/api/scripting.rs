@@ -113,8 +113,9 @@ pub async fn invoke_handler(
     .await
 }
 
-/// invoke_handler for a verb the player `payer` typed: that player's
-/// account pays for the handler's credit spending (`"actor"`)
+/// invoke_handler for a verb a player typed. `payer` is their account when
+/// they clearly picked this object: it then pays for the handler's credit
+/// spending (`"actor"`)
 pub async fn invoke_verb_handler(
     state: &AppState,
     universe_id: &str,
@@ -122,7 +123,7 @@ pub async fn invoke_verb_handler(
     room_id: Option<String>,
     method: &str,
     args: serde_json::Value,
-    payer: &str,
+    payer: Option<&str>,
 ) -> Result<Option<String>, String> {
     invoke_handler_at(
         state,
@@ -132,7 +133,7 @@ pub async fn invoke_verb_handler(
         method,
         args,
         Origin {
-            payer: Some(payer.to_string()),
+            payer: payer.map(str::to_string),
             hooks: HookBudget::new(),
         },
     )

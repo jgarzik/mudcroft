@@ -46,9 +46,11 @@ affected feature.
 
 ### Lua runtime
 
-- **Venice bills the object's owner.** In object code Venice usage is
-  rate-limited against the real user, the owner, not the paying player, and
-  costs no credits (`mudd/src/lua/game_api.rs`).
+- **A verb may spend all of a player's credits.** Typing a verb on an
+  object is consent to whatever its handler spends as `"actor"`; there is no
+  per-call cap or confirmation prompt (`mudd/src/lua/game_api.rs`). Verb
+  dispatch only hands over the wallet when the player clearly picked the
+  object (`dispatch_custom_verb` in `mudd/src/api/websocket.rs`).
 
 ### Accounts and permissions
 
@@ -141,7 +143,9 @@ Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
   | Bot monthly fee | 50¢ |
   | Class definition | $50 |
 
-  Players pay credits to the universe; the operator pays Venice.
+  Players pay credits to the universe; the operator pays Venice. Lua Venice
+  calls already charge per-universe prices (`venice_chat_cost`,
+  `venice_image_cost` in the universe config); the rest are unpriced.
 - **Execution cost model** charging per instruction block, DB read, DB write,
   LLM tier, image and object creation.
 - **Credit ledger**: a `credit_transactions` table (amount, type

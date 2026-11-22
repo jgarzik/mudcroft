@@ -504,7 +504,11 @@ scope (see [docs/blockchain.md](../../docs/blockchain.md)).
 `VeniceClient` (`src/venice/`) talks to an OpenAI-compatible API, configured
 by `VENICE_API_KEY` and `VENICE_API_URL` ([admin.md](admin.md)). Without a
 key, AI features are off. Chat tiers are fast, balanced and quality. A
-token-bucket rate limiter allows 60 requests per minute per account.
+token-bucket rate limiter allows 60 requests per minute per key. Lua calls
+cost the universe config's `venice_chat_cost` / `venice_image_cost` credits
+(default 0), charged to the payer (`"actor"` or `"object"`) before the
+call and refunded if it fails; the rate-limit key is the payer, else the
+object's owner. Room images are the operator's cost and charge nothing.
 
 Room images (`images/gen.rs`) use two steps:
 

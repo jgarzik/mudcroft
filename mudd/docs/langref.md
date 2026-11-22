@@ -188,8 +188,8 @@ for object code, or the `game.set_actor` override if one is set.
 | [`deduct_credits(amount, reason, payer?)`](#gamededuct_creditsamount-reason-payer) | boolean | — |
 | [`transfer_credits(from, to, amount)`](#gametransfer_creditsfrom-to-amount) | boolean | — |
 | [`admin_grant_credits(holder, amount)`](#gameadmin_grant_creditsholder-amount) | boolean | admin+ |
-| [`llm_chat(messages, tier)`](#gamellm_chatmessages-tier) | string or `{error}` | Venice configured |
-| [`llm_image(prompt, style, size)`](#gamellm_imageprompt-style-size) | image hash or `{error}` | Venice configured |
+| [`llm_chat(messages, tier, opts)`](#gamellm_chatmessages-tier-opts) | string or `{error}` | Venice configured |
+| [`llm_image(prompt, style, size, opts)`](#gamellm_imageprompt-style-size-opts) | image hash or `{error}` | Venice configured |
 | [`time()`](#gametime) | milliseconds | — |
 | [`set_time(time_ms)`](#gameset_timetime_ms) | boolean | wizard+ |
 | [`roll_dice(dice)`](#gameroll_dicedice) | integer | — |
@@ -585,6 +585,14 @@ Where the action is registered depends on the script's context:
 game.add_action("pull", "/d/keep/hall/lever", "pull")
 ```
 
+When several nearby objects offer the verb, the one whose name the player
+typed wins: an exact name first, then a name the words contain (or that
+contains them). The player is the handler's **paying player** (see
+[Credits](#credits)) only if they clearly picked the object: it is the only
+one offering the verb, they typed its exact name, or only one name matched.
+Otherwise the handler runs with no paying player, so a look-alike object
+cannot capture a verb and bill someone.
+
 #### `game.remove_action(verb, object_id)`
 
 Removes the action from the same scope that `add_action` would use in
@@ -917,13 +925,22 @@ Requires **admin+**. **Returns** `true` on success, `false` if refused.
 ## Venice AI
 
 These calls need a Venice API key on the server (see [admin](admin.md))
-and count against the Venice limit of 5 calls per execution. Usage is
-billed to the script's real user, which is the owner for object code.
+and count against the Venice limit of 5 calls per execution.
 
-#### `game.llm_chat(messages, tier)`
+Each call costs the universe config's `venice_chat_cost` or
+`venice_image_cost` credits (default 0; an admin sets them with
+`game.update_universe`). `opts.payer` names who pays: `"actor"` (the paying
+player, the default) or `"object"` (see [Credits](#credits)). The price is
+charged before the call and refunded if the call fails. A paid call with no
+one to pay, or a payer short of credits, returns `{error = ...}` without
+calling Venice. The rate limit (60 calls a minute) is kept per payer, or per
+the object's owner when there is none.
+
+#### `game.llm_chat(messages, tier, opts)`
 
 - `messages`: an array of `{role = "system"|"user"|"assistant", content = "..."}`.
 - `tier` (optional): `"fast"`, `"balanced"` (the default) or `"quality"`.
+- `opts` (optional): `{payer = "actor"|"object"}`.
 
 **Returns** the reply text, or `{error = "..."}`.
 
@@ -936,10 +953,11 @@ if type(reply) == "table" then return "The smith ignores you." end
 return "The smith says: " .. reply
 ```
 
-#### `game.llm_image(prompt, style, size)`
+#### `game.llm_image(prompt, style, size, opts)`
 
 - `style`: `"realistic"` (the default), `"anime"`, `"digital"` or `"painterly"`.
 - `size`: `"small"`, `"medium"` (the default) or `"large"`.
+- `opts` (optional): `{payer = "actor"|"object"}`.
 
 **Returns** an image **hash** string, or `{error = "..."}`. The image is
 served at `/images/{hash}`.
@@ -1012,8 +1030,9 @@ universe.
 Merges the top-level keys of `config` into the universe config. Requires
 **admin+**. **Returns** `true`, or `false` if refused.
 
-The server reads only one config key, `lib_hashes`, which maps library
-names to code hashes (see [Core library](#core-library)). Other keys are
+The server reads these config keys: `lib_hashes`, which maps library
+names to code hashes (see [Core library](#core-library)), and the Venice
+prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)). Other keys are
 yours to read with `get_universe()`. Use the `setportal` command to set
 the spawn room; config keys don't affect it.
 
