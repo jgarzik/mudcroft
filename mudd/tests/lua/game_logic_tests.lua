@@ -5,12 +5,13 @@
 --     cargo test --release --test lua_game_logic_test
 --
 -- The Rust runner (tests/lua_game_logic_test.rs) embeds this file with
--- include_str! and runs it through a wizard's `eval`, once per SECTION
+-- include_str! and runs it through an admin's `eval`, once per SECTION
 -- (one eval per section keeps each run well inside the eval budget). It
 -- prepends two locals to the chunk:
 --
---     local ACCOUNTS = { wizard = "<id>", player = "<id>", builder = "<id>",
---                        player_body = "<player object path>" }
+--     local ACCOUNTS = { admin = "<id>", wizard = "<id>", player = "<id>",
+--                        builder = "<id>", player_body = "<player object path>",
+--                        player2 = "<id>", player2_body = "<path>" }
 --     local SECTION = "<section name>"   -- or "list" for the section names
 --
 -- ACCOUNTS holds real accounts created by the runner: access levels come
@@ -764,16 +765,25 @@ end
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- ADDITIONAL COMBAT SYSTEM TESTS
--- Combat.deal_damage (lib/combat.lua) tracks `hp` and models resistance as
--- a percentage: immunity = 100, half damage = 50, double damage = -100.
+-- The Combat library wraps the server's combat engine (game.damage,
+-- game.attack, ...): resistances are "immune" (no damage), "resistant"
+-- (half), "vulnerable" (double); HP are whole numbers.
 -- ═══════════════════════════════════════════════════════════════════════════
 
--- Damage actually applied by Combat.deal_damage (hp before minus hp after)
+-- Damage actually applied by Combat.deal_damage
 local function damage_applied(target_id, amount, damage_type)
-    local before = game.get_object(target_id).metadata.hp
     local result = Combat.deal_damage(target_id, amount, damage_type)
-    Test.assert(result.success, "deal_damage should find the target")
-    return before - result.remaining_hp
+    Test.assert(result.success, "deal_damage should find the target: " .. tostring(result.message))
+    return result.damage
+end
+
+-- End every fight an entity is in (fights started by a test go on in the
+-- background otherwise)
+local function stop_fights(...)
+    act_as(ACCOUNTS.admin)
+    for _, id in ipairs({...}) do
+        game.stop_combat(id)
+    end
 end
 
 function test_combat_multiple_damage_types()
@@ -783,29 +793,23 @@ function test_combat_multiple_damage_types()
     local region = create(P("/arena"), "region", nil, { name = "Arena" })
     local room = create(P("/arena/test-arena"), "room", region.id, { name = "Test Arena" })
 
-    -- Create entity with multiple immunities and resistances
     local golem = create(P("/arena/test-arena/golem"), "npc", room.id, {
         name = "Iron Golem",
-        hp = 100,
+        hp = 500,
+        max_hp = 500,
         armor_class = 20,
         resistances = {
-            poison = 100, psychic = 100,  -- immune
-            physical = 50,                -- resistant
-            lightning = -100              -- vulnerable
+            poison = "immune", psychic = "immune",
+            physical = "resistant",
+            lightning = "vulnerable",
         }
     })
 
-    -- Test poison immunity
     Test.assert_eq(damage_applied(golem.id, 20, "poison"), 0, "Poison damage should be 0 (immune)")
-
-    -- Test physical resistance
     Test.assert_eq(damage_applied(golem.id, 20, "physical"), 10, "Physical damage should be halved (10)")
-
-    -- Test lightning vulnerability
     Test.assert_eq(damage_applied(golem.id, 20, "lightning"), 40, "Lightning damage should be doubled (40)")
-
-    -- Test fire (no modifier)
     Test.assert_eq(damage_applied(golem.id, 20, "fire"), 20, "Fire damage should be normal (20)")
+    Test.assert_eq(game.get_object(golem.id).metadata.hp, 430, "HP is whole numbers: 500 - 70")
 end
 
 function test_combat_death_handling()
@@ -818,18 +822,25 @@ function test_combat_death_handling()
     local minion = create(P("/arena/death-test/minion"), "npc", room.id, {
         name = "Weak Minion",
         hp = 5,
-        armor_class = 8
+        max_hp = 5,
+        armor_class = 8,
+        respawn_seconds = 60,
     })
 
-    -- Deal lethal damage
-    Combat.deal_damage(minion.id, 10, "physical")
+    local result = Combat.deal_damage(minion.id, 10, "physical")
+    Test.assert(result.killed, "Lethal damage kills")
 
+    -- The universe's npc_death policy: out of the world until it respawns
     local updated = game.get_object(minion.id)
-    Test.assert_eq(updated.metadata.hp, 0, "Health should be 0")
+    Test.assert(updated.parent_id == nil, "A dead NPC leaves the room")
+    Test.assert(Combat.is_dead(minion.id), "Combat.is_dead while waiting to respawn")
+    Test.assert_eq(updated.metadata.hp, 5, "HP restored for its respawn")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- COMBAT LOOP TESTS (PvM and PvP)
+-- Fights run in rounds on the server (combat_round_ms apart): within one
+-- script a test can start a fight and see its state, not watch rounds.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 function test_combat_initiation_pvm()
@@ -840,38 +851,43 @@ function test_combat_initiation_pvm()
     local room = create(P("/dungeon/monster-den"), "room", region.id, { name = "Monster Den" })
 
     local goblin = create(P("/dungeon/monster-den/goblin"), "npc", room.id, {
-        name = "Goblin",
-        hp = 20,
-        max_hp = 20,
-        armor_class = 12,
-        in_combat = false,
-        attackers = {}
+        name = "Goblin", hp = 200, max_hp = 200, armor_class = 12,
     })
 
-    -- Move player to room
     game.move_object(actors.body, room.id)
     act_as(actors.player)
 
-    -- Initiate combat
     local result = Combat.initiate(actors.body, goblin.id)
+    Test.assert(result.success, "Combat initiation should succeed: " .. tostring(result.message))
 
-    Test.assert(result.success, "Combat initiation should succeed")
+    local mine = Combat.state(actors.body)
+    Test.assert(mine.in_combat, "Player should be in combat")
+    Test.assert_eq(mine.attacking, goblin.id, "Player should be attacking goblin")
 
-    -- Check player combat state
-    local updated_player = game.get_object(actors.body)
-    Test.assert(updated_player.metadata.in_combat, "Player should be in combat")
-    Test.assert_eq(updated_player.metadata.attacking, goblin.id, "Player should be attacking goblin")
+    local theirs = Combat.state(goblin.id)
+    Test.assert(theirs.in_combat, "Goblin should be in combat")
+    Test.assert_eq(theirs.attacking, actors.body, "Goblin should fight back")
+    Test.assert_eq(theirs.attackers[1], actors.body, "Player should be in goblin's attackers")
 
-    -- Check goblin combat state
-    local updated_goblin = game.get_object(goblin.id)
-    Test.assert(updated_goblin.metadata.in_combat, "Goblin should be in combat")
-    Test.assert(updated_goblin.metadata.attackers[actors.body], "Player should be in goblin's attackers")
-    Test.assert_eq(updated_goblin.metadata.attacking, actors.body, "Goblin should auto-retaliate")
+    -- Retyping attack adds no blow
+    local again = Combat.initiate(actors.body, goblin.id)
+    Test.assert(not again.success, "No extra blow during a fight")
+
+    stop_fights(goblin.id)
 end
 
--- Set the universe PvP mode (game.update_universe needs admin+)
-local function set_pvp_mode(mode)
-    Test.assert(game.update_universe({ pvp_mode = mode }), "update_universe should set pvp_mode")
+-- Set a universe setting (game.update_universe needs admin+)
+local function set_universe(config)
+    act_as(ACCOUNTS.admin)
+    Test.assert(game.update_universe(config), "update_universe should succeed")
+end
+
+-- Both players' bodies in `room`, the first acting
+local function duel_setup(actors, room_id)
+    act_as(actors.wizard)
+    game.move_object(actors.body, room_id)
+    game.move_object(ACCOUNTS.player2_body, room_id)
+    act_as(actors.player)
 end
 
 function test_combat_pvp_disabled()
@@ -879,28 +895,16 @@ function test_combat_pvp_disabled()
     act_as(actors.wizard)
 
     local region = create(P("/town"), "region", nil, { name = "Town" })
-    local room = create(P("/town/square"), "room", region.id, { name = "Town Square" })
+    local room = create(P("/town/square"), "room", region.id, { name = "Town Square", is_arena = true })
 
-    -- Create another player
-    local player2 = create(P("/town/square/other-player"), "player", room.id, {
-        name = "OtherPlayer",
-        hp = 50,
-        in_combat = false,
-        attackers = {}
-    })
+    set_universe({ pvp_policy = Combat.PVP_POLICIES.DISABLED })
+    duel_setup(actors, room.id)
 
-    -- Set universe to PvP disabled
-    set_pvp_mode(Combat.PVP_MODES.DISABLED)
+    local result = Combat.initiate(actors.body, ACCOUNTS.player2_body)
+    Test.assert(not result.success, "PvP should be blocked when disabled, even in an arena")
+    Test.assert(not Combat.state(actors.body).in_combat, "Player should not be in combat")
 
-    -- Move first player to room
-    game.move_object(actors.body, room.id)
-    act_as(actors.player)
-
-    -- Try to attack other player
-    local result = Combat.initiate(actors.body, player2.id)
-
-    Test.assert(not result.success, "PvP should be blocked when disabled")
-    Test.assert(not game.get_object(actors.body).metadata.in_combat, "Player should not be in combat")
+    set_universe({ pvp_policy = Combat.PVP_POLICIES.ARENA })
 end
 
 function test_combat_pvp_arena_only()
@@ -908,38 +912,20 @@ function test_combat_pvp_arena_only()
     act_as(actors.wizard)
 
     local region = create(P("/town"), "region", nil, { name = "Town" })
-    local town_square = create(P("/town/square"), "room", region.id, {
-        name = "Town Square",
-        is_arena = false
-    })
-    local arena = create(P("/town/arena"), "room", region.id, {
-        name = "Arena",
-        is_arena = true
-    })
+    local town_square = create(P("/town/square"), "room", region.id, { name = "Town Square", is_arena = false })
+    local arena = create(P("/town/arena"), "room", region.id, { name = "Arena", is_arena = true })
 
-    local player2 = create(P("/town/other-player"), "player", nil, {
-        name = "OtherPlayer", hp = 50, in_combat = false, attackers = {}
-    })
+    set_universe({ pvp_policy = Combat.PVP_POLICIES.ARENA })
 
-    -- Set universe to arena-only PvP
-    set_pvp_mode(Combat.PVP_MODES.ARENA_ONLY)
-
-    -- Test in town square (non-arena)
-    game.move_object(actors.body, town_square.id)
-    game.move_object(player2.id, town_square.id)
-    act_as(actors.player)
-
-    local result1 = Combat.initiate(actors.body, player2.id)
+    duel_setup(actors, town_square.id)
+    local result1 = Combat.initiate(actors.body, ACCOUNTS.player2_body)
     Test.assert(not result1.success, "PvP should be blocked outside arena")
 
-    -- Test in arena
-    act_as(actors.wizard)
-    game.move_object(actors.body, arena.id)
-    game.move_object(player2.id, arena.id)
-    act_as(actors.player)
+    duel_setup(actors, arena.id)
+    local result2 = Combat.initiate(actors.body, ACCOUNTS.player2_body)
+    Test.assert(result2.success, "PvP should be allowed in arena: " .. tostring(result2.message))
 
-    local result2 = Combat.initiate(actors.body, player2.id)
-    Test.assert(result2.success, "PvP should be allowed in arena")
+    stop_fights(actors.body)
 end
 
 function test_combat_pvp_flagged()
@@ -949,79 +935,78 @@ function test_combat_pvp_flagged()
     local region = create(P("/wilderness"), "region", nil, { name = "Wilderness" })
     local room = create(P("/wilderness/forest"), "room", region.id, { name = "Forest" })
 
-    local player2 = create(P("/wilderness/forest/other-player"), "player", room.id, {
-        name = "OtherPlayer", hp = 50, in_combat = false, attackers = {}, pvp_flagged = false
-    })
-
-    -- Set universe to flagged PvP
-    set_pvp_mode(Combat.PVP_MODES.FLAGGED)
-
-    game.move_object(actors.body, room.id)
-    game.update_object(actors.body, { pvp_flagged = false })
-    act_as(actors.player)
-
-    -- Neither flagged - should fail
-    local result1 = Combat.initiate(actors.body, player2.id)
-    Test.assert(not result1.success, "PvP blocked when neither flagged")
-
-    -- Only attacker flagged - should fail
-    game.update_object(actors.body, { pvp_flagged = true })
-    local result2 = Combat.initiate(actors.body, player2.id)
-    Test.assert(not result2.success, "PvP blocked when only attacker flagged")
-
-    -- Both flagged - should succeed
+    set_universe({ pvp_policy = Combat.PVP_POLICIES.FLAGGED })
     act_as(actors.wizard)
-    game.update_object(player2.id, { pvp_flagged = true })
+    game.update_object(actors.body, { pvp = false })
+    game.update_object(ACCOUNTS.player2_body, { pvp = false })
+    duel_setup(actors, room.id)
+
+    Test.assert(not Combat.initiate(actors.body, ACCOUNTS.player2_body).success,
+        "PvP blocked when neither flagged")
+
+    act_as(actors.wizard)
+    game.update_object(actors.body, { pvp = true })
     act_as(actors.player)
-    local result3 = Combat.initiate(actors.body, player2.id)
-    Test.assert(result3.success, "PvP allowed when both flagged")
+    Test.assert(not Combat.initiate(actors.body, ACCOUNTS.player2_body).success,
+        "PvP blocked when only attacker flagged")
+
+    act_as(actors.wizard)
+    game.update_object(ACCOUNTS.player2_body, { pvp = true })
+    act_as(actors.player)
+    local result3 = Combat.initiate(actors.body, ACCOUNTS.player2_body)
+    Test.assert(result3.success, "PvP allowed when both flagged: " .. tostring(result3.message))
+
+    stop_fights(actors.body)
+    act_as(actors.wizard)
+    game.update_object(actors.body, { pvp = false })
+    game.update_object(ACCOUNTS.player2_body, { pvp = false })
+    set_universe({ pvp_policy = Combat.PVP_POLICIES.ARENA })
 end
 
-function test_combat_heartbeat_round()
+function test_combat_off_universe()
+    local actors = setup_test_world()
+    act_as(actors.wizard)
+
+    local region = create(P("/meadow"), "region", nil, { name = "Meadow" })
+    local room = create(P("/meadow/glade"), "room", region.id, { name = "Glade" })
+    local deer = create(P("/meadow/glade/deer"), "npc", room.id, { name = "Deer", hp = 20 })
+
+    set_universe({ combat = "off" })
+    act_as(actors.wizard)
+    game.move_object(actors.body, room.id)
+    act_as(actors.player)
+    local ok, why = Combat.can_attack(actors.body, deer.id)
+    Test.assert(not ok, "No fighting in a social universe")
+    Test.assert(not Combat.initiate(actors.body, deer.id).success, "initiate refused too")
+
+    set_universe({ combat = "on" })
+    act_as(actors.player)
+    Test.assert(Combat.can_attack(actors.body, deer.id), "Fighting again once combat is on")
+end
+
+function test_combat_rounds_scheduled()
     local actors = setup_test_world()
     act_as(actors.wizard)
 
     local region = create(P("/arena"), "region", nil, { name = "Arena" })
     local room = create(P("/arena/combat-pit"), "room", region.id, { name = "Combat Pit" })
-
     local goblin = create(P("/arena/combat-pit/goblin"), "npc", room.id, {
-        name = "Goblin",
-        hp = 100,  -- High HP to survive multiple rounds
-        max_hp = 100,
-        armor_class = 10,
-        in_combat = false,
-        attackers = {}
+        name = "Goblin", hp = 300, max_hp = 300, armor_class = 10,
     })
-
-    -- Give player a weapon
-    local sword = create(P("/arena/iron-sword"), "weapon", actors.body, {
-        name = "Iron Sword",
-        damage_dice = "1d8",
-        damage_bonus = 0
-    })
-    game.update_object(actors.body, { wielded = sword.id, hp = 100, max_hp = 100 })
 
     game.move_object(actors.body, room.id)
     act_as(actors.player)
+    local before = game.time()
+    Test.assert(Combat.initiate(actors.body, goblin.id).success, "fight starts")
 
-    -- Start combat
-    Combat.initiate(actors.body, goblin.id)
+    -- The next blows are rounds, scheduled ahead (combat_round_ms)
+    local mine = Combat.state(actors.body)
+    local theirs = Combat.state(goblin.id)
+    Test.assert(mine.next_round_at > before, "Player's next round is scheduled")
+    Test.assert(theirs.next_round_at > before, "Goblin's next round is scheduled")
 
-    local player_obj = game.get_object(actors.body)
-    Test.assert_eq(player_obj.metadata.combat_round, 0, "Combat round starts at 0")
-
-    -- Simulate heartbeat (combat round)
-    act_as(actors.wizard)
-    game.set_rng_seed(12345)  -- Deterministic for testing
-    act_as(actors.player)
-    game.use_object(actors.body, actors.body, "heart_beat")
-
-    player_obj = game.get_object(actors.body)
-    Test.assert_eq(player_obj.metadata.combat_round, 1, "Combat round incremented to 1")
-
-    -- Goblin should have taken some damage (or at least attack was attempted)
-    local updated_goblin = game.get_object(goblin.id)
-    Test.assert(updated_goblin.metadata.hp <= 100, "Goblin health should be same or lower after round")
+    stop_fights(goblin.id)
+    Test.assert(not Combat.state(actors.body).in_combat, "stop_combat ends the fight")
 end
 
 function test_combat_stop_when_target_dies()
@@ -1032,28 +1017,18 @@ function test_combat_stop_when_target_dies()
     local room = create(P("/arena/combat-pit"), "room", region.id, { name = "Combat Pit" })
 
     local goblin = create(P("/arena/combat-pit/goblin"), "npc", room.id, {
-        name = "Goblin",
-        hp = 1,  -- Very low HP
-        max_hp = 10,
-        armor_class = 5,  -- Easy to hit
-        in_combat = false,
-        attackers = {}
+        name = "Goblin", hp = 200, max_hp = 200, armor_class = 5,
     })
 
     game.move_object(actors.body, room.id)
     act_as(actors.player)
-
-    Combat.initiate(actors.body, goblin.id)
+    Test.assert(Combat.initiate(actors.body, goblin.id).success, "fight starts")
 
     -- Kill the goblin directly (as the wizard: players cannot modify NPCs)
     act_as(actors.wizard)
-    Combat.deal_damage(goblin.id, 10, "physical")
+    Test.assert(Combat.deal_damage(goblin.id, 1000, "physical").killed, "goblin dies")
 
-    -- Combat.handle_death should have been called, stopping combat
-    local player_obj = game.get_object(actors.body)
-    -- Note: depending on implementation, player might still be "in_combat"
-    -- until their next heartbeat checks for valid target
-    local _ = player_obj
+    Test.assert(not Combat.state(actors.body).in_combat, "A death ends the fight")
 end
 
 function test_combat_flee()
@@ -1061,108 +1036,26 @@ function test_combat_flee()
     act_as(actors.wizard)
 
     local region = create(P("/dungeon"), "region", nil, { name = "Dungeon" })
-    local room1 = create(P("/dungeon/monster-den"), "room", region.id, {
-        name = "Monster Den",
-        exits = {}  -- Will set after creating room2
-    })
+    local room1 = create(P("/dungeon/monster-den"), "room", region.id, { name = "Monster Den", exits = {} })
     local room2 = create(P("/dungeon/corridor"), "room", region.id, {
-        name = "Corridor",
-        exits = { south = room1.id }
+        name = "Corridor", exits = { south = room1.id }
     })
-    -- Link rooms
     game.update_object(room1.id, { exits = { north = room2.id } })
 
     local goblin = create(P("/dungeon/monster-den/goblin"), "npc", room1.id, {
-        name = "Goblin",
-        hp = 20, in_combat = false, attackers = {}
+        name = "Goblin", hp = 200, max_hp = 200,
     })
 
     game.move_object(actors.body, room1.id)
-    game.update_object(actors.body, { in_combat = true, attacking = goblin.id })
-
-    -- Force flee to succeed (seed that gives 2 on d2)
-    game.set_rng_seed(99999)
-
     act_as(actors.player)
+    Test.assert(Combat.initiate(actors.body, goblin.id).success, "fight starts")
 
     local result = Commands.flee(actors.body)
+    Test.assert(result.success, "Flee succeeds (flee_fail_percent 0): " .. tostring(result.message))
+    Test.assert(not Combat.state(actors.body).in_combat, "Player should exit combat on successful flee")
+    Test.assert_eq(game.environment(actors.body).id, room2.id, "Fled north")
 
-    -- Player should have moved to room2 (or failed to flee)
-    local player_obj = game.get_object(actors.body)
-    if result.success then
-        Test.assert(not player_obj.metadata.in_combat, "Player should exit combat on successful flee")
-    end
-end
-
-function test_npc_aggro()
-    local actors = setup_test_world()
-    act_as(actors.wizard)
-
-    local region = create(P("/dungeon"), "region", nil, { name = "Dungeon" })
-    local room = create(P("/dungeon/lair"), "room", region.id, { name = "Lair" })
-
-    -- Aggressive NPC that attacks players on sight
-    local wolf = create(P("/dungeon/lair/wolf"), "npc", room.id, {
-        name = "Dire Wolf",
-        hp = 30,
-        max_hp = 30,
-        in_combat = false,
-        attackers = {},
-        aggro_targets = { player = true },  -- Aggro on players
-        aggro_range = 0  -- Same room only
-    })
-
-    -- Simulate wolf's idle heartbeat before player arrives
-    game.use_object(wolf.id, wolf.id, "ai_idle_tick")
-
-    local wolf_obj = game.get_object(wolf.id)
-    Test.assert(not wolf_obj.metadata.in_combat, "Wolf should not be in combat (no targets)")
-
-    -- Player enters room
-    game.move_object(actors.body, room.id)
-
-    -- Wolf's next idle tick should detect player
-    game.use_object(wolf.id, wolf.id, "ai_idle_tick")
-
-    wolf_obj = game.get_object(wolf.id)
-    Test.assert(wolf_obj.metadata.in_combat, "Wolf should enter combat")
-    Test.assert_eq(wolf_obj.metadata.attacking, actors.body, "Wolf should target player")
-end
-
-function test_npc_flee_at_low_health()
-    local actors = setup_test_world()
-    act_as(actors.wizard)
-
-    local region = create(P("/forest"), "region", nil, { name = "Forest" })
-    local room1 = create(P("/forest/clearing"), "room", region.id, {
-        name = "Clearing",
-        exits = {}
-    })
-    local room2 = create(P("/forest/dense-forest"), "room", region.id, {
-        name = "Dense Forest",
-        exits = { south = room1.id }
-    })
-    game.update_object(room1.id, { exits = { north = room2.id } })
-
-    local coward_goblin = create(P("/forest/clearing/goblin"), "npc", room1.id, {
-        name = "Cowardly Goblin",
-        hp = 5,
-        max_hp = 20,  -- At 25% health
-        in_combat = true,
-        attacking = actors.body,
-        attackers = {},
-        flee_threshold = 0.3  -- Flee at 30% health
-    })
-
-    game.move_object(actors.body, room1.id)
-
-    -- Goblin's combat tick should trigger flee
-    game.use_object(coward_goblin.id, coward_goblin.id, "ai_combat_tick")
-
-    -- Goblin should have fled
-    local goblin_obj = game.get_object(coward_goblin.id)
-    Test.assert(not goblin_obj.metadata.in_combat, "Goblin should have fled combat")
-    Test.assert_eq(game.environment(goblin_obj.id).id, room2.id, "Goblin should have moved to room2")
+    stop_fights(goblin.id)
 end
 
 function test_status_effects_in_combat()
@@ -1171,36 +1064,29 @@ function test_status_effects_in_combat()
 
     local region = create(P("/arena"), "region", nil, { name = "Arena" })
     local room = create(P("/arena/pit"), "room", region.id, { name = "Pit" })
+    local dummy = create(P("/arena/pit/dummy"), "npc", room.id, {
+        name = "Training Dummy", hp = 100, armor_class = 10,
+    })
 
     game.move_object(actors.body, room.id)
-
-    -- Apply stunned status
-    game.update_object(actors.body, { statuses = { stunned = { remaining = 2 } } })
-
-    local dummy = create(P("/arena/pit/dummy"), "npc", room.id, {
-        name = "Training Dummy",
-        hp = 100, armor_class = 10, in_combat = false, attackers = {}
-    })
-
-    local sword = create(P("/arena/sword"), "weapon", actors.body, {
-        name = "Sword",
-        damage_dice = "1d8"
-    })
-    game.update_object(actors.body, { wielded = sword.id })
+    Combat.apply_effect(actors.body, Combat.EFFECTS.STUNNED, 30, 1)
 
     act_as(actors.player)
+    local result = Combat.attack(actors.body, dummy.id)
+    Test.assert(not result.success, "Attack should fail while stunned")
 
-    -- Attack while stunned should fail
-    local result = Combat.attack_extended(actors.body, dummy.id, sword.id)
-    Test.assert(not result.hit, "Attack should fail while stunned")
+    -- Effects are rows the server ends on their deadline; removed here
+    act_as(actors.wizard)
+    local found = false
+    for _, e in ipairs(Combat.effects(actors.body)) do
+        if e.type == "stunned" then found = true end
+    end
+    Test.assert(found, "Stunned is listed")
+    Test.assert(Combat.remove_effect(actors.body, Combat.EFFECTS.STUNNED), "Stunned removed")
+    act_as(actors.player)
+    Test.assert(Combat.attack(actors.body, dummy.id).success, "Can attack again")
 
-    -- Process status effects (decrement duration)
-    Combat.process_statuses(actors.body)
-    Combat.process_statuses(actors.body)  -- Second tick removes it
-
-    local player_obj = game.get_object(actors.body)
-    Test.assert(not player_obj.metadata.statuses or not player_obj.metadata.statuses.stunned,
-        "Stunned should be removed after duration")
+    stop_fights(dummy.id)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -1579,11 +1465,10 @@ local TESTS = {
     { "combat_loop", "test_combat_pvp_disabled", test_combat_pvp_disabled },
     { "combat_loop", "test_combat_pvp_arena_only", test_combat_pvp_arena_only },
     { "combat_loop", "test_combat_pvp_flagged", test_combat_pvp_flagged },
-    { "combat_loop", "test_combat_heartbeat_round", test_combat_heartbeat_round },
+    { "combat_loop", "test_combat_off_universe", test_combat_off_universe },
+    { "combat_loop", "test_combat_rounds_scheduled", test_combat_rounds_scheduled },
     { "combat_loop", "test_combat_stop_when_target_dies", test_combat_stop_when_target_dies },
     { "combat_loop", "test_combat_flee", test_combat_flee },
-    { "combat_loop", "test_npc_aggro", test_npc_aggro },
-    { "combat_loop", "test_npc_flee_at_low_health", test_npc_flee_at_low_health },
     { "combat_loop", "test_status_effects_in_combat", test_status_effects_in_combat },
 
     -- Permissions
@@ -1603,35 +1488,13 @@ local TESTS = {
 
 -- Tests not run, with the reason. "BUG:" marks a server bug: the test
 -- asserts the correct behavior and should pass once the bug is fixed.
-local NO_ATTACK_EXTENDED = "no Combat.attack_extended (elemental damage, immunities): lib/combat.lua"
-    .. " has only Combat.attack, and the Rust combat system (src/combat) has no game.* binding"
-local NO_COMBAT_STATE = "lib/combat.lua Combat.initiate only checks both are in the same room"
-    .. " (TODO at lib/combat.lua:54): no combat state (in_combat/attacking/attackers),"
-    .. " no auto-retaliate"
-local NO_PVP = "no PvP policy in Combat.initiate (TODO at lib/combat.lua:54); also"
-    .. " game.update_universe needs admin+, so the wizard eval cannot set pvp_mode"
+local NO_ATTACK_EXTENDED = "damage_parts weapons and Combat.attack_extended are not built yet (phase 2)"
 
 local SKIP = {
-    test_region_code_executes_on_enter = "no region on_enter hook: game.move_object"
-        .. " (src/lua/game_api.rs:558) fires no hooks, and websocket movement fires on_enter"
-        .. " only on the destination room (src/api/websocket.rs:850), never on its region",
+    test_region_code_executes_on_enter = "region hooks are not built yet (roadmap phase 3)",
     test_fire_sword_damage_against_normal_enemy = NO_ATTACK_EXTENDED,
     test_fire_sword_against_fire_immune_enemy = NO_ATTACK_EXTENDED,
     test_fire_sword_against_fire_resistant_enemy = NO_ATTACK_EXTENDED,
-    test_combat_initiation_pvm = NO_COMBAT_STATE,
-    test_combat_pvp_disabled = NO_PVP,
-    test_combat_pvp_arena_only = NO_PVP,
-    test_combat_pvp_flagged = NO_PVP,
-    test_combat_heartbeat_round = "no combat rounds: player/living objects have no heart_beat"
-        .. " code, nothing tracks combat_round, and Combat.initiate keeps no combat state",
-    test_combat_flee = "Commands.flee (lib/commands.lua:190) moves the player but cannot leave"
-        .. " combat: the mudlib tracks no combat state",
-    test_npc_aggro = "no NPC AI: class npc (src/objects/class.rs:166-171) only lists"
-        .. " ai_idle_tick/ai_combat_tick handler names; no code implements them",
-    test_npc_flee_at_low_health = "no NPC AI: class npc (src/objects/class.rs:166-171) only lists"
-        .. " ai_idle_tick/ai_combat_tick handler names; no code implements them",
-    test_status_effects_in_combat = "no stun handling in attacks and no Combat.process_statuses: "
-        .. NO_ATTACK_EXTENDED .. "; lib/combat.lua only has time-based Combat.process_effects",
 }
 
 local function run_all_tests(section)

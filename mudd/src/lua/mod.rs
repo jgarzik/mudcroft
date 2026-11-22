@@ -1,6 +1,7 @@
 //! Lua sandbox module - secure Lua execution with metering
 
 mod actions;
+pub mod engine;
 mod game_api;
 mod libs;
 mod messaging;

@@ -44,6 +44,11 @@ const IDLE_WAIT: Duration = Duration::from_secs(60);
 /// A universe's combat settings (its config)
 pub struct Settings {
     pub round_ms: u64,
+    /// "on" (default), "npc_only" (no player against player), "off" (no
+    /// fighting at all: social universes)
+    pub combat: String,
+    /// Chance (0-100) that a player's flee fails (default 0)
+    pub flee_fail_percent: u32,
     pub pvp: crate::combat::PvpPolicy,
     pub player_death: String,
     pub npc_death: String,
@@ -68,6 +73,12 @@ pub async fn settings(state: &AppState, universe_id: &str) -> Settings {
             .to_string()
     };
     Settings {
+        combat: choice("combat", &["on", "npc_only", "off"]),
+        flee_fail_percent: config
+            .get("flee_fail_percent")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(100) as u32,
         pvp: config
             .get("pvp_policy")
             .and_then(|v| v.as_str())
@@ -123,7 +134,11 @@ pub async fn pvp_allowed(
         return true;
     }
     let flagged = |o: &Object| o.get_bool("pvp").unwrap_or(false);
-    match settings(state, universe_id).await.pvp {
+    let settings = settings(state, universe_id).await;
+    if settings.combat != "on" {
+        return false;
+    }
+    match settings.pvp {
         PvpPolicy::Disabled => false,
         PvpPolicy::Open => true,
         PvpPolicy::Flagged => flagged(attacker) && flagged(target),
@@ -148,6 +163,43 @@ pub fn weapon_dice(notation: &str) -> Option<crate::combat::DiceRoll> {
             && (1..=1000).contains(&roll.sides)
             && roll.modifier.unsigned_abs() <= 1000
     })
+}
+
+/// Whether `attacker` may fight `target` now: the universe allows fighting
+/// (`combat` not "off"), the target is a creature (an npc, a subclass, a
+/// monster) or a player the PvP rules allow, both are alive and together.
+/// Err is the reason, for the player.
+pub async fn fight_allowed(
+    state: &AppState,
+    universe_id: &str,
+    attacker: &Object,
+    target: &Object,
+) -> Result<(), String> {
+    let tn = name_of(target);
+    if settings(state, universe_id).await.combat == "off" {
+        return Err("There is no fighting in this world.".to_string());
+    }
+    if attacker.id == target.id {
+        return Err("You can't attack yourself.".to_string());
+    }
+    if attacker.parent_id.is_none() || attacker.parent_id != target.parent_id {
+        return Err(format!("You don't see {} here.", tn));
+    }
+    if !alive(target) {
+        return Err(format!("{} is already dead.", tn));
+    }
+    let creature = target.class == "monster"
+        || state
+            .classes
+            .read()
+            .await
+            .is_a(universe_id, &target.class, "npc");
+    let allowed =
+        creature || (is_player(target) && pvp_allowed(state, universe_id, attacker, target).await);
+    if !allowed {
+        return Err(format!("You can't attack {}.", tn));
+    }
+    Ok(())
 }
 
 /// What one blow did, and what each party is told
@@ -443,17 +495,73 @@ async fn arrival_inner(
     let aggressive = |o: &Object| !is_player(o) && o.get_bool("aggro").unwrap_or(false) && alive(o);
     let here = store.get_contents(universe_id, room).await?;
     if is_player(&mover) {
-        for npc in here.iter().filter(|o| aggressive(o)) {
-            if !in_combat(state, universe_id, &npc.id).await? {
+        // Each NPC there not fighting may react with its own ai_idle_tick
+        // (a non-nil result replaces the built-in aggro)
+        let mut handled = std::collections::HashSet::new();
+        for npc in here
+            .iter()
+            .filter(|o| !is_player(o) && o.id != mover.id && alive(o))
+        {
+            if !in_combat(state, universe_id, &npc.id).await?
+                && ai_override(
+                    state,
+                    universe_id,
+                    &npc.id,
+                    Some(room.to_string()),
+                    "ai_idle_tick",
+                    json!({ "reason": "arrival", "arrived_id": mover.id }),
+                )
+                .await
+            {
+                handled.insert(npc.id.clone());
+            }
+        }
+        for npc in here
+            .iter()
+            .filter(|o| aggressive(o) && !handled.contains(&o.id))
+        {
+            if !in_combat(state, universe_id, &npc.id).await?
+                && fight_allowed(state, universe_id, npc, &mover).await.is_ok()
+            {
                 engage_at(state, universe_id, &npc.id, &mover.id, now, next).await?;
             }
         }
     } else if aggressive(&mover) && !in_combat(state, universe_id, &mover.id).await? {
         if let Some(player) = here.iter().find(|o| is_player(o) && alive(o)) {
-            engage_at(state, universe_id, &mover.id, &player.id, now, next).await?;
+            if fight_allowed(state, universe_id, &mover, player)
+                .await
+                .is_ok()
+            {
+                engage_at(state, universe_id, &mover.id, &player.id, now, next).await?;
+            }
         }
     }
     Ok(())
+}
+
+/// Run an NPC's AI handler (as its owner): true if it handled the moment
+/// (returned something other than nil), false to use the built-in
+/// behaviour (no code, no such handler, nil, or an error, which is logged)
+async fn ai_override(
+    state: &AppState,
+    universe_id: &str,
+    npc: &str,
+    room: Option<String>,
+    handler: &str,
+    mut args: serde_json::Value,
+) -> bool {
+    if let Some(map) = args.as_object_mut() {
+        map.insert("object_id".into(), npc.into());
+        map.insert("room_id".into(), room.clone().into());
+    }
+    match super::scripting::invoke_handler(state, universe_id, npc, room, handler, args).await {
+        Ok(Some(reply)) => reply != "nil" && !reply.is_empty(),
+        Ok(None) => false,
+        Err(e) => {
+            warn!("{} of {} failed: {}", handler, npc, e);
+            false
+        }
+    }
 }
 
 /// The exits of a room as (direction, destination)
@@ -506,7 +614,11 @@ async fn leave_randomly(
         return Ok(None);
     }
     let (dir, to) = choices.swap_remove(rand::rng().random_range(0..choices.len()));
-    store.move_object(universe_id, &who.id, Some(&to)).await?;
+    if is_player(who) {
+        move_player(state, universe_id, &who.id, Some(&to)).await?;
+    } else {
+        store.move_object(universe_id, &who.id, Some(&to)).await?;
+    }
     let name = name_of(who);
     notes.push(Note::Room(
         universe_id.to_string(),
@@ -974,6 +1086,11 @@ pub async fn process(state: &AppState, now: u64) {
             return;
         }
     };
+    deliver(state, notes).await;
+}
+
+/// Messages and hooks for after a commit
+async fn deliver(state: &AppState, notes: Vec<Note>) {
     for note in notes {
         match note {
             Note::Player(u, p, text) => {
@@ -1113,9 +1230,9 @@ async fn round(
             }
         }
         let target = target.expect("found above");
-        // Player against player only while the policy allows it (a flag
+        // Only while the rules allow it (combat switched off, a PvP flag
         // switched off, the policy changed)
-        if !pvp_allowed(state, &u, &attacker, &target).await {
+        if fight_allowed(state, &u, &attacker, &target).await.is_err() {
             store.execute_batch(vec![end(&u, &entity)]).await?;
             if is_player(&attacker) {
                 notes.push(Note::Player(
@@ -1142,6 +1259,21 @@ async fn round(
                     "You are stunned and cannot act.".into(),
                 ));
             }
+            return Ok(());
+        }
+        // An NPC's own ai_combat_tick (as its owner) may take its turn
+        // instead: a non-nil result replaces the built-in behaviour
+        if !is_player(&attacker)
+            && ai_override(
+                state,
+                &u,
+                &entity,
+                attacker.parent_id.clone(),
+                "ai_combat_tick",
+                json!({ "target_id": target_id, "hp": Combatant::from_object(&attacker, 10).hp }),
+            )
+            .await
+        {
             return Ok(());
         }
         // A hurt NPC below its flee_threshold (a fraction of max HP) runs
@@ -1337,11 +1469,21 @@ async fn deadline(
                 else {
                     return Ok(());
                 };
-                // Not while fighting, dead or nowhere; within its region
+                // Not while fighting, dead or nowhere; within its region.
+                // Its own ai_idle_tick may act instead (non-nil result).
                 if !is_player(&obj)
                     && alive(&obj)
                     && obj.parent_id.is_some()
                     && !in_combat(state, &u, &id).await?
+                    && !ai_override(
+                        state,
+                        &u,
+                        &id,
+                        obj.parent_id.clone(),
+                        "ai_idle_tick",
+                        json!({ "reason": "wander" }),
+                    )
+                    .await
                 {
                     leave_randomly(state, &u, &obj, true, "leaves", notes).await?;
                 }
@@ -1358,6 +1500,336 @@ async fn deadline(
         }
     }
     Ok(())
+}
+
+/// The engine as Lua sees it (game.attack and friends; lua::engine)
+pub struct CombatEngine {
+    pub state: AppState,
+}
+
+use crate::lua::engine::{BlowReport, BoxFuture, CombatState, DamageReport, Engine};
+
+impl CombatEngine {
+    async fn object(&self, universe_id: &str, id: &str) -> Result<Object, String> {
+        self.state
+            .object_store
+            .get(universe_id, id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no such object: {}", id))
+    }
+
+    /// Deliver notes and a death report once the current run commits
+    async fn after(&self, notes: Vec<Note>, death: Option<Death>) {
+        let st = self.state.clone();
+        crate::db::run::after_commit(move || async move {
+            deliver(&st, notes).await;
+            if let Some(d) = death {
+                let u = d.victim.universe_id.clone();
+                report_death(&st, &u, &d).await;
+            }
+        })
+        .await;
+    }
+
+    async fn attack_inner(
+        &self,
+        u: &str,
+        attacker_id: &str,
+        target_id: &str,
+    ) -> Result<BlowReport, String> {
+        let state = &self.state;
+        let _writes = state.effects.write_guard().await;
+        let attacker = self.object(u, attacker_id).await?;
+        let target = self.object(u, target_id).await?;
+        fight_allowed(state, u, &attacker, &target).await?;
+        let now = now_ms();
+        if !state.effects.get(u, attacker_id).await.can_act(now) {
+            return Err(format!("{} is stunned and cannot act.", name_of(&attacker)));
+        }
+        // Rounds set the pace: no extra blow during a fight
+        match current_target(state, u, attacker_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Some(current) if current == target_id => {
+                return Err(format!("already fighting {}", name_of(&target)));
+            }
+            Some(_) => {
+                retarget(state, u, attacker_id, target_id, now)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(BlowReport {
+                    text: format!(
+                        "{} turns to fight {}.",
+                        name_of(&attacker),
+                        name_of(&target)
+                    ),
+                    ..Default::default()
+                });
+            }
+            None => {}
+        }
+        let blow = strike(state, u, &attacker, &target, now)
+            .await
+            .map_err(|e| e.to_string())?;
+        let room = attacker.parent_id.clone().unwrap_or_default();
+        let mut notes = Vec::new();
+        if is_player(&attacker) {
+            notes.push(Note::Player(
+                u.to_string(),
+                attacker_id.to_string(),
+                blow.attacker_text.clone(),
+            ));
+        }
+        if is_player(&target) {
+            notes.push(Note::Player(
+                u.to_string(),
+                target_id.to_string(),
+                blow.target_text.clone(),
+            ));
+        }
+        notes.push(Note::Room(
+            u.to_string(),
+            room.clone(),
+            blow.room_text.clone(),
+            Some(attacker_id.to_string()),
+        ));
+        if let Some(damage) = blow.damage {
+            notes.push(Note::Hook(
+                u.to_string(),
+                target_id.to_string(),
+                Some(room),
+                json!({ "attacker_id": attacker_id, "damage": damage }),
+            ));
+        }
+        let death = if blow.killed {
+            let dead = self.object(u, target_id).await?;
+            Some(
+                death(state, u, &dead, Some(&attacker), now)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            engage(state, u, attacker_id, target_id, now)
+                .await
+                .map_err(|e| e.to_string())?;
+            None
+        };
+        self.after(notes, death).await;
+        Ok(BlowReport {
+            hit: blow.damage.is_some(),
+            critical: blow.attacker_text.starts_with("CRITICAL"),
+            fumble: blow.attacker_text.starts_with("You fumble"),
+            damage: blow.damage.unwrap_or(0) as i64,
+            killed: blow.killed,
+            text: blow.attacker_text,
+            parts: Vec::new(),
+        })
+    }
+
+    async fn damage_inner(
+        &self,
+        u: &str,
+        target_id: &str,
+        amount: i64,
+        damage_type: &str,
+        source: Option<&str>,
+    ) -> Result<DamageReport, String> {
+        let state = &self.state;
+        let _writes = state.effects.write_guard().await;
+        let target = self.object(u, target_id).await?;
+        let dtype = damage_type
+            .parse::<DamageType>()
+            .map_err(|_| format!("unknown damage type: {}", damage_type))?;
+        let amount = amount.clamp(0, 1_000_000) as i32;
+        let who = Combatant::from_object(&target, if is_player(&target) { 100 } else { 10 });
+        let dealt = who
+            .profile
+            .calculate_damage(amount, dtype, false)
+            .final_damage
+            .max(0);
+        let was_alive = who.hp > 0;
+        let hp = who.hp.saturating_sub(dealt).max(0);
+        state
+            .object_store
+            .execute_batch(vec![crate::objects::ObjectStore::set_properties_statement(
+                u,
+                target_id,
+                &[("hp", json!(hp))],
+            )
+            .map_err(|e| e.to_string())?])
+            .await
+            .map_err(|e| e.to_string())?;
+        let killed = was_alive && hp == 0;
+        let death = if killed {
+            let killer = match source {
+                Some(s) => state.object_store.get(u, s).await.ok().flatten(),
+                None => None,
+            };
+            let dead = self.object(u, target_id).await?;
+            Some(
+                death(state, u, &dead, killer.as_ref(), now_ms())
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        self.after(Vec::new(), death).await;
+        Ok(DamageReport {
+            damage: dealt as i64,
+            hp: hp as i64,
+            killed,
+        })
+    }
+
+    async fn flee_inner(&self, u: &str, id: &str) -> Result<String, String> {
+        let state = &self.state;
+        let who = self.object(u, id).await?;
+        let now = now_ms();
+        if !state.effects.get(u, id).await.can_act(now) {
+            return Err("You are stunned and cannot flee.".to_string());
+        }
+        let fail = settings(state, u).await.flee_fail_percent;
+        if fail > 0 && rand::rng().random_range(0..100) < fail {
+            return Err("You try to flee but fail to get away!".to_string());
+        }
+        let mut notes = Vec::new();
+        let dir = leave_randomly(state, u, &who, false, "flees", &mut notes)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "There is nowhere to run.".to_string())?;
+        // Its own fight ends; its attackers' end on their next round (no
+        // longer together)
+        state
+            .object_store
+            .execute_batch(vec![statement(
+                "DELETE FROM combat WHERE universe_id = ? AND entity_id = ?",
+                vec![json!(u), json!(id)],
+            )])
+            .await
+            .map_err(|e| e.to_string())?;
+        self.after(notes, None).await;
+        Ok(dir)
+    }
+}
+
+impl Engine for CombatEngine {
+    fn can_attack<'a>(
+        &'a self,
+        universe_id: &'a str,
+        attacker: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let a = self.object(universe_id, attacker).await?;
+            let t = self.object(universe_id, target).await?;
+            fight_allowed(&self.state, universe_id, &a, &t).await
+        })
+    }
+
+    fn attack<'a>(
+        &'a self,
+        universe_id: &'a str,
+        attacker: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Result<BlowReport, String>> {
+        Box::pin(self.attack_inner(universe_id, attacker, target))
+    }
+
+    fn combat_state<'a>(
+        &'a self,
+        universe_id: &'a str,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<CombatState, String>> {
+        Box::pin(async move {
+            let pool = self.state.db.pool();
+            let mine: Option<(String, i64)> = sqlx::query_as(
+                "SELECT target_id, next_round_at FROM combat WHERE universe_id = ? AND entity_id = ?",
+            )
+            .bind(universe_id)
+            .bind(id)
+            .fetch_optional(&mut *crate::db::run::reader(pool).await.map_err(|e| e.to_string())?)
+            .await
+            .map_err(|e| e.to_string())?;
+            let attackers: Vec<String> = sqlx::query_scalar(
+                "SELECT entity_id FROM combat WHERE universe_id = ? AND target_id = ? ORDER BY entity_id",
+            )
+            .bind(universe_id)
+            .bind(id)
+            .fetch_all(&mut *crate::db::run::reader(pool).await.map_err(|e| e.to_string())?)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(CombatState {
+                in_combat: mine.is_some(),
+                attacking: mine.as_ref().map(|(t, _)| t.clone()),
+                next_round_at: mine.map(|(_, at)| at.max(0) as u64),
+                attackers,
+            })
+        })
+    }
+
+    fn damage<'a>(
+        &'a self,
+        universe_id: &'a str,
+        target: &'a str,
+        amount: i64,
+        damage_type: &'a str,
+        source: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<DamageReport, String>> {
+        Box::pin(self.damage_inner(universe_id, target, amount, damage_type, source))
+    }
+
+    fn heal<'a>(
+        &'a self,
+        universe_id: &'a str,
+        target: &'a str,
+        amount: i64,
+    ) -> BoxFuture<'a, Result<i64, String>> {
+        Box::pin(async move {
+            let _writes = self.state.effects.write_guard().await;
+            let t = self.object(universe_id, target).await?;
+            let who = Combatant::from_object(&t, if is_player(&t) { 100 } else { 10 });
+            let hp = (who.hp as i64)
+                .saturating_add(amount.clamp(0, 1_000_000))
+                .min(who.max_hp as i64);
+            self.state
+                .object_store
+                .execute_batch(vec![crate::objects::ObjectStore::set_properties_statement(
+                    universe_id,
+                    target,
+                    &[("hp", json!(hp))],
+                )
+                .map_err(|e| e.to_string())?])
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(hp)
+        })
+    }
+
+    fn stop<'a>(&'a self, universe_id: &'a str, id: &'a str) -> BoxFuture<'a, Result<u64, String>> {
+        Box::pin(async move {
+            let response = self
+                .state
+                .raft_writer
+                .execute(
+                    "DELETE FROM combat WHERE universe_id = ? AND (entity_id = ? OR target_id = ?)",
+                    vec![json!(universe_id), json!(id), json!(id)],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(response.rows_affected)
+        })
+    }
+
+    fn flee<'a>(
+        &'a self,
+        universe_id: &'a str,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(self.flee_inner(universe_id, id))
+    }
 }
 
 #[cfg(test)]

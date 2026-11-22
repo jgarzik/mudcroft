@@ -166,16 +166,17 @@ return goblin.error or goblin.id
 
 This is what the built-in `attack goblin` command does:
 
-- It can target objects of class `npc`, of a class derived from `npc` (Lesson 4), or of class `monster`.
-- On the first attack, the combat system copies `hp` and `max_hp` from the NPC. From then on it tracks HP itself.
-- Each attack rolls a d20 against armor class 10. A hit deals 1d6 damage, doubled on a natural 20. The NPC's `armor_class` and `attack_bonus` properties are **not** used.
-- A hit runs the NPC's `on_damage` hook. A kill runs `on_death` and removes the NPC from the room. The NPC object isn't deleted.
-- **NPCs don't fight back on their own.** Part B shows how to add that in Lua.
+- It can target objects of class `npc`, of a class derived from `npc` (Lesson 4), or of class `monster` (and other players, if the universe's `pvp_policy` allows it).
+- HP lives in the NPC's `hp` property (and `max_hp`); the attack reads and writes it there, so Lua sees the same number.
+- Each blow rolls a d20 plus the attacker's `attack_bonus` against the target's `armor_class` (default 10). A hit deals 1d6 damage (or a wielded weapon's dice), doubled on a natural 20, after the target's `resistances`.
+- The first blow lands at once; then both sides strike every `combat_round_ms` until one dies or leaves: the NPC fights back.
+- A hit runs the NPC's `on_damage` hook. A kill runs `on_death`; the NPC leaves the room and respawns after its `respawn_seconds` (default 300), and the killer gains XP.
 
 Players can't `take` NPCs or other living things. `fixed = true` still
-stops non-builders moving them with `game.move_object`. `aggro` and
-`respawn_time` exist as class properties but do nothing; respawning is
-done in Lua (Part B).
+stops non-builders moving them with `game.move_object`. `aggro = true`
+makes an NPC attack whoever arrives; see [Built-in
+combat](langref.md#built-in-combat) for fleeing, factions, wandering and the
+universe's combat settings.
 
 ### Lesson 4: Custom classes
 
@@ -257,8 +258,9 @@ The first four hooks also get `object_id`, `actor_id` and `room_id`.
 `heart_beat` gets `object_id`, `room_id` and `args` (always `nil`).
 
 These handler names **never fire on their own**: `on_create`,
-`on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and
-`ai_combat_tick`. Engine hooks (the table above, plus `on_create` and
+`on_destroy`, `on_init`, `on_move` and `on_use`. (`ai_idle_tick` and
+`ai_combat_tick` fire for NPCs: see [Built-in
+combat](langref.md#built-in-combat).) Engine hooks (the table above, plus `on_create` and
 `on_destroy`) can't be triggered with `game.use_object` either. Other
 limits:
 
@@ -470,25 +472,24 @@ A complete six-room dungeon. It has:
 - a key and a locked chest
 - healing potions with a `drink` verb
 - a trapped corridor that uses a timer
-- skeletons that wake when you enter, fight back, and respawn
-- a boss with a second phase
+- skeletons that attack on sight, fight in rounds, and respawn
+- a boss who enrages at half health and drops loot
 
-Everything here uses features that work today.
+Everything here uses features that work today. The fighting itself is the
+server's combat engine (see [Built-in combat](langref.md#built-in-combat)):
+the crypt only sets properties (`aggro`, `respawn_seconds`, weapons) and
+adds flavour in hooks.
 
 ### How it's organised
 
-The crypt is a **universe library**, `crypt.lua`. Add it when the
-universe is created (the `libs` field of `/universe/create`, or a `.lua`
-file in the ZIP upload; see [API](API.md)).
-
-A library runs before *every* script in the universe, so it only
-**defines** things:
+The crypt is a Lua file, `crypt.lua`, that only **defines** two functions:
 
 - `build_crypt()` builds the area once.
 - `crypt_verbs()` registers the custom verbs (once: they are saved).
-- `crypt_strike()` is a shared attack helper. Object code can call it because libraries are loaded into object code too.
 
-To play it, connect as a wizard and run:
+Install it as a universe library (the `libs` field of `/universe/create`,
+or a `.lua` file in the ZIP upload; see [API](API.md)), or paste it into
+one `eval` together with the calls. Connect as a wizard and run:
 
 ```
 eval return build_crypt()
@@ -498,7 +499,8 @@ setportal /d/crypt/entrance
 
 Everything is created and owned by the wizard who runs `build_crypt()`,
 so all the crypt's code runs with that wizard's rights. That's needed
-here, because the code updates the HP of player objects.
+here, because the trap and the potions change players' HP
+(`game.damage`, `game.heal` need Modify permission on the target).
 
 Each player has a separate player object in every universe they visit,
 created on their first visit, so the crypt hurts, heals and hands items to
@@ -507,56 +509,30 @@ the visitor's player object in this universe only.
 `build_crypt()` is meant for a fresh universe. To rebuild, delete the
 `/d/crypt/...` objects first, contents before containers.
 
-The monsters' code calls `crypt_strike`, so `crypt.lua` must be
-installed as a library. Running it once with `run_script` is not enough.
-
 ### `crypt.lua`
 
 ```lua
--- crypt.lua: universe library for "The Cursed Crypt".
--- Libraries run before every script, so this file only defines things.
+-- crypt.lua: "The Cursed Crypt". Only defines things:
 --   eval return build_crypt()   -- once, on a fresh universe
---   eval return crypt_verbs()   -- after building, and after every restart
+--   eval return crypt_verbs()   -- once, after building
 
 local AREA = "/d/crypt"
 local Code = {}
-
--- Shared attack helper, also used by monster code.
--- Player HP lives in the player object's hp property.
-function crypt_strike(me, target_id, dice)
-    local target = game.get_object(target_id)
-    if not target or target.parent_id ~= me.parent_id then return end
-    local roll = game.roll_dice("1d20") + (me.metadata.attack_bonus or 0)
-    if roll < (target.metadata.armor_class or 10) then
-        game.send(target_id, me.name .. " swings at you and misses.")
-        return
-    end
-    local dmg = game.roll_dice(dice or "1d6")
-    local hp = (target.metadata.hp or 100) - dmg
-    game.send(target_id, string.format("%s hits you for %d damage! (HP: %d)", me.name, dmg, math.max(hp, 0)))
-    game.broadcast(me.parent_id, me.name .. " hits " .. (target.name or "someone") .. ".", target_id)
-    if hp <= 0 then
-        hp = target.metadata.max_hp or 100
-        game.send(target_id, "You black out... and wake up, battered but whole.")
-    end
-    game.update_object(target_id, {hp = hp})
-end
 
 -- Healing potion: "drink potion" (must be carried)
 Code.potion = [=[
 return {
     drink = function(a)
         local potion = game.get_object(a.object_id)
-        local me = game.get_object(a.actor_id)
-        if not me then return "Only adventurers can drink potions." end
+        if not a.actor_id or not game.get_object(a.actor_id) then
+            return "Only adventurers can drink potions."
+        end
         if potion.parent_id ~= a.actor_id then return "Pick it up first." end
-        local heal = game.roll_dice(potion.metadata.heal_dice)
-        local max_hp = me.metadata.max_hp or 100
-        local hp = math.min((me.metadata.hp or max_hp) + heal, max_hp)
-        game.update_object(a.actor_id, {hp = hp})
+        local hp = game.heal(a.actor_id, game.roll_dice(potion.metadata.heal_dice))
+        local me = game.get_object(a.actor_id)
         game.broadcast(a.room_id, me.name .. " drinks a glowing potion.", a.actor_id)
         game.delete_object(a.object_id)
-        return string.format("You recover %d HP. (HP: %d/%d)", heal, hp, max_hp)
+        return string.format("You feel better. (HP: %d)", hp)
     end,
 }
 ]=]
@@ -606,94 +582,56 @@ return {
         -- a timer on a room: a.object_id is the room, a.args the victim
         local victim = game.get_object(a.args)
         if not victim or victim.parent_id ~= a.object_id then return end
-        local dmg = game.roll_dice("2d6")
-        local hp = math.max((victim.metadata.hp or 100) - dmg, 1)
-        game.update_object(victim.id, {hp = hp})
-        game.send(victim.id, string.format("Poison darts hit you for %d damage! (HP: %d)", dmg, hp))
-        game.broadcast(a.object_id, "Darts hiss out of the walls!", victim.id)
-    end,
-}
-]=]
-
--- Lair (room code): wake every monster here when someone enters
-Code.lair = [=[
-return {
-    on_enter = function(a)
-        if not a.actor_id then return end   -- only living arrivals
-        for _, npc in ipairs(game.get_living_in(a.object_id)) do
-            if npc.class == "npc" and npc.code_hash then
-                game.use_object(npc.id, a.actor_id, "wake")
-            end
+        local hit = game.damage(victim.id, game.roll_dice("2d6"), "piercing", a.object_id)
+        if hit then
+            game.send(victim.id, string.format("Poison darts hit you for %d damage! (HP: %d)", hit.damage, hit.hp))
+            game.broadcast(a.object_id, "Darts hiss out of the walls!", victim.id)
         end
     end,
 }
 ]=]
 
--- Skeleton: attacks every 3s while players are present, strikes back
--- when hit, and respawns after respawn_secs
+-- Skeletons: the engine does the fighting (aggro, rounds, respawn); the
+-- code only adds flavour
 Code.skeleton = [=[
 return {
-    wake = function(a)
-        game.set_heart_beat(3000)
-    end,
-    heart_beat = function(a)
-        local me = game.get_object(a.object_id)
-        if not me or not me.parent_id then game.remove_heart_beat() return end
-        for _, e in ipairs(game.get_living_in(me.parent_id)) do
-            if e.class == "player" then
-                crypt_strike(me, e.id, me.metadata.damage_dice)
-                return
-            end
-        end
-        game.remove_heart_beat()   -- nobody here: back to sleep
-    end,
-    on_damage = function(a)
-        local me = game.get_object(a.object_id)
-        if me.parent_id then crypt_strike(me, a.attacker_id, me.metadata.damage_dice) end
-    end,
     on_death = function(a)
-        game.remove_heart_beat()
         game.broadcast(a.room_id, "The skeleton collapses into a pile of bones.")
-        local me = game.get_object(a.object_id)
-        game.call_out(me.metadata.respawn_secs or 180, "respawn", a.room_id)
-    end,
-    respawn = function(a)
-        local me = game.get_object(a.object_id)
-        game.move_object(a.object_id, a.args)
-        game.update_object(a.object_id, {hp = me.metadata.max_hp})
-        game.broadcast(a.args, "Bones rattle and reassemble. " .. me.name .. " rises again!")
     end,
 }
 ]=]
 
--- Boss: strikes back when hit, enrages at half health, drops loot
+-- Boss: enrages at half health. On its rounds, once enraged, its
+-- ai_combat_tick adds a burst of green fire; returning nil lets its
+-- normal blow follow. It never respawns (respawn_seconds = 0).
 Code.boss = [=[
 return {
     on_damage = function(a)
         local me = game.get_object(a.object_id)
-        if not me.parent_id then return end   -- this hit killed him
-        local taken = (me.metadata.damage_taken or 0) + a.damage
-        local enraged = me.metadata.enraged or taken * 2 >= me.metadata.max_hp
-        if enraged and not me.metadata.enraged then
-            game.broadcast(a.room_id, 'Valdris roars: "YOU DARE?" Green fire wreathes his blade!')
+        if me.metadata.enraged or me.metadata.hp * 2 > me.metadata.max_hp then return end
+        game.update_object(a.object_id, {enraged = true})
+        game.broadcast(a.room_id, 'Valdris roars: "YOU DARE?" Green fire wreathes his blade!')
+    end,
+    ai_combat_tick = function(a)
+        local me = game.get_object(a.object_id)
+        if me.metadata.enraged and a.target_id then
+            game.damage(a.target_id, game.roll_dice("1d6"), "necrotic", a.object_id)
+            game.send(a.target_id, "Green fire sears you!")
         end
-        game.update_object(a.object_id, {damage_taken = taken, enraged = enraged})
-        crypt_strike(me, a.attacker_id, "1d8+2")
-        if enraged then crypt_strike(me, a.attacker_id, "2d6") end
+        return nil   -- and strike as usual
     end,
     on_death = function(a)
         game.broadcast(a.room_id, 'Valdris shrieks: "I AM ETERNAL!" and dissolves into shadow.')
-        game.create_object("/d/crypt/loot/soulreaver", "weapon", a.room_id, {
+        game.create_object("/d/crypt/loot/soulreaver", "item", a.room_id, {
             name = "Soulreaver",
             description = "The Crypt Lord's blade, still pulsing with dark energy.",
-            damage_dice = "2d6", damage_type = "necrotic", value = 2000,
+            slot = "weapon", damage = "2d6", damage_type = "necrotic", value = 2000,
         })
         game.create_object("/d/crypt/loot/crown", "item", a.room_id, {
             name = "Crown of the Crypt Lord",
             description = "Black iron set with a single blood-red gem.",
-            value = 5000,
+            slot = "head", armor_class = 2, value = 5000,
         })
-        game.delete_object(a.object_id)   -- a permanent kill
     end,
 }
 ]=]
@@ -733,10 +671,10 @@ function build_crypt()
         {south = R("antechamber")})
     room("antechamber", "Burial Antechamber",
         "Alcoves line the walls, each holding a corpse in rotting cloth.",
-        {north = R("entrance"), west = R("hall")}, h.lair)
+        {north = R("entrance"), west = R("hall")})
     room("hall", "Hall of Bones",
         "The walls are stacked skulls. Passages lead north and south.",
-        {east = R("antechamber"), north = R("corridor"), south = R("throne")}, h.lair)
+        {east = R("antechamber"), north = R("corridor"), south = R("throne")})
     room("corridor", "Trapped Corridor",
         "A narrow passage. The floor tiles look suspiciously uniform.",
         {south = R("hall"), north = R("treasury")}, h.trap)
@@ -745,7 +683,7 @@ function build_crypt()
         {south = R("corridor")})
     room("throne", "Throne of the Crypt Lord",
         "A throne of blackened bone. Ancient runes glow a sickly green.",
-        {north = R("hall")}, h.lair)
+        {north = R("hall")})
 
     local key = make(R("key"), "item", R("entrance"), {
         name = "rusty key", description = "An iron key, rusted but sound.",
@@ -762,25 +700,30 @@ function build_crypt()
         name = "iron chest", description = "A heavy iron chest with a rusted lock.",
         key_id = key, code_hash = h.chest,
     })
-    make(R("flamebrand"), "weapon", R("treasury"), {
+    make(R("flamebrand"), "item", R("treasury"), {
         name = "Flamebrand", description = "Flames dance along the blade.",
-        damage_dice = "1d8", damage_type = "fire", value = 1500,
+        slot = "weapon", damage = "1d8", damage_type = "fire", value = 1500,
     })
 
     make(R("skeleton-guard"), "npc", R("antechamber"), {
         name = "skeleton guard", description = "Rusted armor over yellowed bones.",
-        hp = 12, max_hp = 12, attack_bonus = 2, damage_dice = "1d4+1",
-        respawn_secs = 120, fixed = true, code_hash = h.skeleton,
+        hp = 12, max_hp = 12, attack_bonus = 2, armor_class = 11,
+        aggro = true, respawn_seconds = 120, fixed = true, code_hash = h.skeleton,
     })
-    make(R("skeleton-warrior"), "npc", R("hall"), {
+    local warrior = make(R("skeleton-warrior"), "npc", R("hall"), {
         name = "skeleton warrior", description = "A tall skeleton with a notched greatsword.",
-        hp = 18, max_hp = 18, attack_bonus = 3, damage_dice = "1d6+1",
-        respawn_secs = 180, fixed = true, code_hash = h.skeleton,
+        hp = 18, max_hp = 18, attack_bonus = 3, armor_class = 12,
+        aggro = true, respawn_seconds = 180, fixed = true, code_hash = h.skeleton,
+    })
+    -- An NPC wields a weapon it holds, marked as equipped by it
+    make(R("greatsword"), "item", warrior, {
+        name = "notched greatsword", slot = "weapon", damage = "1d10", equipped_by = warrior,
     })
     make(R("valdris"), "npc", R("throne"), {
         name = "Valdris the Crypt Lord",
         description = "A towering skeleton in black armor, eyes burning with green fire.",
-        hp = 40, max_hp = 40, attack_bonus = 5, fixed = true, code_hash = h.boss,
+        hp = 40, max_hp = 40, attack_bonus = 5, armor_class = 14,
+        aggro = true, respawn_seconds = 0, fixed = true, code_hash = h.boss,
     })
 
     return "The Cursed Crypt is built. Next: eval return crypt_verbs()"
@@ -803,34 +746,35 @@ end
 
 | Piece | Technique |
 |---|---|
-| Potions | Object action `drink`, registered from `eval` by `crypt_verbs()`, so it follows the potion into the player's inventory. The handler checks `parent_id` to require carrying it, heals by updating the player object's `hp`, then deletes the potion, which also removes its verb. |
-| Chest | Two verbs on one object. Its state (`locked`, `looted`) lives in properties, because code is re-run fresh on every call. The gold is created directly in the player's inventory (parent = `a.actor_id`). |
-| Trap | A room `on_enter` hook. It skips spawns (`a.from == nil`) and schedules a `call_out` that passes the victim's ID as the string argument. When the timer fires, it checks the victim is still in the room. |
-| Lair rooms | `on_enter` uses `game.use_object(npc, actor, "wake")`. That runs each skeleton's `wake` handler in the skeleton's own context, so its `set_heart_beat` applies to the skeleton, not the room. |
-| Skeletons | The heartbeat attacks a player in the room and goes back to sleep when the room is empty. `on_damage` strikes back. `on_death` stops the heartbeat and schedules `respawn`, passing the room ID because the dead NPC is no longer in a room. `respawn` moves it back and restores `hp`. The built-in combat re-reads `hp` on the next fight. |
-| Boss | No heartbeat: it fights back from `on_damage`, tracks damage taken in a property, and enrages at half health. `on_death` drops loot into `args.room_id` and deletes the boss. |
-| Shared helper | `crypt_strike` is defined in the library, so every monster's code can call it. |
+| Potions | Object action `drink`, registered by `crypt_verbs()`, so it follows the potion into the player's inventory. The handler checks `parent_id` to require carrying it, heals with `game.heal`, then deletes the potion, which also removes its verb. |
+| Chest | Two verbs on one object. Its state (`locked`, `looted`) lives in properties, because code is re-run fresh on every call. The gold is created directly in the player's inventory (parent = `a.actor_id`). A `container` can also be emptied with `get all from chest` once unlocked. |
+| Trap | A room `on_enter` hook. It skips spawns (`a.from == nil`) and schedules a `call_out` that passes the victim's ID as the string argument. When the timer fires, it checks the victim is still in the room and deals damage with `game.damage` (a death follows the universe's policy). |
+| Skeletons | `aggro = true`: they attack whoever walks in, and fight in rounds until someone dies or leaves (`flee`). `respawn_seconds` brings them back at full HP; the corpse keeps what they carried. The warrior wields a weapon it holds (`equipped_by`), so its blows use the weapon's dice. |
+| Boss | `on_damage` notices half health and sets `enraged`; its `ai_combat_tick` then adds fire damage on each of its rounds and returns `nil`, so its normal blow follows. `respawn_seconds = 0` makes the kill permanent: `on_death` drops the loot, then the engine deletes it. |
 
 ### Playing it
 
 ```
 > s
 Burial Antechamber ...
+skeleton guard hits you for 4 damage.
 > take potion
 You take healing potion.
 > attack skeleton
 You hit skeleton guard for 5 damage.
 skeleton guard has 7 HP remaining.
-skeleton guard hits you for 4 damage! (HP: 96)
-> attack skeleton
+skeleton guard misses you.
 CRITICAL HIT! You strike skeleton guard for 8 damage!
 skeleton guard is slain!
+skeleton guard dies.
 The skeleton collapses into a pile of bones.
+You gain 12 experience.
 > drink potion
-You recover 6 HP. (HP: 100/100)
+You feel better. (HP: 100)
 ```
 
-The actual numbers depend on the dice.
+The actual numbers depend on the dice. After `attack`, the blows come in
+rounds (every `combat_round_ms`) without typing it again.
 
 ---
 
@@ -844,8 +788,8 @@ The actual numbers depend on the dice.
 | `update_object: permission denied` | The acting user can't modify that object. In object code the acting user is the object's **owner**, not the player. |
 | `only the owner or a superior may attach code` | You tried to set `code_hash` on an object owned by someone of your level or higher. |
 | `database query limit exceeded (101 > 100)` | Object code may make 100 `game.*` database calls per run. Loop less, or cache results in locals. |
-| Verbs answer `Unknown command` after a restart | Actions are memory-only. Run your registration function again (`crypt_verbs()`). |
-| `attack` says "You can't attack ..." | The target's class is neither `npc` (or a class derived from it) nor `monster`. |
+| `attack` says "You can't attack ..." | The target's class is neither `npc` (or a class derived from it) nor `monster`, or it is a player the universe's `pvp_policy` protects. |
+| `attack` says "There is no fighting in this world." | The universe's `combat` config is `off` (a social universe). |
 | `game.environment(id)` is `nil` in `on_death` | The dead NPC was already removed from the room. Use `args.room_id`. |
 
 Limits per run:
@@ -867,10 +811,9 @@ See [Sandbox limits](langref.md#sandbox-limits).
 These are planned or partial; see the [roadmap](../../docs/roadmap.md).
 Don't build on them yet:
 
-- **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
-- **NPC behaviour:** `aggro` and `respawn_time` do nothing, and NPCs don't fight back in the built-in combat. Script it as in Part B.
-- **Commands and combat:** there are no `use`, `give` or `flee` player commands (add verbs instead), no PvP, and no Lua access to the combat engine's damage types and effects.
-- **Universe config:** keys like `pvp_mode` or `spawn_room` have no effect. Use `setportal` for the spawn room.
+- **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move` and `on_use`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
+- **Commands and combat:** there are no `use` or `give` player commands (add verbs instead), and a weapon deals one damage type.
+- **Universe config:** a key like `spawn_room` has no effect. Use `setportal` for the spawn room.
 
 ---
 

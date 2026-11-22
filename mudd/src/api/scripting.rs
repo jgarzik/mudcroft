@@ -421,6 +421,9 @@ fn prepare(
     game_api.set_room_context(ctx.room_id.clone());
     game_api.set_object_context(ctx.object_id.clone());
     game_api.set_payer(ctx.payer.clone());
+    game_api.set_engine(Arc::new(super::combat::CombatEngine {
+        state: state.clone(),
+    }));
 
     let mut sandbox =
         Sandbox::new(config).map_err(|e| format!("Failed to create sandbox: {}", e))?;

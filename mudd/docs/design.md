@@ -189,6 +189,7 @@ after the verb as their argument.
 | `north`/`n`, `south`/`s`, `east`/`e`, `west`/`w`, `up`/`u`, `down`/`d` | all | Follow exit; `on_leave` on the old room, `on_enter` on the new one |
 | `say <msg>` | all | `<name> says: ...` to others in the room |
 | `get`/`take <item>`, `drop <item>`, `inventory`/`inv`/`i` | all | Call `Commands.take/drop/inventory` from the mudlib; `take` refuses `fixed` and living objects, and item names match literally (`%`, `_` escaped); `get <item>\|all from <container>` calls `Commands.take_from` |
+| `flee` | all | Leave through a random exit, ending your fight (`game.flee`) |
 | `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`), or a player as `pvp_policy` allows: the first blow, then rounds both ways until the fight ends |
 | `pvp on`/`off` | all | Flag yourself for player combat (counts under `pvp_policy = "flagged"`) |
 | `wield`/`unwield`, `wear`/`remove <item>`, `equipment`/`eq` | all | Equipment (`api/equipment.rs`): weapon dice, type and bonus and worn armor class count in combat |
@@ -513,9 +514,17 @@ Two layers exist:
   effects goes through `combat::death` in the same batch, so nobody is left
   dead at 0 HP; reports, including an NPC's `on_death` hook, run after the
   commit.
-- **Lua mudlib** (`mudd/lib/combat.lua`): `Combat.initiate`, `Combat.attack`,
-  `Combat.deal_damage`, `Combat.heal`, effects, working on object
-  properties. `Commands.flee` lives in `lib/commands.lua`.
+- **Lua** reaches the engine through `lua::engine::Engine`, implemented by
+  `api::combat::CombatEngine` and set on every sandbox: `game.attack`,
+  `combat_state`, `damage`, `heal`, `can_attack`, `stop_combat`, `flee`
+  (a player acts only as themselves and never from object code). The
+  universe's `combat` config (`on`, `npc_only`, `off`) gates every fight
+  (`combat::fight_allowed`); `flee_fail_percent` gates fleeing. An NPC's
+  `ai_combat_tick` / `ai_idle_tick` (`combat::ai_override`) replace the
+  built-in round, aggro or wander when they return non-nil.
+- **Lua mudlib** (`mudd/lib/combat.lua`): `Combat.*` are thin wrappers over
+  those bindings (the engine is the single source of rules).
+  `Commands.flee` (`lib/commands.lua`) wraps `game.flee`.
 
 Rust combat types:
 

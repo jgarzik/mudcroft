@@ -180,6 +180,13 @@ for object code, or the `game.set_actor` override if one is set.
 | [`apply_effect(target_id, type, duration, magnitude, damage_type, period)`](#gameapply_effecttarget_id-type-duration-magnitude-damage_type-period) | `true` | Modify on the target |
 | [`remove_effect(target_id, type)`](#gameremove_effecttarget_id-type) | boolean | Modify on the target |
 | [`get_effects(target_id)`](#gameget_effectstarget_id) | list of effects | — |
+| [`can_attack(attacker_id, target_id)`](#gamecan_attackattacker_id-target_id) | `true` or `false, reason` | — |
+| [`attack(attacker_id, target_id)`](#gameattackattacker_id-target_id) | blow table or `nil, reason` | control the attacker (players: themselves, never object code) |
+| [`combat_state(id)`](#gamecombat_stateid) | state table | — |
+| [`damage(target_id, amount, type, source_id)`](#gamedamagetarget_id-amount-type-source_id) | `{damage, hp, killed}` or `nil, reason` | Modify on the target |
+| [`heal(target_id, amount)`](#gamehealtarget_id-amount) | new HP or `nil, reason` | Modify on the target |
+| [`stop_combat(id)`](#gamestop_combatid) | fighters stopped or `nil, reason` | Modify on it |
+| [`flee(id)`](#gamefleeid) | direction or `nil, reason` | Move on it (players: themselves, never object code) |
 | [`set_actor(account_id)`](#gameset_actoraccount_id) | boolean | wizard+, target below caller |
 | [`get_actor()`](#gameget_actor) | account ID or `nil` | — |
 | [`check_permission(action, target_id, is_fixed, owner_id)`](#gamecheck_permissionaction-target_id-is_fixed-owner_id) | `{allowed, error}` | — |
@@ -447,7 +454,7 @@ Hook details:
 - **Return values:** hook return values are ignored. Errors are logged on the server.
 - **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
   - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
-- **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
+- **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move` and `on_use` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`. `ai_idle_tick` and `ai_combat_tick` are fired for NPCs (see [Built-in combat](#built-in-combat)).
 
 ### `parent(class_name, handler_name, args)`
 
@@ -736,12 +743,10 @@ effect given a damage type) deals its magnitude in damage per pulse, after
 the target's resistances, and `regenerating` heals it (up to `max_hp`).
 Pulses change the target's `hp` property. A player is told each pulse
 (`You take 3 poison damage (poisoned).`) and when an effect ends
-(`You are no longer poisoned.`). Damage that brings HP to 0 kills: an NPC
-leaves the room (onlookers hear `<name> dies.`) and its `on_death` runs, with
-`killer_id` set to whoever applied the effect (an attacker's critical hit
-causes bleeding); a player drops what they carried where they died and
-respawns at once (full HP, at the respawn room, or where they fell if the
-universe has none yet), all in one atomic change. Within one pass, all damage is
+(`You are no longer poisoned.`). Damage that brings HP to 0 kills, as any
+death does (see [Built-in combat](#built-in-combat): the universe's death
+policies, respawns, XP), with `killer_id` set to whoever applied the effect
+(an attacker's critical hit causes bleeding), all in one atomic change. Within one pass, all damage is
 applied before any healing, and healing cannot revive the dead. If the
 server falls behind (or was down), the missed pulses are applied together.
 
@@ -773,6 +778,63 @@ Modify permission on the target.
 **Returns** a list of `{type, remaining, magnitude, damage_type, period}`
 tables: `remaining` is whole seconds left, rounded up; `damage_type` and
 `period` are `nil` for effects that do not pulse.
+
+### Combat engine
+
+The rules of [Built-in combat](#built-in-combat), callable from Lua (the
+`Combat` library wraps these). Each runs in the current run, so a script's
+fights, damage and deaths are part of its one change.
+
+#### `game.can_attack(attacker_id, target_id)`
+
+**Returns** `true` if `attacker_id` may fight `target_id` now (combat
+setting, a creature or a player the PvP rules allow, both alive and in the
+same room), else `false` and the reason.
+
+#### `game.attack(attacker_id, target_id)`
+
+One blow now, and the fight starts (both sides) if it is not on; during a
+fight it switches target instead (no extra blow), returning a blow with
+only `text` set. The acting user must be able to modify the attacker; a
+player attacker only as themselves and never from object code (so no
+script can make a player fight).
+
+**Returns** `{hit, critical, fumble, damage, killed, text, parts}`, or
+`nil` and the reason (not allowed, stunned, already fighting that target).
+
+#### `game.combat_state(id)`
+
+**Returns** `{in_combat, attacking, attackers, next_round_at}`: whom `id`
+attacks, who attacks it (a list), and when its next round is due (ms since
+epoch).
+
+#### `game.damage(target_id, amount, type, source_id)`
+
+Deals `amount` (0 to 1,000,000) damage of `type` (default `physical`) after
+the target's resistances. Reaching 0 HP is a death (the universe's policy),
+with `source_id` (optional) as the killer. Needs Modify permission on the
+target.
+
+**Returns** `{damage, hp, killed}` (`damage` as applied), or `nil` and the
+reason.
+
+#### `game.heal(target_id, amount)`
+
+Heals up to `max_hp`. Needs Modify permission on the target. **Returns**
+the new HP, or `nil` and the reason.
+
+#### `game.stop_combat(id)`
+
+Ends every fight `id` is in, as fighter or target (a peace spell, a
+referee). Needs Modify permission on it. **Returns** how many fighters
+stopped, or `nil` and the reason.
+
+#### `game.flee(id)`
+
+Leaves through a random exit, ending `id`'s fight (see Fleeing under
+[Built-in combat](#built-in-combat)). Needs Move permission; a player only
+as themselves, never from object code. **Returns** the direction, or `nil`
+and the reason.
 
 ---
 
@@ -1067,7 +1129,7 @@ Merges the top-level keys of `config` into the universe config. Requires
 The server reads these config keys: `lib_hashes`, which maps library
 names to code hashes (see [Core library](#core-library)), the Venice
 prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)), and the
-combat settings `combat_round_ms`, `pvp_policy`, `player_death`, `npc_death` and `corpse_decay_s` (see
+combat settings `combat`, `combat_round_ms`, `pvp_policy`, `flee_fail_percent`, `player_death`, `npc_death` and `corpse_decay_s` (see
 [Built-in combat](#built-in-combat)). Other keys are
 yours to read with `get_universe()`. Use the `setportal` command to set
 the spawn room; config keys don't affect it.
@@ -1103,26 +1165,28 @@ the onlookers' broadcast excludes the player.
 that are `fixed` or living (`game.is_a(id, "living")`: NPCs, players and
 their subclasses).
 
-The library also defines `Commands.give`, `Commands.look`, `Commands.flee`,
-`Commands.say` and `Commands.use`, but no player command calls them.
+`Commands.flee` wraps [`game.flee`](#gamefleeid) (the built-in `flee`
+command uses the same engine call). The library also defines
+`Commands.give`, `Commands.look`, `Commands.say` and `Commands.use`, but no
+player command calls them.
 
 ### `Combat`
 
-A Lua combat helper that stores HP in object properties. It is separate
-from the built-in `attack` command (see [Built-in combat](#built-in-combat)).
+Thin wrappers over the server's combat engine (the [combat
+functions](#combat-engine) and status effects), which is the single source
+of combat rules: the same rules as the built-in `attack` command (see
+[Built-in combat](#built-in-combat)).
 
-- `Combat.attack(attacker_id, defender_id, weapon_id)`
-- `Combat.deal_damage(target_id, amount, damage_type)`: applies `metadata.resistances[damage_type]` as a percentage.
-- `Combat.heal(target_id, amount)`
-- `Combat.apply_effect(target_id, effect, duration_secs, strength)` and `Combat.remove_effect(target_id, effect)`
-- `Combat.process_effects(id)`: call it from a heartbeat; poison and burn deal damage, regen heals.
-- `Combat.is_dead(id)` and `Combat.get_stats(id)`
-- Constants:
-  - `Combat.DAMAGE_TYPES`: `physical`, `fire`, `ice`, `lightning`, `poison`, `holy`, `dark`
-  - `Combat.EFFECTS`: `stun`, `poison`, `burn`, `freeze`, `bleed`, `regen`
+- `Combat.can_attack(attacker_id, target_id)`: `true`, or `false` and the reason.
+- `Combat.initiate(attacker_id, target_id)` (and its alias `Combat.attack`): starts a fight, one blow now, rounds after. Returns `{success, message, blow}`; during a fight it switches target (no extra blow).
+- `Combat.deal_damage(target_id, amount, damage_type, source_id)`: resistances apply; returns `{success, damage, remaining_hp, killed, message}`.
+- `Combat.heal(target_id, amount)`: returns `{success, new_hp, message}`.
+- `Combat.apply_effect(target_id, effect, duration, magnitude, damage_type, period)`, `Combat.remove_effect(target_id, effect)`, `Combat.effects(target_id)`: the status effect functions.
+- `Combat.state(id)`: `game.combat_state`. `Combat.stop(id)`: `game.stop_combat`. `Combat.flee(id)`: `{success, message, direction}`.
+- `Combat.is_dead(id)`: gone, at 0 HP, or out of the world (an NPC waiting to respawn). `Combat.get_stats(id)`: `{hp, max_hp, armor_class, attack_bonus, resistances, effects, state}` with the engine's defaults.
+- Constants: `Combat.PVP_POLICIES`, `Combat.DAMAGE_TYPES` (the engine's damage types), `Combat.EFFECTS` (the status effect types).
 
-These functions write object properties as the acting user, so they need
-Modify permission on the target.
+Each needs the same permission as the `game.*` function it wraps.
 
 ### `Utils`
 
@@ -1178,13 +1242,16 @@ All other properties, including `weight`, `value`, `lighting`,
 
 The built-in `attack <name>` (or `kill`) command works like this:
 
+- A universe chooses whether there is fighting at all with its `combat` config: `on` (default), `npc_only` (creatures only, no player against player whatever `pvp_policy` says) or `off` (a social universe: no attacks, no aggro, no rounds; status effects still work).
 - It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`, or another player as the universe config's `pvp_policy` allows: `arena` (the default: only in a room with `is_arena = true`), `flagged` (both players typed `pvp on`), `open`, or `disabled`. A fight between players ends as soon as the policy no longer allows it.
 - HP lives in the objects' properties: `hp`, `max_hp`, `armor_class` (default 10), `attack_bonus` (default 0) and `resistances` (e.g. `{fire = "resistant"}`, also `immune` and `vulnerable`). An attack reads them and writes the target's new `hp` back, as one atomic change.
 - Each attack is a d20 roll plus `attack_bonus` against the target's `armor_class`. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit), then the target's resistances. A natural 1 always misses.
 - Status effects count: a stunned or paralyzed attacker cannot attack; a blinded attacker or an invisible target is -4 to hit, a stunned or paralyzed target +4; `strengthened`/`weakened` on the attacker and `exposed`/`protected` on the target add or subtract their magnitude from the damage roll.
 - A critical hit that does not kill makes the target **bleed**: 2 physical damage per second for 3 seconds.
 - **Rounds.** The first blow lands at once; then each fighter strikes again every `combat_round_ms` (universe config, default 3000, 1000 to 10000) until the fight ends, without further commands. The target fights back. A fight ends when either side dies or they are no longer in the same room (walk away to flee); a fighter whose target is gone turns on someone still fighting it. Attacking someone else switches target; retyping `attack` during a fight adds no blow (rounds set the pace). A stunned or paralyzed fighter loses its turn.
-- A hit fires `on_damage`. A kill fires `on_death`.
+- A hit fires `on_damage`. A kill fires `on_death` (after `on_damage`).
+- **Fleeing:** the `flee` command (or [`game.flee`](#gamefleeid)) leaves through a random exit and ends your fight; your attackers stop once you are gone. It fails with the universe's `flee_fail_percent` chance (default 0), and never works while stunned.
+- **NPC scripts:** an NPC's code may define `ai_combat_tick` (run as its owner on each of its rounds, with `{object_id, room_id, target_id, hp}`) and `ai_idle_tick` (run when a player arrives in its room, `{reason = "arrival", arrived_id}`, or when it would wander, `{reason = "wander"}`). If the handler returns anything but `nil`, it replaces the built-in behaviour for that moment (the blow or flee, the aggro, the wander move); `nil`, no handler or an error falls back to the built-in behaviour.
 - **Equipment**: `wield <item>` / `unwield`, `wear <item>` / `remove <item>`, `equipment` (or `eq`). An item names its slot in `slot`: `weapon` (an item with `damage` and no slot is one), `head`, `body`, `hands`, `feet`, `shield`, `neck` or `ring`; one item per slot (if marks say otherwise, only the first item of a slot, by id, counts; a clone of worn gear is not worn). A wielded weapon replaces the bare 1d6 with its `damage` dice (e.g. `"1d8"`, `"2d4+1"`; at most 100 dice of 1 to 1000 sides, modifier within ±1000, else the bare 1d6) of its `damage_type` (resistances apply) and adds its `attack_bonus`; each worn item adds its `armor_class` to the wearer's. Equipped items carry `equipped_by` (the wearer); anything that moves an item away (dropping, giving, death, a script) unequips it, and death policies treat gear like other belongings.
 - **NPC behaviour** (NPC properties):
   - `aggro = true`: attacks a player who arrives in its room (walking, `goto`, spawning or moved by Lua), and a player in a room it arrives in, at once (PvP rules don't apply to NPCs).
@@ -1209,11 +1276,10 @@ use the [`Combat`](#combat) library or your own code.
 
 These are not built yet. See the [roadmap](../../docs/roadmap.md).
 
-- **Unfired handlers:** `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` never fire on their own. Call the ones other than `on_create` and `on_destroy` with `game.use_object` (which refuses engine hooks), or start a heartbeat yourself.
-- **Unused NPC properties:** `aggro` and `respawn_time` do nothing.
-- **Missing player commands:** there is no `use`, `give` or `flee` command. Add verbs with `game.add_action`.
-- **Combat gaps:** the server has no NPC counter-attacks and no PvP. Lua has no bindings to the combat engine.
-- **Universe config:** keys such as `pvp_mode` or `spawn_room` are not read by the server.
+- **Unfired handlers:** `on_create`, `on_destroy`, `on_init`, `on_move` and `on_use` never fire on their own. Call the ones other than `on_create` and `on_destroy` with `game.use_object` (which refuses engine hooks), or start a heartbeat yourself.
+- **Missing player commands:** there is no `use` or `give` command. Add verbs with `game.add_action`.
+- **Combat gaps:** weapons deal one damage type (no elemental parts yet).
+- **Universe config:** keys such as `spawn_room` are not read by the server; use `setportal`.
 
 ---
 

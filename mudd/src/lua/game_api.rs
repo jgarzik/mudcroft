@@ -255,6 +255,8 @@ pub struct GameApi {
     /// game.use_object calls made so far by this top-level execution,
     /// shared with every nested sandbox it spawns
     use_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// The combat engine (api::combat), set by the script runner
+    engine: Option<Arc<dyn crate::lua::engine::Engine>>,
 }
 
 /// Deepest allowed game.use_object nesting (object code using objects...)
@@ -318,6 +320,7 @@ impl GameApi {
             rng: Arc::new(Mutex::new(StdRng::from_rng(&mut rand::rng()))),
             use_depth: 0,
             use_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            engine: None,
         }
     }
 
@@ -345,12 +348,18 @@ impl GameApi {
             rng: self.rng.clone(),
             use_depth: self.use_depth + 1,
             use_calls: self.use_calls.clone(),
+            engine: self.engine.clone(),
         }
     }
 
     /// Set the account paying for credit spending as `"actor"`
     pub fn set_payer(&mut self, payer: Option<String>) {
         self.payer = payer;
+    }
+
+    /// Set the combat engine reached by game.attack and friends
+    pub fn set_engine(&mut self, engine: Arc<dyn crate::lua::engine::Engine>) {
+        self.engine = Some(engine);
     }
 
     /// Set the current user context for permission checks
@@ -2063,6 +2072,8 @@ impl GameApi {
             Ok(list)
         })?;
         game.set("get_effects", get_effects)?;
+
+        self.register_combat(lua, game)?;
         Ok(())
     }
 
@@ -3027,6 +3038,294 @@ pub fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<Value> {
             }
             Ok(Value::Table(table))
         }
+    }
+}
+
+/// May the acting user make `obj` act (fight, flee)? A player acts only as
+/// themselves and never through object code (not even code its own account
+/// owns: hooks run when others trigger them); anything else needs `action`
+/// permission on it.
+async fn may_act_for(
+    permissions: &PermissionManager,
+    user: Option<&str>,
+    object_code: bool,
+    universe_id: &str,
+    obj: &crate::objects::Object,
+    action: PermAction,
+) -> Result<(), String> {
+    if obj.class == "player" {
+        return match user {
+            Some(account)
+                if !object_code && crate::player::PlayerManager::player_path(account) == obj.id =>
+            {
+                Ok(())
+            }
+            _ => Err("a player acts only for themselves".to_string()),
+        };
+    }
+    object_permission(permissions, user, universe_id, obj, action).await
+}
+
+impl GameApi {
+    /// game.attack / combat_state / damage / heal / can_attack / flee: the
+    /// combat engine (api::combat), the single source of combat rules. The
+    /// mudlib's Combat library wraps these.
+    fn register_combat(&self, lua: &Lua, game: &mlua::Table) -> LuaResult<()> {
+        let no_engine = || mlua::Error::runtime("the combat engine is not available here");
+
+        // game.can_attack(attacker, target) -> true | false, reason
+        let (engine, universe) = (self.engine.clone(), self.universe_id.clone());
+        game.set(
+            "can_attack",
+            lua.create_function(move |lua, (a, t): (String, String)| {
+                charge_db(lua)?;
+                let engine = engine.clone().ok_or_else(no_engine)?;
+                let universe = universe.clone();
+                let r = block_now(async move { engine.can_attack(&universe, &a, &t).await });
+                Ok(match r {
+                    Ok(()) => (true, None),
+                    Err(reason) => (false, Some(reason)),
+                })
+            })?,
+        )?;
+
+        // game.attack(attacker, target) -> {hit, critical, fumble, damage,
+        // killed, text} | nil, reason. One blow now; the fight goes on in
+        // rounds. The acting user must control the attacker (a player only
+        // as themselves).
+        let (engine, universe, perms, store, user) = (
+            self.engine.clone(),
+            self.universe_id.clone(),
+            self.permissions.clone(),
+            self.store.clone(),
+            self.current_user_id.clone(),
+        );
+        let object_code = self.current_object_id.is_some();
+        game.set(
+            "attack",
+            lua.create_function(move |lua, (a, t): (String, String)| {
+                charge_db(lua)?;
+                let engine = engine.clone().ok_or_else(no_engine)?;
+                let user = actor_override(lua).or(user.clone());
+                let (universe, perms, store) = (universe.clone(), perms.clone(), store.clone());
+                let r: Result<crate::lua::engine::BlowReport, String> = block_now(async move {
+                    let attacker = store
+                        .get(&universe, &a)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("no such object: {}", a))?;
+                    may_act_for(
+                        &perms,
+                        user.as_deref(),
+                        object_code,
+                        &universe,
+                        &attacker,
+                        PermAction::Modify,
+                    )
+                    .await?;
+                    engine.attack(&universe, &a, &t).await
+                });
+                match r {
+                    Ok(b) => {
+                        let tbl = lua.create_table()?;
+                        tbl.set("hit", b.hit)?;
+                        tbl.set("critical", b.critical)?;
+                        tbl.set("fumble", b.fumble)?;
+                        tbl.set("damage", b.damage)?;
+                        tbl.set("killed", b.killed)?;
+                        tbl.set("text", b.text)?;
+                        let parts = lua.create_table()?;
+                        for (i, (dtype, rolled, applied)) in b.parts.into_iter().enumerate() {
+                            let p = lua.create_table()?;
+                            p.set("type", dtype)?;
+                            p.set("rolled", rolled)?;
+                            p.set("applied", applied)?;
+                            parts.set(i + 1, p)?;
+                        }
+                        tbl.set("parts", parts)?;
+                        Ok((Some(tbl), None))
+                    }
+                    Err(reason) => Ok((None, Some(reason))),
+                }
+            })?,
+        )?;
+
+        // game.combat_state(id) -> {in_combat, attacking, attackers, next_round_at}
+        let (engine, universe) = (self.engine.clone(), self.universe_id.clone());
+        game.set(
+            "combat_state",
+            lua.create_function(move |lua, id: String| {
+                charge_db(lua)?;
+                let engine = engine.clone().ok_or_else(no_engine)?;
+                let universe = universe.clone();
+                let s = block_now(async move { engine.combat_state(&universe, &id).await })
+                    .map_err(mlua::Error::runtime)?;
+                let tbl = lua.create_table()?;
+                tbl.set("in_combat", s.in_combat)?;
+                tbl.set("attacking", s.attacking)?;
+                tbl.set("attackers", s.attackers)?;
+                tbl.set("next_round_at", s.next_round_at)?;
+                Ok(tbl)
+            })?,
+        )?;
+
+        // game.damage(target, amount, type [, source]) -> {damage, hp, killed}
+        // | nil, reason. Resistances apply; a death follows the universe's
+        // policy. Checked like other writes to the target (Modify).
+        let (engine, universe, perms, store, user) = (
+            self.engine.clone(),
+            self.universe_id.clone(),
+            self.permissions.clone(),
+            self.store.clone(),
+            self.current_user_id.clone(),
+        );
+        game.set(
+            "damage",
+            lua.create_function(
+                move |lua, (t, amount, dtype, source): (String, i64, Option<String>, Option<String>)| {
+                    charge_db(lua)?;
+                    let engine = engine.clone().ok_or_else(no_engine)?;
+                    let user = actor_override(lua).or(user.clone());
+                    let (universe, perms, store) = (universe.clone(), perms.clone(), store.clone());
+                    let dtype = dtype.unwrap_or_else(|| "physical".to_string());
+                    let r: Result<crate::lua::engine::DamageReport, String> = block_now(async move {
+                        let target = store
+                            .get(&universe, &t)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("no such object: {}", t))?;
+                        object_permission(&perms, user.as_deref(), &universe, &target, PermAction::Modify)
+                            .await?;
+                        engine
+                            .damage(&universe, &t, amount, &dtype, source.as_deref())
+                            .await
+                    });
+                    match r {
+                        Ok(d) => {
+                            let tbl = lua.create_table()?;
+                            tbl.set("damage", d.damage)?;
+                            tbl.set("hp", d.hp)?;
+                            tbl.set("killed", d.killed)?;
+                            Ok((Some(tbl), None))
+                        }
+                        Err(reason) => Ok((None, Some(reason))),
+                    }
+                },
+            )?,
+        )?;
+
+        // game.heal(target, amount) -> new hp | nil, reason (Modify)
+        let (engine, universe, perms, store, user) = (
+            self.engine.clone(),
+            self.universe_id.clone(),
+            self.permissions.clone(),
+            self.store.clone(),
+            self.current_user_id.clone(),
+        );
+        game.set(
+            "heal",
+            lua.create_function(move |lua, (t, amount): (String, i64)| {
+                charge_db(lua)?;
+                let engine = engine.clone().ok_or_else(no_engine)?;
+                let user = actor_override(lua).or(user.clone());
+                let (universe, perms, store) = (universe.clone(), perms.clone(), store.clone());
+                let r: Result<i64, String> = block_now(async move {
+                    let target = store
+                        .get(&universe, &t)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("no such object: {}", t))?;
+                    object_permission(
+                        &perms,
+                        user.as_deref(),
+                        &universe,
+                        &target,
+                        PermAction::Modify,
+                    )
+                    .await?;
+                    engine.heal(&universe, &t, amount).await
+                });
+                Ok(match r {
+                    Ok(hp) => (Some(hp), None),
+                    Err(reason) => (None, Some(reason)),
+                })
+            })?,
+        )?;
+
+        // game.stop_combat(id) -> fighters stopped | nil, reason: ends every
+        // fight `id` is in (Modify permission on it)
+        let (engine, universe, perms, store, user) = (
+            self.engine.clone(),
+            self.universe_id.clone(),
+            self.permissions.clone(),
+            self.store.clone(),
+            self.current_user_id.clone(),
+        );
+        game.set(
+            "stop_combat",
+            lua.create_function(move |lua, id: String| {
+                charge_db(lua)?;
+                let engine = engine.clone().ok_or_else(no_engine)?;
+                let user = actor_override(lua).or(user.clone());
+                let (universe, perms, store) = (universe.clone(), perms.clone(), store.clone());
+                let r: Result<u64, String> = block_now(async move {
+                    let who = store
+                        .get(&universe, &id)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("no such object: {}", id))?;
+                    object_permission(&perms, user.as_deref(), &universe, &who, PermAction::Modify)
+                        .await?;
+                    engine.stop(&universe, &id).await
+                });
+                Ok(match r {
+                    Ok(n) => (Some(n), None),
+                    Err(reason) => (None, Some(reason)),
+                })
+            })?,
+        )?;
+
+        // game.flee(id) -> direction | nil, reason. A player only as
+        // themselves; anything else needs Move permission.
+        let (engine, universe, perms, store, user) = (
+            self.engine.clone(),
+            self.universe_id.clone(),
+            self.permissions.clone(),
+            self.store.clone(),
+            self.current_user_id.clone(),
+        );
+        let object_code = self.current_object_id.is_some();
+        game.set(
+            "flee",
+            lua.create_function(move |lua, id: String| {
+                charge_db(lua)?;
+                let engine = engine.clone().ok_or_else(no_engine)?;
+                let user = actor_override(lua).or(user.clone());
+                let (universe, perms, store) = (universe.clone(), perms.clone(), store.clone());
+                let r: Result<String, String> = block_now(async move {
+                    let who = store
+                        .get(&universe, &id)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("no such object: {}", id))?;
+                    may_act_for(
+                        &perms,
+                        user.as_deref(),
+                        object_code,
+                        &universe,
+                        &who,
+                        PermAction::Move,
+                    )
+                    .await?;
+                    engine.flee(&universe, &id).await
+                });
+                Ok(match r {
+                    Ok(dir) => (Some(dir), None),
+                    Err(reason) => (None, Some(reason)),
+                })
+            })?,
+        )?;
+        Ok(())
     }
 }
 

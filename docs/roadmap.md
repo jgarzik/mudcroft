@@ -102,19 +102,6 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Elemental combat**: `Combat.attack_extended` with weapon elemental dice
   and types, applying immunities, resistances and vulnerabilities, critical
   hits doubling dice, and a weapon `on_hit` handler.
-- **Combat state for Lua**: rounds, retaliation, retargeting and deaths are
-  built (`mudd/src/api/combat.rs`, the `combat` table); the mudlib's
-  `Combat.initiate` and the suite's `in_combat`/`attackers` view of it are
-  not.
-- **PvP policy in the mudlib**: the built-in `attack` and rounds enforce
-  `pvp_policy` (`mudd/src/api/combat.rs`); the mudlib's
-  `Combat.initiate`/`can_attack` do not.
-- **Status effects in combat**: stun and paralysis skip turns, stat
-  modifiers apply to rolls, effects tick down per round
-  (`Combat.process_statuses`).
-- **NPC AI in Lua**: aggro, wandering, fleeing and faction assist are
-  built in (`mudd/src/api/combat.rs`); class `npc` still names
-  `ai_idle_tick`/`ai_combat_tick` handlers that nothing calls.
 - **Region hooks**: `on_enter`/`on_leave` on the region when a player
   crosses region boundaries.
 - **An LPC-style `init()` cascade on moves.** `game.move_object` already

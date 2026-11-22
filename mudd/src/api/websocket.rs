@@ -1329,7 +1329,7 @@ async fn execute_command(
         "help" => {
             let mut text = String::from(
                 "Commands: look, north/south/east/west/up/down, say <message>, \
-                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, wield/wear/remove/equipment, pvp on/off, help. \
+                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, flee, wield/wear/remove/equipment, pvp on/off, help. \
                  Objects may offer their own verbs (e.g. 'pull lever').",
             );
             if access_level >= AccessLevel::Builder {
@@ -1632,27 +1632,15 @@ async fn execute_command(
                 .unwrap_or("something")
                 .to_string();
 
-            // Check if target is attackable (NPC or PvP-flagged player)
-            // Any npc, including subclasses defined with define_class
-            let is_npc = target.class == "monster"
-                || state
-                    .classes
-                    .read()
-                    .await
-                    .is_a(universe_id, &target.class, "npc");
-            // Another player only as the universe's pvp_policy allows
-            let allowed = is_npc
-                || (target.class == "player"
-                    && match state.object_store.get(universe_id, player_id).await {
-                        Ok(Some(me)) => {
-                            super::combat::pvp_allowed(state, universe_id, &me, target).await
-                        }
-                        _ => false,
-                    });
-            if !allowed {
+            // The engine's rules (combat setting, creatures, PvP)
+            let Ok(Some(me)) = state.object_store.get(universe_id, player_id).await else {
                 return ServerMessage::Error {
-                    message: format!("You can't attack {}.", target_display_name),
+                    message: "You have no body to fight with.".to_string(),
                 };
+            };
+            if let Err(reason) = super::combat::fight_allowed(state, universe_id, &me, target).await
+            {
+                return ServerMessage::Error { message: reason };
             }
 
             // Serialized with every HP and effect writer; the target is read
@@ -1846,6 +1834,18 @@ async fn execute_command(
             .await
         }
         "equipment" | "eq" => super::equipment::list(state, universe_id, player_id).await,
+        "flee" => {
+            use crate::lua::engine::Engine;
+            let engine = super::combat::CombatEngine {
+                state: state.clone(),
+            };
+            match engine.flee(universe_id, player_id).await {
+                Ok(dir) => ServerMessage::Output {
+                    text: format!("You flee {}!", dir),
+                },
+                Err(reason) => ServerMessage::Output { text: reason },
+            }
+        }
         "pvp" => {
             // Flag yourself for player combat (counts under pvp_policy
             // "flagged")

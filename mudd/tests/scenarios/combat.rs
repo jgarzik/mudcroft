@@ -1783,3 +1783,224 @@ async fn test_failing_shadow_verb_falls_back() {
         .await
         .expect("the built-in ran");
 }
+
+/// `flee` leaves through a random exit and ends the fight; a universe can
+/// make fleeing fail (flee_fail_percent) or switch combat off entirely
+#[tokio::test]
+async fn test_flee_and_combat_settings() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "runner".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/npcs/bear", "npc", "{}", {{name = "bear", hp = 1000, max_hp = 1000, aggro = true}}) return "ok""#,
+            entrance
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("attack bear").await.unwrap();
+    adm.drain().await;
+    adm.command("flee").await.unwrap();
+    adm.expect_output_containing("You flee north")
+        .await
+        .expect("fled through the only exit");
+    let fighting: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM combat WHERE entity_id LIKE '/players/%'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(fighting, 0, "the fleer's fight ended");
+
+    // Fleeing always fails here
+    eval_as(
+        &mut adm,
+        r#"game.update_universe({flee_fail_percent = 100}) return "ok""#,
+    )
+    .await;
+    adm.drain().await;
+    adm.command("flee").await.unwrap();
+    adm.expect_output_containing("fail to get away")
+        .await
+        .expect("flee failed");
+
+    // A social universe: no attacking, no aggro
+    eval_as(
+        &mut adm,
+        r#"game.update_universe({combat = "off"}) return "ok""#,
+    )
+    .await;
+    adm.drain().await;
+    adm.command("south").await.unwrap();
+    let heard = adm.outputs_within(Duration::from_millis(1500)).await;
+    assert!(
+        !heard
+            .iter()
+            .any(|t| t.contains("bear hits") || t.contains("bear misses")),
+        "{:?}",
+        heard
+    );
+    adm.drain().await;
+    adm.command("attack bear").await.unwrap();
+    let _ = adm.expect("echo").await;
+    let reply = adm.expect_any().await.unwrap();
+    assert!(
+        reply["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no fighting"),
+        "{}",
+        reply
+    );
+}
+
+/// An NPC's ai_combat_tick and ai_idle_tick replace the built-in behaviour
+/// when they return something; object code can make its own NPC attack but
+/// never a player
+#[tokio::test]
+async fn test_ai_overrides_and_attack_authority() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let passage = server.world().passage_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "puppeteer".into(),
+        })
+        .await
+        .unwrap();
+    let me = adm.player_id().unwrap().to_string();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"local pacifist = game.store_code([[return {{
+                 ai_combat_tick = function(a) game.broadcast(a.room_id, "The monk meditates.") return "handled" end,
+               }}]])
+               game.create_object("/npcs/monk", "npc", "{e}", {{name = "monk", hp = 1000, max_hp = 1000, code_hash = pacifist}})
+               local greeter = game.store_code([[return {{
+                 ai_idle_tick = function(a) game.broadcast(a.room_id, "The hound wags its tail.") return "handled" end,
+               }}]])
+               game.create_object("/npcs/hound", "npc", "{p}", {{name = "hound", hp = 50, aggro = true, code_hash = greeter}})
+               local puppet = game.store_code([[return {{
+                 make_fight = function(a) local r, why = game.attack(a.object_id, a.target_id) return r and "fought" or why end,
+                 make_player_fight = function(a) local r, why = game.attack(a.target_id, "/npcs/monk") return r and "fought" or why end,
+               }}]])
+               game.create_object("/npcs/puppet", "npc", "{e}", {{name = "puppet", hp = 1000, max_hp = 1000, code_hash = puppet}})
+               return "ready""#,
+            e = entrance,
+            p = passage
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+
+    // The monk's turn is its own ai_combat_tick: it never strikes back
+    adm.drain().await;
+    adm.command("attack monk").await.unwrap();
+    let heard = adm.outputs_within(Duration::from_millis(2500)).await;
+    assert!(heard.iter().any(|t| t.contains("meditates")), "{:?}", heard);
+    assert!(
+        !heard
+            .iter()
+            .any(|t| t.contains("monk hits you") || t.contains("monk misses you")),
+        "{:?}",
+        heard
+    );
+    eval_as(
+        &mut adm,
+        &format!(r#"game.stop_combat("{}") return "ok""#, me),
+    )
+    .await;
+
+    // Object code makes its own NPC attack, but never a player
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"return game.use_object("/npcs/puppet", "/npcs/puppet", "make_fight", "/npcs/monk") .. "|" ..
+                      game.use_object("/npcs/puppet", "/npcs/puppet", "make_player_fight", "{}")"#,
+            me
+        ),
+    )
+    .await;
+    let text = out["text"].as_str().unwrap_or_default().to_string();
+    assert!(text.starts_with("fought|"), "{}", text);
+    assert!(text.contains("only for themselves"), "{}", text);
+    eval_as(&mut adm, r#"game.stop_combat("/npcs/monk") return "ok""#).await;
+
+    // The aggressive hound's ai_idle_tick greets instead of attacking
+    adm.drain().await;
+    adm.command("north").await.unwrap();
+    let heard = adm.outputs_within(Duration::from_millis(1500)).await;
+    assert!(
+        heard.iter().any(|t| t.contains("wags its tail")),
+        "{:?}",
+        heard
+    );
+    assert!(
+        !heard
+            .iter()
+            .any(|t| t.contains("hound hits") || t.contains("hound misses")),
+        "{:?}",
+        heard
+    );
+}
+
+/// The tutorial's Part B crypt (docs/langtutor.md), taken from the doc
+/// itself, builds and plays on the engine: the skeleton guard attacks on
+/// sight, a potion heals. Keeps the tutorial in step with the engine.
+#[tokio::test]
+async fn test_tutorial_crypt_plays() {
+    const TUTORIAL: &str = include_str!("../../docs/langtutor.md");
+    let start = TUTORIAL.find("### `crypt.lua`").expect("crypt section");
+    let code_start = TUTORIAL[start..].find("```lua\n").expect("code block") + start + 7;
+    let code_end = TUTORIAL[code_start..].find("\n```").expect("block end") + code_start;
+    let crypt = &TUTORIAL[code_start..code_end];
+
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "cryptkeeper".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut wiz,
+        &format!("{}\nreturn build_crypt() .. ' / ' .. crypt_verbs()", crypt),
+    )
+    .await;
+    let text = out["text"].as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("is built") && text.contains("4 verbs"),
+        "{}",
+        out
+    );
+
+    wiz.drain().await;
+    wiz.command("goto /d/crypt/entrance").await.unwrap();
+    wiz.expect("room").await.expect("at the entrance");
+    wiz.drain().await;
+    wiz.command("s").await.unwrap();
+    let heard = wiz.outputs_within(Duration::from_millis(2500)).await;
+    assert!(
+        heard.iter().any(|t| t.contains("skeleton guard hits you")
+            || t.contains("skeleton guard misses you")
+            || t.contains("skeleton guard critically")),
+        "the guard attacks on sight: {:?}",
+        heard
+    );
+    wiz.drain().await;
+    wiz.command("take potion").await.unwrap();
+    wiz.expect_output_containing("You take healing potion")
+        .await
+        .expect("took the potion");
+    wiz.drain().await;
+    wiz.command("drink potion").await.unwrap();
+    wiz.expect_output_containing("You feel better")
+        .await
+        .expect("drank it");
+}

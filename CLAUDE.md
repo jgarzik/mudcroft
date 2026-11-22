@@ -103,7 +103,8 @@ One SQLite file with tables: accounts, universes, universe_settings, objects, co
 - Connect: `/ws?universe=<id>&token=...` (token required; 401 without a valid one, no guests)
 - Universe ID required (DNS-style: 3-64 chars, lowercase alphanumeric and hyphens)
 - Client sends `{type:"command", text, id?}` or `{type:"ping"}`; a command with an `id` is answered `done` once saved and never run twice (gateways retry with it after a failover); server sends `welcome`, `room`, `output`, `error`, `echo` (every command is echoed first), `confirm` (a payment prompt; client answers `{type:"confirm", id, accept}` or types yes/no), `replaced` (a newer connection for the same player took over; clients must not auto-reconnect)
-- Commands: look, north/south/east/west/up/down (and n/s/e/w/u/d), say, get/take, drop, inventory/i, attack/kill, help; builder+: create; wizard+: eval, goto, setportal; other verbs dispatch to `game.add_action` handlers
+- Commands: look, north/south/east/west/up/down (and n/s/e/w/u/d), say, get/take (also `from <container>`), drop, inventory/i, attack/kill, flee, wield/unwield/wear/remove/equipment, pvp on|off, help; builder+: create; wizard+: eval, goto, setportal; other verbs dispatch to `game.add_action` handlers
+- Combat is the engine in `mudd/src/api/combat.rs` (rules configurable per universe); Lua reaches it through `game.attack` & co. (`lua/engine.rs`) and `mudd/lib/combat.lua` only wraps those: keep engine, mudlib and docs in sync
 
 ## Test Infrastructure
 
