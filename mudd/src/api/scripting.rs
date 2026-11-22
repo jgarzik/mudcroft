@@ -182,18 +182,34 @@ fn invoke_handler_at<'a>(
     })
 }
 
-/// How often the timer loop checks for due call_outs and heartbeats
-const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+/// Longest timer-loop sleep with nothing due (a safety net: additions wake
+/// it sooner)
+const TIMER_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Fire due call_out timers and heartbeats forever.
+/// Fire due call_out timers and heartbeats forever. Deadline-driven: the
+/// loop sleeps until the earliest fire_at or heartbeat (or until one is
+/// added), not on a fixed poll.
 ///
 /// Each callback runs the named handler on the object's code (as the
 /// object's owner, see [`invoke_handler`]) with {object_id, room_id, args}.
 pub async fn run_timer_loop(state: AppState) {
-    let mut interval = tokio::time::interval(TIMER_TICK);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        interval.tick().await;
+        // Register for change notification before reading the deadline,
+        // so a timer added in between is not missed
+        let changed = state.timers.changed();
+        tokio::pin!(changed);
+        let now = chrono::Utc::now().timestamp_millis();
+        let wait = match state.timers.next_deadline().await {
+            Some(due) if due <= now => std::time::Duration::ZERO,
+            Some(due) => std::time::Duration::from_millis((due - now) as u64).min(TIMER_IDLE_WAIT),
+            None => TIMER_IDLE_WAIT,
+        };
+        if !wait.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = &mut changed => continue,
+            }
+        }
         for fired in state.timers.tick().await {
             let room_id = match state
                 .object_store

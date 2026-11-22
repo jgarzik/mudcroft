@@ -347,7 +347,9 @@ contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; th
 its method on the object's code (as the owner) with `{object_id, room_id,
 args}`. A heartbeat whose object no longer exists is removed. One-shot timers
 are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
-remove; beats write nothing), both reloaded at startup. An object may have at most 32 pending timers; heartbeat intervals are
+remove; beats write nothing), both reloaded at startup. The timer loop is
+deadline-driven: it sleeps until the earliest `fire_at` or next beat, and a
+new timer or heartbeat wakes it. An object may have at most 32 pending timers; heartbeat intervals are
 at least 100 ms. `game.delete_object` cancels the object's timers and
 heartbeat and clears its actions.
 

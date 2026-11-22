@@ -135,6 +135,8 @@ pub struct TimerManager {
     pool: Option<SqlitePool>,
     /// Raft writer for consensus
     raft_writer: Option<Arc<RaftWriter>>,
+    /// Wakes the timer loop when a new deadline may be earlier
+    changed: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for TimerManager {
@@ -154,6 +156,7 @@ impl TimerManager {
             heartbeats: RwLock::new(BTreeMap::new()),
             pool,
             raft_writer,
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -197,6 +200,7 @@ impl TimerManager {
         .await?;
         let id = timer.id.clone();
         self.timers.write().await.insert(id.clone(), timer);
+        self.changed.notify_one();
         Ok(id)
     }
 
@@ -310,6 +314,7 @@ impl TimerManager {
         .await?;
         let key = (heartbeat.universe_id.clone(), heartbeat.object_id.clone());
         self.heartbeats.write().await.insert(key, heartbeat);
+        self.changed.notify_one();
         Ok(())
     }
 
@@ -330,6 +335,24 @@ impl TimerManager {
             return false;
         }
         self.heartbeats.write().await.remove(&key).is_some()
+    }
+
+    /// The earliest call_out or heartbeat deadline (Unix ms), if any
+    pub async fn next_deadline(&self) -> Option<i64> {
+        let timers = self.timers.read().await.values().map(|t| t.fire_at).min();
+        let beats = self
+            .heartbeats
+            .read()
+            .await
+            .values()
+            .map(|h| h.next_due)
+            .min();
+        timers.into_iter().chain(beats).min()
+    }
+
+    /// Resolves when a timer or heartbeat is added (it may be due sooner)
+    pub async fn changed(&self) {
+        self.changed.notified().await
     }
 
     /// Check for due timers and heartbeats, returning fired callbacks
@@ -582,5 +605,23 @@ mod tests {
 
         manager.remove_timers_for_object("u1", "obj1").await;
         assert_eq!(manager.timer_count().await, 1); // Only obj2's timer remains
+    }
+
+    /// The loop sleeps until the earliest deadline of either kind
+    #[tokio::test]
+    async fn test_next_deadline() {
+        let mgr = TimerManager::new(None, None);
+        assert_eq!(mgr.next_deadline().await, None);
+        let id = mgr
+            .try_add_timer(Timer::new("u", "/a", "m", 60_000, None))
+            .await
+            .unwrap();
+        let fire_at = mgr.timers.read().await[&id].fire_at;
+        assert_eq!(mgr.next_deadline().await, Some(fire_at));
+        mgr.set_heartbeat(HeartBeat::new("u", "/b", 1_000))
+            .await
+            .unwrap();
+        let beat = mgr.next_deadline().await.unwrap();
+        assert!(beat < fire_at, "the heartbeat is due first");
     }
 }
