@@ -47,7 +47,7 @@ impl Timer {
             universe_id: universe_id.to_string(),
             object_id: object_id.to_string(),
             method: method.to_string(),
-            fire_at: now + delay_ms as i64,
+            fire_at: now.saturating_add(delay_ms.min(MAX_TIMER_DELAY_MS) as i64),
             args,
         }
     }
@@ -88,11 +88,14 @@ pub struct HeartBeat {
 impl HeartBeat {
     /// Create a new heartbeat
     pub fn new(universe_id: &str, object_id: &str, interval_ms: u64) -> Self {
+        let interval_ms = interval_ms.clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS);
         Self {
             object_id: object_id.to_string(),
             universe_id: universe_id.to_string(),
             interval_ms,
-            next_due: chrono::Utc::now().timestamp_millis() + interval_ms as i64,
+            next_due: chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(interval_ms as i64),
             method: "heart_beat".to_string(),
         }
     }
@@ -105,7 +108,10 @@ impl HeartBeat {
     /// After a beat: the next is one interval from now (a late server does
     /// not fire a burst of missed beats)
     pub fn reset(&mut self) {
-        self.next_due = chrono::Utc::now().timestamp_millis() + self.interval_ms as i64;
+        self.interval_ms = self.interval_ms.clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS);
+        self.next_due = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(self.interval_ms as i64);
     }
 }
 
@@ -121,8 +127,12 @@ pub struct TimerFired {
 /// Most pending one-shot timers a single object may have
 pub const MAX_TIMERS_PER_OBJECT: usize = 32;
 
-/// Shortest allowed heartbeat interval (one timer-loop tick)
+/// Shortest allowed heartbeat interval
 pub const MIN_HEARTBEAT_MS: u64 = 100;
+/// Longest heartbeat interval (one day)
+pub const MAX_HEARTBEAT_MS: u64 = 86_400_000;
+/// Longest call_out delay (30 days)
+pub const MAX_TIMER_DELAY_MS: u64 = 30 * 86_400_000;
 
 /// Timer manager for a universe
 pub struct TimerManager {
@@ -300,8 +310,7 @@ impl TimerManager {
     /// [`MIN_HEARTBEAT_MS`]): stored first (one write; beats themselves
     /// write nothing), cached only once stored
     pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) -> anyhow::Result<()> {
-        heartbeat.interval_ms = heartbeat.interval_ms.max(MIN_HEARTBEAT_MS);
-        heartbeat.reset();
+        heartbeat.reset(); // clamps the interval too
         self.write(
             "INSERT INTO heartbeats (universe_id, object_id, interval_ms) VALUES (?, ?, ?)
              ON CONFLICT (universe_id, object_id) DO UPDATE SET interval_ms = excluded.interval_ms",
@@ -623,5 +632,18 @@ mod tests {
             .unwrap();
         let beat = mgr.next_deadline().await.unwrap();
         assert!(beat < fire_at, "the heartbeat is due first");
+    }
+
+    /// Huge intervals and delays are clamped, never wrapped into the past
+    /// (which would fire them in a tight loop)
+    #[test]
+    fn test_times_are_clamped() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let hb = HeartBeat::new("u", "/o", u64::MAX);
+        assert_eq!(hb.interval_ms, MAX_HEARTBEAT_MS);
+        assert!(hb.next_due > now);
+        let timer = Timer::new("u", "/o", "m", u64::MAX, None);
+        assert!(timer.fire_at > now && timer.fire_at <= now + MAX_TIMER_DELAY_MS as i64 + 1_000);
+        assert!(!timer.is_due());
     }
 }

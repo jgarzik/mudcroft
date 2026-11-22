@@ -650,7 +650,7 @@ callback runs that object's code, as its owner.
 #### `game.call_out(delay_secs, method, args)`
 
 Schedules handler `method` on the current object after `delay_secs`
-seconds. Fractions are allowed.
+seconds (fractions allowed; at most 30 days).
 
 - `args` is an optional **string**. It arrives as `args.args` in the callback. To pass structured data, encode it in a string or store it in a property.
 - The callback receives `{object_id, room_id, args}`, where `room_id` is the object's `parent_id` when the timer fires.
@@ -685,7 +685,7 @@ Calls the current object's `heart_beat` handler every `interval_ms`
 milliseconds. Calling it again replaces the interval. **Returns** `true`,
 or `false` without an object context.
 
-- The minimum interval is 100 ms.
+- The interval is clamped to 100 ms through one day.
 - The callback receives `{object_id, room_id, args = nil}`.
 - Heartbeats are stored and resume after a server restart (the first beat one interval after startup).
 
