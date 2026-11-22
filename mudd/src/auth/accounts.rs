@@ -28,41 +28,54 @@ fn argon2_permits() -> &'static tokio::sync::Semaphore {
     })
 }
 
+/// The hash an unknown user's login is verified against
+fn dummy_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hash_password("dummy password").unwrap_or_default())
+}
+
+/// Compute the dummy hash now, so even the first login for an unknown user
+/// takes no longer than one for a known user (call once at startup)
+pub fn prepare_login_timing() {
+    let _ = dummy_hash();
+}
+
 /// Hash a password off the async executor (argon2 is CPU-heavy)
 async fn hash_blocking(password: &str) -> Result<String, AuthError> {
     if password.len() > MAX_PASSWORD_BYTES {
         return Err(AuthError::Write("password too long".to_string()));
     }
-    let _permit = argon2_permits()
+    let permit = argon2_permits()
         .acquire()
         .await
         .map_err(|e| AuthError::Write(e.to_string()))?;
     let password = password.to_string();
-    tokio::task::spawn_blocking(move || hash_password(&password))
-        .await
-        .map_err(|e| AuthError::Write(e.to_string()))?
-        .map_err(|e| AuthError::Write(format!("password hashing failed: {}", e)))
+    // The permit moves into the blocking task: it is released when hashing
+    // ends, even if the request is dropped (and its future with it) sooner
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await
+    .map_err(|e| AuthError::Write(e.to_string()))?
+    .map_err(|e| AuthError::Write(format!("password hashing failed: {}", e)))
 }
 
 /// Verify a password off the async executor. With no stored hash (unknown
 /// user) it still runs a verification against a dummy hash, so the time
 /// taken does not reveal whether the account exists.
 async fn verify_blocking(password: &str, stored: Option<String>) -> bool {
-    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if password.len() > MAX_PASSWORD_BYTES {
         return false;
     }
-    let Ok(_permit) = argon2_permits().acquire().await else {
+    let Ok(permit) = argon2_permits().acquire().await else {
         return false;
     };
     let password = password.to_string();
     tokio::task::spawn_blocking(move || {
+        let _permit = permit; // held until the verify ends (see hash_blocking)
         let found = stored.is_some();
-        let hash = stored.unwrap_or_else(|| {
-            DUMMY
-                .get_or_init(|| hash_password("dummy password").unwrap_or_default())
-                .clone()
-        });
+        let hash = stored.unwrap_or_else(|| dummy_hash().to_string());
         verify_password(&password, &hash) && found
     })
     .await

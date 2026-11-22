@@ -211,7 +211,6 @@ impl TimerManager {
         Some(self.add_timer(timer).await)
     }
 
-    /// Remove a timer by ID
     /// Remove a timer only if it belongs to `object_id` in `universe_id`
     /// (game.remove_call_out: an object may cancel only its own timers)
     pub async fn remove_timer_owned(
@@ -229,6 +228,7 @@ impl TimerManager {
         owned && self.remove_timer(timer_id).await
     }
 
+    /// Remove a timer by ID
     pub async fn remove_timer(&self, timer_id: &str) -> bool {
         // Remove from DB via Raft if available, otherwise direct SQL
         if let Some(ref raft_writer) = self.raft_writer {

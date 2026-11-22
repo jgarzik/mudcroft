@@ -61,6 +61,8 @@ pub async fn router(
     raft_writer: Arc<RaftWriter>,
     static_dir: Option<std::path::PathBuf>,
 ) -> Router {
+    // Before serving: the first unknown-user login must not pay for this
+    let _ = tokio::task::spawn_blocking(crate::auth::accounts::prepare_login_timing).await;
     let connections = Arc::new(ConnectionManager::new());
     let object_store = Arc::new(ObjectStore::new(
         db.pool().clone(),
