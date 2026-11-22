@@ -1146,6 +1146,29 @@ async fn execute_command(
 
     let verb = parts[0].to_lowercase();
 
+    // Built-ins added later than custom verbs could exist under their names:
+    // for these, an object's or room's own verb comes first
+    let soft = matches!(
+        verb.as_str(),
+        "wield" | "wear" | "unwield" | "remove" | "equipment" | "eq" | "pvp" | "flee"
+    ) || (matches!(verb.as_str(), "get" | "take") && command.contains(" from "));
+    if soft {
+        let args = parts[1..].join(" ");
+        if let Some(reply) = dispatch_custom_verb(
+            state,
+            universe_id,
+            player_id,
+            account_id,
+            access_level,
+            &verb,
+            &args,
+        )
+        .await
+        {
+            return reply;
+        }
+    }
+
     match verb.as_str() {
         "look" | "l" => {
             // Get player's current room

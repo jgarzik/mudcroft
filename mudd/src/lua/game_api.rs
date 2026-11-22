@@ -939,6 +939,8 @@ impl GameApi {
                                     }
                                     let mut cloned = original.clone();
                                     cloned.id = validated_path;
+                                    // A copy of worn gear is not worn
+                                    cloned.properties.remove("equipped_by");
                                     if let Err(reason) =
                                         check_parent(&store, &universe_id, new_parent_id.as_deref())
                                             .await?

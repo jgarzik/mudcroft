@@ -27,16 +27,21 @@ pub fn slot_of(item: &Object) -> Option<String> {
     }
 }
 
-/// What `wearer` has equipped (held and marked as theirs)
+/// What `wearer` has equipped (held and marked as theirs): at most one
+/// item per slot counts (the first by id), however the marks got there
 pub async fn equipped(state: &AppState, universe_id: &str, wearer: &str) -> Vec<Object> {
-    state
+    let mut items: Vec<Object> = state
         .object_store
         .get_contents(universe_id, wearer)
         .await
         .unwrap_or_default()
         .into_iter()
         .filter(|item| item.get_string("equipped_by") == Some(wearer) && slot_of(item).is_some())
-        .collect()
+        .collect();
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|item| seen.insert(slot_of(item)));
+    items
 }
 
 /// The wielded weapon, if any

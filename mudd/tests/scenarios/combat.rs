@@ -1593,3 +1593,79 @@ async fn test_respawn_without_home_room() {
     .unwrap();
     assert_eq!(room.as_deref(), Some(entrance.as_str()));
 }
+
+/// One item per slot counts, however equipped_by got set: clones of a worn
+/// item come unequipped
+#[tokio::test]
+async fn test_equipment_one_per_slot() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "stacker".into(),
+        })
+        .await
+        .unwrap();
+    let me = adm.player_id().unwrap().to_string();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/items/buckler", "item", "{me}", {{name = "buckler", slot = "shield", armor_class = 5}})
+               game.create_object("/items/target", "item", "{me}", {{name = "target", slot = "shield", armor_class = 7, equipped_by = "{me}"}})
+               return "ok""#,
+            me = me
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("wear buckler").await.unwrap();
+    adm.expect_output_containing("You wear buckler")
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"for i = 1, 3 do game.clone_object("/items/buckler", "/items/buckler-" .. i, "{me}") end return "ok""#,
+            me = me
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("equipment").await.unwrap();
+    let eq = adm.expect_output_containing("Armor class").await.unwrap();
+    // Base 10 plus one shield (5 or 7, whichever counts), never several
+    assert!(
+        eq.contains("Armor class: 15") || eq.contains("Armor class: 17"),
+        "{}",
+        eq
+    );
+}
+
+/// A room's own verb named like a built-in (remove, wear, get X from Y) is
+/// still reachable: custom verbs come first for those
+#[tokio::test]
+async fn test_custom_verbs_beat_soft_builtins() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "curator".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"local h = game.store_code([[return {{ take_down = function(a) return "You take down the painting." end }}]])
+               game.create_object("/items/painting", "item", "{e}", {{name = "painting", fixed = true, code_hash = h}})
+               game.add_action("remove", "/items/painting", "take_down")
+               return "ok""#,
+            e = entrance
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("remove painting").await.unwrap();
+    adm.expect_output_containing("You take down the painting")
+        .await
+        .expect("the room's verb ran");
+}
