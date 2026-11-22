@@ -27,11 +27,8 @@ affected feature.
   `mudd/src/api/scripting.rs`), so in a cluster each call_out and heartbeat
   would run on every node.
 - **Per-node caches are never invalidated.** Access levels
-  (`PermissionManager`, `mudd/src/permissions/mod.rs`) and credit balances
-  (`CreditManager`, `mudd/src/credits/mod.rs`) are cached per node and not
-  updated when Raft applies another node's write. Credit writes store an
-  absolute balance computed from the local cache, so concurrent writers would
-  lose updates.
+  (`PermissionManager`, `mudd/src/permissions/mod.rs`) are cached per node
+  and not updated when Raft applies another node's write.
 - **Snapshots.** The state machine is created without the database path,
   so snapshots carry no data and a follower refuses to install them (a
   lagging follower cannot catch up by snapshot). Installing one that did

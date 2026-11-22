@@ -67,7 +67,7 @@ and Raft metadata. Tables are created by `Database::run_migrations`
 | Raft | `raft_log`, `raft_vote`, `raft_meta` |
 
 ```
-accounts(id) <-- universes(owner_id), credits(player_id), path_grants(grantee_id)
+accounts(id) <-- universes(owner_id), path_grants(grantee_id)
 universes(id) <-- objects(universe_id), credits, timers, path_grants, universe_settings
 objects(id)   <-- objects(parent_id)       -- containment
 code_store(hash) <-- objects(code_hash), universe config lib_hashes
@@ -481,9 +481,13 @@ Rust combat types:
 
 ## Credits
 
-`CreditManager` keeps per-universe balances in the `credits` table with an
-in-memory cache. Writes go through Raft; a failed read is an error, never a
-zero balance. Lua exposes `get_credits`, `deduct_credits` and
+Balances live only in the `credits` table, held by an account or an object,
+with no cache: `CreditManager` reads the row and writes relative updates
+(`balance = balance - ?`) through Raft. `CHECK (balance >= 0)` rejects an
+overdraft, so `deduct` and `transfer` (debit and credit in one batch) are
+atomic and report "not enough" instead of overdrawing; no read-modify-write,
+so concurrent writers (or nodes) cannot lose updates. A failed read is an
+error, never a zero balance. Lua exposes `get_credits`, `deduct_credits` and
 `admin_grant_credits`. No action costs credits yet, and purchasing is out of
 scope (see [docs/blockchain.md](../../docs/blockchain.md)).
 

@@ -3,7 +3,7 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 5):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 6):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). There are no upgrade steps yet,
 so an older database is refused with a "create a new database" error (from
@@ -209,14 +209,20 @@ Unique: `(universe_id, grantee_id, path_prefix)`. Index:
 
 ### credits
 
+Per-universe balances, held by an account or an object (a room's budget, a
+shop's till). The only copy of a balance: every change is a relative update
+in one atomic batch, and the CHECK rejects an overdraft, so a spend or a
+transfer is all-or-nothing.
+
 | Column | Type | Notes |
 |--------|------|-------|
-| id | TEXT PRIMARY KEY | UUID |
 | universe_id | TEXT NOT NULL REFERENCES universes(id) | |
-| player_id | TEXT NOT NULL REFERENCES accounts(id) | An account id, not a player object path |
-| balance | INTEGER NOT NULL DEFAULT 0 | |
+| holder_kind | TEXT NOT NULL | `account` or `object` |
+| holder_id | TEXT NOT NULL | Account id, or object path in the universe |
+| balance | INTEGER NOT NULL DEFAULT 0 | `CHECK (balance >= 0)` |
 
-Unique: `(universe_id, player_id)`.
+Primary key: `(universe_id, holder_kind, holder_id)`. No foreign key (a holder
+may be an account or an object); deleting an object deletes its balance.
 
 ## Combat
 

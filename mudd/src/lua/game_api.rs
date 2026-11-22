@@ -628,12 +628,13 @@ impl GameApi {
             self.timers.clone(),
             self.actions.clone(),
             self.effects.clone(),
+            self.credits.clone(),
         );
         let delete_object = lua.create_function(move |lua, id: String| {
             charge_db(lua)?;
             let store = store_clone.clone();
             let (user, universe_id, permissions) = ctx_clone.clone();
-            let (timers, actions, effects) = cleanup.clone();
+            let (timers, actions, effects, credits) = cleanup.clone();
             let user = actor_override(lua).or(user);
 
             let result: anyhow::Result<Result<bool, String>> = tokio::task::block_in_place(|| {
@@ -661,6 +662,12 @@ impl GameApi {
                         // Its effect rows went with it (cascade); drop them
                         // from the cache too
                         effects.cache_clear(&universe_id, &id).await;
+                        // Its balance goes too (credits has no foreign key:
+                        // holders may be accounts)
+                        let holder = crate::credits::Holder::Object(id.clone());
+                        if let Err(e) = credits.clear(&universe_id, &holder).await {
+                            tracing::warn!("credits of deleted {} not cleared: {}", id, e);
+                        }
                         timers.remove_heartbeat(&universe_id, &id).await;
                         actions.clear_by_object(&universe_id, &id).await;
                     }
@@ -2031,15 +2038,15 @@ impl GameApi {
             let universe_id = universe_clone.clone();
             let user_id = user_clone.clone();
 
-            let balance = block_now(async {
-                if let Some(uid) = user_id {
-                    credits.get_balance(&universe_id, &uid).await
-                } else {
-                    0
-                }
-            });
-
-            Ok(balance)
+            let Some(uid) = user_id else {
+                return Ok(0);
+            };
+            block_now(async {
+                credits
+                    .balance(&universe_id, &crate::credits::Holder::Account(uid))
+                    .await
+            })
+            .map_err(mlua::Error::external)
         })?;
         game.set("get_credits", get_credits)?;
 
@@ -2055,15 +2062,16 @@ impl GameApi {
             let universe_id = universe_clone.clone();
             let user_id = user_clone.clone();
 
-            let result = block_now(async {
-                if let Some(uid) = user_id {
-                    credits.deduct(&universe_id, &uid, amount, &reason).await
-                } else {
-                    false
-                }
-            });
-
-            Ok(result)
+            let _ = reason;
+            let Some(uid) = user_id else {
+                return Ok(false);
+            };
+            block_now(async {
+                credits
+                    .deduct(&universe_id, &crate::credits::Holder::Account(uid), amount)
+                    .await
+            })
+            .map_err(mlua::Error::external)
         })?;
         game.set("deduct_credits", deduct_credits)?;
 
@@ -2097,8 +2105,13 @@ impl GameApi {
                     }
 
                     credits
-                        .grant(&universe_id, &account_id, amount, "admin_grant")
+                        .grant(
+                            &universe_id,
+                            &crate::credits::Holder::parse(&account_id),
+                            amount,
+                        )
                         .await
+                        .is_ok()
                 });
 
                 Ok(result)

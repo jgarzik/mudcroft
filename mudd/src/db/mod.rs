@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
@@ -75,6 +75,7 @@ impl Database {
     /// - 3 -> 4 (active_effects stores absolute deadlines: expires_at,
     ///   period_ms, next_pulse_at, instead of remaining_ticks).
     /// - 4 -> 5 (heartbeats table; timers cascade with their object).
+    /// - 5 -> 6 (credits held by accounts or objects, CHECK balance >= 0).
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -292,11 +293,11 @@ impl Database {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS credits (
-                id TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL REFERENCES universes(id),
-                player_id TEXT NOT NULL REFERENCES accounts(id),
-                balance INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(universe_id, player_id)
+                holder_kind TEXT NOT NULL CHECK (holder_kind IN ('account', 'object')),
+                holder_id TEXT NOT NULL,
+                balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+                PRIMARY KEY (universe_id, holder_kind, holder_id)
             )
             "#,
         )
