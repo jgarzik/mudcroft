@@ -60,7 +60,7 @@ parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Zip file handling
-zip = "2.2"
+zip = "9"
 base64 = "0.23"
 
 # Regex for validation

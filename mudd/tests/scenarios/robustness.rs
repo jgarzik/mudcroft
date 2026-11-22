@@ -436,3 +436,55 @@ async fn test_replaced_connection_is_told() {
     second.command("look").await.unwrap();
     assert!(second.expect("room").await.is_ok());
 }
+
+/// A universe can be created by uploading a zip of universe.json and libs
+#[tokio::test]
+async fn test_universe_upload_zip() {
+    use std::io::Write;
+    let server = TestServer::start().await.expect("server");
+    let login: serde_json::Value = server
+        .post(
+            "/auth/login",
+            &serde_json::json!({"username": "test_admin", "password": "testpass123"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+    let admin_id = login["account_id"].as_str().unwrap();
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("universe.json", opts).unwrap();
+        zip.write_all(
+            serde_json::json!({"id": "zipped-world", "name": "Zipped", "owner_id": admin_id})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        zip.start_file("lib/greet.lua", opts).unwrap();
+        zip.write_all(b"return { hello = function() return 'hi' end }")
+            .unwrap();
+        zip.finish().unwrap();
+    }
+
+    let resp = server
+        .client
+        .post(format!("{}/universe/upload", server.base_url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .body(buf.into_inner())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 201, "{}", body);
+    assert_eq!(body["id"], "zipped-world");
+    // The uploaded lib, alongside the core mudlib
+    let libs = body["libs_loaded"].as_array().unwrap();
+    assert!(libs.contains(&serde_json::json!("greet")), "{}", body);
+}

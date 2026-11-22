@@ -305,7 +305,11 @@ async fn create_universe_from_zip(
 
         // Get all Lua file names
         let file_names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+            .filter_map(|i| {
+                let file = archive.by_index(i).ok()?;
+                // Skip entries whose names cannot be decoded
+                file.name().ok().map(|name| name.to_string())
+            })
             .collect();
 
         // Extract all Lua files
