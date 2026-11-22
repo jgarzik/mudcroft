@@ -305,7 +305,7 @@ Every message is JSON with a `type` field.
 
 A command may carry an `id` (up to 64 characters): the server answers
 `{"type": "done", "id": ...}` once the command is saved, and a command
-whose id was already saved (in the last ten minutes) is not run again, only
+whose id this player already saved (in the last ten minutes) is not run again, only
 answered `done`. Gateways use this to retry a command interrupted by a
 failover; a client may use it the same way.
 

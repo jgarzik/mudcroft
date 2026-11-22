@@ -413,10 +413,11 @@ deadline are deleted by later such entries.
 | Column | Type | Notes |
 |--------|------|-------|
 | universe_id | TEXT NOT NULL | |
+| player_id | TEXT NOT NULL | The player who sent it (ids are per player) |
 | command_id | TEXT NOT NULL | Up to 64 characters |
 | expires_at | INTEGER NOT NULL | ms since epoch (ten minutes after) |
 
-Primary key `(universe_id, command_id)`.
+Primary key `(universe_id, player_id, command_id)`.
 
 ## Startup Validation
 

@@ -770,7 +770,7 @@ async fn handle_client_message(
             let id = id.filter(|id| !id.is_empty() && id.len() <= 64);
             // Already saved (a retry after a failover): not run again
             if let Some(ref id) = id {
-                if command_applied(state, universe_id, id).await {
+                if command_applied(state, universe_id, player_id, id).await {
                     state
                         .connections
                         .send_to_player(
@@ -801,7 +801,7 @@ async fn handle_client_message(
             // included, is one change (db::run): one Raft entry.
             let saved = super::scripting::in_run_with(
                 state,
-                command_marker(universe_id, id.as_deref()),
+                command_marker(universe_id, player_id, id.as_deref()),
                 async {
                     let mut deferred = Vec::new();
                     let response = execute_command(
@@ -874,12 +874,15 @@ async fn handle_client_message(
 /// How long a command id is remembered (a retry comes within seconds)
 const COMMAND_ID_TTL_MS: i64 = 10 * 60 * 1000;
 
-/// Whether a command with this id was saved already
-async fn command_applied(state: &AppState, universe_id: &str, id: &str) -> bool {
+/// Whether this player's command with this id was saved already (ids are
+/// per player: nobody can claim another player's)
+async fn command_applied(state: &AppState, universe_id: &str, player_id: &str, id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM applied_commands WHERE universe_id = ? AND command_id = ?",
+        "SELECT 1 FROM applied_commands
+         WHERE universe_id = ? AND player_id = ? AND command_id = ?",
     )
     .bind(universe_id)
+    .bind(player_id)
     .bind(id)
     .fetch_optional(state.db.pool())
     .await
@@ -891,7 +894,11 @@ async fn command_applied(state: &AppState, universe_id: &str, id: &str) -> bool 
 /// Statements leading a command's batch when it has an id: the id is
 /// recorded with it (a duplicate fails the batch), and ids past their
 /// deadline go
-fn command_marker(universe_id: &str, id: Option<&str>) -> Vec<crate::db::run::Statement> {
+fn command_marker(
+    universe_id: &str,
+    player_id: &str,
+    id: Option<&str>,
+) -> Vec<crate::db::run::Statement> {
     let Some(id) = id else {
         return Vec::new();
     };
@@ -902,10 +909,12 @@ fn command_marker(universe_id: &str, id: Option<&str>) -> Vec<crate::db::run::St
             vec![universe_id.into(), now.into()],
         ),
         (
-            "INSERT INTO applied_commands (universe_id, command_id, expires_at) VALUES (?, ?, ?)"
+            "INSERT INTO applied_commands (universe_id, player_id, command_id, expires_at)
+             VALUES (?, ?, ?, ?)"
                 .to_string(),
             vec![
                 universe_id.into(),
+                player_id.into(),
                 id.into(),
                 (now + COMMAND_ID_TTL_MS).into(),
             ],

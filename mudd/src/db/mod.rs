@@ -67,9 +67,10 @@ const ONLINE_PLAYERS_TABLE: &str = r#"
 pub const APPLIED_COMMANDS_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS applied_commands (
         universe_id TEXT NOT NULL,
+        player_id TEXT NOT NULL,
         command_id TEXT NOT NULL,
         expires_at INTEGER NOT NULL,
-        PRIMARY KEY (universe_id, command_id)
+        PRIMARY KEY (universe_id, player_id, command_id)
     )
 "#;
 

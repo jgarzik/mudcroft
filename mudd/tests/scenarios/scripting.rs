@@ -962,3 +962,37 @@ async fn test_command_id_runs_once() {
     .unwrap();
     assert_eq!(n, 2);
 }
+
+/// Command ids are per player: another player's command with the same id
+/// still runs (nobody can suppress someone else's commands)
+#[tokio::test]
+async fn test_command_ids_are_per_player() {
+    let server = TestServer::start().await.expect("server");
+    let mut a = server
+        .connect_as(Role::Wizard {
+            username: "ida".into(),
+        })
+        .await
+        .unwrap();
+    let mut b = server
+        .connect_as(Role::Wizard {
+            username: "idb".into(),
+        })
+        .await
+        .unwrap();
+    let cmd = |who: &str| {
+        serde_json::json!({
+            "type": "command",
+            "id": "same-id",
+            "text": format!(r#"eval game.create_object("/items/mark-{}", "item", nil, {{name = "mark"}}) return "marked""#, who),
+        })
+    };
+    a.drain().await;
+    a.send_json(&cmd("a")).await.unwrap();
+    a.expect("done").await.expect("a done");
+    b.drain().await;
+    b.send_json(&cmd("b")).await.unwrap();
+    b.expect_output_containing("marked")
+        .await
+        .expect("b's command ran despite a's id");
+}
