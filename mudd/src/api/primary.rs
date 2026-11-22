@@ -99,15 +99,11 @@ async fn handle_orphaned_sessions(state: AppState) {
         }
     };
     for (universe, player, since) in online {
-        // The same claim as a normal disconnect: a player who reconnects
-        // meanwhile cancels it, and a live session is never handled
-        let (_cancel, gen) = state
-            .connections
-            .schedule_disconnect(&universe, &player)
-            .await;
+        // Not if they have a session or a disconnect pending here (that
+        // grace period stays in charge)
         if !state
             .connections
-            .claim_expired_disconnect(&universe, &player, gen)
+            .claim_orphaned_disconnect(&universe, &player)
             .await
         {
             continue;

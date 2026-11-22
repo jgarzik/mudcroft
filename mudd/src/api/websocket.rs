@@ -106,6 +106,16 @@ impl ConnectionManager {
     /// only if it is still the pending one (`gen`) and the player has no
     /// session, checked under the sessions lock so a reconnect that raced
     /// past the cancel is never treated as gone.
+    /// Claim the disconnect of a player whose server was lost (recorded
+    /// online, not connected here): false if they have a live session or a
+    /// disconnect already pending here, which then stays in charge
+    pub async fn claim_orphaned_disconnect(&self, universe_id: &str, player_id: &str) -> bool {
+        let k = key(universe_id, player_id);
+        let sessions = self.sessions.read().await;
+        let pending = self.pending_disconnects.read().await;
+        !sessions.contains_key(&k) && !pending.contains_key(&k)
+    }
+
     pub async fn claim_expired_disconnect(
         &self,
         universe_id: &str,
