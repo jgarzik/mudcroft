@@ -182,7 +182,7 @@ Recommended: roodb's model rather than a static `--peers` list.
 - Each node needs `--advertise` (an address peers can reach; `0.0.0.0` is
   refused).
 
-## Durability (with Phase 6)
+## Durability (built in Phase 6)
 
 Phase 6's single durable commit (only the Raft log fsyncs; the state machine
 applies with `synchronous = NORMAL`) interacts with snapshots and purge: the

@@ -584,6 +584,14 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   table's rows in one transaction, with foreign keys deferred, then records
   the position: the node has the old state or the new, its own Raft log and
   vote stay, and no connection the application holds is closed.
+- **One durable commit per write** (as in roodb): the log append syncs;
+  applying does not (`synchronous = NORMAL` on that connection, restored to
+  `FULL` before it goes back to the pool). A crash may roll back an apply,
+  but its `last_applied` goes with it (same transaction), so the entry is
+  applied again from the log, exactly once. Building a snapshot first makes
+  a syncing commit, so the log is never purged past data not yet on disk.
+  The committed log position is recorded as a lower bound
+  (`save_committed`, not synced). About 2.2 ms per write instead of 3.9.
 - **Timing**: heartbeat 100 ms, election timeout 400-800 ms. Timers start
   off and are switched on at runtime once the membership has more than one
   node.

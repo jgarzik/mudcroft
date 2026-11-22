@@ -95,13 +95,6 @@ Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
   and moderation.
 - **Backups**: Raft replicates but is not an offsite backup; add periodic
   SQLite backups to object storage.
-- **One durable commit per write, not two.** Each write now commits twice
-  durably (the log append, then the apply), about 3.5 ms per write. As in
-  the sister project roodb, only the log needs to be durable: apply with a
-  non-syncing connection (`PRAGMA synchronous` is per connection) and let
-  openraft re-apply from the log after a crash, with `save_committed` /
-  `read_committed` on the log store and the applied position kept in the
-  apply transaction (already the case). Needs a crash-recovery test.
 
 ## Economy and Limits
 

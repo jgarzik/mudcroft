@@ -79,6 +79,30 @@ pub async fn write_node_id(pool: &SqlitePool, node_id: super::types::NodeId) -> 
     write_meta(&mut conn, "node_id", &node_id).await
 }
 
+/// One durable commit per write (as in the sister project roodb): the Raft
+/// log append syncs (the connection's default `synchronous = FULL`), and
+/// applying it does not (`NORMAL`: in WAL mode a commit is then not synced
+/// until a later sync or checkpoint). Nothing is lost: an apply that a crash
+/// rolls back takes its `last_applied` with it (same transaction), so the
+/// entry is applied again from the log, exactly once. The log is purged only
+/// up to a snapshot, and building one first forces a sync (`durable_fence`).
+async fn relaxed_sync(conn: &mut SqliteConnection) -> io::Result<()> {
+    sqlx::query("PRAGMA synchronous = NORMAL")
+        .execute(&mut *conn)
+        .await
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
+/// Back to the pool's default before the connection is returned
+async fn full_sync(conn: &mut SqliteConnection) -> io::Result<()> {
+    sqlx::query("PRAGMA synchronous = FULL")
+        .execute(&mut *conn)
+        .await
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
 async fn read_meta(pool: &SqlitePool, key: &str) -> io::Result<Option<String>> {
     sqlx::query_scalar("SELECT value FROM raft_meta WHERE key = ?")
         .bind(key)
@@ -227,6 +251,30 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
+    }
+
+    /// Recorded without forcing a sync: openraft only needs a lower bound
+    /// (the next log append's sync carries it)
+    async fn save_committed(&mut self, committed: Option<LogId>) -> io::Result<()> {
+        let pool = self.pool.read().await;
+        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+        relaxed_sync(&mut conn).await?;
+        let written = write_meta(&mut conn, "committed", &committed).await;
+        // Back to syncing before the connection returns to the pool (or
+        // never returns)
+        if let Err(e) = full_sync(&mut conn).await {
+            conn.detach();
+            return Err(e);
+        }
+        written
+    }
+
+    async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
+        let pool = self.pool.read().await;
+        match read_meta(&pool, "committed").await? {
+            Some(json) => serde_json::from_str(&json).map_err(io::Error::other),
+            None => Ok(None),
+        }
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
@@ -539,6 +587,16 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
         let file = scratch.file();
         {
             let pool = self.pool.read().await;
+            // Applies are not synced (relaxed_sync); the log is purged up to
+            // this snapshot, so first make everything applied durable: a
+            // commit on a FULL connection syncs the WAL, earlier frames too
+            sqlx::query(
+                "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('durable_fence', ?)",
+            )
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&*pool)
+            .await
+            .map_err(io::Error::other)?;
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "VACUUM INTO {}",
                 sql_literal(&file, "rwc")
@@ -639,25 +697,41 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         let mut replies = Vec::with_capacity(batch.len());
 
         let pool = self.pool.read().await;
-        let mut tx = pool.begin().await.map_err(io::Error::other)?;
-        for (entry, responder) in batch {
-            last_applied = Some(entry.log_id);
-            let response = match entry.payload {
-                EntryPayload::Blank => Response::ok(0),
-                EntryPayload::Normal(request) => Self::apply_request(&mut tx, &request).await?,
-                EntryPayload::Membership(m) => {
-                    membership = StoredMembership::new(Some(entry.log_id), m);
-                    membership_changed = true;
-                    Response::ok(0)
-                }
-            };
-            replies.push((responder, response));
+        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+        // Not synced: the log entry already is (see relaxed_sync)
+        relaxed_sync(&mut conn).await?;
+        let applied = async {
+            let mut tx = sqlx::Connection::begin(&mut *conn)
+                .await
+                .map_err(io::Error::other)?;
+            for (entry, responder) in batch {
+                last_applied = Some(entry.log_id);
+                let response = match entry.payload {
+                    EntryPayload::Blank => Response::ok(0),
+                    EntryPayload::Normal(request) => Self::apply_request(&mut tx, &request).await?,
+                    EntryPayload::Membership(m) => {
+                        membership = StoredMembership::new(Some(entry.log_id), m);
+                        membership_changed = true;
+                        Response::ok(0)
+                    }
+                };
+                replies.push((responder, response));
+            }
+            write_meta(&mut tx, "last_applied", &last_applied).await?;
+            if membership_changed {
+                write_meta(&mut tx, "last_membership", &membership).await?;
+            }
+            tx.commit().await.map_err(io::Error::other)
         }
-        write_meta(&mut tx, "last_applied", &last_applied).await?;
-        if membership_changed {
-            write_meta(&mut tx, "last_membership", &membership).await?;
+        .await;
+        // Whatever happened, the connection goes back syncing: log appends
+        // use the same pool. If even that fails, it never goes back.
+        if full_sync(&mut conn).await.is_err() {
+            conn.detach();
+        } else {
+            drop(conn);
         }
-        tx.commit().await.map_err(io::Error::other)?;
+        applied?;
 
         // No checkpoint here: in WAL mode a committed transaction is visible
         // to every connection at once, and SQLite checkpoints on its own
@@ -1034,5 +1108,35 @@ mod tests {
         assert!(!scratch.file().exists());
         drop(scratch);
         assert!(!path.exists(), "removed when done");
+    }
+
+    /// Applying does not sync, but the connection goes back to the pool
+    /// syncing (log appends share the pool), also after a failed request
+    #[tokio::test]
+    async fn test_apply_returns_connection_syncing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.db");
+        crate::db::Database::new(Some(path.to_str().unwrap()))
+            .await
+            .unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        let mut sm = StateMachine::new(shared(pool.clone()), None).await.unwrap();
+        apply(
+            &mut sm,
+            vec![
+                normal(1, Request::simple("SELECT 1")),
+                normal(2, Request::simple("INSERT INTO no_such_table VALUES (1)")),
+            ],
+        )
+        .await;
+        let level: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(level, 2, "FULL");
     }
 }

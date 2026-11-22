@@ -556,3 +556,86 @@ async fn test_sigterm_shuts_down_gracefully() {
     let log = std::fs::read_to_string(&server.log_path).unwrap();
     assert!(log.contains("mudd shutdown complete"), "{}", log);
 }
+
+/// Acknowledged writes survive a crash (SIGKILL mid-stream), and the
+/// database comes back consistent: the Raft log is the durable record, and
+/// an apply lost in the crash is replayed from it exactly once
+#[tokio::test]
+async fn test_crash_loses_no_acknowledged_write() {
+    let mut server = TestServer::start_with_world(false).await.expect("server");
+    for round in 0..3 {
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let mut writers = tokio::task::JoinSet::new();
+        for i in 0..40 {
+            let (client, base) = (client.clone(), base.clone());
+            writers.spawn(async move {
+                let name = format!("crash{}_{}", round, i);
+                let resp = client
+                    .post(format!("{}/auth/register", base))
+                    .json(&serde_json::json!({"username": name, "password": "testpass123"}))
+                    .send()
+                    .await;
+                matches!(resp, Ok(r) if r.status().as_u16() == 201).then_some(name)
+            });
+        }
+        // Kill while registrations are in flight
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        server.stop();
+        let mut acknowledged = Vec::new();
+        while let Some(done) = writers.join_next().await {
+            if let Ok(Some(name)) = done {
+                acknowledged.push(name);
+            }
+        }
+        server.start_again().await.expect("restart after crash");
+        for name in &acknowledged {
+            let found: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE username = ?")
+                .bind(name)
+                .fetch_one(server.pool())
+                .await
+                .unwrap();
+            assert_eq!(found, 1, "round {}: acknowledged {} lost", round, name);
+        }
+        let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+        assert_eq!(check, "ok");
+    }
+}
+
+/// Probe (run by hand): time of 300 sequential Raft writes from Lua
+#[tokio::test]
+#[ignore]
+async fn zz_write_latency_probe() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "latency_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    let entrance = server.world().entrance_id.clone();
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/counter", "item", "{}", {{name = "counter"}}) return "made""#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("made").await.unwrap();
+    let started = std::time::Instant::now();
+    wiz.command(
+        r#"eval for i = 1, 300 do game.update_object("/items/counter", {n = i}) end return "done""#,
+    )
+    .await
+    .unwrap();
+    wiz.expect_output_containing("done").await.unwrap();
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "PROBE 300 writes: {:.0} ms ({:.2} ms/write)",
+        ms,
+        ms / 300.0
+    );
+}
