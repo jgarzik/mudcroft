@@ -23,11 +23,6 @@ primary lifecycle, gateways, failover), with these gaps:
   when the primary dies may or may not have taken effect; the player is told
   and nothing is retried (one batch per command and command ids would fix
   it).
-- **A payment and its handler are separate changes.** Accepting a payment
-  moves the credits, then runs the object's handler (its own writes); a
-  crash in between leaves the player charged with nothing handed over, and
-  a handler failing part way keeps both its writes and the payment. One
-  batch per Lua run (below) would make them one change.
 - **Device tokens can run out.** The in-memory store holds 200,000 (10 per
   account). Registering about 20,000 accounts fills it. Live tokens are
   never evicted (expired ones are swept out when room is needed, and an
@@ -47,11 +42,10 @@ Clusters are built (see [cluster-design.md](cluster-design.md)): `--join`
 membership, a TLS cluster port with a shared secret, a single primary that
 runs the game, gateways that relay to it, and failover. Planned:
 
-- **One batch per Lua run.** Each `game.*` write is its own Raft entry
-  today. Collecting a whole execution's writes into one entry would make
-  each command atomic and, with a command id recorded in the batch, let a
-  gateway retry a command interrupted by a failover exactly once. Typed log
-  entries could replace raw SQL at the same time:
+- **Command ids.** Each Lua run is one Raft entry (`mudd/src/db/run.rs`).
+  Recording a command id in that entry would let a gateway retry a command
+  interrupted by a failover exactly once. Typed log entries could replace
+  raw SQL at the same time:
 
   ```rust
   pub enum GameLogEntry {

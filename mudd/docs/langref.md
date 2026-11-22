@@ -901,11 +901,11 @@ They are shown `Pay <amount> credits for <reason>?` (a dialog in the web
 client; text clients type `yes` or `no`) and have a minute to answer. If they
 accept and can afford it, the credits move to this object and its `handler`
 runs (as the object's owner) with `{payment_id, amount, reason, data,
-actor_id, actor_account}`; its return value is the player's reply. If the handler does
-not exist the payment is refunded; once it has run, the payment stands even
-if it fails part way (it may already have handed something over), so write
-handlers that check first and change things last, and refund with
-`game.transfer_credits("object", args.actor_account, ...)` if needed. Declining, or not answering,
+actor_id, actor_account}`; its return value is the player's reply. The payment and
+the handler are one change: if the handler raises an error (or does not
+exist), neither is kept, the player is not charged, and the request is used
+up. To give money back after a successful handler, use
+`game.transfer_credits("object", args.actor_account, ...)`. Declining, or not answering,
 changes nothing. `data` is an optional string (up to 4096 bytes); `reason`
 is cut to 200 characters; `handler` cannot be private or an engine hook.
 

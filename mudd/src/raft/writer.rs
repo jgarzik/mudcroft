@@ -208,6 +208,20 @@ impl RaftWriter {
         Ok(response.data)
     }
 
+    /// Like [`Self::execute`], but inside a run the write stands even if the
+    /// run fails (see db::run)
+    pub async fn execute_kept(
+        &self,
+        sql: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<Response> {
+        if let Some(run) = crate::db::run::current() {
+            let rows = run.execute_kept(&[(sql.to_string(), params)]).await?;
+            return Ok(Response::ok(rows));
+        }
+        self.execute(sql, params).await
+    }
+
     /// Execute a batch of SQL statements atomically via Raft consensus
     ///
     /// The statements are one log entry, applied in one transaction: if any

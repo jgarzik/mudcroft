@@ -512,8 +512,9 @@ running object (`"object"`) freely; a player's credits move only with
 consent: `game.request_payment` (allowed only with a paying player, i.e. a
 verb the player typed: `ScriptContext.payer`) records a `payment_requests`
 row with a one-minute deadline and sends a `confirm` prompt; accepting
-claims the row through Raft (one answer counts), transfers the credits to
-the object and runs its handler (refunding if it fails), in
+claims the row (one answer counts), transfers the credits to the object and
+runs its handler, all in one run: a failing or missing handler undoes the
+transfer and its own writes, while the claim is kept (`execute_kept`), in
 `api/payments.rs`. Passive
 code (hooks, timers, nested `use_object`) has no payer, so walking into a
 room can never cost a player anything. Lua exposes `get_credits`,
