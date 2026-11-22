@@ -1065,7 +1065,7 @@ Merges the top-level keys of `config` into the universe config. Requires
 The server reads these config keys: `lib_hashes`, which maps library
 names to code hashes (see [Core library](#core-library)), the Venice
 prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)), and the
-combat settings `combat_round_ms`, `player_death`, `npc_death` and `corpse_decay_s` (see
+combat settings `combat_round_ms`, `pvp_policy`, `player_death`, `npc_death` and `corpse_decay_s` (see
 [Built-in combat](#built-in-combat)). Other keys are
 yours to read with `get_universe()`. Use the `setportal` command to set
 the spawn room; config keys don't affect it.
@@ -1174,7 +1174,7 @@ All other properties, including `weight`, `value`, `lighting`, `aggro`, the weap
 
 The built-in `attack <name>` (or `kill`) command works like this:
 
-- It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`.
+- It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`, or another player as the universe config's `pvp_policy` allows: `arena` (the default: only in a room with `is_arena = true`), `flagged` (both players typed `pvp on`), `open`, or `disabled`. A fight between players ends as soon as the policy no longer allows it.
 - HP lives in the objects' properties: `hp`, `max_hp`, `armor_class` (default 10), `attack_bonus` (default 0) and `resistances` (e.g. `{fire = "resistant"}`, also `immune` and `vulnerable`). An attack reads them and writes the target's new `hp` back, as one atomic change.
 - Each attack is a d20 roll plus `attack_bonus` against the target's `armor_class`. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit), then the target's resistances. A natural 1 always misses.
 - Status effects count: a stunned or paralyzed attacker cannot attack; a blinded attacker or an invisible target is -4 to hit, a stunned or paralyzed target +4; `strengthened`/`weakened` on the attacker and `exposed`/`protected` on the target add or subtract their magnitude from the damage roll.

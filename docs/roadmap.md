@@ -106,9 +106,9 @@ for features that do not exist yet; see its `SKIP` table. Planned:
   built (`mudd/src/api/combat.rs`, the `combat` table); the mudlib's
   `Combat.initiate` and the suite's `in_combat`/`attackers` view of it are
   not.
-- **PvP policy enforcement** in `Combat.initiate`/`can_attack`: disabled,
-  arena-only (`is_arena` rooms), flagged (`pvp_on`/`pvp_off` commands),
-  open. Today the Rust `PvpPolicy` exists but nothing checks it.
+- **PvP policy in the mudlib**: the built-in `attack` and rounds enforce
+  `pvp_policy` (`mudd/src/api/combat.rs`); the mudlib's
+  `Combat.initiate`/`can_attack` do not.
 - **Status effects in combat**: stun and paralysis skip turns, stat
   modifiers apply to rolls, effects tick down per round
   (`Combat.process_statuses`).

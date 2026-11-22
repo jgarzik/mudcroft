@@ -189,7 +189,8 @@ after the verb as their argument.
 | `north`/`n`, `south`/`s`, `east`/`e`, `west`/`w`, `up`/`u`, `down`/`d` | all | Follow exit; `on_leave` on the old room, `on_enter` on the new one |
 | `say <msg>` | all | `<name> says: ...` to others in the room |
 | `get`/`take <item>`, `drop <item>`, `inventory`/`inv`/`i` | all | Call `Commands.take/drop/inventory` from the mudlib; `take` refuses `fixed` and living objects, and item names match literally (`%`, `_` escaped); `get <item>\|all from <container>` calls `Commands.take_from` |
-| `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`): the first blow, then rounds both ways until the fight ends |
+| `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`), or a player as `pvp_policy` allows: the first blow, then rounds both ways until the fight ends |
+| `pvp on`/`off` | all | Flag yourself for player combat (counts under `pvp_policy = "flagged"`) |
 | `help` | all | Commands for the caller's access level |
 | `create <class> <path> "<name>" ["<desc>"] [key=value ...]` | builder+ | Create an object, path-permission checked |
 | `eval <lua>` | wizard+ | Run Lua as the caller |
@@ -479,7 +480,9 @@ Two layers exist:
   `respawn_seconds` (a `respawn` row in `deadlines`; 0 deletes it), and
   credits its killer's `xp`. Corpses are `/corpses/c-...` items with a
   `decay` row; decaying spills what is left into the room. Messages and the
-  `on_death` hook follow the commit (`report_death`).
+  `on_death` hook follow the commit (`report_death`). Player against player
+  follows `pvp_policy` (`combat::pvp_allowed`: arena by default, flagged,
+  open, disabled), checked at the attack and every round.
 - **Status effects** (`src/combat/effects.rs`, `src/api/effect_scheduler.rs`)
   live in `active_effects`, cached by `EffectRegistry`. They store absolute
   deadlines (`expires_at`; periodic ones also `period_ms`, `next_pulse_at`),

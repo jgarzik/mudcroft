@@ -40,6 +40,7 @@ const IDLE_WAIT: Duration = Duration::from_secs(60);
 /// A universe's combat settings (its config)
 pub struct Settings {
     pub round_ms: u64,
+    pub pvp: crate::combat::PvpPolicy,
     pub player_death: String,
     pub npc_death: String,
     pub corpse_decay_ms: u64,
@@ -63,6 +64,11 @@ pub async fn settings(state: &AppState, universe_id: &str) -> Settings {
             .to_string()
     };
     Settings {
+        pvp: config
+            .get("pvp_policy")
+            .and_then(|v| v.as_str())
+            .and_then(crate::combat::PvpPolicy::from_str)
+            .unwrap_or_default(),
         round_ms: config
             .get("combat_round_ms")
             .and_then(|v| v.as_u64())
@@ -95,6 +101,38 @@ fn alive(obj: &Object) -> bool {
         .get("hp")
         .and_then(|v| v.as_i64())
         .is_none_or(|hp| hp > 0)
+}
+
+/// Whether `attacker` may fight `target` here: anything but player against
+/// player is always allowed; that follows the universe's `pvp_policy`
+/// (arena, the default: only in a room with `is_arena`; flagged: both
+/// players have `pvp` on; open; disabled)
+pub async fn pvp_allowed(
+    state: &AppState,
+    universe_id: &str,
+    attacker: &Object,
+    target: &Object,
+) -> bool {
+    use crate::combat::PvpPolicy;
+    if !(is_player(attacker) && is_player(target)) {
+        return true;
+    }
+    let flagged = |o: &Object| o.get_bool("pvp").unwrap_or(false);
+    match settings(state, universe_id).await.pvp {
+        PvpPolicy::Disabled => false,
+        PvpPolicy::Open => true,
+        PvpPolicy::Flagged => flagged(attacker) && flagged(target),
+        PvpPolicy::ArenaOnly => match attacker.parent_id.as_deref() {
+            Some(room) => state
+                .object_store
+                .get(universe_id, room)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.get_bool("is_arena").unwrap_or(false)),
+            None => false,
+        },
+    }
 }
 
 /// What one blow did, and what each party is told
@@ -678,6 +716,19 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
             }
         }
         let target = target.expect("found above");
+        // Player against player only while the policy allows it (a flag
+        // switched off, the policy changed)
+        if !pvp_allowed(state, &u, &attacker, &target).await {
+            store.execute_batch(vec![end(&u, &entity)]).await?;
+            if is_player(&attacker) {
+                notes.push(Note::Player(
+                    u.clone(),
+                    entity.clone(),
+                    "You stop fighting.".into(),
+                ));
+            }
+            continue;
+        }
         let round_ms = settings(state, &u).await.round_ms;
         store
             .execute_batch(vec![statement(

@@ -1007,3 +1007,93 @@ async fn test_player_death_keep_policy() {
     .unwrap();
     assert_eq!(parent, player_id, "kept");
 }
+
+/// Player against player follows the universe's pvp_policy: arena (the
+/// default: only in rooms with is_arena), flagged (both typed `pvp on`),
+/// open, or disabled
+#[tokio::test]
+async fn test_pvp_policy() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "referee".into(),
+        })
+        .await
+        .unwrap();
+    let mut duelist = server
+        .connect_as(Role::Player {
+            username: "duelist".into(),
+        })
+        .await
+        .unwrap();
+    let mut rival = server
+        .connect_as(Role::Player {
+            username: "rival".into(),
+        })
+        .await
+        .unwrap();
+    // Both stand in the entrance; replies to an attack
+    async fn try_attack(c: &mut TestClient) -> String {
+        c.drain().await;
+        c.command("attack rival").await.unwrap();
+        let _ = c.expect("echo").await;
+        let reply = c.expect_any().await.unwrap();
+        reply["text"]
+            .as_str()
+            .or(reply["message"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+    let refused = |t: &str| t.contains("can't attack");
+
+    // Default (arena): not here
+    assert!(refused(&try_attack(&mut duelist).await));
+    // ... but in an arena
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.update_object("{}", {{is_arena = true}}) return "ok""#,
+            entrance
+        ),
+    )
+    .await;
+    let t = try_attack(&mut duelist).await;
+    assert!(!refused(&t) && t.contains("rival"), "{}", t);
+    rival.drain().await;
+
+    // Disabled: not even in the arena
+    eval_as(
+        &mut adm,
+        r#"game.update_universe({pvp_policy = "disabled"}) return "ok""#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(refused(&try_attack(&mut duelist).await));
+
+    // Flagged: only when both are flagged
+    eval_as(
+        &mut adm,
+        r#"game.update_universe({pvp_policy = "flagged"}) return "ok""#,
+    )
+    .await;
+    assert!(refused(&try_attack(&mut duelist).await));
+    duelist.drain().await;
+    duelist.command("pvp on").await.unwrap();
+    duelist
+        .expect_output_containing("PvP on")
+        .await
+        .expect("flagged");
+    assert!(
+        refused(&try_attack(&mut duelist).await),
+        "rival is not flagged"
+    );
+    rival.drain().await;
+    rival.command("pvp on").await.unwrap();
+    rival
+        .expect_output_containing("PvP on")
+        .await
+        .expect("flagged");
+    let t = try_attack(&mut duelist).await;
+    assert!(!refused(&t) && t.contains("rival"), "{}", t);
+}

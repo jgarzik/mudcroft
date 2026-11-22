@@ -10,9 +10,9 @@ use super::dice::{is_critical, is_fumble};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PvpPolicy {
     /// PvP is completely disabled
-    #[default]
     Disabled,
-    /// PvP only in designated arenas
+    /// PvP only in designated arenas (rooms with `is_arena`): the default
+    #[default]
     ArenaOnly,
     /// Players must flag themselves for PvP
     Flagged,

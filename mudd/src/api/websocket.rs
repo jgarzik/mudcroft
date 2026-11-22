@@ -1275,7 +1275,7 @@ async fn execute_command(
         "help" => {
             let mut text = String::from(
                 "Commands: look, north/south/east/west/up/down, say <message>, \
-                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, help. \
+                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, pvp on/off, help. \
                  Objects may offer their own verbs (e.g. 'pull lever').",
             );
             if access_level >= AccessLevel::Builder {
@@ -1586,7 +1586,16 @@ async fn execute_command(
                     .read()
                     .await
                     .is_a(universe_id, &target.class, "npc");
-            if !is_npc {
+            // Another player only as the universe's pvp_policy allows
+            let allowed = is_npc
+                || (target.class == "player"
+                    && match state.object_store.get(universe_id, player_id).await {
+                        Ok(Some(me)) => {
+                            super::combat::pvp_allowed(state, universe_id, &me, target).await
+                        }
+                        _ => false,
+                    });
+            if !allowed {
                 return ServerMessage::Error {
                     message: format!("You can't attack {}.", target_display_name),
                 };
@@ -1711,6 +1720,50 @@ async fn execute_command(
                 super::combat::report_death(state, universe_id, d).await;
             }
             ServerMessage::Silent
+        }
+        "pvp" => {
+            // Flag yourself for player combat (counts under pvp_policy
+            // "flagged")
+            let on = match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => {
+                    let flagged = state
+                        .object_store
+                        .get(universe_id, player_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|me| me.get_bool("pvp"))
+                        .unwrap_or(false);
+                    return ServerMessage::Output {
+                        text: format!(
+                            "PvP is {} for you. Usage: pvp on|off",
+                            if flagged { "on" } else { "off" }
+                        ),
+                    };
+                }
+            };
+            let statement = match crate::objects::ObjectStore::set_properties_statement(
+                universe_id,
+                player_id,
+                &[("pvp", serde_json::json!(on))],
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ServerMessage::Error {
+                        message: format!("Could not change PvP: {}", e),
+                    }
+                }
+            };
+            match state.object_store.execute_batch(vec![statement]).await {
+                Ok(()) => ServerMessage::Output {
+                    text: format!("PvP {}.", if on { "on" } else { "off" }),
+                },
+                Err(e) => ServerMessage::Error {
+                    message: format!("Could not change PvP: {}", e),
+                },
+            }
         }
         "create" => {
             // Builder+ only
