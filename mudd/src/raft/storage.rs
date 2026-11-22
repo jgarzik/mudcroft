@@ -307,6 +307,12 @@ impl SnapshotScratch {
         let builder = {
             let mut b = tempfile::Builder::new();
             b.prefix(".mudd-snapshot-");
+            // Owner only, whatever the umask
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                b.permissions(std::fs::Permissions::from_mode(0o700));
+            }
             b
         };
         let dir = db_path
