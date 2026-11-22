@@ -53,20 +53,6 @@ impl RateLimiter {
         let _ = self.take(key, true);
     }
 
-    /// Whether `key` has used nothing lately (its bucket is full)
-    pub fn fresh(&self, key: &str) -> bool {
-        if self.per_minute == 0 {
-            return true;
-        }
-        let capacity = f64::from(self.per_minute);
-        let per_sec = capacity / 60.0;
-        let buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        match buckets.get(key) {
-            None => true,
-            Some((tokens, at)) => (*tokens + at.elapsed().as_secs_f64() * per_sec) >= capacity,
-        }
-    }
-
     /// Give back a request taken with `check` (e.g. the login succeeded)
     pub fn refund(&self, key: &str) {
         if self.per_minute == 0 {
@@ -221,13 +207,6 @@ mod tests {
         assert!(limiter.peek("x").is_ok());
         limiter.charge("x");
         assert!(limiter.peek("x").is_err());
-        // fresh: nothing used lately
-        let limiter = RateLimiter::new(5);
-        assert!(limiter.fresh("y"));
-        limiter.charge("y");
-        assert!(!limiter.fresh("y"));
-        limiter.refund("y");
-        assert!(limiter.fresh("y"));
     }
 
     #[test]

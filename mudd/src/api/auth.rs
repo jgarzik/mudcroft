@@ -35,6 +35,11 @@ pub struct AuthResponse {
     pub account_id: String,
     pub username: String,
     pub access_level: String,
+    /// Proof this device logged in (send it with the next login; it is
+    /// renewed each time): spares it the slow queue when the account's name
+    /// is under attack. Kept in server memory only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_token: Option<String>,
 }
 
 /// Error response
@@ -85,6 +90,7 @@ async fn register(
             Json(AuthResponse {
                 token,
                 account_id: account.id,
+                device_token: Some(state.devices.issue(&account.username)),
                 username: account.username,
                 access_level: account.access_level,
             }),
@@ -112,6 +118,9 @@ async fn register(
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+    /// The device token from this device's last login, if any
+    #[serde(default)]
+    pub device_token: Option<String>,
 }
 
 /// Login with username and password
@@ -143,9 +152,13 @@ async fn login(
         .unwrap_or("internal");
     let username = req.username.to_lowercase();
     let user_key = format!("{}|{}", username, client);
-    // A client with no recent failures for this name skips the slow queue
-    // below: attackers filling it cannot keep the owner out
-    let fresh_client = state.auth_by_user.fresh(&user_key);
+    // A device that logged in to this account before (a valid device token)
+    // skips the slow queue below: attackers filling it cannot keep the owner
+    // out, and cannot mint such a token by changing address
+    let trusted_device = req
+        .device_token
+        .as_deref()
+        .is_some_and(|t| state.devices.verify(&username, t));
     // Reserve before hashing (a burst cannot slip past a check made while
     // others are still hashing); a successful login gives the tokens back
     if let Err(retry) = state.auth_by_user.check(&user_key) {
@@ -160,7 +173,7 @@ async fn login(
     // try), rather than being refused, so the owner can still log in; a
     // queue longer than 10 is refused
     let global_ok = state.auth_by_user_global.check(&username).is_ok();
-    let _serialized = if global_ok || fresh_client {
+    let _serialized = if global_ok || trusted_device {
         None
     } else {
         let Some(lock) = state.auth_user_locks.get(&username, 10) else {
@@ -182,6 +195,11 @@ async fn login(
             if global_ok {
                 state.auth_by_user_global.refund(&username);
             }
+            // Renew this device's token (a fresh one each login)
+            if let Some(ref old) = req.device_token {
+                state.devices.revoke(old);
+            }
+            let device_token = Some(state.devices.issue(&account.username));
             (
                 StatusCode::OK,
                 Json(AuthResponse {
@@ -189,6 +207,7 @@ async fn login(
                     account_id: account.id,
                     username: account.username,
                     access_level: account.access_level,
+                    device_token,
                 }),
             )
                 .into_response()
@@ -209,6 +228,9 @@ async fn login(
 #[derive(Debug, Deserialize)]
 pub struct LogoutRequest {
     pub token: String,
+    /// This device's token, revoked with the session
+    #[serde(default)]
+    pub device_token: Option<String>,
 }
 
 /// Logout response
@@ -222,6 +244,9 @@ async fn logout(
     State(state): State<AppState>,
     Json(req): Json<LogoutRequest>,
 ) -> impl IntoResponse {
+    if let Some(ref device) = req.device_token {
+        state.devices.revoke(device);
+    }
     let service = state.accounts();
 
     match service.logout(&req.token).await {

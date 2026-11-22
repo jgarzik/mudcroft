@@ -1294,3 +1294,43 @@ async fn test_successful_logins_do_not_count() {
         );
     }
 }
+
+/// A successful login hands out a device token; presenting it renews it
+/// (a new one each time), and logout with it revokes it
+#[tokio::test]
+async fn test_device_tokens_issued_and_renewed() {
+    let server = TestServer::start_with_world(false).await.expect("server");
+    let creds = serde_json::json!({"username": "devicey", "password": "testpass123"});
+    let reg: serde_json::Value = server
+        .post("/auth/register", &creds)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first = reg["device_token"]
+        .as_str()
+        .expect("issued at registration")
+        .to_string();
+    let login = serde_json::json!({"username": "devicey", "password": "testpass123", "device_token": first});
+    let renewed: serde_json::Value = server
+        .post("/auth/login", &login)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second = renewed["device_token"]
+        .as_str()
+        .expect("renewed")
+        .to_string();
+    assert_ne!(first, second);
+    let out = server
+        .post(
+            "/auth/logout",
+            &serde_json::json!({"token": renewed["token"], "device_token": second}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.status(), 200);
+}

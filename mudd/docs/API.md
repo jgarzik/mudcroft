@@ -78,15 +78,21 @@ letters, digits, `_` or `-`; passwords must be 6 characters to 1 KiB.
 ### POST /auth/login
 
 ```json
-{"username": "player1", "password": "secretpassword123"}
+{"username": "player1", "password": "secretpassword123", "device_token": "<optional>"}
 ```
 
 | Status | Body |
 |--------|------|
-| 200 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player"}` |
+| 200 | `{"token": "<64 hex>", "account_id": "<uuid>", "username": "player1", "access_level": "player", "device_token": "<64 hex>"}` |
 | 401 | `{"error": "invalid credentials"}` (unknown user or wrong password) |
 
 Logging in issues a new token and invalidates the account's previous one.
+
+`device_token` (also returned by registration) proves this device has
+logged in to the account before: send it with the next login, which returns
+a fresh one in its place. Tokens last 30 days and are kept in the server's
+memory only (a restart or failover forgets them; the device then gets a new
+one at its next login).
 
 Limited to `--auth-limit` failed logins a minute per username and client
 (default 30), and twice that many login and registration requests per
@@ -95,17 +101,18 @@ client (an IPv4 address or an IPv6 /64): beyond that,
 header (seconds), before the password is checked. A successful login does
 not count, and one client never blocks another. Beyond ten times the rate of
 failures for one username across all clients, attempts for it go one at a
-time, a second apart (so the owner still gets in); beyond a hundred times
-the rate they are refused.
+time, a second apart, except logins presenting a valid `device_token` for
+the account, which go straight through (the owner's devices are never held
+up by an attack); beyond a hundred times the rate they are refused.
 
 ### POST /auth/logout
 
 ```json
-{"token": "<token>"}
+{"token": "<token>", "device_token": "<optional>"}
 ```
 
 Response 200: `{"success": true}`, or `{"success": false}` if no account had
-that token.
+that token. A `device_token` given is revoked.
 
 ### GET /auth/validate?token=\<token\>
 

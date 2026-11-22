@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { PaymentRequest, RoomData, TerminalMessage } from '../types/messages'
 import { DEFAULT_THEME_ID } from '../theme/themeRegistry'
+import { getDeviceToken, removeDeviceToken } from '../deviceToken'
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
 
@@ -46,7 +47,7 @@ let messageIdCounter = 0
 
 export const useGameStore = create<GameStore>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       // Auth state
       token: null,
       username: null,
@@ -68,7 +69,20 @@ export const useGameStore = create<GameStore>()(
       setUniverse: (universe) =>
         set({ universe }),
 
-      logout: () =>
+      logout: () => {
+        // End the session on the server too, revoking this device's token
+        const { token, username } = get()
+        if (token && username) {
+          const device_token = getDeviceToken(username)
+          fetch('/auth/logout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token, device_token }),
+          }).catch(() => {
+            // Logged out locally either way
+          })
+          removeDeviceToken(username)
+        }
         set({
           token: null,
           username: null,
@@ -79,7 +93,9 @@ export const useGameStore = create<GameStore>()(
           connectionStatus: 'disconnected',
           playerId: null,
           themeId: DEFAULT_THEME_ID,
-        }),
+          pendingPayments: [],
+        })
+      },
 
       // Game actions
       addMessage: (text, type) =>

@@ -1,6 +1,7 @@
 //! HTTP API module - REST endpoints and WebSocket
 
 mod auth;
+mod devices;
 mod effect_scheduler;
 mod gateway;
 mod images;
@@ -57,6 +58,9 @@ pub struct AppState {
     pub auth_by_user_global: Arc<ratelimit::RateLimiter>,
     /// The hard cap across all clients (a hundred times the rate): refused
     pub auth_by_user_cap: Arc<ratelimit::RateLimiter>,
+    /// Device tokens (in memory): logins presenting a valid one skip the
+    /// slow per-username queue
+    pub devices: Arc<devices::DeviceTokens>,
     /// Serializes the slowed attempts per username
     pub auth_user_locks: Arc<ratelimit::KeyedLocks>,
     /// True while this node is the active primary: leader, caches rebuilt,
@@ -155,6 +159,7 @@ pub async fn router(
         auth_by_user_global: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(10))),
         auth_by_user_cap: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(100))),
         auth_user_locks: Arc::new(ratelimit::KeyedLocks::default()),
+        devices: Arc::new(devices::DeviceTokens::default()),
         effects,
     };
 
