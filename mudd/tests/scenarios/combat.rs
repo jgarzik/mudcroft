@@ -319,3 +319,126 @@ async fn test_lua_effects_api() {
     .await;
     assert_eq!(out["text"], "false", "{}", out);
 }
+
+async fn bat_row(server: &TestServer) -> (Option<i64>, Option<String>) {
+    sqlx::query_as(
+        "SELECT json_extract(properties, '$.hp'), parent_id FROM objects
+         WHERE universe_id = ? AND id = ?",
+    )
+    .bind(server.universe_id())
+    .bind(&server.world().bat_id)
+    .fetch_one(server.pool())
+    .await
+    .unwrap()
+}
+
+/// Effects tick once a second: poison deals its damage each tick, through
+/// the object's HP, and expires when its ticks run out
+#[tokio::test]
+async fn test_effects_tick_down() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "tick_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    eval_as(
+        &mut wiz,
+        &format!(r#"return game.apply_effect("{}", "poisoned", 3, 2)"#, bat),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    let (hp, parent) = bat_row(&server).await;
+    assert_eq!(hp, Some(15 - 3 * 2), "three ticks of 2 poison");
+    assert!(parent.is_some(), "still alive");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_effects WHERE entity_id = ?")
+        .bind(&bat)
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "expired effects are gone");
+}
+
+/// Damage over time can kill: the NPC leaves the room and onlookers hear it
+#[tokio::test]
+async fn test_effect_damage_kills() {
+    let server = TestServer::start().await.expect("server");
+    let mut watcher = player_in_passage(&server, "burn_watcher").await;
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "burn_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    eval_as(
+        &mut wiz,
+        &format!(r#"return game.apply_effect("{}", "burning", 2, 50)"#, bat),
+    )
+    .await;
+    watcher
+        .expect_output_containing("Giant Bat dies")
+        .await
+        .expect("the room hears the death");
+    let (hp, parent) = bat_row(&server).await;
+    assert_eq!((hp, parent), (Some(0), None));
+}
+
+/// A player under an effect is told what it does each tick
+#[tokio::test]
+async fn test_player_hears_their_effects() {
+    let server = TestServer::start().await.expect("server");
+    let mut pl = player_in_passage(&server, "poisoned_player").await;
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "poisoner_wiz".into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut wiz,
+        &format!(
+            r#"return game.apply_effect("{}", "poisoned", 2, 3)"#,
+            pl.player_id().unwrap()
+        ),
+    )
+    .await;
+    pl.expect_output_containing("3 poison damage")
+        .await
+        .expect("damage message");
+    pl.expect_output_containing("no longer poisoned")
+        .await
+        .expect("expiry message");
+}
+
+/// Deadlines, not a sweep: a plain effect writes once when applied and once
+/// when it ends, nothing while it lasts
+#[tokio::test]
+async fn test_plain_effect_costs_no_writes_while_active() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "stun_wiz".into(),
+        })
+        .await
+        .unwrap();
+    let bat = server.world().bat_id.clone();
+    async fn effect_writes(server: &TestServer) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%active_effects%'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap()
+    }
+    let before = effect_writes(&server).await;
+    eval_as(
+        &mut wiz,
+        &format!(r#"return game.apply_effect("{}", "stunned", 2.5, 0)"#, bat),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(effect_writes(&server).await - before, 1, "only the apply");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(effect_writes(&server).await - before, 2, "and the end");
+}

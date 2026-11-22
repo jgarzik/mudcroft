@@ -1,6 +1,7 @@
 //! HTTP API module - REST endpoints and WebSocket
 
 mod auth;
+mod effect_scheduler;
 mod images;
 pub mod scripting;
 mod universe;
@@ -123,6 +124,7 @@ pub async fn router(
 
     // Fire call_out timers and heartbeats in the background
     tokio::spawn(scripting::run_timer_loop(state.clone()));
+    tokio::spawn(effect_scheduler::run_effect_scheduler(state.clone()));
 
     let api = Router::new()
         .route("/health", get(health_check))

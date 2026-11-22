@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
@@ -72,6 +72,8 @@ impl Database {
     /// - 2 -> 3 (combat_state dropped: HP lives on the object row;
     ///   active_effects keyed (universe, entity, type), cascading with the
     ///   object).
+    /// - 3 -> 4 (active_effects stores absolute deadlines: expires_at,
+    ///   period_ms, next_pulse_at, instead of remaining_ticks).
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -414,7 +416,9 @@ impl Database {
                 universe_id TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
                 effect_type TEXT NOT NULL,
-                remaining_ticks INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                period_ms INTEGER,
+                next_pulse_at INTEGER,
                 magnitude INTEGER NOT NULL DEFAULT 0,
                 damage_type TEXT,
                 source_id TEXT,

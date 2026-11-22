@@ -440,8 +440,19 @@ Two layers exist:
   then 1d6 physical damage, doubled on a critical, then resistances) and
   commits it as **one atomic batch** (`attack_statements`): the target's new
   `hp` via `json_set`, and on a kill its removal from the room. Targets must
-  be `npc`, a class derived from `npc`, or `monster`. Status effects persist
-  in `active_effects`.
+  be `npc`, a class derived from `npc`, or `monster`. The attack holds the
+  effect write lock and re-reads the target under it, so it never computes
+  HP from a stale row.
+- **Status effects** (`src/combat/effects.rs`, `src/api/effect_scheduler.rs`)
+  live in `active_effects`, cached by `EffectRegistry`. They store absolute
+  deadlines (`expires_at`; periodic ones also `period_ms`, `next_pulse_at`),
+  computed on the primary before proposing. A deadline-driven scheduler
+  sleeps until the earliest deadline (or until effects change) and commits
+  everything due as one batch: pulses as HP changes, moved pulse clocks,
+  ended effects and deaths. A plain effect costs one write to apply and one
+  to end; a periodic effect one per pulse; nothing runs while nothing is
+  due. Missed pulses (lag, downtime) are applied together, computed
+  arithmetically (`engine::process_due`, a pure function).
 - **Lua mudlib** (`mudd/lib/combat.lua`): `Combat.initiate`, `Combat.attack`,
   `Combat.deal_damage`, `Combat.heal`, effects, working on object
   properties. `Commands.flee` lives in `lib/commands.lua`.

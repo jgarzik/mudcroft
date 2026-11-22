@@ -16,5 +16,5 @@ mod state;
 
 pub use damage::{DamageModifier, DamageResult, DamageType};
 pub use dice::{parse_dice, roll_d20, roll_dice, DiceRoll};
-pub use effects::{EffectRegistry, EffectType, EntityEffects, StatusEffect};
+pub use effects::{now_ms, EffectRegistry, EffectType, EntityEffects, StatusEffect};
 pub use state::{AttackResult, PvpPolicy};

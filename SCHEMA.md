@@ -3,7 +3,7 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 3):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 4):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). There are no upgrade steps yet,
 so an older database is refused with a "create a new database" error (from
@@ -224,15 +224,19 @@ Unique: `(universe_id, player_id)`.
 
 Status effects (poison, stun, bleeding, ...): the source of truth, which
 `EffectRegistry` caches. One row per effect type on an entity; applying the
-same type again keeps the longer duration and the stronger magnitude.
+same type again keeps the later end and the stronger magnitude. Times are
+absolute deadlines (Unix ms), so a plain effect is never rewritten while it
+lasts and a periodic one only once per pulse.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | universe_id | TEXT NOT NULL | |
 | entity_id | TEXT NOT NULL | Object id in that universe |
 | effect_type | TEXT NOT NULL | `poisoned`, `stunned`, `bleeding`, ... |
-| remaining_ticks | INTEGER NOT NULL | Effect ticks left |
-| magnitude | INTEGER NOT NULL DEFAULT 0 | Damage or healing per tick, or strength of a buff/debuff |
+| expires_at | INTEGER NOT NULL | When the effect ends (Unix ms) |
+| period_ms | INTEGER | Periodic effects: milliseconds between pulses; NULL otherwise |
+| next_pulse_at | INTEGER | Periodic effects: when the next pulse is due (Unix ms) |
+| magnitude | INTEGER NOT NULL DEFAULT 0 | Damage or healing per pulse, or strength of a buff/debuff |
 | damage_type | TEXT | For damage-over-time effects |
 | source_id | TEXT | Who applied it |
 

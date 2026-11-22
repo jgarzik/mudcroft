@@ -171,7 +171,7 @@ for object code, or the `game.set_actor` override if one is set.
 | [`remove_call_out(timer_id)`](#gameremove_call_outtimer_id) | boolean | object context; own timers only |
 | [`set_heart_beat(interval_ms)`](#gameset_heart_beatinterval_ms) | boolean | object context |
 | [`remove_heart_beat()`](#gameremove_heart_beat) | boolean | object context |
-| [`apply_effect(target_id, type, duration, magnitude, damage_type)`](#gameapply_effecttarget_id-type-duration-magnitude-damage_type) | `true` | Modify on the target |
+| [`apply_effect(target_id, type, duration, magnitude, damage_type, period)`](#gameapply_effecttarget_id-type-duration-magnitude-damage_type-period) | `true` | Modify on the target |
 | [`remove_effect(target_id, type)`](#gameremove_effecttarget_id-type) | boolean | Modify on the target |
 | [`get_effects(target_id)`](#gameget_effectstarget_id) | list of effects | — |
 | [`set_actor(account_id)`](#gameset_actoraccount_id) | boolean | wizard+, target below caller |
@@ -705,19 +705,33 @@ Deleting an object cancels both its call_outs and its heartbeat.
 Status effects (poisoned, stunned, bleeding, ...) are stored in the
 `active_effects` table, one row per effect type on an object, so they
 survive a restart. Deleting an object deletes its effects, and a combatant
-killed by `attack` loses them.
+killed by `attack` or by its effects loses them.
+
+Effects run on deadlines, not a fixed tick. A plain effect (stunned,
+weakened, ...) is simply in force until its end time. A **periodic** effect
+pulses every `period` seconds until it ends (a pulse due exactly at the end
+still happens): damage over time (`poisoned`, `burning`, `bleeding`, or any
+effect given a damage type) deals its magnitude in damage per pulse, after
+the target's resistances, and `regenerating` heals it (up to `max_hp`).
+Pulses change the target's `hp` property. A player is told each pulse
+(`You take 3 poison damage (poisoned).`) and when an effect ends
+(`You are no longer poisoned.`). Damage that brings HP to 0 kills: an NPC
+leaves the room (onlookers hear `<name> dies.`), a player respawns. If the
+server falls behind (or was down), the missed pulses are applied together.
 
 Types: `poisoned`, `stunned`, `blinded`, `burning`, `frozen`, `paralyzed`,
 `slowed`, `hasted`, `strengthened`, `weakened`, `protected`, `exposed`,
 `invisible`, `regenerating`, `silenced`, `bleeding`.
 
-#### `game.apply_effect(target_id, type, duration, magnitude, damage_type)`
+#### `game.apply_effect(target_id, type, duration, magnitude, damage_type, period)`
 
-Adds an effect lasting `duration` effect ticks (1 to 10,000) with strength
-`magnitude` (-10,000 to 10,000). Applying a type the target already has
-keeps the longer duration and the stronger magnitude. `damage_type` is
-optional; `poisoned`, `burning` and `bleeding` default to poison, fire and
-physical. The acting user needs Modify permission on the target.
+Adds an effect lasting `duration` seconds (0.1 to 86,400; fractions allowed)
+with strength `magnitude` (-10,000 to 10,000). `damage_type` is optional;
+`poisoned`, `burning` and `bleeding` default to poison, fire and physical.
+`period` (seconds between pulses, 0.5 to 3,600, default 1) applies to
+periodic effects. Applying a type the target already has keeps the later end
+and the stronger magnitude, and a periodic effect keeps its pulse timing.
+The acting user needs Modify permission on the target.
 
 **Returns** `true`. **Raises** an error for an unknown type or damage type,
 a missing target, or a denied permission.
@@ -729,8 +743,9 @@ Modify permission on the target.
 
 #### `game.get_effects(target_id)`
 
-**Returns** a list of `{type, remaining, magnitude, damage_type}` tables
-(`damage_type` is `nil` for effects that deal no damage).
+**Returns** a list of `{type, remaining, magnitude, damage_type, period}`
+tables: `remaining` is whole seconds left, rounded up; `damage_type` and
+`period` are `nil` for effects that do not pulse.
 
 ---
 

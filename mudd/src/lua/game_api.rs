@@ -1721,8 +1721,11 @@ impl GameApi {
         use crate::combat::{DamageType, EffectType, StatusEffect};
         use std::str::FromStr;
 
-        /// Longest effect, in ticks, and largest magnitude a script may set
-        const MAX_TICKS: u32 = 10_000;
+        /// Bounds a script may set: duration and pulse period (seconds),
+        /// and magnitude
+        const MAX_DURATION_SECS: f64 = 86_400.0;
+        const MIN_PERIOD_SECS: f64 = 0.5;
+        const MAX_PERIOD_SECS: f64 = 3_600.0;
         const MAX_MAGNITUDE: i64 = 10_000;
 
         fn effect_type(name: &str) -> LuaResult<EffectType> {
@@ -1730,9 +1733,11 @@ impl GameApi {
                 .map_err(|_| mlua::Error::runtime(format!("unknown effect type {:?}", name)))
         }
 
-        // game.apply_effect(target_id, type, duration_ticks, magnitude [, damage_type])
-        // Adds (or refreshes) a status effect. Checked like other writes to
-        // the target (Modify); persisted, so it survives a restart.
+        // game.apply_effect(target_id, type, duration_secs, magnitude [, damage_type [, period_secs]])
+        // Adds (or refreshes) a status effect. Damage over time (or any
+        // effect given a damage type) and regenerating pulse every period
+        // (default 1 s). Checked like other writes to the target (Modify);
+        // persisted, so it survives a restart.
         let (store, perms, effects, universe, user) = (
             self.store.clone(),
             self.permissions.clone(),
@@ -1742,12 +1747,13 @@ impl GameApi {
         );
         let apply_effect = lua.create_function(
             move |lua,
-                  (target, kind, duration, magnitude, dtype): (
+                  (target, kind, duration, magnitude, dtype, period): (
                 String,
                 String,
-                u32,
+                f64,
                 i64,
                 Option<String>,
+                Option<f64>,
             )| {
                 charge_db(lua)?;
                 let effect_type = effect_type(&kind)?;
@@ -1763,12 +1769,24 @@ impl GameApi {
                         _ => None,
                     },
                 };
-                let effect = StatusEffect {
-                    effect_type,
-                    remaining_ticks: duration.clamp(1, MAX_TICKS),
-                    magnitude: magnitude.clamp(-MAX_MAGNITUDE, MAX_MAGNITUDE) as i32,
-                    source_id: None,
-                    damage_type,
+                let now = crate::combat::now_ms();
+                let duration_ms = (duration.clamp(0.1, MAX_DURATION_SECS) * 1000.0) as u64;
+                let magnitude = magnitude.clamp(-MAX_MAGNITUDE, MAX_MAGNITUDE) as i32;
+                let pulses = damage_type.is_some() || effect_type == EffectType::Regenerating;
+                let effect = if pulses {
+                    let period = period
+                        .unwrap_or(1.0)
+                        .clamp(MIN_PERIOD_SECS, MAX_PERIOD_SECS);
+                    StatusEffect::periodic(
+                        effect_type,
+                        now,
+                        duration_ms,
+                        (period * 1000.0) as u64,
+                        magnitude,
+                        damage_type,
+                    )
+                } else {
+                    StatusEffect::new(effect_type, now, duration_ms, magnitude)
                 };
                 let user = actor_override(lua).or(user.clone());
                 let (store, perms, effects, universe) = (
@@ -1832,7 +1850,11 @@ impl GameApi {
                 {
                     return Ok(Err(reason));
                 }
-                if !effects.get(&universe, &target).await.has(effect_type) {
+                if !effects
+                    .get(&universe, &target)
+                    .await
+                    .has(effect_type, crate::combat::now_ms())
+                {
                     return Ok(Ok(false));
                 }
                 effects
@@ -1848,19 +1870,22 @@ impl GameApi {
         })?;
         game.set("remove_effect", remove_effect)?;
 
-        // game.get_effects(target_id) -> {{type, remaining, magnitude, damage_type}, ...}
+        // game.get_effects(target_id) -> {{type, remaining, magnitude, damage_type, period}, ...}
         let (effects, universe) = (self.effects.clone(), self.universe_id.clone());
         let get_effects = lua.create_function(move |lua, target: String| {
             charge_db(lua)?;
             let (effects, universe) = (effects.clone(), universe.clone());
             let current = block_now(async move { effects.get(&universe, &target).await });
+            let now = crate::combat::now_ms();
             let list = lua.create_table()?;
-            for (i, e) in current.active_effects().into_iter().enumerate() {
+            for (i, e) in current.active(now).into_iter().enumerate() {
                 let t = lua.create_table()?;
                 t.set("type", e.effect_type.to_string())?;
-                t.set("remaining", e.remaining_ticks)?;
+                // Whole seconds left, rounded up
+                t.set("remaining", (e.expires_at - now).div_ceil(1000))?;
                 t.set("magnitude", e.magnitude)?;
                 t.set("damage_type", e.damage_type.map(|d| d.to_string()))?;
+                t.set("period", e.period_ms.map(|p| p as f64 / 1000.0))?;
                 list.set(i + 1, t)?;
             }
             Ok(list)

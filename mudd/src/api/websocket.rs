@@ -1289,6 +1289,17 @@ async fn execute_command(
                 };
             }
 
+            // Serialize with the effect scheduler and effect writes, and
+            // read the target again under the lock: HP must not be computed
+            // from a stale row
+            let _writes = state.effects.write_guard().await;
+            let Ok(Some(target)) = state.object_store.get(universe_id, &target_id).await else {
+                return ServerMessage::Error {
+                    message: format!("You don't see {} here.", target_display_name),
+                };
+            };
+            let target = &target;
+
             // Stats come from the object rows, the single source of truth
             let Ok(Some(attacker_obj)) = state.object_store.get(universe_id, player_id).await
             else {

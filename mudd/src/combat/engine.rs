@@ -8,7 +8,7 @@
 use std::str::FromStr;
 
 use super::damage::{DamageModifier, DamageProfile};
-use super::{AttackResult, DamageType};
+use super::{AttackResult, DamageType, EffectRegistry, EffectType, EntityEffects};
 use crate::objects::{Object, ObjectStore};
 
 /// Largest HP (and max HP) a combatant can have
@@ -144,6 +144,145 @@ pub fn remove_from_room_statement(universe_id: &str, id: &str) -> (String, Vec<s
     )
 }
 
+/// Something processing an entity's due effects did
+#[derive(Debug, Clone, PartialEq)]
+pub enum TickEvent {
+    /// Damage from an effect's pulses (after resistances)
+    Damage {
+        effect: EffectType,
+        amount: i32,
+        dtype: DamageType,
+    },
+    /// Healing from regeneration, capped at max HP
+    Heal { amount: i32 },
+    /// The effect ended
+    Expired(EffectType),
+}
+
+/// The result of processing one entity's due effects
+#[derive(Debug, Clone)]
+pub struct TickOutcome {
+    /// The effects left afterwards (pulse clocks advanced)
+    pub effects: EntityEffects,
+    pub hp: i32,
+    pub hp_changed: bool,
+    /// HP reached 0 now
+    pub killed: bool,
+    pub events: Vec<TickEvent>,
+}
+
+/// Process everything due on `target` at `now`: every pulse whose time has
+/// come (several at once if the server fell behind, counted arithmetically,
+/// not one by one), then any effect that has ended. Pure: the caller
+/// commits the result.
+pub fn process_due(target: &Combatant, effects: &EntityEffects, now: u64) -> TickOutcome {
+    let mut hp = target.hp;
+    let mut kept = EntityEffects::new();
+    let mut events = Vec::new();
+    for effect in effects.all() {
+        let mut effect = effect.clone();
+        if let (Some(first), Some(period)) = (effect.pending_pulse(), effect.period_ms) {
+            let last = now.min(effect.expires_at);
+            if first <= last {
+                let pulses = (last - first) / period + 1;
+                effect.next_pulse_at = Some(first + pulses * period);
+                let pulses = i32::try_from(pulses).unwrap_or(i32::MAX);
+                match effect.pulse_amount() {
+                    Some((amount, dtype)) if amount > 0 => {
+                        let each = target
+                            .profile
+                            .calculate_damage(amount, dtype, false)
+                            .final_damage;
+                        let dealt = each.saturating_mul(pulses);
+                        hp = hp.saturating_sub(dealt).max(0);
+                        events.push(TickEvent::Damage {
+                            effect: effect.effect_type,
+                            amount: dealt,
+                            dtype,
+                        });
+                    }
+                    Some((amount, _)) => {
+                        let healed = amount
+                            .saturating_neg()
+                            .saturating_mul(pulses)
+                            .min(target.max_hp.saturating_sub(hp))
+                            .max(0);
+                        hp += healed;
+                        events.push(TickEvent::Heal { amount: healed });
+                    }
+                    None => {}
+                }
+            }
+        }
+        if now >= effect.expires_at && effect.pending_pulse().is_none() {
+            events.push(TickEvent::Expired(effect.effect_type));
+        } else {
+            kept.add(effect);
+        }
+    }
+    TickOutcome {
+        effects: kept,
+        hp_changed: hp != target.hp,
+        killed: hp <= 0 && target.hp > 0,
+        hp,
+        events,
+    }
+}
+
+/// The statements that commit one entity's processed effects: pulse clocks
+/// moved, ended effects deleted, the new HP, and on a death the end of all
+/// its effects (and, unless it is a player, who respawns, its removal from
+/// the room)
+pub fn tick_statements(
+    universe_id: &str,
+    entity_id: &str,
+    is_player: bool,
+    before: &EntityEffects,
+    outcome: &TickOutcome,
+) -> anyhow::Result<Vec<(String, Vec<serde_json::Value>)>> {
+    let mut statements = Vec::new();
+    if outcome.killed {
+        statements.push(EffectRegistry::clear_statement(universe_id, entity_id));
+        if !is_player {
+            statements.push(remove_from_room_statement(universe_id, entity_id));
+        }
+    } else {
+        for effect in before.all() {
+            let after = outcome
+                .effects
+                .all()
+                .iter()
+                .find(|e| e.effect_type == effect.effect_type);
+            match after {
+                Some(after) if after.next_pulse_at != effect.next_pulse_at => {
+                    if let Some(next) = after.next_pulse_at {
+                        statements.push(EffectRegistry::set_next_pulse_statement(
+                            universe_id,
+                            entity_id,
+                            effect.effect_type,
+                            next,
+                        ));
+                    }
+                }
+                Some(_) => {}
+                None => statements.push(EffectRegistry::delete_statement(
+                    universe_id,
+                    entity_id,
+                    effect.effect_type,
+                )),
+            }
+        }
+    }
+    if outcome.hp_changed {
+        statements.push(ObjectStore::set_properties_statement(
+            universe_id,
+            entity_id,
+            &[("hp", serde_json::json!(outcome.hp))],
+        )?);
+    }
+    Ok(statements)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +354,85 @@ mod tests {
         assert_eq!(target.hp, 0);
         let outcome = resolve_attack(&attacker, &target, 20, i32::MAX, DamageType::Physical);
         assert_eq!(outcome.target_hp, 0);
+    }
+
+    #[test]
+    fn test_process_due() {
+        use crate::combat::StatusEffect;
+        let target = combatant(serde_json::json!({
+            "hp": 20, "max_hp": 22, "resistances": {"fire": "resistant"}
+        }));
+        let mut effects = EntityEffects::new();
+        effects.add(StatusEffect::periodic(
+            EffectType::Poisoned,
+            0,
+            3_000,
+            1_000,
+            3,
+            Some(DamageType::Poison),
+        ));
+        effects.add(StatusEffect::periodic(
+            EffectType::Burning,
+            0,
+            1_000,
+            1_000,
+            4,
+            Some(DamageType::Fire),
+        ));
+        effects.add(StatusEffect::new(EffectType::Stunned, 0, 5_000, 0));
+
+        // Nothing is due before the first pulse
+        let out = process_due(&target, &effects, 999);
+        assert!(out.events.is_empty() && !out.hp_changed);
+
+        // At 1 s: one poison pulse (3) and the burn's only pulse (4, halved
+        // to 2), and the burn ends; the stun is untouched
+        let out = process_due(&target, &effects, 1_000);
+        assert_eq!(out.hp, 15);
+        assert!(out
+            .events
+            .contains(&TickEvent::Expired(EffectType::Burning)));
+        assert!(!out
+            .events
+            .contains(&TickEvent::Expired(EffectType::Stunned)));
+        let statements = tick_statements("u", "/npcs/x", false, &effects, &out).unwrap();
+        // poison clock moved, burn deleted, hp set: the stun costs nothing
+        assert_eq!(statements.len(), 3, "{:?}", statements);
+
+        // Far behind (10 s): poison catches up on all three pulses at once
+        let out = process_due(&target, &effects, 10_000);
+        assert!(out.events.contains(&TickEvent::Damage {
+            effect: EffectType::Poisoned,
+            amount: 9,
+            dtype: DamageType::Poison
+        }));
+        assert!(out
+            .events
+            .contains(&TickEvent::Expired(EffectType::Poisoned)));
+        assert!(out
+            .events
+            .contains(&TickEvent::Expired(EffectType::Stunned)));
+        assert!(out.effects.is_empty());
+
+        // Lethal damage kills once, ending the effects and leaving the room
+        let weak = combatant(serde_json::json!({"hp": 2}));
+        let mut lethal = EntityEffects::new();
+        lethal.add(StatusEffect::periodic(
+            EffectType::Bleeding,
+            0,
+            5_000,
+            1_000,
+            9,
+            Some(DamageType::Physical),
+        ));
+        let out = process_due(&weak, &lethal, 1_000);
+        assert!(out.killed && out.hp == 0);
+        let statements = tick_statements("u", "/npcs/x", false, &lethal, &out).unwrap();
+        assert!(statements
+            .iter()
+            .any(|(sql, _)| sql.contains("DELETE FROM active_effects")));
+        assert!(statements
+            .iter()
+            .any(|(sql, _)| sql.contains("parent_id = NULL")));
     }
 }
