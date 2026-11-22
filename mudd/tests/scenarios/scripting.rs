@@ -567,3 +567,23 @@ async fn test_db_query_limit_for_object_code() {
         reply
     );
 }
+
+/// Timer functions need an object context: outside object code (eval) they
+/// do nothing and say so
+#[tokio::test]
+async fn test_timer_functions_need_an_object() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "timer_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command("eval return tostring(game.set_heart_beat(1000)) .. ':' .. tostring(game.remove_call_out('no-such-timer'))")
+        .await
+        .unwrap();
+    let _ = wiz.expect("echo").await;
+    let out = wiz.expect("output").await.expect("eval output");
+    assert_eq!(out["text"], "false:false");
+}

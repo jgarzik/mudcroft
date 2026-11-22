@@ -212,6 +212,23 @@ impl TimerManager {
     }
 
     /// Remove a timer by ID
+    /// Remove a timer only if it belongs to `object_id` in `universe_id`
+    /// (game.remove_call_out: an object may cancel only its own timers)
+    pub async fn remove_timer_owned(
+        &self,
+        timer_id: &str,
+        universe_id: &str,
+        object_id: &str,
+    ) -> bool {
+        let owned = self
+            .timers
+            .read()
+            .await
+            .get(timer_id)
+            .is_some_and(|t| t.universe_id == universe_id && t.object_id == object_id);
+        owned && self.remove_timer(timer_id).await
+    }
+
     pub async fn remove_timer(&self, timer_id: &str) -> bool {
         // Remove from DB via Raft if available, otherwise direct SQL
         if let Some(ref raft_writer) = self.raft_writer {
@@ -393,6 +410,21 @@ impl TimerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timer can be cancelled only through its own object (and universe)
+    #[tokio::test]
+    async fn test_remove_timer_owned() {
+        let mgr = TimerManager::new(None, None);
+        let id = mgr
+            .try_add_timer(Timer::new("a", "/clock", "tick", 60_000, None))
+            .await
+            .unwrap();
+        assert!(!mgr.remove_timer_owned(&id, "a", "/other").await);
+        assert!(!mgr.remove_timer_owned(&id, "b", "/clock").await);
+        assert_eq!(mgr.timer_count().await, 1);
+        assert!(mgr.remove_timer_owned(&id, "a", "/clock").await);
+        assert_eq!(mgr.timer_count().await, 0);
+    }
 
     /// The same object id in two universes has independent timers and
     /// heartbeats

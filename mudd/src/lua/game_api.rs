@@ -1782,15 +1782,26 @@ impl GameApi {
         game.set("call_out", call_out)?;
 
         // game.remove_call_out(timer_id)
-        // Cancel a scheduled timer
+        // Cancel one of the current object's own timers (false otherwise,
+        // and always false outside object code)
         let timers_clone = timers.clone();
+        let universe_clone = universe_id.clone();
+        let object_clone = current_object.clone();
         let remove_call_out = lua.create_function(move |lua, timer_id: String| {
             charge_db(lua)?;
             let timers = timers_clone.clone();
+            let universe_id = universe_clone.clone();
+            let Some(object_id) = object_clone.clone() else {
+                return Ok(false);
+            };
 
             let removed = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async { timers.remove_timer(&timer_id).await })
+                rt.block_on(async {
+                    timers
+                        .remove_timer_owned(&timer_id, &universe_id, &object_id)
+                        .await
+                })
             })
             .join()
             .expect("Thread panicked");
@@ -1800,7 +1811,8 @@ impl GameApi {
         game.set("remove_call_out", remove_call_out)?;
 
         // game.set_heart_beat(interval_ms)
-        // Set a recurring heartbeat for the current object
+        // Set a recurring heartbeat for the current object (false outside
+        // object code, where there is no object to call)
         let timers_clone = timers.clone();
         let universe_clone = universe_id.clone();
         let object_clone = current_object.clone();
@@ -1808,15 +1820,15 @@ impl GameApi {
             charge_db(lua)?;
             let timers = timers_clone.clone();
             let universe_id = universe_clone.clone();
-            let object_id = object_clone.clone();
+            let Some(obj_id) = object_clone.clone() else {
+                return Ok(false);
+            };
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    if let Some(obj_id) = object_id {
-                        let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
-                        timers.set_heartbeat(hb).await;
-                    }
+                    let hb = HeartBeat::new(&universe_id, &obj_id, interval_ms);
+                    timers.set_heartbeat(hb).await;
                 });
             })
             .join()

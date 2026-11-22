@@ -60,9 +60,6 @@ affected feature.
   functions and Venice usage act on the real user, the owner, and ignore
   `set_actor` (`mudd/src/lua/game_api.rs`). A player triggering a verb spends
   the owner's credits.
-- **Timer ownership.** `game.remove_call_out` cancels any timer id without
-  checking that it belongs to the current object, and `game.set_heart_beat`
-  returns `true` even without an object context (`mudd/src/lua/game_api.rs`).
 
 ### Accounts and permissions
 

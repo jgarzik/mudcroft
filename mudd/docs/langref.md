@@ -82,7 +82,7 @@ Each execution may have a **room context** and an **object context**:
 The context decides how some functions behave:
 
 - **Room context:** `game.add_action` registers a *room* action. Without a room context it registers an *object* action.
-- **Object context:** `game.call_out`, `game.set_heart_beat` and `game.remove_heart_beat` need one. Without it they do nothing.
+- **Object context:** `game.call_out`, `game.remove_call_out`, `game.set_heart_beat` and `game.remove_heart_beat` need one. Without it they do nothing (and return `""` or `false`).
 
 ### Output
 
@@ -166,8 +166,8 @@ for object code, or the `game.set_actor` override if one is set.
 | [`broadcast(room_id, message, exclude_id)`](#gamebroadcastroom_id-message-exclude_id) | `true` | — |
 | [`broadcast_region(region_id, message)`](#gamebroadcast_regionregion_id-message) | `true` | — |
 | [`call_out(delay_secs, method, args)`](#gamecall_outdelay_secs-method-args) | timer ID or `""` | object context |
-| [`remove_call_out(timer_id)`](#gameremove_call_outtimer_id) | boolean | — |
-| [`set_heart_beat(interval_ms)`](#gameset_heart_beatinterval_ms) | `true` | object context |
+| [`remove_call_out(timer_id)`](#gameremove_call_outtimer_id) | boolean | object context; own timers only |
+| [`set_heart_beat(interval_ms)`](#gameset_heart_beatinterval_ms) | boolean | object context |
 | [`remove_heart_beat()`](#gameremove_heart_beat) | boolean | object context |
 | [`set_actor(account_id)`](#gameset_actoraccount_id) | boolean | wizard+, target below caller |
 | [`get_actor()`](#gameget_actor) | account ID or `nil` | — |
@@ -656,12 +656,15 @@ return {
 
 #### `game.remove_call_out(timer_id)`
 
-Cancels a pending call_out. **Returns** `true` if it was pending.
+Cancels one of the current object's own pending call_outs. **Returns**
+`true` if it was pending, `false` if it was not, belongs to another object,
+or there is no object context.
 
 #### `game.set_heart_beat(interval_ms)`
 
 Calls the current object's `heart_beat` handler every `interval_ms`
-milliseconds. Calling it again replaces the interval.
+milliseconds. Calling it again replaces the interval. **Returns** `true`,
+or `false` without an object context.
 
 - The minimum interval is 100 ms.
 - The callback receives `{object_id, room_id, args = nil}`.
