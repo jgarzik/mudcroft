@@ -565,7 +565,10 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   or nothing. Managers write through `RaftWriter::execute` (one statement) or
   `execute_batch` (several, atomically); non-deterministic values (UUIDs,
   timestamps) are computed before proposing. Reads go straight to the pool.
-- **Runs** (`db/run.rs`): a Lua run (`scripting::in_run`) is one change.
+- **Runs** (`db/run.rs`): a player command (built-in work plus the hooks
+  and handlers it triggers) and a Lua run (`scripting::in_run`) are each
+  one change; a run started inside another is a nested part (a savepoint:
+  if it fails only its own writes are undone).
   Its writes execute at once on the run's own connection inside a local
   SQLite transaction (so its reads, through `db::run::reader`, see them)
   and are captured; when the run succeeds the local transaction is rolled

@@ -773,26 +773,44 @@ async fn handle_client_message(
 
             // Parse and execute the command; hooks it triggers that should
             // follow the reply (e.g. on_enter after the room description)
-            // run once the reply is queued
-            let mut deferred = Vec::new();
-            let response = execute_command(
-                state,
-                universe_id,
-                player_id,
-                account_id,
-                access_level,
-                &text,
-                &mut deferred,
-            )
+            // run once the reply is queued. The whole command, hooks
+            // included, is one change (db::run): one Raft entry.
+            let saved = super::scripting::in_run(state, async {
+                let mut deferred = Vec::new();
+                let response = execute_command(
+                    state,
+                    universe_id,
+                    player_id,
+                    account_id,
+                    access_level,
+                    &text,
+                    &mut deferred,
+                )
+                .await;
+                if !matches!(response, ServerMessage::Silent) {
+                    state
+                        .connections
+                        .send_to_player(universe_id, player_id, response)
+                        .await;
+                }
+                for hook in deferred {
+                    run_hook(state, universe_id, hook).await;
+                }
+                Ok::<(), String>(())
+            })
             .await;
-            if !matches!(response, ServerMessage::Silent) {
+            if let Err(e) = saved {
+                warn!("command by {} not saved: {}", player_id, e);
                 state
                     .connections
-                    .send_to_player(universe_id, player_id, response)
+                    .send_to_player(
+                        universe_id,
+                        player_id,
+                        ServerMessage::Error {
+                            message: "Your last command could not be saved.".to_string(),
+                        },
+                    )
                     .await;
-            }
-            for hook in deferred {
-                run_hook(state, universe_id, hook).await;
             }
         }
         ClientMessage::Ping => {

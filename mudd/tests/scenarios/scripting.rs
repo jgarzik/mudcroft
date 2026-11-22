@@ -850,3 +850,62 @@ async fn bench_writes() {
         );
     }
 }
+
+/// A command is one change: walking into a room moves the player and runs
+/// the room's on_enter hook (which writes), all as one Raft entry
+#[tokio::test]
+async fn test_command_is_one_raft_entry() {
+    let server = TestServer::start().await.expect("server");
+    let passage = "/rooms/hall".to_string();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "batch_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local h = game.store_code([[return {{ on_enter = function(a)
+               local r = game.get_object("{p}")
+               game.update_object("{p}", {{visits = (r.metadata.visits or 0) + 1}})
+             end }}]])
+           assert(game.create_object("/rooms/porch", "room", nil, {{name = "Porch", exits = {{east = "{p}"}}}}))
+           assert(game.create_object("{p}", "room", nil, {{name = "Hall", code_hash = h}}))
+           return "rooms built""#,
+        p = passage
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("rooms built")
+        .await
+        .expect("built");
+    wiz.drain().await;
+    wiz.command("goto /rooms/porch").await.unwrap();
+    wiz.expect("room").await.expect("at the porch");
+    let entries = || async {
+        sqlx::query_scalar::<_, i64>("SELECT MAX(log_index) FROM raft_log")
+            .fetch_one(server.pool())
+            .await
+            .unwrap()
+    };
+    let before = entries().await;
+    wiz.drain().await;
+    wiz.command("east").await.unwrap();
+    wiz.expect("room").await.expect("moved");
+    let mut visits = None;
+    for _ in 0..50 {
+        visits = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT json_extract(properties, '$.visits') FROM objects WHERE id = ?",
+        )
+        .bind(&passage)
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+        if visits.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(visits, Some(1), "the hook ran");
+    assert_eq!(entries().await - before, 1, "move and hook in one entry");
+}
