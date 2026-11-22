@@ -90,7 +90,7 @@ async fn register(
             Json(AuthResponse {
                 token,
                 account_id: account.id,
-                device_token: Some(state.devices.issue(&account.username)),
+                device_token: state.devices.issue(&account.username),
                 username: account.username,
                 access_level: account.access_level,
             }),
@@ -199,7 +199,7 @@ async fn login(
             if let Some(ref old) = req.device_token {
                 state.devices.revoke(old);
             }
-            let device_token = Some(state.devices.issue(&account.username));
+            let device_token = state.devices.issue(&account.username);
             (
                 StatusCode::OK,
                 Json(AuthResponse {
@@ -212,8 +212,15 @@ async fn login(
             )
                 .into_response()
         }
-        // The reservation stands as the failure's charge
-        Err(AuthError::InvalidCredentials) => invalid(),
+        // The reservation stands as the failure's charge. A device token
+        // presented with a wrong password stops being trusted: a stolen one
+        // buys at most one unthrottled guess
+        Err(AuthError::InvalidCredentials) => {
+            if let Some(ref token) = req.device_token {
+                state.devices.revoke(token);
+            }
+            invalid()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

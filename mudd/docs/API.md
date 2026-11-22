@@ -92,7 +92,9 @@ Logging in issues a new token and invalidates the account's previous one.
 logged in to the account before: send it with the next login, which returns
 a fresh one in its place. Tokens last 30 days and are kept in the server's
 memory only (a restart or failover forgets them; the device then gets a new
-one at its next login).
+one at its next login). A token presented with a wrong password is revoked.
+An account keeps at most 10 (its oldest goes); when the server holds as many
+as it allows, new devices are simply not remembered.
 
 Limited to `--auth-limit` failed logins a minute per username and client
 (default 30), and twice that many login and registration requests per
