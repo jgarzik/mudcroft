@@ -515,7 +515,11 @@ async fn test_mudd_admin_set_level() {
             .expect("run mudd_admin")
     };
     let out = run("made_admin", "admin");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = run("no_such_user", "admin");
     assert!(!out.status.success(), "unknown account must fail");
 
