@@ -26,6 +26,11 @@ For access levels, see [permissions.md](permissions.md#access-levels).
   - Requests the framework rejects before a handler runs: a missing or wrong
     `Content-Type` (415), malformed or incomplete JSON (400 or 422), or a
     missing required query parameter (400)
+- **Every response** carries `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN` and
+  `Referrer-Policy: strict-origin-when-cross-origin`, and text bodies are
+  gzip-compressed when the request sends `Accept-Encoding: gzip`, so `mudd`
+  needs no proxy in front for these.
 
 ## Server
 
