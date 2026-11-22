@@ -790,8 +790,9 @@ fights, damage and deaths are part of its one change.
 **Returns** `true` if `attacker_id` may fight `target_id` now (combat
 setting; the attacker a player or a creature, the target a creature or a
 player the PvP rules allow; both alive and in the same room), else `false`
-and the reason. A creature is an `npc`, a class derived from it, or a
-`monster`; `aggro` only makes creatures attack.
+and the reason. A creature is anything living that is not a player (an
+`npc`, or a class derived from `npc` or `living`), or a `monster`; `aggro`
+only makes creatures attack.
 
 #### `game.attack(attacker_id, target_id)`
 
@@ -819,8 +820,8 @@ Deals `amount` (0 to 1,000,000) damage of `type` (default `physical`) after
 the target's resistances. Reaching 0 HP is a death (the universe's policy),
 with `source_id` (optional) as the killer, who is credited (XP): the caller
 must control the source as for an attacker. Needs Modify permission on the
-target, which must be in the world (not a dead NPC waiting to respawn; the
-same for `game.heal`).
+target, which must not be a dead NPC waiting to respawn (the same for
+`game.heal`).
 
 **Returns** `{damage, hp, killed}` (`damage` as applied), or `nil` and the
 reason.
