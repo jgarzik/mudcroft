@@ -303,6 +303,12 @@ Every message is JSON with a `type` field.
 {"type": "command", "text": "look"}
 ```
 
+A command may carry an `id` (up to 64 characters): the server answers
+`{"type": "done", "id": ...}` once the command is saved, and a command
+whose id was already saved (in the last ten minutes) is not run again, only
+answered `done`. Gateways use this to retry a command interrupted by a
+failover; a client may use it the same way.
+
 ```json
 {"type": "ping"}
 ```
@@ -372,6 +378,12 @@ keep evicting each other.
 
 ```json
 {"type": "replaced", "message": "You connected from another window; this one is now disconnected."}
+```
+
+**done**: the command sent with this `id` is saved (see Client to server).
+
+```json
+{"type": "done", "id": "cmd-1"}
 ```
 
 **confirm**: object code asks the player to pay (`game.request_payment`).

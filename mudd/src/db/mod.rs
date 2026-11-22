@@ -14,7 +14,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -57,6 +57,19 @@ const ONLINE_PLAYERS_TABLE: &str = r#"
         PRIMARY KEY (universe_id, player_id),
         FOREIGN KEY (universe_id, player_id)
             REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    )
+"#;
+
+/// Commands saved with an id (a gateway's, or a client's): a command sent
+/// again with the same id (a retry after a failover) is not run twice.
+/// Written in the command's own batch; rows past their deadline are deleted
+/// by later such batches.
+pub const APPLIED_COMMANDS_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS applied_commands (
+        universe_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (universe_id, command_id)
     )
 "#;
 
@@ -187,6 +200,7 @@ impl Database {
     /// - 8 -> 9 (cluster_nodes table: node ids never reused): in place.
     /// - 9 -> 10 (online_players table): in place.
     /// - 10 -> 11 (payment_requests table): in place.
+    /// - 11 -> 12 (applied_commands table): in place.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -243,6 +257,14 @@ impl Database {
                 .await?;
             self.set_schema_version(11).await?;
             info!("Upgraded database schema 10 -> 11");
+            version = 11;
+        }
+        if version == 11 {
+            sqlx::query(APPLIED_COMMANDS_TABLE)
+                .execute(&self.pool)
+                .await?;
+            self.set_schema_version(12).await?;
+            info!("Upgraded database schema 11 -> 12");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -363,6 +385,7 @@ impl Database {
             "cluster_nodes",
             "online_players",
             "payment_requests",
+            "applied_commands",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -583,6 +606,9 @@ impl Database {
             .execute(&self.pool)
             .await?;
         sqlx::query(PAYMENT_REQUESTS_TABLE)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(APPLIED_COMMANDS_TABLE)
             .execute(&self.pool)
             .await?;
 

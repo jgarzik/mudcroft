@@ -335,6 +335,9 @@ pub enum ServerMessage {
     /// is about to close; clients must not reconnect automatically
     #[serde(rename = "replaced")]
     Replaced { message: String },
+    /// A command sent with an id has been saved (or had been already)
+    #[serde(rename = "done")]
+    Done { id: String },
     /// No reply: the command already said everything it had to (e.g. a verb
     /// handler that only used game.send). Never sent to clients.
     #[serde(skip)]
@@ -347,7 +350,13 @@ pub enum ServerMessage {
 pub enum ClientMessage {
     /// Player command input
     #[serde(rename = "command")]
-    Command { text: String },
+    Command {
+        text: String,
+        /// Optional, up to 64 characters: answered with `done` once saved,
+        /// and never run twice (a gateway sets it to retry after failover)
+        #[serde(default)]
+        id: Option<String>,
+    },
     /// Ping to keep connection alive
     #[serde(rename = "ping")]
     Ping,
@@ -756,8 +765,23 @@ async fn handle_client_message(
     msg: ClientMessage,
 ) {
     match msg {
-        ClientMessage::Command { text } => {
+        ClientMessage::Command { text, id } => {
             info!("Player {} command: {}", player_id, text);
+            let id = id.filter(|id| !id.is_empty() && id.len() <= 64);
+            // Already saved (a retry after a failover): not run again
+            if let Some(ref id) = id {
+                if command_applied(state, universe_id, id).await {
+                    state
+                        .connections
+                        .send_to_player(
+                            universe_id,
+                            player_id,
+                            ServerMessage::Done { id: id.clone() },
+                        )
+                        .await;
+                    return;
+                }
+            }
 
             // Echo the command back
             state
@@ -775,30 +799,40 @@ async fn handle_client_message(
             // follow the reply (e.g. on_enter after the room description)
             // run once the reply is queued. The whole command, hooks
             // included, is one change (db::run): one Raft entry.
-            let saved = super::scripting::in_run(state, async {
-                let mut deferred = Vec::new();
-                let response = execute_command(
-                    state,
-                    universe_id,
-                    player_id,
-                    account_id,
-                    access_level,
-                    &text,
-                    &mut deferred,
-                )
-                .await;
-                if !matches!(response, ServerMessage::Silent) {
-                    state
-                        .connections
-                        .send_to_player(universe_id, player_id, response)
-                        .await;
-                }
-                for hook in deferred {
-                    run_hook(state, universe_id, hook).await;
-                }
-                Ok::<(), String>(())
-            })
+            let saved = super::scripting::in_run_with(
+                state,
+                command_marker(universe_id, id.as_deref()),
+                async {
+                    let mut deferred = Vec::new();
+                    let response = execute_command(
+                        state,
+                        universe_id,
+                        player_id,
+                        account_id,
+                        access_level,
+                        &text,
+                        &mut deferred,
+                    )
+                    .await;
+                    if !matches!(response, ServerMessage::Silent) {
+                        state
+                            .connections
+                            .send_to_player(universe_id, player_id, response)
+                            .await;
+                    }
+                    for hook in deferred {
+                        run_hook(state, universe_id, hook).await;
+                    }
+                    Ok::<(), String>(())
+                },
+            )
             .await;
+            if let (Ok(()), Some(id)) = (&saved, id) {
+                state
+                    .connections
+                    .send_to_player(universe_id, player_id, ServerMessage::Done { id })
+                    .await;
+            }
             if let Err(e) = saved {
                 warn!("command by {} not saved: {}", player_id, e);
                 state
@@ -835,6 +869,48 @@ async fn handle_client_message(
                 .await;
         }
     }
+}
+
+/// How long a command id is remembered (a retry comes within seconds)
+const COMMAND_ID_TTL_MS: i64 = 10 * 60 * 1000;
+
+/// Whether a command with this id was saved already
+async fn command_applied(state: &AppState, universe_id: &str, id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM applied_commands WHERE universe_id = ? AND command_id = ?",
+    )
+    .bind(universe_id)
+    .bind(id)
+    .fetch_optional(state.db.pool())
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Statements leading a command's batch when it has an id: the id is
+/// recorded with it (a duplicate fails the batch), and ids past their
+/// deadline go
+fn command_marker(universe_id: &str, id: Option<&str>) -> Vec<crate::db::run::Statement> {
+    let Some(id) = id else {
+        return Vec::new();
+    };
+    let now = crate::combat::now_ms() as i64;
+    vec![
+        (
+            "DELETE FROM applied_commands WHERE universe_id = ? AND expires_at < ?".to_string(),
+            vec![universe_id.into(), now.into()],
+        ),
+        (
+            "INSERT INTO applied_commands (universe_id, command_id, expires_at) VALUES (?, ?, ?)"
+                .to_string(),
+            vec![
+                universe_id.into(),
+                id.into(),
+                (now + COMMAND_ID_TTL_MS).into(),
+            ],
+        ),
+    ]
 }
 
 /// Everything after a command's verb, verbatim apart from surrounding

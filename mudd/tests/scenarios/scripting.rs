@@ -909,3 +909,56 @@ async fn test_command_is_one_raft_entry() {
     assert_eq!(visits, Some(1), "the hook ran");
     assert_eq!(entries().await - before, 1, "move and hook in one entry");
 }
+
+/// A command sent with an id is answered with `done` once saved, and the
+/// same id sent again (a gateway retrying after a failover) does not run it
+/// a second time
+#[tokio::test]
+async fn test_command_id_runs_once() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "once_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    let cmd = serde_json::json!({
+        "type": "command",
+        "id": "cmd-1",
+        "text": format!(
+            r#"eval local o = game.get_object("/items/tally") if o then game.update_object("/items/tally", {{n = o.metadata.n + 1}}) else game.create_object("/items/tally", "item", "{}", {{name = "tally", n = 1}}) end return "counted""#,
+            entrance
+        ),
+    });
+    wiz.send_json(&cmd).await.unwrap();
+    wiz.expect_output_containing("counted").await.expect("ran");
+    let done = wiz.expect("done").await.expect("done");
+    assert_eq!(done["id"], "cmd-1");
+
+    // The retry: not run again
+    wiz.send_json(&cmd).await.unwrap();
+    let done = wiz.expect("done").await.expect("done again");
+    assert_eq!(done["id"], "cmd-1");
+    let n: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.n') FROM objects WHERE id = '/items/tally'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "the command ran once");
+
+    // A new id runs
+    let mut next = cmd.clone();
+    next["id"] = "cmd-2".into();
+    wiz.send_json(&next).await.unwrap();
+    wiz.expect("done").await.expect("done");
+    let n: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.n') FROM objects WHERE id = '/items/tally'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+}

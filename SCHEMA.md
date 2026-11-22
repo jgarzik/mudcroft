@@ -3,12 +3,12 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 11):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 12):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). The upgrade steps are
 6 -> 7 (adds the `credits_holder_exists` trigger), 7 -> 8 (adds the
 `actions` table), 8 -> 9 (adds `cluster_nodes`), 9 -> 10 (adds `online_players`) and
-10 -> 11 (adds `payment_requests`); an older database is refused with a "create a new database" error (from
+10 -> 11 (adds `payment_requests`), 11 -> 12 (adds `applied_commands`); an older database is refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
@@ -402,6 +402,22 @@ the object.
 | expires_at | INTEGER NOT NULL | ms since epoch (a minute after the request) |
 
 Foreign key `(universe_id, object_id)` to `objects` ON DELETE CASCADE.
+
+### applied_commands
+
+Commands saved with an id (`{"type": "command", "id"}`, set by gateways):
+a command sent again with a saved id (a retry after a failover) is not run
+twice. The row is written in the command's own Raft entry; rows past their
+deadline are deleted by later such entries.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| command_id | TEXT NOT NULL | Up to 64 characters |
+| expires_at | INTEGER NOT NULL | ms since epoch (ten minutes after) |
+
+Primary key `(universe_id, command_id)`.
+
 ## Startup Validation
 
 `mudd` opens an existing database only. It does not create the database or

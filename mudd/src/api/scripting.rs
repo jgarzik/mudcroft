@@ -89,6 +89,18 @@ pub async fn in_run<T, F>(state: &AppState, f: F) -> Result<T, String>
 where
     F: Future<Output = Result<T, String>>,
 {
+    in_run_with(state, Vec::new(), f).await
+}
+
+/// [`in_run`] with statements leading the batch (if anything is written)
+pub async fn in_run_with<T, F>(
+    state: &AppState,
+    prefix: Vec<crate::db::run::Statement>,
+    f: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
     // A failed run's cache changes are undone by rebuilding from the tables
     let rebuilder = state.clone();
     let rebuild = move || async move {
@@ -97,7 +109,7 @@ where
         }
     };
     let committer: std::sync::Arc<dyn crate::db::run::Committer> = state.raft_writer.clone();
-    match crate::db::run::scope(state.db.pool(), committer, Vec::new(), f, rebuild).await {
+    match crate::db::run::scope(state.db.pool(), committer, prefix, f, rebuild).await {
         Ok(result) => result,
         Err(e) => Err(format!("not saved: {}", e)),
     }

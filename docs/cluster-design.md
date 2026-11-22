@@ -93,12 +93,13 @@ connected directly to the old primary reconnect themselves (the client
 already reconnects unless it was `replaced`). Target: under 1 s of
 disruption (election 150–300 ms plus reconnect).
 
-**In-flight commands are not retried.** A command whose primary died may or
-may not have taken effect, and today one command can make several Raft
-writes, so a retry is not safe. The player is told the command was
-interrupted. Exactly-once commands need each Lua run's writes buffered into
-one batch (also wanted for atomicity) plus a command id recorded in that
-batch; that is future work.
+**In-flight commands are retried, exactly once.** Each command is one Raft
+entry (`db/run.rs`). The gateway sends each command with an id; the primary
+records the id in the command's entry (`applied_commands`) and answers
+`done`. A command unanswered when the primary is lost is sent again, same
+id, to the new primary, which (having applied every committed entry before
+serving) skips it if the id is recorded; a race is caught by the id's
+primary key failing the batch.
 
 ## Cluster transport
 

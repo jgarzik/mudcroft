@@ -7,9 +7,12 @@
 //! - a game connection is relayed to a session on the primary (one cluster
 //!   connection per player). If that connection drops without the primary
 //!   ending the session, the primary has failed over: the player is told,
-//!   and the gateway reopens the session on the new primary. A command in
-//!   flight at that moment may or may not have taken effect; it is never
-//!   retried.
+//!   and the gateway reopens the session on the new primary. Each command
+//!   is sent with an id (the client's, or one the gateway assigns); the
+//!   primary answers `done` once it is saved. A command still unanswered
+//!   when the primary is lost is sent again, with the same id, to the new
+//!   primary, which does not run a command whose id it has already saved:
+//!   exactly once.
 //!
 //! The primary serves forwarded requests with its own router, and
 //! forwarded sessions exactly like local ones.
@@ -330,6 +333,55 @@ enum Outcome {
     NotReady,
 }
 
+/// The command sent to the primary and not yet answered `done`
+struct InFlight {
+    id: String,
+    /// The JSON sent (resent as is after a failover)
+    json: String,
+    /// The gateway assigned the id: its `done` is not the client's business
+    ours: bool,
+}
+
+/// A client message to forward: a command gets an id if it has none
+/// (returned as the command now in flight)
+fn tag_command(text: &str) -> (String, Option<InFlight>) {
+    let Ok(mut msg) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (text.to_string(), None);
+    };
+    if msg["type"] != "command" {
+        return (text.to_string(), None);
+    }
+    let (id, ours) = match msg["id"].as_str() {
+        Some(id) if !id.is_empty() && id.len() <= 64 => (id.to_string(), false),
+        _ => (format!("gw-{}", uuid::Uuid::new_v4()), true),
+    };
+    msg["id"] = serde_json::Value::String(id.clone());
+    let json = msg.to_string();
+    (json.clone(), Some(InFlight { id, json, ours }))
+}
+
+/// If `text` is a `done` for the command in flight: clears it, and says
+/// whether the client should see it
+fn take_done(text: &str, in_flight: &mut Option<InFlight>) -> bool {
+    if !text.contains("\"done\"") {
+        return true;
+    }
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
+        return true;
+    };
+    if msg["type"] != "done" {
+        return true;
+    }
+    match in_flight {
+        Some(f) if msg["id"] == f.id.as_str() => {
+            let show = !f.ours;
+            *in_flight = None;
+            show
+        }
+        _ => true,
+    }
+}
+
 async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
     match serde_json::to_string(msg) {
         Ok(json) => socket.send(Message::Text(json.into())).await.is_ok(),
@@ -348,6 +400,8 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
     let mut deadline = tokio::time::Instant::now() + PRIMARY_WAIT;
     // The player was told about the current outage
     let mut notified = false;
+    // The command sent and not yet saved: sent again after a failover
+    let mut in_flight: Option<InFlight> = None;
     loop {
         let opened = match primary_addr(&state) {
             Some(addr) => transport::open_game_session(&addr, &security, &open)
@@ -376,13 +430,26 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 return;
             }
         };
+        // A command the lost primary may not have saved: again, same id
+        // (not run twice if it was)
+        let resent = match in_flight {
+            Some(ref f) => remote.send(&f.json).await,
+            None => true,
+        };
         // Whether this session got anything from the primary yet
         let mut live = false;
         let outcome = loop {
+            if !resent {
+                break Outcome::NotReady;
+            }
             tokio::select! {
                 incoming = socket.recv() => match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !remote.send(&text).await {
+                        let (json, command) = tag_command(&text);
+                        if command.is_some() {
+                            in_flight = command;
+                        }
+                        if !remote.send(&json).await {
                             break Outcome::Lost;
                         }
                     }
@@ -395,7 +462,9 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                             live = true;
                             notified = false;
                         }
-                        if socket.send(Message::Text(text.into())).await.is_err() {
+                        if take_done(&text, &mut in_flight)
+                            && socket.send(Message::Text(text.into())).await.is_err()
+                        {
                             break Outcome::ClientGone;
                         }
                     }
@@ -442,9 +511,13 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 let still_here = send_json(
                     &mut socket,
                     &ServerMessage::Output {
-                        text: "The world shimmers as the servers change hands. Your last \
-                               command may not have taken effect."
-                            .to_string(),
+                        text: if in_flight.is_some() {
+                            "The world shimmers as the servers change hands. Your last \
+                             command will be retried."
+                        } else {
+                            "The world shimmers as the servers change hands."
+                        }
+                        .to_string(),
                     },
                 )
                 .await;

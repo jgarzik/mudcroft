@@ -19,10 +19,9 @@ affected feature.
 Clusters work as described in `docs/cluster-design.md` (joining, the
 primary lifecycle, gateways, failover), with these gaps:
 
-- **Commands are not exactly-once across a failover.** A command in flight
-  when the primary dies may or may not have taken effect; the player is told
-  and nothing is retried (one batch per command and command ids would fix
-  it).
+- **Players on the primary itself are not retried.** A player connected
+  directly to the primary that dies reconnects; a command in flight then is
+  lost unless the client resends it with its `id` (the web client does not).
 - **Device tokens can run out.** The in-memory store holds 200,000 (10 per
   account). Registering about 20,000 accounts fills it. Live tokens are
   never evicted (expired ones are swept out when room is needed, and an
@@ -42,10 +41,8 @@ Clusters are built (see [cluster-design.md](cluster-design.md)): `--join`
 membership, a TLS cluster port with a shared secret, a single primary that
 runs the game, gateways that relay to it, and failover. Planned:
 
-- **Command ids.** Each Lua run is one Raft entry (`mudd/src/db/run.rs`).
-  Recording a command id in that entry would let a gateway retry a command
-  interrupted by a failover exactly once. Typed log entries could replace
-  raw SQL at the same time:
+- **Typed log entries** instead of raw SQL (each command is one entry,
+  with its id: `mudd/src/db/run.rs`, `applied_commands`):
 
   ```rust
   pub enum GameLogEntry {

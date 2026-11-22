@@ -331,9 +331,9 @@ mod tests {
 
     /// Upgrades chain: a version 6 database gets the credits holder trigger
     /// (7), the actions table (8), cluster_nodes (9), online_players (10)
-    /// and payment_requests (11)
+    /// payment_requests (11) and applied_commands (12)
     #[tokio::test]
-    async fn test_upgrade_6_to_11() {
+    async fn test_upgrade_6_to_12() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         init_database(
@@ -367,6 +367,10 @@ mod tests {
                 .execute(db.pool())
                 .await
                 .unwrap();
+            sqlx::query("DROP TABLE applied_commands")
+                .execute(db.pool())
+                .await
+                .unwrap();
             sqlx::query("PRAGMA user_version = 6")
                 .execute(db.pool())
                 .await
@@ -375,17 +379,18 @@ mod tests {
         }
         init_database(&db_path, None, None, HashMap::new(), None)
             .await
-            .expect("mudd_init upgrades 6 -> 11");
+            .expect("mudd_init upgrades 6 -> 12");
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 11);
+        assert_eq!(db.schema_version().await.unwrap(), 12);
         let tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
-             AND name IN ('actions', 'cluster_nodes', 'online_players', 'payment_requests')",
+             AND name IN ('actions', 'cluster_nodes', 'online_players', 'payment_requests',
+                          'applied_commands')",
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(tables, 4);
+        assert_eq!(tables, 5);
         let triggers: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'credits_holder_exists'",
         )
@@ -416,6 +421,7 @@ mod tests {
                 "DROP TABLE cluster_nodes",
                 "DROP TABLE online_players",
                 "DROP TABLE payment_requests",
+                "DROP TABLE applied_commands",
                 "PRAGMA user_version = 8",
             ] {
                 sqlx::query(sqlx::AssertSqlSafe(sql))
