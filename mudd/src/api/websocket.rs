@@ -739,9 +739,11 @@ async fn handle_socket(
                         info!("Disconnect handling skipped for {} (connected again)", player_id_for_task);
                         return;
                     }
+                    let room = state_clone.object_store.get(&universe_for_task, &player_id_for_task).await.ok().flatten().and_then(|p| p.parent_id);
                     if let Err(e) = state_clone.player_manager.finish_disconnect(&universe_for_task, &player_id_for_task, &since_for_task).await {
                         warn!("Error handling player disconnect: {}", e);
                     }
+                    disconnect_hook(&state_clone, &universe_for_task, &player_id_for_task, room).await;
                     info!("Disconnect handling completed for {} (grace period expired)", player_id_for_task);
                 }
                 _ = cancel_rx => {
@@ -750,6 +752,35 @@ async fn handle_socket(
                 }
             }
         });
+    }
+}
+
+/// The room a player was in gets on_disconnect when their grace period
+/// ends (an engine hook, as the room's owner)
+pub(crate) async fn disconnect_hook(
+    state: &AppState,
+    universe_id: &str,
+    player_id: &str,
+    room: Option<String>,
+) {
+    let Some(room) = room else { return };
+    let has_code = state
+        .object_store
+        .get(universe_id, &room)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.code_hash.is_some());
+    if has_code {
+        super::combat::engine_hook(
+            state,
+            universe_id,
+            &room,
+            Some(room.clone()),
+            "on_disconnect",
+            serde_json::json!({ "player_id": player_id }),
+        )
+        .await;
     }
 }
 

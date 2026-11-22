@@ -366,7 +366,9 @@ lacks Move permission.
 #### `game.clone_object(id, new_path, new_parent_id)`
 
 Copies an object to a new path. The copy keeps the original's properties
-and `code_hash`, and the acting user becomes its owner.
+and `code_hash`, and the acting user becomes its owner; since the copy's
+code would run as them, it keeps `code_hash` only if they own the original
+or may act as its owner. A copy with code runs its `on_create`.
 
 **Returns** the copy, `nil` if the source doesn't exist, or
 `{error = "..."}` if the source belongs to another universe, `new_path` is
@@ -442,6 +444,8 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 | `on_enter` / `on_leave` (region) | a move crosses into (out of) the region: a room's region, for hooks, is its parent object of class `region` (not its `region_id`, which anyone may set on their room) | the region | `moved_id`, `from`, `to`, `actor_id` |
 | `on_init` | something arrives where the object is (any move, as for `on_enter`) | each object with code already there, with `arrived_id`; and the newcomer, if it has code, once per object there, with `other_id` | `room_id`, `actor_id` |
 | `on_move` | the object is moved (any move) | the moved object | `from`, `to`, `moved_id`, `actor_id` |
+| `on_reset` | every `reset_seconds` (a property: set it to start, remove it to stop) | the object, usually a room (to restock) | `room_id` |
+| `on_disconnect` | a player's disconnect grace period ends | the room they were in | `room_id`, `player_id` |
 | any name | a `call_out` is due | the object | `room_id`, `args` (the string given to `call_out`, or `nil`) |
 | any name | a custom verb is typed | the verb's object | `actor_id`, `room_id`, `verb`, `args` (the rest of the line) |
 | any name | `game.use_object` is called | the used object | `actor_id`, `verb`, `target_id`, `code_hash` |
@@ -459,7 +463,7 @@ Hook details:
 - **Return values:** hook return values are ignored. Errors are logged on the server.
 - **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
   - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
-- **Engine-invoked hooks** (region hooks, `on_init`, `on_move`, `on_create`, `on_destroy`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action (a command or script run, or one NPC's turn): at most 4 deep (a hook's doing setting off another) and 32 calls; beyond it they are skipped (and logged). After a move they run after the room's `on_enter`.
+- **Engine-invoked hooks** (region hooks, `on_init`, `on_move`, `on_create`, `on_destroy`, `on_reset`, `on_disconnect`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action (a command or script run, or one NPC's turn): at most 4 deep (a hook's doing setting off another) and 32 calls; beyond it they are skipped (and logged). After a move they run after the room's `on_enter`.
 - **Unwired hooks:** the class handler name `on_use` is fired only by `game.use_object` (verb `"use"`).
 
 ### `parent(class_name, handler_name, args)`
@@ -1117,7 +1121,7 @@ Calls a handler on another object's code.
 - It runs in a **fresh sandbox, as that object's owner**, with object-code limits. Its object context is that object, and its room context is the object's `parent_id`.
 - The caller's identity is never passed on.
 - `actor_id` is whatever the caller passed. Handlers must treat it as untrusted: it need not be the player who acted.
-- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`, `on_init`, `on_move`, `ai_idle_tick` and `ai_combat_tick`. Such calls return `nil`.
+- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`, `on_init`, `on_move`, `on_reset`, `on_disconnect`, `ai_idle_tick` and `ai_combat_tick`. Such calls return `nil`.
 - Nesting is limited to 8 levels, and one top-level execution may make at most 32 `use_object` calls in total, across all levels. Call 33 raises an error.
 
 **Returns** the handler's result as plain data: tables, strings, numbers
@@ -1247,6 +1251,7 @@ Which properties the server reads:
 | `hp`, `max_hp`, `armor_class`, `attack_bonus` (npc, player) | built-in combat |
 | `xp_value`, `respawn_seconds`, `home_room` (npc); `xp` (player) | death and respawn (see [Built-in combat](#built-in-combat)) |
 | `aggro`, `flee_threshold`, `faction`, `wander_seconds` (npc) | NPC behaviour (see [Built-in combat](#built-in-combat)) |
+| `reset_seconds` (any, usually a room) | runs its `on_reset` that often (see [When handlers run](#when-handlers-run)) |
 | `slot`, `damage`, `damage_type`, `damage_parts`, `attack_bonus`, `armor_class`, `equipped_by` (item) | equipment (see [Built-in combat](#built-in-combat)) |
 
 All other properties, including `weight`, `value`, `lighting`,

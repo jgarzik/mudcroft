@@ -436,15 +436,16 @@ to `objects` ON DELETE CASCADE.
 ### deadlines
 
 World events due at an absolute time: a corpse decaying, an NPC respawning
-or wandering. Triggers `wander_on_insert` and `wander_on_update` give an
-object whose properties get a positive `wander_seconds` a `wander` row due at
+or wandering, a room resetting. Triggers `wander_on_insert`/`wander_on_update`
+(and `reset_on_insert`/`reset_on_update`) give an object whose properties get
+a positive `wander_seconds` (`reset_seconds`) a `wander` (`reset`) row due at
 time 0 (the same on every replica); the scheduler reschedules it.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | universe_id | TEXT NOT NULL | |
 | object_id | TEXT NOT NULL | The corpse or NPC |
-| kind | TEXT NOT NULL | `decay`, `respawn`, `wander` or `delete` (an NPC gone for good: its death report deletes it after `on_death`; this row deletes it a minute later if the report never ran) |
+| kind | TEXT NOT NULL | `decay`, `respawn`, `wander`, `reset` (an object's `on_reset`, every `reset_seconds`) or `delete` (an NPC gone for good: its death report deletes it after `on_death`; this row deletes it a minute later if the report never ran) |
 | due_at | INTEGER NOT NULL | ms since epoch; index `deadlines_due` |
 
 Primary key `(universe_id, object_id, kind)`; foreign key to `objects` ON

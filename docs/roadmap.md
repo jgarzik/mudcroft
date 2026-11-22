@@ -102,8 +102,6 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Weapon `on_hit` handler**: weapons deal damage parts of several types
   (`damage_parts`, `Combat.attack_extended`); a weapon's own code run on a
   hit is not built.
-- **More lifecycle handlers**: `on_reset` (room respawn timer),
-  `on_disconnect` (`on_create`, `on_destroy`, `on_init`, `on_move` fire).
 - **Persistent actions**: registered verbs are in memory and lost on restart.
 - **High-occupancy rooms**: above about 100 occupants, send an aggregated
   view (count, notable entities, sampled chat).

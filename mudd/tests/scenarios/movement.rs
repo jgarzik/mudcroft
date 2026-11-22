@@ -720,3 +720,55 @@ async fn test_region_hooks_not_spoofed_by_region_id() {
     .unwrap();
     assert_eq!(hits, 0, "the vault's hook did not fire");
 }
+
+/// A room with reset_seconds runs its on_reset that often (to restock); the
+/// room a player was in gets on_disconnect when their grace period ends
+#[tokio::test]
+async fn test_on_reset_and_on_disconnect() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "reset_wiz").await;
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/items/tally", "item", nil, {name = "tally", resets = 0, left = ""})
+           local h = game.store_code([[return {
+             on_reset = function(a)
+               local t = game.get_object("/items/tally")
+               game.update_object("/items/tally", {resets = t.metadata.resets + 1})
+             end,
+             on_disconnect = function(a)
+               game.update_object("/items/tally", {left = a.player_id})
+             end }]])
+           game.create_object("/rooms/shop", "room", nil, {name = "Shop", reset_seconds = 1, code_hash = h})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    let mut pl = server
+        .connect_as(crate::harness::Role::Player {
+            username: "shopper".into(),
+        })
+        .await
+        .unwrap();
+    let shopper = pl.player_id().unwrap().to_string();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"game.move_object("{}", "/rooms/shop") return "ok""#,
+            shopper
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    pl.close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+    let (resets, left): (i64, String) = sqlx::query_as(
+        "SELECT json_extract(properties, '$.resets'), json_extract(properties, '$.left')
+         FROM objects WHERE universe_id = ? AND id = '/items/tally'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(resets >= 3, "on_reset ran about once a second: {}", resets);
+    assert_eq!(left, shopper, "on_disconnect told the room");
+}

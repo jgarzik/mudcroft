@@ -97,7 +97,7 @@ pub const DEADLINES_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS deadlines (
         universe_id TEXT NOT NULL,
         object_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn', 'wander', 'delete')),
+        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn', 'wander', 'delete', 'reset')),
         due_at INTEGER NOT NULL,
         PRIMARY KEY (universe_id, object_id, kind),
         FOREIGN KEY (universe_id, object_id)
@@ -115,6 +115,18 @@ pub const DEADLINES_TABLE: &str = r#"
     BEGIN
         INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
         VALUES (NEW.universe_id, NEW.id, 'wander', 0);
+    END;
+    CREATE TRIGGER IF NOT EXISTS reset_on_insert AFTER INSERT ON objects
+    WHEN json_extract(NEW.properties, '$.reset_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'reset', 0);
+    END;
+    CREATE TRIGGER IF NOT EXISTS reset_on_update AFTER UPDATE OF properties ON objects
+    WHEN json_extract(NEW.properties, '$.reset_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'reset', 0);
     END
 "#;
 

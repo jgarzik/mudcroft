@@ -121,6 +121,13 @@ async fn handle_orphaned_sessions(state: AppState) {
             "primary: {} lost its server; handling the disconnect",
             player
         );
+        let room = state
+            .object_store
+            .get(&universe, &player)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|p| p.parent_id);
         if let Err(e) = state
             .player_manager
             .finish_disconnect(&universe, &player, &since)
@@ -128,6 +135,7 @@ async fn handle_orphaned_sessions(state: AppState) {
         {
             warn!("primary: disconnect of {} failed: {}", player, e);
         }
+        super::websocket::disconnect_hook(&state, &universe, &player, room).await;
     }
 }
 

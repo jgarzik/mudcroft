@@ -1867,6 +1867,29 @@ async fn deadline(
                 // An NPC gone for good, after its death was reported
                 delete_tree(state, &u, &id, None).await?;
             }
+            "reset" => {
+                // Opt-in (reset_seconds), every that many seconds: its
+                // on_reset (to restock), then the next one
+                let Some(every) = obj
+                    .properties
+                    .get("reset_seconds")
+                    .and_then(|v| v.as_u64())
+                    .filter(|s| *s > 0)
+                    .map(|s| s.min(MAX_DELAY_S))
+                else {
+                    return Ok(());
+                };
+                if obj.code_hash.is_some() {
+                    engine_hook(state, &u, &id, obj.parent_id.clone(), "on_reset", json!({})).await;
+                }
+                store
+                    .execute_batch(vec![statement(
+                        "INSERT OR REPLACE INTO deadlines (universe_id, object_id, kind, due_at)
+                         VALUES (?, ?, 'reset', ?)",
+                        vec![json!(u), json!(id), json!(now + every * 1000)],
+                    )])
+                    .await?;
+            }
             "wander" => {
                 // Opt-in (wander_seconds), and only while it lasts
                 let Some(every) = obj

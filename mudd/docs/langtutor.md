@@ -261,10 +261,13 @@ The first four hooks also get `object_id`, `actor_id` and `room_id`.
 `on_destroy` just before it is deleted. After any move, a region crossed
 into or out of gets `on_enter`/`on_leave`, each object with code where
 something arrived gets `on_init` (with `arrived_id`), and the moved object
-gets `on_move` (see [When handlers run](langref.md#when-handlers-run)).
+gets `on_move`; a room with `reset_seconds` runs `on_reset` that often,
+and gets `on_disconnect` when a player who was in it is gone for good
+(see [When handlers run](langref.md#when-handlers-run)).
 `on_use` fires only through `game.use_object`. Engine hooks (the table
-above, plus `on_create`, `on_destroy`, `on_init`, `on_move` and the `ai_`
-handlers) can't be triggered with `game.use_object`. Other
+above, plus `on_create`, `on_destroy`, `on_init`, `on_move`, `on_reset`,
+`on_disconnect` and the `ai_` handlers) can't be triggered with
+`game.use_object`. Other
 limits:
 
 - `game.move_object` runs the old and new rooms' `on_leave`/`on_enter`
