@@ -96,6 +96,7 @@ pub fn resolve_attack(
 
 /// The statements that make an attack's outcome durable, to commit as one
 /// batch: the target's new HP and, if it died, its removal from the room
+/// and the end of its status effects
 pub fn attack_statements(
     universe_id: &str,
     target_id: &str,
@@ -111,6 +112,10 @@ pub fn attack_statements(
     }
     if outcome.killed {
         statements.push(remove_from_room_statement(universe_id, target_id));
+        statements.push(super::EffectRegistry::clear_statement(
+            universe_id,
+            target_id,
+        ));
     }
     Ok(statements)
 }

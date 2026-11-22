@@ -42,6 +42,8 @@ pub struct AppState {
     pub venice: Arc<VeniceClient>,
     pub image_store: Arc<ImageStore>,
     pub themes: Arc<ThemeRegistry>,
+    /// Status effects: a cache of the active_effects table
+    pub effects: Arc<crate::combat::EffectRegistry>,
 }
 
 impl AppState {
@@ -95,6 +97,10 @@ pub async fn router(
     if let Err(e) = class_registry.load_from_db().await {
         tracing::warn!("Failed to load classes from database: {}", e);
     }
+    let effects = crate::combat::EffectRegistry::shared();
+    if let Err(e) = effects.load_from_db(db.pool()).await {
+        tracing::warn!("Failed to load status effects from database: {}", e);
+    }
 
     let classes = Arc::new(RwLock::new(class_registry));
 
@@ -112,6 +118,7 @@ pub async fn router(
         venice,
         image_store,
         themes,
+        effects,
     };
 
     // Fire call_out timers and heartbeats in the background

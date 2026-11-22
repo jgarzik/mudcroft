@@ -222,20 +222,23 @@ Unique: `(universe_id, player_id)`.
 
 ### active_effects
 
-Status effects (poison, stun, ...).
+Status effects (poison, stun, bleeding, ...): the source of truth, which
+`EffectRegistry` caches. One row per effect type on an entity; applying the
+same type again keeps the longer duration and the stronger magnitude.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| id | TEXT PRIMARY KEY | UUID |
-| universe_id | TEXT | |
-| entity_id | TEXT NOT NULL | No foreign key |
-| effect_type | TEXT NOT NULL | |
-| remaining_ticks | INTEGER NOT NULL | |
-| magnitude | INTEGER NOT NULL DEFAULT 0 | |
+| universe_id | TEXT NOT NULL | |
+| entity_id | TEXT NOT NULL | Object id in that universe |
+| effect_type | TEXT NOT NULL | `poisoned`, `stunned`, `bleeding`, ... |
+| remaining_ticks | INTEGER NOT NULL | Effect ticks left |
+| magnitude | INTEGER NOT NULL DEFAULT 0 | Damage or healing per tick, or strength of a buff/debuff |
 | damage_type | TEXT | For damage-over-time effects |
 | source_id | TEXT | Who applied it |
 
-Index: `idx_active_effects_entity (entity_id)`.
+Primary key: `(universe_id, entity_id, effect_type)`. Foreign key
+`(universe_id, entity_id)` to `objects(universe_id, id)` ON DELETE CASCADE:
+deleting an object deletes its effects.
 
 ## Timers
 
@@ -319,7 +322,6 @@ It also checks that an `admin` or `owner` account exists. If either check fails,
 | idx_objects_parent | objects(universe_id, parent_id) |
 | idx_objects_owner | objects(owner_id) |
 | idx_path_grants_grantee | path_grants(universe_id, grantee_id) |
-| idx_active_effects_entity | active_effects(entity_id) |
 | idx_timers_fire_at | timers(fire_at) |
 | idx_raft_log_term | raft_log(term) |
 

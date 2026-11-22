@@ -69,7 +69,9 @@ impl Database {
     /// time. There are no upgrade steps yet, so anything older is refused:
     /// - 1 -> 2 (argon2id passwords, accounts.salt dropped): old salted
     ///   SHA-256 hashes cannot be converted, so there is no step.
-    /// - 2 -> 3 (combat_state dropped: HP lives on the object row).
+    /// - 2 -> 3 (combat_state dropped: HP lives on the object row;
+    ///   active_effects keyed (universe, entity, type), cascading with the
+    ///   object).
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -409,23 +411,18 @@ impl Database {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS active_effects (
-                id TEXT PRIMARY KEY,
-                universe_id TEXT,
+                universe_id TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
                 effect_type TEXT NOT NULL,
                 remaining_ticks INTEGER NOT NULL,
                 magnitude INTEGER NOT NULL DEFAULT 0,
                 damage_type TEXT,
-                source_id TEXT
+                source_id TEXT,
+                PRIMARY KEY (universe_id, entity_id, effect_type),
+                FOREIGN KEY (universe_id, entity_id)
+                    REFERENCES objects(universe_id, id) ON DELETE CASCADE
             )
             "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Index for active effects lookup
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_active_effects_entity ON active_effects(entity_id)",
         )
         .execute(&self.pool)
         .await?;

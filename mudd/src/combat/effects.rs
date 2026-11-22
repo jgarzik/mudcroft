@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use super::DamageType;
+use crate::objects::ObjectStore;
 
 /// Types of status effects
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -48,6 +49,8 @@ pub enum EffectType {
     Regenerating,
     /// Silenced - cannot cast spells
     Silenced,
+    /// Bleeding - takes physical damage over time (e.g. after a critical hit)
+    Bleeding,
 }
 
 impl FromStr for EffectType {
@@ -70,6 +73,7 @@ impl FromStr for EffectType {
             "invisible" | "invis" => Ok(EffectType::Invisible),
             "regenerating" | "regen" => Ok(EffectType::Regenerating),
             "silenced" | "silence" => Ok(EffectType::Silenced),
+            "bleeding" | "bleed" => Ok(EffectType::Bleeding),
             _ => Err(()),
         }
     }
@@ -95,6 +99,7 @@ impl EffectType {
                 | EffectType::Weakened
                 | EffectType::Exposed
                 | EffectType::Silenced
+                | EffectType::Bleeding
         )
     }
 }
@@ -117,6 +122,7 @@ impl std::fmt::Display for EffectType {
             EffectType::Invisible => "invisible",
             EffectType::Regenerating => "regenerating",
             EffectType::Silenced => "silenced",
+            EffectType::Bleeding => "bleeding",
         };
         write!(f, "{}", s)
     }
@@ -279,241 +285,249 @@ impl EntityEffects {
     }
 }
 
-/// Global effect registry for tracking effects on all entities
-#[derive(Debug)]
+/// Effects of every entity, a cache of the `active_effects` table (the
+/// source of truth, written through Raft), keyed by (universe, entity).
+///
+/// Writes go to the table first, as statements that can share an atomic
+/// batch with other changes (an attack, a tick); the cache is updated only
+/// after the batch commits. `load_from_db` rebuilds the cache at startup.
+#[derive(Debug, Default)]
 pub struct EffectRegistry {
-    entities: RwLock<HashMap<String, EntityEffects>>,
-    db_pool: Option<SqlitePool>,
+    cache: RwLock<HashMap<EntityKey, EntityEffects>>,
 }
 
-impl Default for EffectRegistry {
-    fn default() -> Self {
-        Self {
-            entities: RwLock::new(HashMap::new()),
-            db_pool: None,
-        }
-    }
+/// (universe_id, entity_id)
+pub type EntityKey = (String, String);
+
+fn key(universe_id: &str, entity_id: &str) -> EntityKey {
+    (universe_id.to_string(), entity_id.to_string())
 }
+
+type Statement = (String, Vec<serde_json::Value>);
 
 impl EffectRegistry {
-    /// Create a new effect registry
+    /// An empty registry
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a new effect registry with database pool
-    pub fn with_db(pool: SqlitePool) -> Self {
-        Self {
-            entities: RwLock::new(HashMap::new()),
-            db_pool: Some(pool),
-        }
-    }
-
-    /// Create a shared instance
+    /// Wrap in Arc for sharing
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
     }
 
-    /// Create a shared instance with database pool
-    pub fn shared_with_db(pool: SqlitePool) -> Arc<Self> {
-        Arc::new(Self::with_db(pool))
+    /// Statement adding an effect, or refreshing one of the same type to
+    /// the longer duration and stronger magnitude (as `EntityEffects::add`)
+    pub fn upsert_statement(
+        universe_id: &str,
+        entity_id: &str,
+        effect: &StatusEffect,
+    ) -> Statement {
+        (
+            "INSERT INTO active_effects
+               (universe_id, entity_id, effect_type, remaining_ticks, magnitude, damage_type, source_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (universe_id, entity_id, effect_type) DO UPDATE SET
+               remaining_ticks = max(active_effects.remaining_ticks, excluded.remaining_ticks),
+               magnitude = max(active_effects.magnitude, excluded.magnitude),
+               damage_type = excluded.damage_type,
+               source_id = excluded.source_id"
+                .to_string(),
+            vec![
+                serde_json::json!(universe_id),
+                serde_json::json!(entity_id),
+                serde_json::json!(effect.effect_type.to_string()),
+                serde_json::json!(effect.remaining_ticks),
+                serde_json::json!(effect.magnitude),
+                serde_json::json!(effect.damage_type.map(|d| d.to_string())),
+                serde_json::json!(effect.source_id),
+            ],
+        )
     }
 
-    /// Add an effect to an entity
-    pub async fn add_effect(&self, entity_id: &str, effect: StatusEffect) {
-        // Persist to database
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) = self.persist_effect(entity_id, &effect, pool).await {
-                warn!("Failed to persist effect for {}: {}", entity_id, e);
-            }
-        }
+    /// Statement setting an effect's remaining ticks (after a tick)
+    pub fn set_remaining_statement(
+        universe_id: &str,
+        entity_id: &str,
+        effect_type: EffectType,
+        remaining_ticks: u32,
+    ) -> Statement {
+        (
+            "UPDATE active_effects SET remaining_ticks = ?
+             WHERE universe_id = ? AND entity_id = ? AND effect_type = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(remaining_ticks),
+                serde_json::json!(universe_id),
+                serde_json::json!(entity_id),
+                serde_json::json!(effect_type.to_string()),
+            ],
+        )
+    }
 
-        let mut entities = self.entities.write().await;
-        entities
-            .entry(entity_id.to_string())
+    /// Statement removing one effect
+    pub fn delete_statement(
+        universe_id: &str,
+        entity_id: &str,
+        effect_type: EffectType,
+    ) -> Statement {
+        (
+            "DELETE FROM active_effects WHERE universe_id = ? AND entity_id = ? AND effect_type = ?"
+                .to_string(),
+            vec![
+                serde_json::json!(universe_id),
+                serde_json::json!(entity_id),
+                serde_json::json!(effect_type.to_string()),
+            ],
+        )
+    }
+
+    /// Statement removing all of an entity's effects (e.g. on death)
+    pub fn clear_statement(universe_id: &str, entity_id: &str) -> Statement {
+        (
+            "DELETE FROM active_effects WHERE universe_id = ? AND entity_id = ?".to_string(),
+            vec![serde_json::json!(universe_id), serde_json::json!(entity_id)],
+        )
+    }
+
+    /// Add (or refresh) an effect: write it, then cache it
+    pub async fn apply(
+        &self,
+        store: &ObjectStore,
+        universe_id: &str,
+        entity_id: &str,
+        effect: StatusEffect,
+    ) -> anyhow::Result<()> {
+        store
+            .execute_batch(vec![Self::upsert_statement(
+                universe_id,
+                entity_id,
+                &effect,
+            )])
+            .await?;
+        self.cache_add(universe_id, entity_id, effect).await;
+        Ok(())
+    }
+
+    /// Remove an effect: write it, then uncache it
+    pub async fn remove(
+        &self,
+        store: &ObjectStore,
+        universe_id: &str,
+        entity_id: &str,
+        effect_type: EffectType,
+    ) -> anyhow::Result<()> {
+        store
+            .execute_batch(vec![Self::delete_statement(
+                universe_id,
+                entity_id,
+                effect_type,
+            )])
+            .await?;
+        self.cache_remove(universe_id, entity_id, effect_type).await;
+        Ok(())
+    }
+
+    /// After a committed upsert: cache the effect
+    pub async fn cache_add(&self, universe_id: &str, entity_id: &str, effect: StatusEffect) {
+        self.cache
+            .write()
+            .await
+            .entry(key(universe_id, entity_id))
             .or_default()
             .add(effect);
     }
 
-    /// Persist an effect to database
-    async fn persist_effect(
-        &self,
-        entity_id: &str,
-        effect: &StatusEffect,
-        pool: &SqlitePool,
-    ) -> anyhow::Result<()> {
-        let effect_type_str = effect.effect_type.to_string();
-        let damage_type_str = effect.damage_type.map(|dt| format!("{:?}", dt));
-        let id = uuid::Uuid::new_v4().to_string();
-
-        sqlx::query(
-            r#"
-            INSERT INTO active_effects
-            (id, entity_id, effect_type, remaining_ticks, magnitude, damage_type, source_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&id)
-        .bind(entity_id)
-        .bind(&effect_type_str)
-        .bind(effect.remaining_ticks as i32)
-        .bind(effect.magnitude)
-        .bind(&damage_type_str)
-        .bind(&effect.source_id)
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Remove an effect from an entity
-    pub async fn remove_effect(&self, entity_id: &str, effect_type: EffectType) {
-        // Remove from database
-        if let Some(ref pool) = self.db_pool {
-            let effect_type_str = effect_type.to_string();
-            if let Err(e) =
-                sqlx::query("DELETE FROM active_effects WHERE entity_id = ? AND effect_type = ?")
-                    .bind(entity_id)
-                    .bind(&effect_type_str)
-                    .execute(pool)
-                    .await
-            {
-                warn!(
-                    "Failed to remove effect {} for {}: {}",
-                    effect_type, entity_id, e
-                );
-            }
-        }
-
-        let mut entities = self.entities.write().await;
-        if let Some(effects) = entities.get_mut(entity_id) {
+    /// After a committed delete: uncache the effect
+    pub async fn cache_remove(&self, universe_id: &str, entity_id: &str, effect_type: EffectType) {
+        let mut cache = self.cache.write().await;
+        let k = key(universe_id, entity_id);
+        if let Some(effects) = cache.get_mut(&k) {
             effects.remove(effect_type);
+            if effects.active_effects().is_empty() {
+                cache.remove(&k);
+            }
+        }
+    }
+
+    /// After a committed clear (or when the entity is gone): uncache all
+    pub async fn cache_clear(&self, universe_id: &str, entity_id: &str) {
+        self.cache
+            .write()
+            .await
+            .remove(&key(universe_id, entity_id));
+    }
+
+    /// After a committed tick: replace an entity's cached effects
+    pub async fn cache_set(&self, universe_id: &str, entity_id: &str, effects: EntityEffects) {
+        let mut cache = self.cache.write().await;
+        if effects.active_effects().is_empty() {
+            cache.remove(&key(universe_id, entity_id));
+        } else {
+            cache.insert(key(universe_id, entity_id), effects);
         }
     }
 
-    /// Check if entity has an effect
-    pub async fn has_effect(&self, entity_id: &str, effect_type: EffectType) -> bool {
-        let entities = self.entities.read().await;
-        entities.get(entity_id).is_some_and(|e| e.has(effect_type))
+    /// An entity's current effects (empty if none)
+    pub async fn get(&self, universe_id: &str, entity_id: &str) -> EntityEffects {
+        self.cache
+            .read()
+            .await
+            .get(&key(universe_id, entity_id))
+            .cloned()
+            .unwrap_or_default()
     }
 
-    /// Check if entity can act
-    pub async fn can_act(&self, entity_id: &str) -> bool {
-        let entities = self.entities.read().await;
-        entities.get(entity_id).is_none_or(|e| e.can_act())
+    /// Every entity that has effects, with them (for the tick)
+    pub async fn snapshot(&self) -> Vec<(EntityKey, EntityEffects)> {
+        self.cache
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
-    /// Tick effects for an entity
-    pub async fn tick(&self, entity_id: &str) -> Vec<(i32, DamageType)> {
-        let results = {
-            let mut entities = self.entities.write().await;
-            if let Some(effects) = entities.get_mut(entity_id) {
-                effects.tick_all()
-            } else {
-                Vec::new()
-            }
-        };
+    /// Rebuild the cache from the table (at startup)
+    pub async fn load_from_db(&self, pool: &SqlitePool) -> anyhow::Result<()> {
+        type Row = (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT universe_id, entity_id, effect_type, remaining_ticks, magnitude,
+                    damage_type, source_id
+             FROM active_effects",
+        )
+        .fetch_all(pool)
+        .await?;
 
-        // Update remaining ticks in database
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) = self.sync_effects_to_db(entity_id, pool).await {
-                warn!("Failed to sync effects for {}: {}", entity_id, e);
-            }
-        }
-
-        results
-    }
-
-    /// Sync effects to database after tick
-    async fn sync_effects_to_db(&self, entity_id: &str, pool: &SqlitePool) -> anyhow::Result<()> {
-        // Delete all effects for entity and re-insert active ones
-        sqlx::query("DELETE FROM active_effects WHERE entity_id = ?")
-            .bind(entity_id)
-            .execute(pool)
-            .await?;
-
-        let entities = self.entities.read().await;
-        if let Some(entity_effects) = entities.get(entity_id) {
-            for effect in entity_effects.active_effects() {
-                self.persist_effect(entity_id, effect, pool).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Load effects from database on startup
-    pub async fn load_from_db(&self) -> anyhow::Result<()> {
-        let Some(ref pool) = self.db_pool else {
-            return Ok(());
-        };
-
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, String, i32, i32, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT id, entity_id, effect_type, remaining_ticks, magnitude, damage_type, source_id FROM active_effects",
-            )
-            .fetch_all(pool)
-            .await?;
-
-        let mut entities = self.entities.write().await;
-        for (
-            _id,
-            entity_id,
-            effect_type_str,
-            remaining_ticks,
-            magnitude,
-            damage_type_str,
-            source_id,
-        ) in rows
-        {
-            let effect_type = match EffectType::from_str(&effect_type_str) {
-                Ok(et) => et,
-                Err(_) => continue,
+        let mut cache = HashMap::<EntityKey, EntityEffects>::new();
+        for (universe_id, entity_id, effect_type, remaining, magnitude, dtype, source) in rows {
+            let Ok(effect_type) = EffectType::from_str(&effect_type) else {
+                warn!("Unknown effect type in database: {}", effect_type);
+                continue;
             };
-
-            let damage_type = damage_type_str.and_then(|s| match s.as_str() {
-                "Physical" => Some(DamageType::Physical),
-                "Slashing" => Some(DamageType::Slashing),
-                "Piercing" => Some(DamageType::Piercing),
-                "Bludgeoning" => Some(DamageType::Bludgeoning),
-                "Fire" => Some(DamageType::Fire),
-                "Cold" => Some(DamageType::Cold),
-                "Lightning" => Some(DamageType::Lightning),
-                "Acid" => Some(DamageType::Acid),
-                "Poison" => Some(DamageType::Poison),
-                "Psychic" => Some(DamageType::Psychic),
-                "Radiant" => Some(DamageType::Radiant),
-                "Necrotic" => Some(DamageType::Necrotic),
-                "Force" => Some(DamageType::Force),
-                "Thunder" => Some(DamageType::Thunder),
-                _ => None,
-            });
-
-            let mut effect = StatusEffect::new(effect_type, remaining_ticks as u32, magnitude);
-            effect.damage_type = damage_type;
-            effect.source_id = source_id;
-
-            entities.entry(entity_id).or_default().add(effect);
+            let effect = StatusEffect {
+                effect_type,
+                remaining_ticks: remaining.max(0) as u32,
+                magnitude: magnitude as i32,
+                source_id: source,
+                damage_type: dtype.and_then(|d| DamageType::from_str(&d).ok()),
+            };
+            cache
+                .entry((universe_id, entity_id))
+                .or_default()
+                .add(effect);
         }
-
-        debug!("Loaded effects for {} entities", entities.len());
+        debug!("Loaded effects for {} entities", cache.len());
+        *self.cache.write().await = cache;
         Ok(())
-    }
-
-    /// Clear effects for an entity
-    pub async fn clear(&self, entity_id: &str) {
-        // Remove from database
-        if let Some(ref pool) = self.db_pool {
-            if let Err(e) = sqlx::query("DELETE FROM active_effects WHERE entity_id = ?")
-                .bind(entity_id)
-                .execute(pool)
-                .await
-            {
-                warn!("Failed to clear effects for {}: {}", entity_id, e);
-            }
-        }
-
-        let mut entities = self.entities.write().await;
-        entities.remove(entity_id);
     }
 }
 
@@ -606,20 +620,111 @@ mod tests {
         assert_eq!(effect.remaining_ticks, 5);
     }
 
+    async fn universe_with(pool: &SqlitePool, universe: &str, objects: &[&str]) -> ObjectStore {
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES ('acct', 'acct', 'x', 'admin', '2026-01-01')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let store = ObjectStore::new(pool.clone(), None);
+        store
+            .create_universe(universe, universe, "acct", serde_json::json!({}))
+            .await
+            .unwrap();
+        for id in objects {
+            let obj = crate::objects::Object::new(id, universe, "npc").unwrap();
+            store.create(&obj).await.unwrap();
+        }
+        store
+    }
+
+    /// The table is the truth: effects written through the registry come
+    /// back in a fresh registry loaded from it, per universe
     #[tokio::test]
-    async fn test_effect_registry() {
+    async fn test_effect_registry_persists_per_universe() {
+        let pool = crate::db::test_utils::test_pool().await;
+        let store = universe_with(&pool, "a", &["/npcs/rat"]).await;
+        universe_with(&pool, "b", &["/npcs/rat"]).await;
         let registry = EffectRegistry::new();
 
-        // Add effect
         registry
-            .add_effect("player1", StatusEffect::new(EffectType::Stunned, 2, 0))
-            .await;
-        assert!(registry.has_effect("player1", EffectType::Stunned).await);
-        assert!(!registry.can_act("player1").await);
+            .apply(
+                &store,
+                "a",
+                "/npcs/rat",
+                StatusEffect::new(EffectType::Stunned, 2, 0),
+            )
+            .await
+            .unwrap();
+        // Refreshing keeps the longer duration and stronger magnitude
+        registry
+            .apply(
+                &store,
+                "a",
+                "/npcs/rat",
+                StatusEffect::dot(EffectType::Poisoned, 3, 2, DamageType::Poison),
+            )
+            .await
+            .unwrap();
+        registry
+            .apply(
+                &store,
+                "a",
+                "/npcs/rat",
+                StatusEffect::dot(EffectType::Poisoned, 1, 5, DamageType::Poison),
+            )
+            .await
+            .unwrap();
+        assert!(!registry.get("a", "/npcs/rat").await.can_act());
+        assert!(
+            registry.get("b", "/npcs/rat").await.can_act(),
+            "per universe"
+        );
 
-        // Remove effect
-        registry.remove_effect("player1", EffectType::Stunned).await;
-        assert!(!registry.has_effect("player1", EffectType::Stunned).await);
-        assert!(registry.can_act("player1").await);
+        let fresh = EffectRegistry::new();
+        fresh.load_from_db(&pool).await.unwrap();
+        let effects = fresh.get("a", "/npcs/rat").await;
+        let poison = effects.get(EffectType::Poisoned).expect("poison persisted");
+        assert_eq!((poison.remaining_ticks, poison.magnitude), (3, 5));
+        assert_eq!(poison.damage_type, Some(DamageType::Poison));
+        assert!(effects.has(EffectType::Stunned));
+        assert!(fresh
+            .get("b", "/npcs/rat")
+            .await
+            .active_effects()
+            .is_empty());
+
+        registry
+            .remove(&store, "a", "/npcs/rat", EffectType::Stunned)
+            .await
+            .unwrap();
+        assert!(registry.get("a", "/npcs/rat").await.can_act());
+        let fresh = EffectRegistry::new();
+        fresh.load_from_db(&pool).await.unwrap();
+        assert!(!fresh.get("a", "/npcs/rat").await.has(EffectType::Stunned));
+    }
+
+    /// Effects belong to an object: deleting it deletes them
+    #[tokio::test]
+    async fn test_effects_cascade_with_object() {
+        let pool = crate::db::test_utils::test_pool().await;
+        let store = universe_with(&pool, "a", &["/npcs/rat"]).await;
+        EffectRegistry::new()
+            .apply(
+                &store,
+                "a",
+                "/npcs/rat",
+                StatusEffect::new(EffectType::Stunned, 2, 0),
+            )
+            .await
+            .unwrap();
+        store.delete("a", "/npcs/rat").await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_effects")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
     }
 }

@@ -1324,6 +1324,9 @@ async fn execute_command(
                     };
                 }
             }
+            if outcome.killed {
+                state.effects.cache_clear(universe_id, &target_id).await;
+            }
             let attack_result = &outcome.result;
 
             // Build result message
