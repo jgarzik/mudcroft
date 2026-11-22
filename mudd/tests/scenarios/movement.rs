@@ -687,3 +687,36 @@ async fn test_region_init_and_move_hooks() {
         log
     );
 }
+
+/// A room naming a region in its region_id (without being inside it) does
+/// not fire that region's hooks: only the room's parent region does
+#[tokio::test]
+async fn test_region_hooks_not_spoofed_by_region_id() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "spoof_wiz").await;
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/items/tripwire", "item", nil, {name = "tripwire", hits = 0})
+           local h = game.store_code([[return { on_enter = function(a)
+             local t = game.get_object("/items/tripwire")
+             game.update_object("/items/tripwire", {hits = t.metadata.hits + 1})
+           end }]])
+           game.create_object("/d/vault", "region", nil, {name = "Vault", code_hash = h})
+           game.create_object("/rooms/fake", "room", nil, {name = "Fake", region_id = "/d/vault"})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    wiz.drain().await;
+    wiz.command("goto /rooms/fake").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hits: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.hits') FROM objects WHERE universe_id = ? AND id = '/items/tripwire'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(hits, 0, "the vault's hook did not fire");
+}

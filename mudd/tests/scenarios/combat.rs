@@ -2297,3 +2297,40 @@ async fn test_engine_edges_after_review() {
         "still fighting"
     );
 }
+
+/// An NPC deleted for good whose on_destroy puts things inside it is still
+/// deleted (with them)
+#[tokio::test]
+async fn test_on_destroy_cannot_block_deletion() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "stubborn".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"local h = game.store_code([[return {{ on_destroy = function(a)
+                 game.create_object(a.object_id .. "/stowaway", "item", a.object_id, {{name = "stowaway"}})
+               end }}]])
+               game.create_object("/npcs/limpet", "npc", "{}", {{name = "limpet", hp = 1, max_hp = 1, armor_class = 1, respawn_seconds = 0, code_hash = h}})
+               return "ready""#,
+            entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    attack_until_slain(&mut adm, "attack limpet", "limpet").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE universe_id = ? AND id LIKE '/npcs/limpet%'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "deleted with what its hook added");
+}

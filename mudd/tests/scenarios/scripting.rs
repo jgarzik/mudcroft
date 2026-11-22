@@ -1081,3 +1081,64 @@ async fn test_lifecycle_create_destroy() {
     .unwrap();
     assert!((2..=40).contains(&rabbits), "a bounded chain: {}", rabbits);
 }
+
+/// A clone keeps code only for a cloner who may act as the original's
+/// owner (else the copy's code would run as the cloner); on_destroy cannot
+/// block a deletion by adding contents
+#[tokio::test]
+async fn test_lifecycle_hooks_cannot_be_abused() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "lifecycle_adm".into(),
+        })
+        .await
+        .unwrap();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "lifecycle_cloner".into(),
+        })
+        .await
+        .unwrap();
+    adm.drain().await;
+    adm.command(&format!(
+        r#"eval local h = game.store_code([[return {{
+             on_destroy = function(a) game.create_object(a.object_id .. "/stowaway", "item", a.object_id, {{name = "stowaway"}}) end,
+           }}]])
+           game.create_object("/items/idol", "item", "{e}", {{name = "idol", code_hash = h}})
+           game.create_object("/items/crate", "item", "{e}", {{name = "crate", code_hash = h}})
+           return "made""#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    adm.expect_output_containing("made").await.unwrap();
+
+    // The wizard's copy of the admin's idol carries no code
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local c = game.clone_object("/items/idol", "/items/idol-copy", "{e}") return "code:" .. tostring(c.code_hash)"#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("code:nil")
+        .await
+        .expect("code dropped");
+
+    // on_destroy putting a stowaway inside does not stop the deletion
+    adm.drain().await;
+    adm.command(r#"eval return tostring(game.delete_object("/items/crate"))"#)
+        .await
+        .unwrap();
+    adm.expect_output_containing("true").await.expect("deleted");
+    let crate_left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE universe_id = ? AND id = '/items/crate'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(crate_left, 0);
+}

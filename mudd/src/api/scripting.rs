@@ -109,7 +109,16 @@ where
         }
     };
     let committer: std::sync::Arc<dyn crate::db::run::Committer> = state.raft_writer.clone();
-    let outcome = crate::db::run::scope(state.db.pool(), committer, prefix, f, rebuild).await;
+    // One engine hook budget for the whole run (its moves, creates, ...)
+    // (boxed: the run's future is large, and runs nest)
+    let outcome = super::combat::with_ai_budget(Box::pin(crate::db::run::scope(
+        state.db.pool(),
+        committer,
+        prefix,
+        f,
+        rebuild,
+    )))
+    .await;
     // A committed run may have added a fight or a deadline (some come from
     // triggers, e.g. wander_seconds): the combat scheduler looks again
     // (one indexed query)

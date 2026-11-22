@@ -820,12 +820,31 @@ impl GameApi {
                     {
                         return Ok(Err(reason));
                     }
-                    // Its own code's on_destroy first, while it still exists
+                    // Its own code's on_destroy first, while it still exists;
+                    // anything it put inside goes to the object's room (a
+                    // hook must not be able to block the deletion)
                     if obj.code_hash.is_some() {
                         if let Some(ref engine) = delete_engine {
+                            let before: std::collections::HashSet<String> = store
+                                .get_contents(&universe_id, &id)
+                                .await?
+                                .into_iter()
+                                .map(|o| o.id)
+                                .collect();
                             engine
                                 .hook(&universe_id, &id, "on_destroy", serde_json::json!({}))
                                 .await;
+                            for added in store.get_contents(&universe_id, &id).await? {
+                                if !before.contains(&added.id) {
+                                    store
+                                        .move_object(
+                                            &universe_id,
+                                            &added.id,
+                                            obj.parent_id.as_deref(),
+                                        )
+                                        .await?;
+                                }
+                            }
                         }
                     }
                     // The object and its balance go together, atomically
@@ -986,6 +1005,20 @@ impl GameApi {
                                         return Ok(Err(reason));
                                     }
                                     cloned.parent_id = new_parent_id;
+                                    // The copy is the cloner's, so its code
+                                    // would run as them: kept only if they
+                                    // may act as the original's owner
+                                    if let (Some(owner), Some(cloner)) =
+                                        (original.owner_id.as_deref(), user.as_deref())
+                                    {
+                                        if owner != cloner
+                                            && !permissions
+                                                .can_act_as(&universe_id, cloner, owner)
+                                                .await
+                                        {
+                                            cloned.code_hash = None;
+                                        }
+                                    }
                                     cloned.owner_id = user.clone();
                                     cloned.created_at = chrono::Utc::now().to_rfc3339();
                                     cloned.updated_at = cloned.created_at.clone();

@@ -675,9 +675,16 @@ tokio::task_local! {
     static AI_BUDGET: (u32, std::sync::Arc<std::sync::atomic::AtomicU32>);
 }
 
-/// Run `f` as one action for the AI handler budget: inside an action
-/// already, it shares that action's budget; else it starts a fresh one
-async fn with_ai_budget<F: std::future::Future>(f: F) -> F::Output {
+/// Run `f` with a fresh engine hook budget of its own (an NPC's turn)
+async fn fresh_ai_budget<F: std::future::Future>(f: F) -> F::Output {
+    let fresh = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(MAX_AI_CALLS));
+    AI_BUDGET.scope((0, fresh), f).await
+}
+
+/// Run `f` as one action for the engine hook budget: inside an action
+/// already (a run, a command), it shares that action's budget; else it
+/// starts a fresh one
+pub(crate) async fn with_ai_budget<F: std::future::Future>(f: F) -> F::Output {
     if AI_BUDGET.try_with(|_| ()).is_ok() {
         return f.await;
     }
@@ -797,7 +804,10 @@ async fn move_extras_inner(
         }
     };
     let (from_room, to_room) = (get(from).await, get(to).await);
-    let region = |room: &Option<Object>| room.as_ref().and_then(region_of);
+    // For hooks a room's region is its parent region object only: the
+    // region_id property (a style hint anyone may set on their room) must
+    // not let a room fire someone else's region hooks
+    let region = |room: &Option<Object>| room.as_ref().and_then(|r| r.parent_id.clone());
     let (rf, rt) = (region(&from_room), region(&to_room));
     let args = json!({ "moved_id": moved, "from": from, "to": to, "actor_id": actor });
     if rf != rt {
@@ -1053,8 +1063,9 @@ pub async fn delete_tree(
         }
         i += 1;
     }
+    // Every on_destroy first (while everything still exists), deepest
+    // first; a failing or skipped hook does not stop the deletion
     for victim in order.iter().rev() {
-        // Its own code's on_destroy first, while it still exists
         if let Some(obj) = store.get(universe_id, victim).await? {
             if obj.code_hash.is_some() {
                 engine_hook(
@@ -1068,6 +1079,28 @@ pub async fn delete_tree(
                 .await;
             }
         }
+    }
+    // Then list the tree again (the hooks may have added to it or moved a
+    // player in), and delete it all, players spilled out
+    let mut order = vec![id.to_string()];
+    let mut seen = std::collections::HashSet::from([id.to_string()]);
+    let mut i = 0;
+    while i < order.len() {
+        for child in store.get_contents(universe_id, &order[i]).await? {
+            if is_player(&child) {
+                move_player(state, universe_id, &child.id, spill_to).await?;
+                continue;
+            }
+            if seen.insert(child.id.clone()) {
+                order.push(child.id);
+                if order.len() > MAX_TREE {
+                    anyhow::bail!("{} holds more than {} objects", id, MAX_TREE);
+                }
+            }
+        }
+        i += 1;
+    }
+    for victim in order.iter().rev() {
         store.delete(universe_id, victim).await?;
     }
     Ok(())
@@ -1511,7 +1544,7 @@ async fn rounds(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow::Re
         // undone and its fight ended, and the other rounds go on
         let mut mine = Vec::new();
         // Each fighter's turn has its own AI handler budget
-        let done = with_ai_budget(super::scripting::in_run(state, async {
+        let done = fresh_ai_budget(super::scripting::in_run(state, async {
             round(state, now, u.clone(), entity.clone(), &mut mine)
                 .await
                 .map_err(|e| e.to_string())
@@ -1739,7 +1772,7 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
     for (u, id, kind) in due {
         // Isolated like rounds: a failing one is dropped, the rest go on
         let mut mine = Vec::new();
-        let done = with_ai_budget(super::scripting::in_run(state, async {
+        let done = fresh_ai_budget(super::scripting::in_run(state, async {
             deadline(state, now, u.clone(), id.clone(), kind.clone(), &mut mine)
                 .await
                 .map_err(|e| e.to_string())
