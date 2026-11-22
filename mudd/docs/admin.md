@@ -101,14 +101,18 @@ affects only universes created after that.
 
 ### mudd_admin
 
-Administration. `set-level` is offline: like `mudd_init` it writes the
-database directly (outside Raft and the server's caches), so **stop `mudd`
-first**. `cluster` talks to a running cluster (see [Clusters](#clusters)).
+Administration. `set-level` is offline and for a single node: like
+`mudd_init` it writes the database directly (outside Raft and the server's
+caches), so **stop `mudd` first**; it refuses a cluster member's database
+(changing one copy would leave the others different). `cluster` talks to a
+running cluster (see [Clusters](#clusters)), including `cluster set-level`,
+which goes through the leader so every node gets the change.
 
 ```
 mudd_admin --database <PATH> set-level <USERNAME> <admin|owner|none>
 mudd_admin cluster --node <HOST:PORT> --cluster-ca <PEM> --cluster-secret-file <FILE> status
 mudd_admin cluster --node <HOST:PORT> --cluster-ca <PEM> --cluster-secret-file <FILE> remove <NODE_ID>
+mudd_admin cluster --node <HOST:PORT> --cluster-ca <PEM> --cluster-secret-file <FILE> set-level <USERNAME> <admin|owner|none>
 ```
 
 `set-level` sets an account's global level: `admin` or `owner` apply in
@@ -341,7 +345,9 @@ mudd_admin cluster --node 10.0.0.1:9000 --cluster-ca ca.pem \
     --cluster-secret-file cluster.secret remove 3
 ```
 
-`remove` goes to the leader (a member that is not the leader names it),
+`set-level` sets a global level on every node (through the leader, with the
+same last-admin rule as the offline command). `remove` goes to the leader
+(a member that is not the leader names it),
 demotes a voter first, and refuses to remove the last voter. Remove dead
 nodes so they stop counting toward the majority. A removed node refuses to
 start again with its old id, even if it was down during the removal (it

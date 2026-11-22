@@ -522,3 +522,46 @@ async fn test_cluster_half_joined_node_joins_again() {
         cluster.logs()
     );
 }
+
+/// Global levels in a cluster go through the leader (replicated to every
+/// node); the offline tool refuses a cluster member's database, which would
+/// change one copy only
+#[tokio::test]
+async fn test_cluster_set_level() {
+    let mut cluster = TestCluster::start(3).await.expect("cluster");
+    cluster.register(0, "promoted").await.expect("register");
+    let level = "SELECT CASE access_level WHEN 'admin' THEN 1 ELSE 0 END FROM accounts
+                 WHERE username = 'promoted'";
+    let (ok, out) = cluster
+        .admin(1, &["set-level", "promoted", "admin"])
+        .unwrap();
+    assert!(ok, "{}", out);
+    for node in 0..3 {
+        assert_eq!(
+            cluster
+                .wait_for(node, level, 1, Duration::from_secs(20))
+                .await,
+            1,
+            "node {} has the new level",
+            node + 1
+        );
+    }
+    let (ok, out) = cluster
+        .admin(0, &["set-level", "nobody_here", "admin"])
+        .unwrap();
+    assert!(!ok && out.contains("no account"), "{}", out);
+
+    cluster.stop(2);
+    let offline = std::process::Command::new(env!("CARGO_BIN_EXE_mudd_admin"))
+        .arg("--database")
+        .arg(&cluster.nodes[2].db_path)
+        .args(["set-level", "promoted", "none"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&offline.stderr).to_string();
+    assert!(
+        !offline.status.success() && text.contains("cluster"),
+        "{}",
+        text
+    );
+}

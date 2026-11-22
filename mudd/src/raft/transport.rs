@@ -79,6 +79,8 @@ enum Kind {
     GameOpen = 10,
     /// A stepping-down leader hands leadership to a chosen voter
     TransferLeader = 11,
+    /// Set an account's global level (through the leader)
+    SetLevel = 12,
 }
 
 /// Frame tags on a game-session connection (after GameOpen)
@@ -105,6 +107,7 @@ impl Kind {
             9 => Kind::Http,
             10 => Kind::GameOpen,
             11 => Kind::TransferLeader,
+            12 => Kind::SetLevel,
             _ => return None,
         })
     }
@@ -170,6 +173,21 @@ pub enum RemoveReply {
     Refused(String),
 }
 
+/// Set an account's global level (admin, owner or none)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetLevelRequest {
+    pub username: String,
+    pub level: String,
+}
+
+/// The answer to a set-level request
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SetLevelReply {
+    Done,
+    NotLeader { leader: Option<String> },
+    Refused(String),
+}
+
 /// An HTTP API request forwarded from a gateway to the primary
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HttpRequest {
@@ -204,6 +222,8 @@ type BoxFuture<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send>>;
 pub type HttpHook = Arc<dyn Fn(HttpRequest) -> BoxFuture<HttpResponse> + Send + Sync>;
 /// Serves a forwarded game session until it ends (installed by the API layer)
 pub type GameHook = Arc<dyn Fn(GameOpen, GameStream) -> BoxFuture<()> + Send + Sync>;
+/// Sets a global level through Raft (installed by the API layer)
+pub type LevelHook = Arc<dyn Fn(SetLevelRequest) -> BoxFuture<Result<(), String>> + Send + Sync>;
 
 /// A game session's frames over a cluster connection, from either end.
 /// Received text arrives through a channel filled by a reader task, so
@@ -581,6 +601,16 @@ impl PeerClient {
             .await
     }
 
+    /// Set an account's global level
+    pub async fn set_level(&self, username: &str, level: &str) -> Result<SetLevelReply, String> {
+        let request = SetLevelRequest {
+            username: username.to_string(),
+            level: level.to_string(),
+        };
+        self.request(Kind::SetLevel, &request, CONTROL_TIMEOUT)
+            .await
+    }
+
     /// This node's view of the cluster
     pub async fn status(&self) -> Result<ClusterStatus, String> {
         self.request(Kind::Status, &(), CONTROL_TIMEOUT).await
@@ -757,6 +787,7 @@ pub struct ClusterService {
     /// Installed by the API layer once its router exists
     http: std::sync::OnceLock<HttpHook>,
     game: std::sync::OnceLock<GameHook>,
+    level: std::sync::OnceLock<LevelHook>,
     /// One snapshot received at a time
     receiving_snapshot: Mutex<()>,
     /// Joins are admitted one at a time; ids handed out but not yet members
@@ -770,15 +801,17 @@ impl ClusterService {
             pool,
             http: std::sync::OnceLock::new(),
             game: std::sync::OnceLock::new(),
+            level: std::sync::OnceLock::new(),
             receiving_snapshot: Mutex::new(()),
             joining: Mutex::new(HashMap::new()),
         })
     }
 
     /// Install the handlers for forwarded HTTP requests and game sessions
-    pub fn set_hooks(&self, http: HttpHook, game: GameHook) {
+    pub fn set_hooks(&self, http: HttpHook, game: GameHook, level: LevelHook) {
         let _ = self.http.set(http);
         let _ = self.game.set(game);
+        let _ = self.level.set(level);
     }
 
     /// The leader's cluster address, if known and not this node
@@ -1057,6 +1090,20 @@ impl ClusterService {
                     Ok(r) => encode(&r).map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
                 },
+                Err(e) => Err(e.to_string()),
+            },
+            Kind::SetLevel => match decode::<SetLevelRequest>(&body) {
+                Ok(request) => {
+                    let reply = match (self.not_leader(), self.level.get()) {
+                        (Some(leader), _) => SetLevelReply::NotLeader { leader },
+                        (None, None) => SetLevelReply::Refused("not serving yet".to_string()),
+                        (None, Some(hook)) => match hook(request).await {
+                            Ok(()) => SetLevelReply::Done,
+                            Err(e) => SetLevelReply::Refused(e),
+                        },
+                    };
+                    encode(&reply).map_err(|e| e.to_string())
+                }
                 Err(e) => Err(e.to_string()),
             },
             Kind::Http => match (decode::<HttpRequest>(&body), self.http.get()) {

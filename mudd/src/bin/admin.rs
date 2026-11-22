@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use mudd::admin::{set_global_level, GlobalLevel};
-use mudd::raft::transport::{PeerClient, RemoveReply};
+use mudd::raft::transport::{PeerClient, RemoveReply, SetLevelReply};
 use mudd::raft::ClusterSecurity;
 
 /// Mudcroft offline administration
@@ -60,6 +60,14 @@ enum ClusterAction {
         /// The node's id (see status)
         node_id: u64,
     },
+    /// Set an account's global level (admin, owner or none) through the
+    /// leader, so every node gets it
+    SetLevel {
+        /// Account username
+        username: String,
+        /// admin, owner or none
+        level: GlobalLevel,
+    },
 }
 
 #[tokio::main]
@@ -90,6 +98,34 @@ async fn main() -> Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?;
                     println!("{}", serde_json::to_string_pretty(&status)?);
+                }
+                ClusterAction::SetLevel { username, level } => {
+                    let level = match level {
+                        GlobalLevel::Admin => "admin",
+                        GlobalLevel::Owner => "owner",
+                        GlobalLevel::None => "none",
+                    };
+                    let mut target = node;
+                    for _ in 0..5 {
+                        let reply = PeerClient::new(target.clone(), security.clone())
+                            .set_level(&username, level)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        match reply {
+                            SetLevelReply::Done => {
+                                println!("{}: global level set to {}", username, level);
+                                return Ok(());
+                            }
+                            SetLevelReply::NotLeader {
+                                leader: Some(leader),
+                            } => target = leader,
+                            SetLevelReply::NotLeader { leader: None } => {
+                                anyhow::bail!("the cluster has no leader right now; try again")
+                            }
+                            SetLevelReply::Refused(why) => anyhow::bail!("refused: {}", why),
+                        }
+                    }
+                    anyhow::bail!("could not reach the leader");
                 }
                 ClusterAction::Remove { node_id } => {
                     // Follow "not the leader" answers to the leader

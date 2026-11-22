@@ -1,9 +1,9 @@
-//! Offline administration of global access levels (the `mudd_admin` tool)
+//! Administration of global access levels (the `mudd_admin` tool)
 //!
 //! Global admins and owners exist only through this tool (and `mudd_init`
 //! for the first admin): there is no Lua or HTTP path to a global level.
-//! Like `mudd_init`, it writes the database directly, so run it while mudd
-//! is stopped.
+//! On a single node it writes the database directly, so run it while mudd
+//! is stopped; in a cluster the change goes through the leader (Raft).
 
 use std::path::Path;
 
@@ -47,11 +47,35 @@ impl GlobalLevel {
     }
 }
 
-/// Set `username`'s global level in the database at `db_path`. Refuses to
-/// remove the last global admin or owner (mudd will not start without one).
+/// Set `username`'s global level in the database at `db_path` (offline,
+/// single node). Refuses a cluster member's database: changing one copy
+/// would leave the others different (use `mudd_admin cluster set-level`).
 pub async fn set_global_level(db_path: &Path, username: &str, level: GlobalLevel) -> Result<()> {
     let db = Database::open(&db_path.to_string_lossy()).await?;
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cluster_nodes")
+        .fetch_one(db.pool())
+        .await?;
+    if members > 0 {
+        bail!(
+            "this database belongs to a cluster: set levels through it with \
+             `mudd_admin cluster ... set-level` instead"
+        );
+    }
     let service = AccountService::offline(db.pool().clone());
+    apply_global_level(&service, db.pool(), username, level).await?;
+    db.pool().close().await;
+    Ok(())
+}
+
+/// Set `username`'s global level through `service` (offline, or through
+/// Raft on a cluster's primary). Refuses to remove the last global admin or
+/// owner (mudd will not start without one).
+pub async fn apply_global_level(
+    service: &AccountService,
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    level: GlobalLevel,
+) -> Result<()> {
     let Some(account) = service.get_by_username(username).await? else {
         bail!("no account named {:?}", username);
     };
@@ -61,7 +85,7 @@ pub async fn set_global_level(db_path: &Path, username: &str, level: GlobalLevel
         let admins: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM accounts WHERE access_level IN ('admin', 'owner')",
         )
-        .fetch_one(db.pool())
+        .fetch_one(pool)
         .await?;
         if admins <= 1 {
             bail!(
@@ -74,7 +98,6 @@ pub async fn set_global_level(db_path: &Path, username: &str, level: GlobalLevel
     service
         .set_access_level(&account.id, level.stored())
         .await?;
-    db.pool().close().await;
     Ok(())
 }
 

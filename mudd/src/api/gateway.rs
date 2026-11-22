@@ -217,7 +217,24 @@ pub fn install_hooks(state: &AppState, app: &Router) {
         let state = session_state.clone();
         Box::pin(super::websocket::serve_remote_session(state, open, stream))
     });
-    service.set_hooks(http, game);
+    let level_state = state.clone();
+    let level: crate::raft::transport::LevelHook = Arc::new(move |request| {
+        let state = level_state.clone();
+        Box::pin(async move {
+            let level: crate::admin::GlobalLevel = request.level.parse()?;
+            crate::admin::apply_global_level(
+                &state.accounts(),
+                state.db.pool(),
+                &request.username,
+                level,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            // Cached levels are rebuilt from the table
+            state.permissions.reset().await.map_err(|e| e.to_string())
+        })
+    });
+    service.set_hooks(http, game, level);
 }
 
 /// `/ws` on a gateway: check the token with the primary (this node's copy
