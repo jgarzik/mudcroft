@@ -206,20 +206,20 @@ sudo systemctl enable --now mudd
 
 ## Docker
 
-The `Dockerfile` builds a single image that contains:
+The `Dockerfile` builds a single image in which `mudd` serves everything
+itself (web client, API, WebSocket, gzip and security headers), with no proxy
+or process supervisor:
 
-- `mudd` and `mudd_init` in `/app`, and the core library in `/app/lib`
-- the built web client in `/var/www/html`
-- **nginx** on port 80, which serves the client and proxies `/ws`, `/auth`,
-  `/universe`, `/images` and `/health` to `mudd` on `127.0.0.1:8080`
-- **supervisord**, which runs nginx, and `mudd` as user `appuser`
-
-The client is served by nginx, so the container does not use `--static-dir`.
+- `mudd`, `mudd_init` and `mudd_admin` in `/app`, the core library in
+  `/app/lib`, `scripts/*.lua` in `/app/scripts` (for `run_script`) and the
+  built web client in `/app/static`
+- `mudd --static-dir /app/static` on port 8080, as the unprivileged user
+  `appuser` (uid 1000), as the container's main process
 
 ```bash
 docker build -t mudcroft .
 docker run -d --name mudcroft \
-    -p 8080:80 \
+    -p 8080:8080 \
     -v mudcroft-data:/data \
     -e MUDD_ADMIN_USERNAME=admin \
     -e MUDD_ADMIN_PASSWORD='choose-a-long-password' \
@@ -228,27 +228,33 @@ docker run -d --name mudcroft \
 
 Then open `http://localhost:8080/`.
 
-On every start, `docker/entrypoint.sh` runs
-`mudd_init --database "$MUDD_DATABASE_PATH" --lib-dir "$MUDD_LIB_DIR"`. On the
-first start this creates the database. On later starts it upgrades it, and the
-admin variables are no longer needed. The entrypoint then starts supervisord.
+On every start, `docker/entrypoint.sh` makes `/data` (and an existing
+database) owned by `appuser`, since a bind mount may be root-owned. It then
+runs `mudd_init --database "$MUDD_DATABASE_PATH" --lib-dir "$MUDD_LIB_DIR"` as
+`appuser`: on the first start this creates the database, and on later starts
+it upgrades it, so the admin variables are no longer needed. Finally it
+replaces itself with `mudd` (via `setpriv`), so `docker stop`'s SIGTERM
+reaches `mudd`, which shuts down gracefully. A new database without the admin
+variables makes the container exit with status 1.
 
 | Variable | Default | Used by |
 |----------|---------|---------|
-| `MUDD_DATABASE_PATH` | `/data/mudcroft.db` | entrypoint (`mudd_init`) and supervisord (`mudd --database`) |
-| `MUDD_BIND_ADDR` | `127.0.0.1:8080` | supervisord (`mudd --bind`). The nginx upstream is hard-coded to `127.0.0.1:8080`, so leave this alone. |
-| `MUDD_LIB_DIR` | `/app/lib` | entrypoint (`mudd_init --lib-dir`) |
-| `MUDD_ADMIN_USERNAME`, `MUDD_ADMIN_PASSWORD` | (none) | entrypoint. Required on first start. |
+| `MUDD_DATABASE_PATH` | `/data/mudcroft.db` | `mudd_init` and `mudd --database` |
+| `MUDD_BIND_ADDR` | `0.0.0.0:8080` | `mudd --bind` |
+| `MUDD_LIB_DIR` | `/app/lib` | `mudd_init --lib-dir` |
+| `MUDD_ADMIN_USERNAME`, `MUDD_ADMIN_PASSWORD` | (none) | `mudd_init`. Required on first start. |
 | `RUST_LOG` | `mudd=info` | `mudd` |
-| `VENICE_API_KEY`, `VENICE_API_URL` | (none) | `mudd`, inherited through supervisord |
+| `VENICE_API_KEY`, `VENICE_API_URL` | (none) | `mudd` |
 
 - **Volume:** `/data` holds the database. Mount it to keep data across
   containers.
-- **Ports:** only 80 (nginx) is exposed. `mudd` listens on loopback inside the
-  container.
-- **Health check:** the image's `HEALTHCHECK` runs `curl -f http://localhost/health`.
-- **No scripts:** `mudd` runs in `/app`, and the image contains no `scripts/`
-  directory, so `run_script` returns 404 unless you mount one at `/app/scripts`.
+- **Ports:** 8080 (`EXPOSE 8080`).
+- **Health check:** the image's `HEALTHCHECK` runs
+  `curl -fsS http://localhost:8080/health`.
+- **Global levels:** with the container stopped, run `mudd_admin` against the
+  volume, for example
+  `docker run --rm -v mudcroft-data:/data --entrypoint /app/mudd_admin mudcroft --database /data/mudcroft.db set-level alice admin`
+  (files it leaves root-owned are handed back to `appuser` on the next start).
 
 ## Creating Universes
 

@@ -53,14 +53,6 @@ affected feature.
   exhaust memory, but it can still keep every core busy and delay real
   logins. Needs per-IP and per-username limits.
 
-### Docker
-
-- `docker/entrypoint.sh` runs `mudd_init` as root (the `Dockerfile` sets no
-  `USER`), while supervisord runs `mudd` as `appuser`, so a new database may
-  be root-owned (unverified at runtime).
-- The nginx upstream is hard-coded to `127.0.0.1:8080` (`docker/nginx.conf`),
-  so `MUDD_BIND_ADDR` cannot change.
-
 ## Raft Cluster Operation
 
 Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
@@ -253,7 +245,7 @@ Ideas from the original design, beyond today's `/auth/*` and `/universe/*`:
 ## Deployment
 
 Today there is a single-container Docker image (`Dockerfile`, `docker/`):
-nginx serves the client and proxies to one `mudd`. Planned:
+one `mudd` serving the client and the API. Planned:
 
 - Docker Compose for a three-node cluster plus the client.
 - A script to start a local three-node cluster.

@@ -1,78 +1,41 @@
 #!/bin/bash
-set -e
+# Mudcroft container entrypoint: create or upgrade the database with
+# mudd_init, then run mudd in its place. Both run as appuser; root is used
+# only to make the data directory appuser's (a bind mount may be root-owned).
+set -euo pipefail
 
-# Mudcroft Docker Entrypoint Script
-# Initializes database and starts supervisord
-
-echo "========================================="
-echo "Mudcroft Container Initialization"
-echo "========================================="
-
-# Environment variable defaults
 DB_PATH="${MUDD_DATABASE_PATH:-/data/mudcroft.db}"
 LIB_DIR="${MUDD_LIB_DIR:-/app/lib}"
-BIND_ADDR="${MUDD_BIND_ADDR:-127.0.0.1:8080}"
+BIND_ADDR="${MUDD_BIND_ADDR:-0.0.0.0:8080}"
 
-echo "Database path: $DB_PATH"
-echo "Library dir: $LIB_DIR"
-echo "Bind address: $BIND_ADDR"
+# Prefix that runs a command as appuser (empty if already unprivileged);
+# setpriv execs the command itself, so mudd ends up as PID 1
+AS_APP=()
+if [ "$(id -u)" = 0 ]; then
+    AS_APP=(setpriv --reuid=appuser --regid=appuser --init-groups --)
+fi
 
-# Check if this is a new database
+if [ "$(id -u)" = 0 ]; then
+    chown appuser:appuser "$(dirname "$DB_PATH")"
+    # Files a root-run older image may have left behind
+    for f in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
+        if [ -e "$f" ]; then chown appuser:appuser "$f"; fi
+    done
+fi
+
 if [ ! -f "$DB_PATH" ]; then
-    echo ""
-    echo "New database detected. Initializing..."
-    echo ""
-
-    # Validate admin credentials are provided
-    if [ -z "$MUDD_ADMIN_USERNAME" ]; then
-        echo "ERROR: MUDD_ADMIN_USERNAME environment variable is required for new database"
-        echo "Usage: docker run -e MUDD_ADMIN_USERNAME=admin -e MUDD_ADMIN_PASSWORD=secret ..."
+    if [ -z "${MUDD_ADMIN_USERNAME:-}" ] || [ -z "${MUDD_ADMIN_PASSWORD:-}" ]; then
+        echo "A new database needs MUDD_ADMIN_USERNAME and MUDD_ADMIN_PASSWORD:" >&2
+        echo "  docker run -e MUDD_ADMIN_USERNAME=admin -e MUDD_ADMIN_PASSWORD=... ..." >&2
         exit 1
     fi
-
-    if [ -z "$MUDD_ADMIN_PASSWORD" ]; then
-        echo "ERROR: MUDD_ADMIN_PASSWORD environment variable is required for new database"
-        echo "Usage: docker run -e MUDD_ADMIN_USERNAME=admin -e MUDD_ADMIN_PASSWORD=secret ..."
-        exit 1
-    fi
-
-    echo "Creating new database with admin user: $MUDD_ADMIN_USERNAME"
+    echo "Creating database $DB_PATH (admin: $MUDD_ADMIN_USERNAME)"
 else
-    echo ""
-    echo "Existing database found. Running upgrade check..."
-    echo ""
+    echo "Checking database $DB_PATH"
 fi
 
-# Run mudd_init (idempotent - safe for both new and existing databases)
-echo "Running mudd_init..."
-/app/mudd_init \
-    --database "$DB_PATH" \
-    --lib-dir "$LIB_DIR"
+# Creates a new database, or upgrades an existing one (idempotent)
+"${AS_APP[@]}" /app/mudd_init --database "$DB_PATH" --lib-dir "$LIB_DIR"
 
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "ERROR: Database initialization failed"
-    exit 1
-fi
-
-echo ""
-echo "Database initialization complete"
-echo ""
-
-# Verify database file exists and is readable
-if [ ! -r "$DB_PATH" ]; then
-    echo "ERROR: Database file $DB_PATH is not readable"
-    exit 1
-fi
-
-echo "========================================="
-echo "Starting Mudcroft Services"
-echo "========================================="
-echo ""
-echo "Services:"
-echo "  - nginx (port 80)"
-echo "  - mudd ($BIND_ADDR)"
-echo ""
-
-# Start supervisord (replaces this process)
-exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
+echo "Starting mudd on $BIND_ADDR"
+exec "${AS_APP[@]}" /app/mudd --bind "$BIND_ADDR" --database "$DB_PATH" --static-dir /app/static
