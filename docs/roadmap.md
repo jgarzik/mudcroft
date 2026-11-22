@@ -28,6 +28,11 @@ primary lifecycle, gateways, failover), with these gaps:
   crash in between leaves the player charged with nothing handed over, and
   a handler failing part way keeps both its writes and the payment. One
   batch per Lua run (below) would make them one change.
+- **Device tokens can run out.** The in-memory store holds 200,000 (10 per
+  account). Registering about 20,000 accounts fills it: no token is ever
+  evicted, but new devices are then not remembered (they log in normally,
+  without the fast lane during an attack on their name). Accepted as is
+  (`mudd/src/api/devices.rs`).
 - **Snapshots are held in memory whole.** A snapshot travels in 1 MiB
   chunks, but is built, sent and installed from one in-memory buffer (the
   whole game database) on each side (`mudd/src/raft/storage.rs`,
