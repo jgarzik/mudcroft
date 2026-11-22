@@ -91,7 +91,7 @@ impl ObjectStore {
         )
         .bind(universe_id)
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *crate::db::run::reader(&self.pool).await?)
         .await?;
 
         match row {
@@ -265,7 +265,7 @@ impl ObjectStore {
         )
         .bind(universe_id)
         .bind(parent_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *crate::db::run::reader(&self.pool).await?)
         .await?;
 
         rows.into_iter().map(|r| r.into_object()).collect()
@@ -305,7 +305,7 @@ impl ObjectStore {
         )
         .bind(universe_id)
         .bind(class)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *crate::db::run::reader(&self.pool).await?)
         .await?;
 
         rows.into_iter().map(|r| r.into_object()).collect()
@@ -335,7 +335,7 @@ impl ObjectStore {
     pub async fn get_code(&self, hash: &str) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as("SELECT source FROM code_store WHERE hash = ?")
             .bind(hash)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *crate::db::run::reader(&self.pool).await?)
             .await?;
 
         Ok(row.map(|(s,)| s))
@@ -375,7 +375,7 @@ impl ObjectStore {
         .bind(universe_id)
         .bind(parent_id)
         .bind(&search_pattern)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *crate::db::run::reader(&self.pool).await?)
         .await?;
 
         match rows.into_iter().next() {
@@ -407,7 +407,7 @@ impl ObjectStore {
         )
         .bind(universe_id)
         .bind(parent_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *crate::db::run::reader(&self.pool).await?)
         .await?;
 
         rows.into_iter().map(|r| r.into_object()).collect()
@@ -483,7 +483,7 @@ impl ObjectStore {
     pub async fn universe_exists(&self, universe_id: &str) -> Result<bool> {
         let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM universes WHERE id = ?")
             .bind(universe_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *crate::db::run::reader(&self.pool).await?)
             .await?;
         Ok(row.is_some())
     }
@@ -497,7 +497,7 @@ impl ObjectStore {
             "#,
         )
         .bind(universe_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *crate::db::run::reader(&self.pool).await?)
         .await?;
 
         match row {
@@ -510,7 +510,7 @@ impl ObjectStore {
     pub async fn list_universes(&self) -> Result<Vec<(String, String)>> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT id, name FROM universes ORDER BY name")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *crate::db::run::reader(&self.pool).await?)
                 .await?;
         Ok(rows)
     }
@@ -586,7 +586,7 @@ impl ObjectStore {
             sqlx::query_as("SELECT value FROM universe_settings WHERE universe_id = ? AND key = ?")
                 .bind(universe_id)
                 .bind(key)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *crate::db::run::reader(&self.pool).await?)
                 .await?;
 
         Ok(row.map(|(v,)| v))
@@ -627,7 +627,7 @@ impl ObjectStore {
     /// Get all core lib hashes (canonical mudlib versions)
     pub async fn get_core_lib_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, hash FROM core_lib_hashes")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *crate::db::run::reader(&self.pool).await?)
             .await?;
         Ok(rows.into_iter().collect())
     }

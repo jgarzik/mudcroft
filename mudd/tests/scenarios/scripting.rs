@@ -682,3 +682,79 @@ async fn test_custom_verbs_survive_restart() {
         .await
         .expect("the verb went with its object");
 }
+
+/// A Lua run is one change: if it errors part way, nothing it did is kept:
+/// no object, no verb, no timer (tables and caches alike)
+#[tokio::test]
+async fn test_failed_run_keeps_nothing() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "atomic_wiz".into(),
+        })
+        .await
+        .unwrap();
+    // A bell exists (with code); a failing run adds a verb to it and a new
+    // object, then errors
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local h = game.store_code([[return {{ ring = function(a) return "Ding!" end }}]])
+           return game.create_object("/items/bell", "item", "{}", {{name = "bell", fixed = true, code_hash = h}}) and "made" or "not made""#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("made")
+        .await
+        .expect("bell made");
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval assert(game.add_action("ring", "/items/bell", "ring"), "add_action failed")
+           assert(game.create_object("/items/clapper", "item", "{}", {{name = "clapper"}}), "create failed")
+           error("changed my mind")"#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    let err = wiz.expect("error").await.expect("the run failed");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("changed my mind"),
+        "{err}"
+    );
+    let objects: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE id = '/items/clapper'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(objects, 0, "the object was not kept");
+    let actions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE object_id = '/items/bell'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(actions, 0, "nor its verb");
+    wiz.drain().await;
+    wiz.command("ring bell").await.unwrap();
+    wiz.expect_output_containing("Unknown command")
+        .await
+        .expect("the verb is not in the cache either");
+
+    // A run that succeeds keeps everything, as one change, and can read its
+    // own writes along the way
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/gong", "item", "{}", {{name = "gong"}})
+           local g = game.get_object("/items/gong")
+           return g and ("read back " .. g.name) or "not visible""#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("read back gong")
+        .await
+        .expect("a run sees its own writes");
+}

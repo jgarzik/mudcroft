@@ -90,8 +90,14 @@ The context decides how some functions behave:
 - `eval` shows the chunk's return value as text. Strings, numbers and booleans print as-is, `nil` prints `nil`, and a table prints `[table]`. Return a string to see table contents.
 - `eval` accepts a bare expression too: `eval 1 + 2` prints `3`.
 - The web client sends one line at a time. Separate statements with spaces or `;`.
-- Messages from `game.send`, `game.broadcast` and `game.broadcast_region` are queued and delivered **after the script finishes**, in the order they were queued. A script that raises an error still delivers the messages it queued before the error.
+- Messages from `game.send`, `game.broadcast` and `game.broadcast_region` are queued and delivered **after the script finishes**, in the order they were queued. A script that raises an error delivers none of them (see [One run, one change](#one-run-one-change)).
 - A custom verb's return value is the player's reply. See [Custom verbs](#custom-verbs).
+
+### One run, one change
+
+Each run (an `eval`, a script, a handler or hook, with everything it calls through `game.use_object`) is **one change**: its writes are saved together, as one Raft entry, when it finishes without error. If it raises an error (or runs out of time or budget), **nothing it did is kept**: no object, property, verb, timer, effect or credit change, and no message is sent. Within a run, reads see the run's own earlier writes. An error caught with `pcall` does not end the run; the writes made before it stand unless the run as a whole fails.
+
+The one exception: what a paid Venice call costs (`venice_chat_cost`, `venice_image_cost`) is charged even if the run later fails, since the call was made.
 
 ### Sandbox limits
 

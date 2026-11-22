@@ -564,6 +564,17 @@ adventure-game look (King's Quest era, 320x200 VGA, 256 colors, dithered,
   or nothing. Managers write through `RaftWriter::execute` (one statement) or
   `execute_batch` (several, atomically); non-deterministic values (UUIDs,
   timestamps) are computed before proposing. Reads go straight to the pool.
+- **Runs** (`db/run.rs`): a Lua run (`scripting::in_run`) is one change.
+  Its writes execute at once on the run's own connection inside a local
+  SQLite transaction (so its reads, through `db::run::reader`, see them)
+  and are captured; when the run succeeds the local transaction is rolled
+  back and the captured statements are proposed as one entry. A failed run
+  proposes nothing (except `execute_kept` statements, e.g. a paid Venice
+  call's charge) and rebuilds the caches from the tables
+  (`primary::rebuild_caches`), since managers update their caches as writes
+  happen. A process-wide write gate, held from a run's first write until
+  its outcome is settled, makes writing runs take turns, so that rebuild
+  cannot race another run's pending change.
 - **Batching**: openraft merges concurrent client writes into one log
   append, and the state machine applies each batch it is handed as one
   SQLite transaction (each request in its own savepoint, so requests stay

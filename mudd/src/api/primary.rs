@@ -137,7 +137,7 @@ fn leading(m: &openraft::RaftMetrics<crate::raft::TypeConfig>, me: crate::raft::
 }
 
 /// Rebuild every cache game logic reads from its table
-async fn rebuild_caches(state: &AppState) -> anyhow::Result<()> {
+pub(crate) async fn rebuild_caches(state: &AppState) -> anyhow::Result<()> {
     state.timers.load_from_db().await?;
     state.permissions.reset().await?;
     state.classes.write().await.load_from_db().await?;

@@ -443,11 +443,18 @@ impl TimerManager {
             sqlx::query_as("SELECT universe_id, object_id, interval_ms FROM heartbeats")
                 .fetch_all(pool)
                 .await?;
+        // A heartbeat already scheduled keeps its next beat (rebuilds after
+        // a failed run must not shift every heartbeat)
         let mut heartbeats = self.heartbeats.write().await;
-        heartbeats.clear();
+        let mut old = std::mem::take(&mut *heartbeats);
         for (universe_id, object_id, interval_ms) in rows {
-            let hb = HeartBeat::new(&universe_id, &object_id, interval_ms.max(0) as u64);
-            heartbeats.insert((universe_id, object_id), hb);
+            let interval_ms = interval_ms.max(0) as u64;
+            let key = (universe_id, object_id);
+            let hb = match old.remove(&key) {
+                Some(hb) if hb.interval_ms == interval_ms => hb,
+                _ => HeartBeat::new(&key.0, &key.1, interval_ms),
+            };
+            heartbeats.insert(key, hb);
         }
         debug!("Loaded {} heartbeats from database", heartbeats.len());
         drop(heartbeats);

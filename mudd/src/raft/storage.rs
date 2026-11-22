@@ -574,7 +574,7 @@ impl StateMachine {
 
 /// Bind JSON parameters to a query. Strings prefixed `blob:` carry base64
 /// binary data.
-fn bind_params<'q>(
+pub(crate) fn bind_params<'q>(
     mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     params: &[serde_json::Value],
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {

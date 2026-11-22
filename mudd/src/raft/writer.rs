@@ -187,6 +187,11 @@ impl RaftWriter {
     /// The SQL and params are replicated to all nodes before being applied.
     /// Non-deterministic values (UUIDs, timestamps) must be pre-computed.
     pub async fn execute(&self, sql: &str, params: Vec<serde_json::Value>) -> Result<Response> {
+        // Inside a run (one logical change): part of its batch
+        if let Some(run) = crate::db::run::current() {
+            let rows = run.execute(&[(sql.to_string(), params)]).await?;
+            return Ok(Response::ok(rows));
+        }
         let request = Request::new(sql, params);
 
         debug!("Submitting write to Raft: {}", sql);
@@ -208,6 +213,20 @@ impl RaftWriter {
     /// The statements are one log entry, applied in one transaction: if any
     /// fails, none are applied and an error is returned.
     pub async fn execute_batch(
+        &self,
+        statements: Vec<(String, Vec<serde_json::Value>)>,
+    ) -> Result<()> {
+        // Inside a run (one logical change): part of its batch
+        if let Some(run) = crate::db::run::current() {
+            run.execute(&statements).await?;
+            return Ok(());
+        }
+        self.execute_batch_direct(statements).await
+    }
+
+    /// Propose a batch now, even inside a run (for writes that must not
+    /// wait for, or depend on, the run: e.g. billing an external call)
+    pub async fn execute_batch_direct(
         &self,
         statements: Vec<(String, Vec<serde_json::Value>)>,
     ) -> Result<()> {
@@ -287,6 +306,15 @@ impl RaftWriter {
     /// Get the current leader's node ID (if known)
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow_watched().current_leader
+    }
+}
+
+impl crate::db::run::Committer for RaftWriter {
+    fn commit<'a>(
+        &'a self,
+        statements: Vec<crate::db::run::Statement>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.execute_batch_direct(statements))
     }
 }
 

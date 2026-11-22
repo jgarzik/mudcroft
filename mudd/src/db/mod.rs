@@ -1,5 +1,6 @@
 //! Database module - SQLite with shared and per-universe schemas
 
+pub mod run;
 #[cfg(test)]
 pub mod test_utils;
 

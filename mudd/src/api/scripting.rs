@@ -59,23 +59,47 @@ pub async fn run_lua(
     config: SandboxConfig,
 ) -> Result<String, String> {
     let libs = load_universe_lib_codes(state, &ctx.universe_id).await?;
-    let queue = MessageQueue::shared();
-
-    let result = {
-        let mut sandbox = prepare(state, ctx, &queue, &libs, config)?;
-        let value: Result<Value, _> = if args.is_empty() {
-            // `execute` also accepts bare expressions (e.g. `1 + 2`)
-            sandbox.execute(code)
-        } else {
-            sandbox.execute_with_args(code, mlua::Variadic::from_iter(args))
+    // One change: a failing run keeps nothing (see db::run)
+    in_run(state, async {
+        let queue = MessageQueue::shared();
+        let result = {
+            let mut sandbox = prepare(state, ctx, &queue, &libs, config)?;
+            let value: Result<Value, _> = if args.is_empty() {
+                // `execute` also accepts bare expressions (e.g. `1 + 2`)
+                sandbox.execute(code)
+            } else {
+                sandbox.execute_with_args(code, mlua::Variadic::from_iter(args))
+            };
+            value
+                .map(|v| lua_value_to_string(&v))
+                .map_err(|e| e.to_string())
         };
-        value
-            .map(|v| lua_value_to_string(&v))
-            .map_err(|e| e.to_string())
-    };
+        // Messages (and the hooks moves trigger) only if the run succeeded
+        if result.is_ok() {
+            deliver(state, &queue, &ctx.universe_id).await;
+        }
+        result
+    })
+    .await
+}
 
-    deliver(state, &queue, &ctx.universe_id).await;
-    result
+/// Run `f` as one change (db::run): its writes are one Raft batch, kept
+/// only if it succeeds. A failed commit becomes the run's error.
+pub async fn in_run<T, F>(state: &AppState, f: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    // A failed run's cache changes are undone by rebuilding from the tables
+    let rebuild = || async {
+        if let Err(e) = super::primary::rebuild_caches(state).await {
+            tracing::error!("rebuilding caches after a failed run: {}", e);
+        }
+    };
+    match crate::db::run::scope(state.db.pool(), &*state.raft_writer, Vec::new(), f, rebuild).await
+    {
+        Ok(result) => result,
+        Err(e) => Err(format!("not saved: {}", e)),
+    }
 }
 
 /// Call handler `method` on an object's attached code (`code_hash`).
@@ -217,15 +241,20 @@ fn invoke_handler_at<'a>(
             payer,
         };
         let libs = load_universe_lib_codes(state, universe_id).await?;
-        let queue = MessageQueue::shared();
-
-        let result = {
-            let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
-            call_handler(&mut sandbox, &code, method, &args)
-        };
-
-        deliver_at(state, &queue, &ctx.universe_id, budget).await;
-        result
+        // One change (joins the caller's if inside one): a failing handler
+        // keeps nothing
+        in_run(state, async {
+            let queue = MessageQueue::shared();
+            let result = {
+                let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
+                call_handler(&mut sandbox, &code, method, &args)
+            };
+            if result.is_ok() {
+                deliver_at(state, &queue, &ctx.universe_id, budget).await;
+            }
+            result
+        })
+        .await
     })
 }
 

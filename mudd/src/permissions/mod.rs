@@ -683,7 +683,7 @@ impl PermissionManager {
         )
         .bind(grant_id)
         .bind(universe_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *crate::db::run::reader(pool).await?)
         .await?;
 
         Ok(row.map(|r| r.into_grant()))

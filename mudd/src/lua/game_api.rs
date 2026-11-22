@@ -107,7 +107,7 @@ impl VeniceBilling {
             };
             if !self
                 .credits
-                .deduct(&self.universe_id, holder, price)
+                .deduct_kept(&self.universe_id, holder, price)
                 .await
                 .map_err(|e| e.to_string())?
             {
@@ -125,7 +125,11 @@ impl VeniceBilling {
         let result = call(key).await;
         if result.is_err() && price > 0 {
             if let Some(ref holder) = holder {
-                if let Err(e) = self.credits.grant(&self.universe_id, holder, price).await {
+                if let Err(e) = self
+                    .credits
+                    .grant_kept(&self.universe_id, holder, price)
+                    .await
+                {
                     tracing::warn!("venice refund of {} to {:?} failed: {}", price, holder, e);
                 }
             }
@@ -2291,15 +2295,17 @@ impl GameApi {
                 let universe_id = u.clone();
                 let store = store.clone();
                 let pending: i64 = block_now(async {
-                    sqlx::query_scalar(
+                    let mut conn = crate::db::run::reader(store.pool()).await?;
+                    let count: i64 = sqlx::query_scalar(
                         "SELECT COUNT(*) FROM payment_requests
                          WHERE universe_id = ? AND account_id = ? AND expires_at > ?",
                     )
                     .bind(&universe_id)
                     .bind(&account)
                     .bind(now)
-                    .fetch_one(store.pool())
-                    .await
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    anyhow::Ok(count)
                 })
                 .map_err(mlua::Error::external)?;
                 if pending >= crate::api::payments::MAX_PENDING_PER_PLAYER {
@@ -2345,11 +2351,15 @@ impl GameApi {
                         ),
                     ]))
                 .map_err(mlua::Error::external)?;
-                let stored: Option<i64> = block_now(
-                    sqlx::query_scalar("SELECT 1 FROM payment_requests WHERE id = ?")
+                // Read through the run (the insert is not committed yet)
+                let stored: Option<i64> = block_now(async {
+                    let mut conn = crate::db::run::reader(store.pool()).await?;
+                    let row = sqlx::query_scalar("SELECT 1 FROM payment_requests WHERE id = ?")
                         .bind(&id)
-                        .fetch_optional(store.pool()),
-                )
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                    anyhow::Ok(row)
+                })
                 .map_err(mlua::Error::external)?;
                 if stored.is_none() {
                     return Err(mlua::Error::runtime(

@@ -149,6 +149,16 @@ impl CreditManager {
     }
 
     async fn execute(&self, statements: Vec<Statement>) -> anyhow::Result<()> {
+        self.execute_as(statements, false).await
+    }
+
+    /// `kept`: inside a run, the statements stand even if the run fails
+    async fn execute_as(&self, statements: Vec<Statement>, kept: bool) -> anyhow::Result<()> {
+        if kept {
+            if let Some(run) = crate::db::run::current() {
+                return run.execute_kept(&statements).await.map(|_| ());
+            }
+        }
         if let Some(ref raft_writer) = self.raft_writer {
             return raft_writer.execute_batch(statements).await;
         }
@@ -182,14 +192,14 @@ impl CreditManager {
             Holder::Account(id) => {
                 sqlx::query_scalar("SELECT 1 FROM accounts WHERE id = ?")
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(&mut *crate::db::run::reader(pool).await?)
                     .await?
             }
             Holder::Object(id) => {
                 sqlx::query_scalar("SELECT 1 FROM objects WHERE universe_id = ? AND id = ?")
                     .bind(universe_id)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(&mut *crate::db::run::reader(pool).await?)
                     .await?
             }
         };
@@ -208,7 +218,7 @@ impl CreditManager {
         .bind(universe_id)
         .bind(holder.kind())
         .bind(holder.id())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *crate::db::run::reader(pool).await?)
         .await?;
         Ok(balance.unwrap_or(0))
     }
@@ -223,6 +233,40 @@ impl CreditManager {
         check_amount(amount)?;
         self.execute(vec![Self::credit_statement(universe_id, holder, amount)])
             .await
+    }
+
+    /// Payment for something outside the database (a Venice call): like
+    /// [`Self::deduct`], but it stands even if the current run fails
+    pub async fn deduct_kept(
+        &self,
+        universe_id: &str,
+        holder: &Holder,
+        amount: i64,
+    ) -> anyhow::Result<bool> {
+        check_amount(amount)?;
+        match self
+            .execute_as(Self::debit_statements(universe_id, holder, amount), true)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(e) if is_overdraft(&e) || is_missing_holder(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The refund of a [`Self::deduct_kept`] (the call failed): stands too
+    pub async fn grant_kept(
+        &self,
+        universe_id: &str,
+        holder: &Holder,
+        amount: i64,
+    ) -> anyhow::Result<()> {
+        check_amount(amount)?;
+        self.execute_as(
+            vec![Self::credit_statement(universe_id, holder, amount)],
+            true,
+        )
+        .await
     }
 
     /// Spend `amount` from a holder's balance. `Ok(false)` if it does not

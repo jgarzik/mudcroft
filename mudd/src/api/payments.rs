@@ -45,7 +45,7 @@ pub async fn answer(
     .bind(now)
     .bind(id)
     .bind(id)
-    .fetch_optional(state.db.pool())
+    .fetch_optional(&mut *crate::db::run::reader(state.db.pool()).await.ok()?)
     .await
     .ok()
     .flatten();

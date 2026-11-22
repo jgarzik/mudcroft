@@ -598,7 +598,7 @@ impl EffectRegistry {
         )
         .bind(universe_id)
         .bind(entity_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *crate::db::run::reader(pool).await?)
         .await?;
         let mut effects = EntityEffects::new();
         for row in rows {
