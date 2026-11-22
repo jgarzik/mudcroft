@@ -90,18 +90,32 @@ pub const COMBAT_TABLE: &str = r#"
 "#;
 
 /// World events due at an absolute time: a corpse decaying, an NPC
-/// respawning. Goes with the object.
+/// respawning or wandering. Goes with the object. An object given a
+/// positive `wander_seconds` gets a wander deadline due at once (time 0, so
+/// every replica applies the same row); the scheduler then reschedules it.
 pub const DEADLINES_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS deadlines (
         universe_id TEXT NOT NULL,
         object_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn')),
+        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn', 'wander')),
         due_at INTEGER NOT NULL,
         PRIMARY KEY (universe_id, object_id, kind),
         FOREIGN KEY (universe_id, object_id)
             REFERENCES objects(universe_id, id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS deadlines_due ON deadlines (due_at)
+    CREATE INDEX IF NOT EXISTS deadlines_due ON deadlines (due_at);
+    CREATE TRIGGER IF NOT EXISTS wander_on_insert AFTER INSERT ON objects
+    WHEN json_extract(NEW.properties, '$.wander_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'wander', 0);
+    END;
+    CREATE TRIGGER IF NOT EXISTS wander_on_update AFTER UPDATE OF properties ON objects
+    WHEN json_extract(NEW.properties, '$.wander_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'wander', 0);
+    END
 "#;
 
 /// Payments a player has been asked to confirm (game.request_payment):

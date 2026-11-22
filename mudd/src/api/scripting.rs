@@ -109,7 +109,14 @@ where
         }
     };
     let committer: std::sync::Arc<dyn crate::db::run::Committer> = state.raft_writer.clone();
-    match crate::db::run::scope(state.db.pool(), committer, prefix, f, rebuild).await {
+    let outcome = crate::db::run::scope(state.db.pool(), committer, prefix, f, rebuild).await;
+    // A committed run may have added a fight or a deadline (some come from
+    // triggers, e.g. wander_seconds): the combat scheduler looks again
+    // (one indexed query)
+    if matches!(outcome, Ok(Ok(_))) {
+        state.combat_changed.notify_one();
+    }
+    match outcome {
         Ok(result) => result,
         Err(e) => Err(format!("not saved: {}", e)),
     }
@@ -557,6 +564,12 @@ async fn handle_moved(
                 }
             }
         }
+    }
+
+    // Aggressive NPCs notice an arrival (and an aggressive NPC moved in
+    // notices players), whatever moved it
+    if let Some(ref room) = to {
+        super::combat::arrival(state, universe_id, object_id, room).await;
     }
 
     if budget.depth >= MAX_MOVE_HOOK_DEPTH {

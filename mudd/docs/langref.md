@@ -1164,8 +1164,9 @@ Which properties the server reads:
 | `last_safe_location`, `workroom_id` (player) | where a returning player respawns |
 | `hp`, `max_hp`, `armor_class`, `attack_bonus` (npc, player) | built-in combat |
 | `xp_value`, `respawn_seconds`, `home_room` (npc); `xp` (player) | death and respawn (see [Built-in combat](#built-in-combat)) |
+| `aggro`, `flee_threshold`, `faction`, `wander_seconds` (npc) | NPC behaviour (see [Built-in combat](#built-in-combat)) |
 
-All other properties, including `weight`, `value`, `lighting`, `aggro`, the weapon and armor fields,
+All other properties, including `weight`, `value`, `lighting`, the weapon and armor fields,
 `capacity` and `locked`, are data for your own scripts.
 
 ---
@@ -1181,6 +1182,11 @@ The built-in `attack <name>` (or `kill`) command works like this:
 - A critical hit that does not kill makes the target **bleed**: 2 physical damage per second for 3 seconds.
 - **Rounds.** The first blow lands at once; then each fighter strikes again every `combat_round_ms` (universe config, default 3000, 1000 to 10000) until the fight ends, without further commands. The target fights back. A fight ends when either side dies or they are no longer in the same room (walk away to flee); a fighter whose target is gone turns on someone still fighting it. Attacking someone else switches target. A stunned or paralyzed fighter loses its turn.
 - A hit fires `on_damage`. A kill fires `on_death`.
+- **NPC behaviour** (NPC properties):
+  - `aggro = true`: attacks a player who arrives in its room (walking, `goto`, spawning or moved by Lua), and a player in a room it arrives in, at once (PvP rules don't apply to NPCs).
+  - `flee_threshold` (a fraction of `max_hp`, e.g. `0.25`): below it, the NPC runs through a random exit on its turn instead of attacking, ending its fight.
+  - `faction` (a name): NPCs of the same faction in the room join a fight against one of their own (when it is attacked).
+  - `wander_seconds`: about that often (randomized ±50%) the NPC takes a random exit to a room of the same region (the room's `region_id`, else its parent), never while fighting. Setting it starts the wandering; removing it stops it.
 - **Deaths** follow the universe config:
   - `player_death`: `corpse` (default: what the player carries is left in a corpse where they died), `keep` (nothing is lost) or `drop` (on the floor). The player respawns at once, at full HP, in their workroom or the universe's spawn room.
   - `npc_death`: `corpse` (default), `drop` or `destroy` (its belongings are deleted). The NPC leaves the world (`parent_id = nil`, HP restored) and comes back to its `home_room` (default: where it died) after its `respawn_seconds` (default 300; `0` deletes it for good, with everything it still holds). A player who kills it gains its `xp_value` (default its `max_hp`) in their `xp` property.

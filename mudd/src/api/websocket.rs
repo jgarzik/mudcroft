@@ -1105,6 +1105,13 @@ impl Hook {
 /// Run an object hook triggered by a player. The hook runs as the
 /// object's owner (see scripting::invoke_handler); errors are logged.
 async fn run_hook(state: &AppState, universe_id: &str, hook: Hook) {
+    // Entering a room: aggressive NPCs there notice (api/combat.rs)
+    if hook.method == "on_enter" {
+        if let (Some(room), Some(moved)) = (hook.room_id.as_deref(), hook.args["moved_id"].as_str())
+        {
+            super::combat::arrival(state, universe_id, moved, room).await;
+        }
+    }
     if let Err(e) = scripting::invoke_handler(
         state,
         universe_id,

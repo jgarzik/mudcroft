@@ -112,9 +112,9 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Status effects in combat**: stun and paralysis skip turns, stat
   modifiers apply to rolls, effects tick down per round
   (`Combat.process_statuses`).
-- **NPC AI**: `ai_idle_tick` (aggro on sight, wandering) and
-  `ai_combat_tick` (flee below `flee_threshold`, assist allies). Class `npc`
-  only names these handlers.
+- **NPC AI in Lua**: aggro, wandering, fleeing and faction assist are
+  built in (`mudd/src/api/combat.rs`); class `npc` still names
+  `ai_idle_tick`/`ai_combat_tick` handlers that nothing calls.
 - **Equipment**: wield/unwield, wear/remove, armor slots.
 - **Region hooks**: `on_enter`/`on_leave` on the region when a player
   crosses region boundaries.

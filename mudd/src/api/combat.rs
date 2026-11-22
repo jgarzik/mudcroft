@@ -233,6 +233,19 @@ pub async fn engage(
     now: u64,
 ) -> anyhow::Result<()> {
     let next = now + settings(state, universe_id).await.round_ms;
+    engage_at(state, universe_id, attacker, target, next, next).await?;
+    assist(state, universe_id, target, attacker, now).await
+}
+
+/// [`engage`] with explicit first rounds for each side (no assist)
+async fn engage_at(
+    state: &AppState,
+    universe_id: &str,
+    attacker: &str,
+    target: &str,
+    attacker_at: u64,
+    target_at: u64,
+) -> anyhow::Result<()> {
     state
         .object_store
         .execute_batch(vec![
@@ -245,7 +258,7 @@ pub async fn engage(
                     json!(universe_id),
                     json!(attacker),
                     json!(target),
-                    json!(next),
+                    json!(attacker_at),
                 ],
             ),
             (
@@ -256,7 +269,7 @@ pub async fn engage(
                     json!(universe_id),
                     json!(target),
                     json!(attacker),
-                    json!(next),
+                    json!(target_at),
                 ],
             ),
         ])
@@ -267,6 +280,167 @@ pub async fn engage(
     })
     .await;
     Ok(())
+}
+
+async fn in_combat(state: &AppState, universe_id: &str, id: &str) -> anyhow::Result<bool> {
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM combat WHERE universe_id = ? AND entity_id = ?")
+            .bind(universe_id)
+            .bind(id)
+            .fetch_optional(&mut *crate::db::run::reader(state.db.pool()).await?)
+            .await?;
+    Ok(found.is_some())
+}
+
+/// NPCs of the victim's `faction` in its room, alive and not fighting
+/// already, join in against the attacker (their first round a round away)
+pub async fn assist(
+    state: &AppState,
+    universe_id: &str,
+    victim: &str,
+    attacker: &str,
+    now: u64,
+) -> anyhow::Result<()> {
+    let store = &state.object_store;
+    let Some(victim) = store.get(universe_id, victim).await? else {
+        return Ok(());
+    };
+    if is_player(&victim) {
+        return Ok(());
+    }
+    let Some(faction) = victim
+        .get_string("faction")
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    let Some(ref room) = victim.parent_id else {
+        return Ok(());
+    };
+    let next = now + settings(state, universe_id).await.round_ms;
+    for ally in store.get_contents(universe_id, room).await? {
+        if ally.id == victim.id
+            || ally.id == attacker
+            || is_player(&ally)
+            || ally.get_string("faction") != Some(faction.as_str())
+            || !alive(&ally)
+            || in_combat(state, universe_id, &ally.id).await?
+        {
+            continue;
+        }
+        engage_at(state, universe_id, &ally.id, attacker, next, next).await?;
+    }
+    Ok(())
+}
+
+/// Someone arrived in `room`: an aggressive NPC there attacks a player who
+/// walked in, and an aggressive NPC that walked in attacks a player there
+/// (at once; the player fights back a round later)
+pub async fn arrival(state: &AppState, universe_id: &str, mover: &str, room: &str) {
+    if let Err(e) = arrival_inner(state, universe_id, mover, room).await {
+        warn!("combat: arrival of {} in {}: {}", mover, room, e);
+    }
+}
+
+async fn arrival_inner(
+    state: &AppState,
+    universe_id: &str,
+    mover: &str,
+    room: &str,
+) -> anyhow::Result<()> {
+    let store = &state.object_store;
+    let Some(mover) = store.get(universe_id, mover).await? else {
+        return Ok(());
+    };
+    if !alive(&mover) {
+        return Ok(());
+    }
+    let now = now_ms();
+    let next = now + settings(state, universe_id).await.round_ms;
+    let aggressive = |o: &Object| !is_player(o) && o.get_bool("aggro").unwrap_or(false) && alive(o);
+    let here = store.get_contents(universe_id, room).await?;
+    if is_player(&mover) {
+        for npc in here.iter().filter(|o| aggressive(o)) {
+            if !in_combat(state, universe_id, &npc.id).await? {
+                engage_at(state, universe_id, &npc.id, &mover.id, now, next).await?;
+            }
+        }
+    } else if aggressive(&mover) && !in_combat(state, universe_id, &mover.id).await? {
+        if let Some(player) = here.iter().find(|o| is_player(o) && alive(o)) {
+            engage_at(state, universe_id, &mover.id, &player.id, now, next).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The exits of a room as (direction, destination)
+fn exits(room: &Object) -> Vec<(String, String)> {
+    room.properties
+        .get("exits")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(dir, to)| to.as_str().map(|t| (dir.clone(), t.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A room's region: its `region_id`, else its parent (a region object)
+fn region_of(room: &Object) -> Option<String> {
+    room.get_string("region_id")
+        .map(str::to_string)
+        .or_else(|| room.parent_id.clone())
+}
+
+/// Move someone out through a random exit of its room (`same_region`: only
+/// to rooms of the same region), telling both rooms. Returns the direction
+/// taken, or None if there was nowhere to go.
+async fn leave_randomly(
+    state: &AppState,
+    universe_id: &str,
+    who: &Object,
+    same_region: bool,
+    verb: &str,
+    notes: &mut Vec<Note>,
+) -> anyhow::Result<Option<String>> {
+    let store = &state.object_store;
+    let Some(ref from) = who.parent_id else {
+        return Ok(None);
+    };
+    let Some(room) = store.get(universe_id, from).await? else {
+        return Ok(None);
+    };
+    let mut choices = Vec::new();
+    for (dir, to) in exits(&room) {
+        if let Some(dest) = store.get(universe_id, &to).await? {
+            if dest.class == "room" && (!same_region || region_of(&dest) == region_of(&room)) {
+                choices.push((dir, to));
+            }
+        }
+    }
+    if choices.is_empty() {
+        return Ok(None);
+    }
+    let (dir, to) = choices.swap_remove(rand::rng().random_range(0..choices.len()));
+    store.move_object(universe_id, &who.id, Some(&to)).await?;
+    let name = name_of(who);
+    notes.push(Note::Room(
+        universe_id.to_string(),
+        from.clone(),
+        format!("{} {} {}.", name, verb, dir),
+        None,
+    ));
+    notes.push(Note::Room(
+        universe_id.to_string(),
+        to.clone(),
+        format!("{} arrives.", name),
+        None,
+    ));
+    // An aggressive NPC arriving attacks a player there (in this run)
+    arrival(state, universe_id, &who.id, &to).await;
+    Ok(Some(dir))
 }
 
 /// What a death did, for the messages and hooks after the commit
@@ -281,15 +455,36 @@ pub struct Death {
     pub xp: Option<i64>,
 }
 
+/// Most objects one deletion may take with it
+const MAX_TREE: usize = 10_000;
+
 /// Delete an object and everything inside it, deepest first (an object
-/// that still contains anything cannot be deleted)
-pub async fn delete_tree(state: &AppState, universe_id: &str, id: &str) -> anyhow::Result<()> {
+/// that still contains anything cannot be deleted). Players inside are
+/// never deleted: they are moved to `spill_to` first (or out of the world).
+/// Each object is visited once (a containment cycle cannot loop), and a
+/// tree larger than MAX_TREE is refused.
+pub async fn delete_tree(
+    state: &AppState,
+    universe_id: &str,
+    id: &str,
+    spill_to: Option<&str>,
+) -> anyhow::Result<()> {
     let store = &state.object_store;
     let mut order = vec![id.to_string()];
+    let mut seen = std::collections::HashSet::from([id.to_string()]);
     let mut i = 0;
     while i < order.len() {
         for child in store.get_contents(universe_id, &order[i]).await? {
-            order.push(child.id);
+            if is_player(&child) {
+                store.move_object(universe_id, &child.id, spill_to).await?;
+                continue;
+            }
+            if seen.insert(child.id.clone()) {
+                order.push(child.id);
+                if order.len() > MAX_TREE {
+                    anyhow::bail!("{} holds more than {} objects", id, MAX_TREE);
+                }
+            }
         }
         i += 1;
     }
@@ -344,11 +539,16 @@ pub async fn death(
     } else {
         settings.npc_death.as_str()
     };
-    let items: Vec<Object> = store
-        .get_contents(universe_id, id)
-        .await?
+    // Players inside are not belongings: they go to the room
+    let contents = store.get_contents(universe_id, id).await?;
+    for p in contents.iter().filter(|o| is_player(o)) {
+        store
+            .move_object(universe_id, &p.id, room.as_deref())
+            .await?;
+    }
+    let items: Vec<Object> = contents
         .into_iter()
-        .filter(|item| !item.get_bool("fixed").unwrap_or(false))
+        .filter(|item| !is_player(item) && !item.get_bool("fixed").unwrap_or(false))
         .collect();
     if !items.is_empty() {
         match (policy, room.as_deref()) {
@@ -391,7 +591,7 @@ pub async fn death(
             }
             ("destroy", _) => {
                 for item in &items {
-                    delete_tree(state, universe_id, &item.id).await?;
+                    delete_tree(state, universe_id, &item.id, room.as_deref()).await?;
                 }
             }
             ("keep", _) => {}
@@ -448,7 +648,7 @@ pub async fn death(
             .unwrap_or(DEFAULT_RESPAWN_S);
         if respawn_s == 0 {
             // For good, with whatever it still holds (fixed things)
-            delete_tree(state, universe_id, id).await?;
+            delete_tree(state, universe_id, id, room.as_deref()).await?;
         } else {
             let home = victim
                 .get_string("home_room")
@@ -801,6 +1001,25 @@ async fn round(
             }
             return Ok(());
         }
+        // A hurt NPC below its flee_threshold (a fraction of max HP) runs
+        // through a random exit instead (if there is one)
+        if !is_player(&attacker) {
+            let threshold = attacker
+                .properties
+                .get("flee_threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let me = Combatant::from_object(&attacker, 10);
+            if threshold > 0.0
+                && (me.hp as f64) < threshold * me.max_hp as f64
+                && leave_randomly(state, &u, &attacker, false, "flees", notes)
+                    .await?
+                    .is_some()
+            {
+                store.execute_batch(vec![end(&u, &entity)]).await?;
+                return Ok(());
+            }
+        }
         let blow = strike(state, &u, &attacker, &target, now).await?;
         let room = attacker.parent_id.clone().expect("checked above");
         if is_player(&attacker) {
@@ -870,7 +1089,7 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
         // Isolated like rounds: a failing one is dropped, the rest go on
         let mut mine = Vec::new();
         let done = super::scripting::in_run(state, async {
-            deadline(state, u.clone(), id.clone(), kind.clone(), &mut mine)
+            deadline(state, now, u.clone(), id.clone(), kind.clone(), &mut mine)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -894,6 +1113,7 @@ async fn deadlines(state: &AppState, now: u64, notes: &mut Vec<Note>) -> anyhow:
 /// One due deadline
 async fn deadline(
     state: &AppState,
+    now: u64,
     u: String,
     id: String,
     kind: String,
@@ -917,7 +1137,7 @@ async fn deadline(
                 for item in store.get_contents(&u, &id).await? {
                     store.move_object(&u, &item.id, room.as_deref()).await?;
                 }
-                delete_tree(state, &u, &id).await?;
+                delete_tree(state, &u, &id, room.as_deref()).await?;
                 if let Some(room) = room {
                     notes.push(Note::Room(
                         u.clone(),
@@ -936,10 +1156,38 @@ async fn deadline(
                 store.move_object(&u, &id, Some(&home)).await?;
                 notes.push(Note::Room(
                     u.clone(),
-                    home,
+                    home.clone(),
                     format!("{} appears.", name_of(&obj)),
                     None,
                 ));
+                arrival(state, &u, &id, &home).await;
+            }
+            "wander" => {
+                // Opt-in (wander_seconds), and only while it lasts
+                let Some(every) = obj
+                    .properties
+                    .get("wander_seconds")
+                    .and_then(|v| v.as_f64())
+                    .filter(|s| *s > 0.0)
+                else {
+                    return Ok(());
+                };
+                // Not while fighting, dead or nowhere; within its region
+                if !is_player(&obj)
+                    && alive(&obj)
+                    && obj.parent_id.is_some()
+                    && !in_combat(state, &u, &id).await?
+                {
+                    leave_randomly(state, &u, &obj, true, "leaves", notes).await?;
+                }
+                let next_ms = (every * 1000.0 * rand::rng().random_range(0.5..1.5)) as u64;
+                store
+                    .execute_batch(vec![statement(
+                        "INSERT OR REPLACE INTO deadlines (universe_id, object_id, kind, due_at)
+                         VALUES (?, ?, 'wander', ?)",
+                        vec![json!(u), json!(id), json!(now + next_ms.max(1000))],
+                    )])
+                    .await?;
             }
             _ => {}
         }

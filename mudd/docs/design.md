@@ -482,7 +482,16 @@ Two layers exist:
   `decay` row; decaying spills what is left into the room. Messages and the
   `on_death` hook follow the commit (`report_death`). Player against player
   follows `pvp_policy` (`combat::pvp_allowed`: arena by default, flagged,
-  open, disabled), checked at the attack and every round.
+  open, disabled), checked at the attack and every round. NPC behaviour:
+  `combat::arrival` (called from every `on_enter` path: walking, goto,
+  spawn, Lua moves, respawn, wandering) starts an aggressive NPC's fight
+  at once; `assist` (from `engage`) brings in NPCs of the victim's
+  `faction`; a round of an NPC below its `flee_threshold` moves it out
+  instead; `wander` deadlines (started by a trigger when an object gets a
+  positive `wander_seconds`: due at time 0, so every replica writes the
+  same row; the scheduler is woken after every committed run) move it to
+  a room of the same region and reschedule. Deleting an object for good
+  (`delete_tree`) takes its contents, deepest first, but moves players out.
 - **Status effects** (`src/combat/effects.rs`, `src/api/effect_scheduler.rs`)
   live in `active_effects`, cached by `EffectRegistry`. They store absolute
   deadlines (`expires_at`; periodic ones also `period_ms`, `next_pulse_at`),

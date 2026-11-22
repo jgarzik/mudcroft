@@ -1188,3 +1188,189 @@ async fn test_take_from_respects_containers() {
         .await
         .expect("unlocked");
 }
+
+/// An admin standing in the entrance, with 1 s combat rounds
+async fn arena_admin(server: &TestServer, name: &str) -> TestClient {
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: name.into(),
+        })
+        .await
+        .unwrap();
+    eval_as(
+        &mut adm,
+        r#"game.update_universe({combat_round_ms = 1000}) return "ok""#,
+    )
+    .await;
+    adm
+}
+
+/// An aggressive NPC attacks a player who walks in, unprovoked
+#[tokio::test]
+async fn test_npc_aggro_on_arrival() {
+    let server = TestServer::start().await.expect("server");
+    let passage = server.world().passage_id.clone();
+    let mut adm = arena_admin(&server, "wanderer").await;
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/npcs/wolf", "npc", "{}", {{name = "wolf", hp = 500, max_hp = 500, attack_bonus = 30, aggro = true}}) return "ok""#,
+            passage
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("north").await.unwrap();
+    let heard = adm.outputs_within(Duration::from_millis(1500)).await;
+    assert!(
+        heard.iter().any(|t| t.contains("wolf hits you")
+            || t.contains("wolf misses you")
+            || t.contains("wolf critically")),
+        "the wolf attacked: {:?}",
+        heard
+    );
+}
+
+/// An NPC below its flee_threshold runs instead of fighting
+#[tokio::test]
+async fn test_npc_flees_when_hurt() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = arena_admin(&server, "chaser").await;
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/npcs/hare", "npc", "{}", {{name = "hare", hp = 45, max_hp = 100, armor_class = 1, flee_threshold = 0.5}}) return "ok""#,
+            entrance
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("attack hare").await.unwrap();
+    let heard = adm.outputs_within(Duration::from_millis(2500)).await;
+    assert!(
+        heard.iter().any(|t| t.contains("hare flees")),
+        "{:?}",
+        heard
+    );
+    let room: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/npcs/hare'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_ne!(room, entrance, "it left");
+}
+
+/// NPCs of the same faction join a fight against one of their own
+#[tokio::test]
+async fn test_npc_faction_assists() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = arena_admin(&server, "provoker").await;
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"for _, n in ipairs({{"orc", "brute"}}) do
+                 game.create_object("/npcs/" .. n, "npc", "{}", {{name = n, hp = 500, max_hp = 500, attack_bonus = 30, faction = "horde"}})
+               end
+               return "ok""#,
+            entrance
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("attack orc").await.unwrap();
+    let heard = adm.outputs_within(Duration::from_millis(2500)).await;
+    assert!(
+        heard.iter().any(|t| t.contains("brute hits you")
+            || t.contains("brute misses you")
+            || t.contains("brute critically")),
+        "the brute joined in: {:?}",
+        heard
+    );
+}
+
+/// An NPC with wander_seconds roams its region by itself
+#[tokio::test]
+async fn test_npc_wanders() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = arena_admin(&server, "watcher").await;
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/npcs/rat", "npc", "{}", {{name = "rat", wander_seconds = 1}}) return "ok""#,
+            entrance
+        ),
+    )
+    .await;
+    let mut moved = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let room: String = sqlx::query_scalar(
+            "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/npcs/rat'",
+        )
+        .bind(server.universe_id())
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+        if room != entrance {
+            assert_eq!(
+                room,
+                server.world().passage_id,
+                "within the region, by an exit"
+            );
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "the rat wandered");
+}
+
+/// Deleting a dead NPC never deletes a player it holds: the player is put
+/// in the room instead
+#[tokio::test]
+async fn test_npc_deletion_spares_players_inside() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "rescuer".into(),
+        })
+        .await
+        .unwrap();
+    let pl = server
+        .connect_as(Role::Player {
+            username: "swallowed".into(),
+        })
+        .await
+        .unwrap();
+    let victim = pl.player_id().unwrap().to_string();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/npcs/whale", "npc", "{e}", {{name = "whale", hp = 1, max_hp = 1, armor_class = 1, respawn_seconds = 0}})
+               game.move_object("{v}", "/npcs/whale")
+               return "ready""#,
+            e = entrance,
+            v = victim
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    attack_until_slain(&mut adm, "attack whale", "whale").await;
+    let room: Option<String> =
+        sqlx::query_scalar("SELECT parent_id FROM objects WHERE universe_id = ? AND id = ?")
+            .bind(server.universe_id())
+            .bind(&victim)
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        room.as_deref(),
+        Some(entrance.as_str()),
+        "the player survives, in the room"
+    );
+}
