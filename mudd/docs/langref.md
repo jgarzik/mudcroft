@@ -372,6 +372,7 @@ takes one `args` table:
 ```lua
 return {
     on_enter = function(args)
+        if not args.actor_id then return end   -- an object was moved in
         game.send(args.actor_id, "Cold air rushes past you.")
     end,
     pull = function(args)
@@ -391,7 +392,9 @@ Code that has no handler for an event is skipped silently.
 Attach stored code by setting `code_hash`:
 
 ```lua
-local h = game.store_code([[return { on_enter = function(a) game.send(a.actor_id, "Welcome!") end }]])
+local h = game.store_code([[return { on_enter = function(a)
+    if a.actor_id then game.send(a.actor_id, "Welcome!") end
+end }]])
 game.update_object("/d/keep/hall", {code_hash = h})   -- attach to an existing object
 game.create_object("/d/keep/bell", "item", "/d/keep/hall", {name = "bell", code_hash = h})   -- or attach at creation
 game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
@@ -426,6 +429,7 @@ Hook details:
   - By the time `on_death` runs, the dead NPC has been removed from the room (`parent_id = nil`). Use `args.room_id`, not `game.environment`.
 - **Return values:** hook return values are ignored. Errors are logged on the server.
 - **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
+  - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
 - **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
 
 ### `parent(class_name, handler_name, args)`

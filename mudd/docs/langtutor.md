@@ -219,6 +219,7 @@ attach it by setting `code_hash`.
 local h = game.store_code([[
 return {
     on_enter = function(a)
+        if not a.actor_id then return end  -- an item was dropped or moved in
         if a.from == nil then return end   -- nil when the player just logged in
         game.send(a.actor_id, "The smell of fresh bread drifts over from the bakery.")
         game.broadcast(a.room_id, "Someone wanders into the square.", a.actor_id)
@@ -596,7 +597,7 @@ return {
 Code.trap = [=[
 return {
     on_enter = function(a)
-        if a.from == nil then return end
+        if not a.actor_id or a.from == nil then return end
         if game.roll_dice("1d100") > 50 then return end
         game.send(a.actor_id, "Click. You feel a pressure plate sink under your foot!")
         game.call_out(1, "spring", a.actor_id)
@@ -618,6 +619,7 @@ return {
 Code.lair = [=[
 return {
     on_enter = function(a)
+        if not a.actor_id then return end   -- only living arrivals
         for _, npc in ipairs(game.get_living_in(a.object_id)) do
             if npc.class == "npc" and npc.code_hash then
                 game.use_object(npc.id, a.actor_id, "wake")
