@@ -28,6 +28,8 @@ pub enum GameMessage {
         object_id: String,
         from: Option<String>,
         to: Option<String>,
+        /// Account the moving script acted as
+        moved_by: Option<String>,
     },
 }
 
@@ -74,11 +76,18 @@ impl MessageQueue {
     }
 
     /// Queue a move notification (see GameMessage::Moved)
-    pub fn moved(&self, object_id: &str, from: Option<&str>, to: Option<&str>) {
+    pub fn moved(
+        &self,
+        object_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        moved_by: Option<&str>,
+    ) {
         self.messages.lock().push(GameMessage::Moved {
             object_id: object_id.to_string(),
             from: from.map(str::to_string),
             to: to.map(str::to_string),
+            moved_by: moved_by.map(str::to_string),
         });
     }
 

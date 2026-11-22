@@ -262,8 +262,10 @@ Every hook also gets `object_id`, `actor_id` and (when known) `room_id`.
 Errors in hooks are logged. Lua `game.move_object` queues a
 `GameMessage::Moved`; delivering it moves a connected player's session
 (sending the new room) and runs the old and new containers' `on_leave` and
-`on_enter` with `moved_id`. Delivery tracks how deeply hooks nest and stops
-running move hooks past 4 levels.
+`on_enter` with `moved_id` and `moved_by` (no `actor_id`: no player chose
+to move). A `HookBudget` carried through delivery stops move hooks past 4
+nesting levels or 32 hooks per top-level run. The moved player's room view
+is built without an account, so it never starts image generation.
 
 ### Custom Verbs
 

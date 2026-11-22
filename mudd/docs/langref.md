@@ -326,8 +326,12 @@ After the script ends, a move:
   and later commands happen there;
 - runs `on_leave` on the old container and `on_enter` on the new one (for
   any moved object, not only players), with `moved_id` set to the moved
-  object. Hooks that move things run more hooks, nested at most 4 deep;
-  deeper moves happen but run no hooks.
+  object and `moved_by` to the account the script acted as. `actor_id` is
+  **not** set: no player chose to move. Hooks that move things run more
+  hooks: they nest at most 4 deep, and one top-level run causes at most 32
+  move hooks in total; further moves happen but run no hooks.
+- shows a moved player the new room without starting room image
+  generation.
 
 **Returns** `true`. **Raises** an error if the object or destination
 doesn't exist, either belongs to another universe, or the acting user
@@ -399,8 +403,8 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 
 | Handler | Fires when | Runs on | `args` fields (all include `object_id`) |
 |---|---|---|---|
-| `on_enter` | a player walks in, arrives by `goto`, or connects and spawns there; or `game.move_object` moves anything into it | the room (or container) | `actor_id`, `moved_id` (what arrived), `room_id`, `from` (`nil` on spawn), `direction` (walking only) |
-| `on_leave` | a player walks out, or leaves by `goto`; or `game.move_object` moves anything out of it | the room (or container) | `actor_id`, `moved_id` (what left), `room_id`, `to`, `direction` (walking only) |
+| `on_enter` | a player walks in, arrives by `goto`, or connects and spawns there; or `game.move_object` moves anything into it | the room (or container) | `moved_id` (what arrived), `room_id`, `from` (`nil` on spawn), `direction` (walking only); `actor_id` when a player moved themselves, `moved_by` for a Lua move |
+| `on_leave` | a player walks out, or leaves by `goto`; or `game.move_object` moves anything out of it | the room (or container) | `moved_id` (what left), `room_id`, `to`, `direction` (walking only); `actor_id` when a player moved themselves, `moved_by` for a Lua move |
 | `on_damage` | the `attack` command hits | the target NPC | `actor_id`, `room_id`, `attacker_id`, `damage` |
 | `on_death` | the `attack` command kills | the target NPC | `actor_id`, `room_id`, `killer_id` |
 | `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
@@ -419,7 +423,7 @@ Hook details:
 - **Combat hooks:** `on_damage` and `on_death` run after the attacker's combat report. A killing blow fires both.
   - By the time `on_death` runs, the dead NPC has been removed from the room (`parent_id = nil`). Use `args.room_id`, not `game.environment`.
 - **Return values:** hook return values are ignored. Errors are logged on the server.
-- **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `actor_id` and `moved_id` both naming the moved object.
+- **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
 - **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
 
 ### `parent(class_name, handler_name, args)`

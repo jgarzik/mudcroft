@@ -94,10 +94,59 @@ pub async fn invoke_handler(
     method: &str,
     args: serde_json::Value,
 ) -> Result<Option<String>, String> {
-    invoke_handler_at(state, universe_id, object_id, room_id, method, args, 0).await
+    invoke_handler_at(
+        state,
+        universe_id,
+        object_id,
+        room_id,
+        method,
+        args,
+        HookBudget::new(),
+    )
+    .await
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// How deeply move hooks may nest: a hook that moves something runs more
+/// hooks, so rooms that pass an object back and forth stop here
+const MAX_MOVE_HOOK_DEPTH: u32 = 4;
+
+/// How many move hooks one top-level run may cause in total: a hook can
+/// move many objects, so depth alone does not bound the work
+const MAX_MOVE_HOOKS_PER_RUN: u32 = 32;
+
+/// The move-hook allowance of one top-level run, carried down through the
+/// hooks it causes
+#[derive(Clone)]
+struct HookBudget {
+    depth: u32,
+    remaining: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl HookBudget {
+    fn new() -> Self {
+        Self {
+            depth: 0,
+            remaining: Arc::new(std::sync::atomic::AtomicU32::new(MAX_MOVE_HOOKS_PER_RUN)),
+        }
+    }
+
+    fn deeper(&self) -> Self {
+        Self {
+            depth: self.depth + 1,
+            remaining: self.remaining.clone(),
+        }
+    }
+
+    /// Take one hook from the allowance; false when none is left
+    fn take(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.remaining
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
 
 /// invoke_handler at a hook nesting depth (move hooks run handlers that can
 /// move things and so run more hooks; see MAX_MOVE_HOOK_DEPTH)
@@ -108,7 +157,7 @@ fn invoke_handler_at<'a>(
     room_id: Option<String>,
     method: &'a str,
     args: serde_json::Value,
-    depth: u32,
+    budget: HookBudget,
 ) -> BoxFuture<'a, Result<Option<String>, String>> {
     Box::pin(async move {
         let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
@@ -128,7 +177,7 @@ fn invoke_handler_at<'a>(
             call_handler(&mut sandbox, &code, method, &args)
         };
 
-        deliver_at(state, &queue, &ctx.universe_id, depth).await;
+        deliver_at(state, &queue, &ctx.universe_id, budget).await;
         result
     })
 }
@@ -276,18 +325,14 @@ fn prepare(
 /// Deliver queued script messages to connected players in `universe_id`
 /// (sessions are keyed per universe, so nothing reaches other universes)
 pub async fn deliver(state: &AppState, queue: &MessageQueue, universe_id: &str) {
-    deliver_at(state, queue, universe_id, 0).await
+    deliver_at(state, queue, universe_id, HookBudget::new()).await
 }
-
-/// How deeply move hooks may nest: a hook that moves something runs more
-/// hooks, so rooms that pass an object back and forth stop here
-const MAX_MOVE_HOOK_DEPTH: u32 = 4;
 
 fn deliver_at<'a>(
     state: &'a AppState,
     queue: &'a MessageQueue,
     universe_id: &'a str,
-    depth: u32,
+    budget: HookBudget,
 ) -> BoxFuture<'a, ()> {
     Box::pin(async move {
         for msg in queue.drain() {
@@ -324,8 +369,9 @@ fn deliver_at<'a>(
                     object_id,
                     from,
                     to,
+                    moved_by,
                 } => {
-                    handle_moved(state, universe_id, &object_id, from, to, depth).await;
+                    handle_moved(state, universe_id, &object_id, from, to, moved_by, &budget).await;
                 }
             }
         }
@@ -334,24 +380,33 @@ fn deliver_at<'a>(
 
 /// A Lua move_object: move a connected player's session (and show them the
 /// new room), then run on_leave on the old container and on_enter on the
-/// new one, with moved_id naming what moved
+/// new one, with moved_id naming what moved and moved_by the account the
+/// script acted as. actor_id is not set: no player chose to move, so hook
+/// code that trusts actor_id cannot be triggered on someone's behalf.
 async fn handle_moved(
     state: &AppState,
     universe_id: &str,
     object_id: &str,
     from: Option<String>,
     to: Option<String>,
-    depth: u32,
+    moved_by: Option<String>,
+    budget: &HookBudget,
 ) {
-    if let Some(account_id) = state.connections.account_id(universe_id, object_id).await {
+    if state
+        .connections
+        .account_id(universe_id, object_id)
+        .await
+        .is_some()
+    {
         state
             .connections
             .update_room(universe_id, object_id, to.clone())
             .await;
         if let Some(ref room) = to {
+            // No account: a script's move must not start (and charge the
+            // moved player for) room image generation
             if let Some(room_msg) =
-                super::websocket::build_room_message(state, universe_id, room, Some(&account_id))
-                    .await
+                super::websocket::build_room_message(state, universe_id, room, None).await
             {
                 state
                     .connections
@@ -361,11 +416,11 @@ async fn handle_moved(
         }
     }
 
-    if depth >= MAX_MOVE_HOOK_DEPTH {
+    if budget.depth >= MAX_MOVE_HOOK_DEPTH {
         tracing::warn!(
             "move hooks for {} not run: nested {} deep",
             object_id,
-            depth
+            budget.depth
         );
         return;
     }
@@ -375,11 +430,19 @@ async fn handle_moved(
     ];
     for (container, method, mut args) in hooks {
         let Some(container) = container else { continue };
+        if !budget.take() {
+            tracing::warn!(
+                "{} hook on {} not run: the run's move-hook budget is spent",
+                method,
+                container
+            );
+            return;
+        }
         if let Some(map) = args.as_object_mut() {
             map.insert("object_id".into(), container.clone().into());
             map.insert("room_id".into(), container.clone().into());
-            map.insert("actor_id".into(), object_id.into());
             map.insert("moved_id".into(), object_id.into());
+            map.insert("moved_by".into(), moved_by.clone().into());
         }
         if let Err(e) = invoke_handler_at(
             state,
@@ -388,7 +451,7 @@ async fn handle_moved(
             Some(container.clone()),
             method,
             args,
-            depth + 1,
+            budget.deeper(),
         )
         .await
         {

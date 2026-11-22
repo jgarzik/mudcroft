@@ -373,7 +373,7 @@ async fn test_lua_move_fires_room_hooks() {
     eval(
         &mut wiz,
         r#"local h = game.store_code([[return {
-             on_enter = function(a) game.broadcast(a.room_id, "arrived:" .. tostring(a.moved_id)) end,
+             on_enter = function(a) game.broadcast(a.room_id, "arrived:" .. tostring(a.moved_id) .. ":" .. tostring(a.actor_id)) end,
              on_leave = function(a) game.broadcast(a.to, "left-from-ring:" .. tostring(a.moved_id)) end,
            }]])
            game.create_object("/rooms/ring", "room", nil, {name = "Ring", code_hash = h})
@@ -410,9 +410,9 @@ async fn test_lua_move_fires_room_hooks() {
     )
     .await;
     watcher
-        .expect_output_containing("arrived:/rooms/ring/pebble")
+        .expect_output_containing("arrived:/rooms/ring/pebble:nil")
         .await
-        .expect("on_enter ran with moved_id");
+        .expect("on_enter ran with moved_id, and no actor_id for a Lua move");
 }
 
 /// Hooks that move the object on (rooms bouncing it back and forth) stop at
@@ -456,4 +456,44 @@ async fn test_move_hooks_are_depth_limited() {
         "hooks ran a bounded number of times, got {}",
         bounces
     );
+}
+
+/// Hooks that move several objects each fan out; a total budget per run
+/// bounds the work, not just the nesting depth
+#[tokio::test]
+async fn test_move_hooks_fan_out_is_bounded() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "fan_wiz").await;
+    eval(
+        &mut wiz,
+        r#"game.create_object("/items/counter", "item", nil, {name = "counter", n = 0})
+           local function fan(other)
+             return game.store_code(string.format([[return {
+               on_enter = function(a)
+                 local c = game.get_object("/items/counter")
+                 game.update_object("/items/counter", {n = c.metadata.n + 1})
+                 for i = 1, 5 do game.move_object("/items/ball" .. i, %q) end
+               end,
+             }]], other))
+           end
+           game.create_object("/rooms/fan-a", "room", nil, {name = "A", code_hash = fan("/rooms/fan-b")})
+           game.create_object("/rooms/fan-b", "room", nil, {name = "B", code_hash = fan("/rooms/fan-a")})
+           for i = 1, 5 do game.create_object("/items/ball" .. i, "item", nil, {name = "ball"}) end
+           return "ok""#,
+    )
+    .await;
+    eval(
+        &mut wiz,
+        r#"return tostring(game.move_object("/items/ball1", "/rooms/fan-a"))"#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let n: i64 = eval(
+        &mut wiz,
+        r#"return game.get_object("/items/counter").metadata.n"#,
+    )
+    .await
+    .parse()
+    .unwrap_or(-1);
+    assert!((1..=40).contains(&n), "on_enter ran {} times", n);
 }

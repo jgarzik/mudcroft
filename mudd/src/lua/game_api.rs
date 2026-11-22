@@ -711,7 +711,12 @@ impl GameApi {
 
                 match result {
                     Ok(Ok(from)) => {
-                        move_queue.moved(&id, from.as_deref(), new_parent_id.as_deref());
+                        move_queue.moved(
+                            &id,
+                            from.as_deref(),
+                            new_parent_id.as_deref(),
+                            user.as_deref(),
+                        );
                         Ok(true)
                     }
                     Ok(Err(reason)) => Err(denied("move_object", reason)),
