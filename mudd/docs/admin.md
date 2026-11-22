@@ -324,8 +324,8 @@ The leader assigns it an id, sends it a snapshot of the game data, adds it
 as a learner and promotes it to voter once it has caught up. A member that
 is not the leader points the newcomer at the leader. Once joined, the node
 remembers its id, so a restart needs no `--join` (it is ignored). A node
-with the wrong secret, or a certificate not signed by the cluster CA, is
-refused and exits. Keep an odd number of voters (3 or 5): writes need a
+with the wrong secret, or whose CA does not match the cluster's, is refused
+and exits at once. Keep an odd number of voters (3 or 5): writes need a
 majority.
 
 **Inspect and remove nodes** through any member's cluster port (the tool

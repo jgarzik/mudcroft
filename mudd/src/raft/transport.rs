@@ -1217,8 +1217,15 @@ pub async fn join_cluster(
                 }) => next.push(leader),
                 Ok(JoinReply::NotLeader { leader: None }) => {}
                 Err(e) => {
+                    // A wrong secret or certificate does not heal with time
                     if e.contains("authentication") {
                         anyhow::bail!("cluster refused this node: {}", e);
+                    }
+                    if e.contains("certificate") {
+                        anyhow::bail!(
+                            "cannot verify the cluster's certificate (another CA?): {}",
+                            e
+                        );
                     }
                     debug!("cluster: join via {}: {}", target, e);
                 }

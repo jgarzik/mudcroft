@@ -395,3 +395,27 @@ async fn test_gateway_follows_live_step_down() {
         .await
         .unwrap_or_else(|e| panic!("back in the world: {}\n{}", e, cluster.logs()));
 }
+
+/// A node whose certificates come from another CA cannot join (the cluster
+/// is not verified), and gives up at once rather than retrying
+#[tokio::test]
+async fn test_cluster_other_ca_refused() {
+    let mut cluster = TestCluster::start(1).await.expect("cluster");
+    let other = cluster.dir.path().join("other-ca");
+    std::fs::create_dir(&other).unwrap();
+    let certs = mudd_test_certs(&other);
+    let started = std::time::Instant::now();
+    let err = cluster
+        .add_joiner_with(Some(&certs), Some(&cluster.certs.secret.clone()))
+        .await
+        .expect_err("refused");
+    assert!(err.to_string().contains("certificate"), "{}", err);
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "gave up promptly"
+    );
+}
+
+fn mudd_test_certs(dir: &std::path::Path) -> crate::harness::ClusterCerts {
+    crate::harness::make_certs(dir, "cluster-test-secret-0123456789").expect("certs")
+}

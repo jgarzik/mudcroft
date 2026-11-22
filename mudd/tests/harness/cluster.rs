@@ -219,6 +219,15 @@ impl TestCluster {
     }
 
     fn cluster_args(&self, cluster_port: u16, secret: Option<&Path>) -> Vec<String> {
+        self.cluster_args_with(cluster_port, &self.certs, secret)
+    }
+
+    fn cluster_args_with(
+        &self,
+        cluster_port: u16,
+        certs: &ClusterCerts,
+        secret: Option<&Path>,
+    ) -> Vec<String> {
         let addr = format!("127.0.0.1:{}", cluster_port);
         vec![
             "--advertise".into(),
@@ -226,13 +235,13 @@ impl TestCluster {
             "--cluster-listen".into(),
             addr,
             "--cluster-cert".into(),
-            self.certs.cert.display().to_string(),
+            certs.cert.display().to_string(),
             "--cluster-key".into(),
-            self.certs.key.display().to_string(),
+            certs.key.display().to_string(),
             "--cluster-ca".into(),
-            self.certs.ca.display().to_string(),
+            certs.ca.display().to_string(),
             "--cluster-secret-file".into(),
-            secret.unwrap_or(&self.certs.secret).display().to_string(),
+            secret.unwrap_or(&certs.secret).display().to_string(),
         ]
     }
 
@@ -301,10 +310,20 @@ impl TestCluster {
     /// Start a new empty node joining node 1 (with another secret file, if
     /// given); its index in `nodes`
     pub async fn add_joiner(&mut self, secret: Option<&Path>) -> Result<usize> {
+        self.add_joiner_with(None, secret).await
+    }
+
+    /// Start a new empty node joining node 1 with its own certificates
+    /// (e.g. from another CA)
+    pub async fn add_joiner_with(
+        &mut self,
+        certs: Option<&ClusterCerts>,
+        secret: Option<&Path>,
+    ) -> Result<usize> {
         let name = format!("node{}", self.nodes.len() + 1);
         self.run_init(&self.dir.path().join(format!("{}.db", name)), true)?;
         let port = free_port()?;
-        let mut args = self.cluster_args(port, secret);
+        let mut args = self.cluster_args_with(port, certs.unwrap_or(&self.certs), secret);
         args.push("--join".into());
         args.push(self.nodes[0].cluster_addr.clone());
         self.launch(&name, args, format!("127.0.0.1:{}", port))
