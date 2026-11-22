@@ -1245,3 +1245,27 @@ async fn test_portal_endpoint() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+/// Login and registration are rate-limited before any password hashing:
+/// per username (the configured rate) and per client IP (twice it)
+#[tokio::test]
+async fn test_auth_rate_limits() {
+    let server = TestServer::start_with_args(false, &["--auth-limit", "3"])
+        .await
+        .expect("server");
+    let login = |name: &str| {
+        let body = serde_json::json!({"username": name, "password": "wrong-password"});
+        let server = &server;
+        async move { server.post("/auth/login", &body).await.unwrap() }
+    };
+    for _ in 0..3 {
+        assert_eq!(login("target").await.status(), 401);
+    }
+    let limited = login("target").await;
+    assert_eq!(limited.status(), 429, "per-username limit");
+    assert!(limited.headers().contains_key("retry-after"));
+    // Other names from the same client still get through, up to the IP limit
+    assert_eq!(login("someone_else").await.status(), 401);
+    assert_eq!(login("third_person").await.status(), 401);
+    assert_eq!(login("fourth_person").await.status(), 429, "per-IP limit");
+}

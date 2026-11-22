@@ -125,7 +125,7 @@ global admin or owner, and exits non-zero on an unknown account.
 Runs the server. The database must already exist (see `mudd_init`).
 
 ```
-mudd --database <PATH> [--bind <ADDR>] [--static-dir <DIR>]
+mudd --database <PATH> [--bind <ADDR>] [--static-dir <DIR>] [--auth-limit <N>]
      [--advertise <HOST:PORT> --cluster-cert <PEM> --cluster-key <PEM>
       --cluster-ca <PEM> --cluster-secret-file <FILE>
       [--cluster-listen <ADDR>] [--join <HOST:PORT,...>]]
@@ -136,6 +136,7 @@ mudd --database <PATH> [--bind <ADDR>] [--static-dir <DIR>]
 | `-d`, `--database <PATH>` | (required) | Database created by `mudd_init` |
 | `-b`, `--bind <ADDR>` | `127.0.0.1:8080` | HTTP and WebSocket listen address. Use `0.0.0.0:8080` to accept remote connections. |
 | `--static-dir <DIR>` | (none) | Serve the built web client (for example `client/dist`) on the same origin as the API. Requests no API route claims get the matching file, falling back to `index.html` for client-side routes. Startup fails if `DIR/index.html` is missing. Without this flag, `GET /` returns `{"name":"mudd","version":"..."}`. |
+| `--auth-limit <N>` | `30` | Login attempts a minute per username, and twice that per client IP for login and registration; over it, `429` with `Retry-After`, before any password hashing. `0` turns the limits off. Behind a proxy every client shares the proxy's IP. |
 | `--advertise <HOST:PORT>` | (none) | Run as a cluster member, reachable by peers at this cluster-port address (not `0.0.0.0`). Requires the four `--cluster-*` files. Omit for a single node. See [Clusters](#clusters). |
 | `--cluster-listen <ADDR>` | `0.0.0.0` and the `--advertise` port | Address the cluster port listens on |
 | `--join <HOST:PORT,...>` | (none) | For a new node (database from `mudd_init --empty`): join through these members' cluster ports. Ignored once the node has joined (it remembers its id). |

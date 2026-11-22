@@ -91,7 +91,12 @@ impl TestServer {
             );
         }
 
-        let extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
+        // Every test client logs in from 127.0.0.1: limits off unless the
+        // test sets them
+        let mut extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
+        if !extra_args.iter().any(|a| a == "--auth-limit") {
+            extra_args.extend(["--auth-limit".to_string(), "0".to_string()]);
+        }
         let log_path = temp_dir.path().join("mudd.log");
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
         // Pick a free port and start; if another process took the port in the

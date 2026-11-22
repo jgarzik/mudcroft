@@ -251,6 +251,8 @@ impl TestCluster {
             certs.ca.display().to_string(),
             "--cluster-secret-file".into(),
             secret.unwrap_or(&certs.secret).display().to_string(),
+            "--auth-limit".into(),
+            "0".into(),
         ]
     }
 

@@ -5,6 +5,7 @@ mod effect_scheduler;
 mod gateway;
 mod images;
 mod primary;
+mod ratelimit;
 pub mod scripting;
 mod universe;
 mod websocket;
@@ -45,6 +46,10 @@ pub struct AppState {
     pub venice: Arc<VeniceClient>,
     pub image_store: Arc<ImageStore>,
     pub themes: Arc<ThemeRegistry>,
+    /// Login/registration limits: per client IP (twice the configured
+    /// rate) and per username (login; the configured rate)
+    pub auth_by_ip: Arc<ratelimit::RateLimiter>,
+    pub auth_by_user: Arc<ratelimit::RateLimiter>,
     /// True while this node is the active primary: leader, caches rebuilt,
     /// schedulers running (set by api/primary.rs). Game traffic is served
     /// locally only then.
@@ -82,6 +87,7 @@ pub async fn router(
     db: Arc<Database>,
     raft_writer: Arc<RaftWriter>,
     static_dir: Option<std::path::PathBuf>,
+    auth_limit: u32,
 ) -> Router {
     // Before serving: the first unknown-user login must not pay for this
     let _ = tokio::task::spawn_blocking(crate::auth::accounts::prepare_login_timing).await;
@@ -135,6 +141,8 @@ pub async fn router(
         themes,
         image_jobs: crate::images::ImageJobs::new(),
         primary: primary_rx,
+        auth_by_ip: Arc::new(ratelimit::RateLimiter::new(auth_limit.saturating_mul(2))),
+        auth_by_user: Arc::new(ratelimit::RateLimiter::new(auth_limit)),
         effects,
     };
 
@@ -156,9 +164,19 @@ pub async fn router(
         .route("/ws", get(websocket::ws_handler))
         .nest("/images", images::router())
         // On a gateway these are forwarded to the primary
-        .merge(auth::router().merge(universe::router()).route_layer(
-            axum::middleware::from_fn_with_state(state.clone(), gateway::forward_to_primary),
-        ));
+        .merge(
+            auth::router()
+                .merge(universe::router())
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    gateway::forward_to_primary,
+                ))
+                // Outermost: before a gateway forwards anything
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    ratelimit::limit_auth_by_ip,
+                )),
+        );
 
     let app = match static_dir {
         Some(dir) => {

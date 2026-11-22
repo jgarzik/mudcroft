@@ -88,6 +88,11 @@ letters, digits, `_` or `-`; passwords must be 6 characters to 1 KiB.
 
 Logging in issues a new token and invalidates the account's previous one.
 
+Limited to `--auth-limit` attempts a minute per username (default 30) and
+twice that per client IP for login and registration together: beyond that,
+`429 {"error": "too many attempts; try again later"}` with a `Retry-After`
+header (seconds), before the password is checked.
+
 ### POST /auth/logout
 
 ```json

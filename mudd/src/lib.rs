@@ -57,6 +57,9 @@ pub struct Config {
     pub static_dir: Option<std::path::PathBuf>,
     /// Cluster settings (None = a single node)
     pub cluster: Option<ClusterConfig>,
+    /// Login attempts a minute per username (twice that per client IP, for
+    /// login and registration); 0 turns the limits off
+    pub auth_limit: u32,
 }
 
 impl Default for Config {
@@ -66,6 +69,7 @@ impl Default for Config {
             db_path: String::new(),
             static_dir: None,
             cluster: None,
+            auth_limit: 30,
         }
     }
 }
@@ -158,6 +162,7 @@ impl Server {
             self.db.clone(),
             self.raft_writer.clone(),
             self.config.static_dir.clone(),
+            self.config.auth_limit,
         )
         .await
     }
@@ -172,7 +177,9 @@ impl Server {
         let router = self.router().await;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
-        let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        // Client addresses, for the per-IP login limit
+        let app = router.into_make_service_with_connect_info::<SocketAddr>();
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
             tokio::select! {
                 _ = shutdown_rx.changed() => {}
                 _ = stop.wait_for(|stop| *stop) => {}

@@ -132,7 +132,8 @@ export async function startServer(): Promise<ServerState> {
       const log = fs.openSync(logPath, 'a')
       const child = spawn(
         path.join(BIN_DIR, 'mudd'),
-        ['--bind', `127.0.0.1:${port}`, '--database', dbPath, '--static-dir', dist],
+        // Every test logs in from 127.0.0.1: no login rate limits
+        ['--bind', `127.0.0.1:${port}`, '--database', dbPath, '--static-dir', dist, '--auth-limit', '0'],
         {
           // run_script reads scripts/ relative to the working directory
           cwd: REPO_DIR,

@@ -116,6 +116,10 @@ pub struct LoginRequest {
 
 /// Login with username and password
 async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
+    // Before any password hashing
+    if let Err(retry) = state.auth_by_user.check(&req.username.to_lowercase()) {
+        return super::ratelimit::too_many(retry);
+    }
     let service = state.accounts();
 
     match service.login(&req.username, &req.password).await {

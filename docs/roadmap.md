@@ -43,13 +43,6 @@ primary lifecycle, gateways, failover), with these gaps:
   payer = that player). Pending requests are rows with absolute deadlines.
   `"actor"` stops being a direct payer, including for paid Venice calls.
 
-### Accounts and permissions
-
-- **No rate limiting on login and register.** Concurrent argon2 work is
-  capped at the CPU count (`mudd/src/auth/accounts.rs`), so a flood cannot
-  exhaust memory, but it can still keep every core busy and delay real
-  logins. Needs per-IP and per-username limits.
-
 ## Raft Cluster Operation
 
 Today `mudd` runs a single-node openraft cluster whose log carries plain SQL

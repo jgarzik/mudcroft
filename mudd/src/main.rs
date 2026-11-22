@@ -52,6 +52,11 @@ struct Args {
     #[arg(long, requires = "advertise")]
     cluster_secret_file: Option<std::path::PathBuf>,
 
+    /// Login attempts a minute per username, and twice that per client IP
+    /// for login and registration (0 turns the limits off)
+    #[arg(long, default_value = "30")]
+    auth_limit: u32,
+
     /// Serve the built web client (e.g. client/dist) from this directory on
     /// the same origin as the API. Must contain index.html.
     #[arg(long)]
@@ -105,6 +110,7 @@ async fn main() -> Result<()> {
         db_path: args.database,
         static_dir: args.static_dir,
         cluster,
+        auth_limit: args.auth_limit,
     };
 
     // Signals are handled from here on, startup included
