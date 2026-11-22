@@ -168,7 +168,9 @@ pub async fn strike(
     let dice = weapon
         .and_then(|w| w.get_string("damage"))
         .and_then(|n| crate::combat::parse_dice(n).ok())
-        .filter(|roll| roll.count <= 100 && roll.sides <= 1000);
+        .filter(|roll| {
+            roll.count <= 100 && (1..=1000).contains(&roll.sides) && roll.modifier.abs() <= 1000
+        });
     let dtype = weapon
         .and_then(|w| w.get_string("damage_type"))
         .and_then(|t| t.parse::<DamageType>().ok())

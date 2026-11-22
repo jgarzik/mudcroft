@@ -34,17 +34,18 @@ impl DiceRoll {
     /// Roll and return individual die results plus total
     pub fn roll_detailed(&self) -> (Vec<u32>, i32) {
         let mut rng = rand::rng();
-        let mut results = Vec::with_capacity(self.count as usize);
-
-        for _ in 0..self.count {
-            let roll = rng.random_range(1..=self.sides);
-            results.push(roll);
+        let mut results = Vec::with_capacity(self.count.min(1000) as usize);
+        // No sides: nothing to roll (never an empty range)
+        if self.sides > 0 {
+            for _ in 0..self.count {
+                results.push(rng.random_range(1..=self.sides));
+            }
         }
-
-        let sum: u32 = results.iter().sum();
-        let total = sum as i32 + self.modifier;
-
-        (results, total)
+        // Saturating: builder-set dice cannot overflow
+        let sum = results.iter().fold(0i32, |t, r| {
+            t.saturating_add(i32::try_from(*r).unwrap_or(i32::MAX))
+        });
+        (results, sum.saturating_add(self.modifier))
     }
 
     /// Get the minimum possible result
@@ -152,12 +153,15 @@ pub fn parse_dice(notation: &str) -> Result<DiceRoll, String> {
 pub fn roll_dice(count: u32, sides: u32, modifier: i32) -> i32 {
     let mut rng = rand::rng();
     let mut total: i32 = 0;
-
-    for _ in 0..count {
-        total += rng.random_range(1..=sides) as i32;
+    // No sides: nothing to roll (never an empty range); saturating, so
+    // builder-set dice cannot overflow
+    if sides > 0 {
+        for _ in 0..count {
+            let r = rng.random_range(1..=sides);
+            total = total.saturating_add(i32::try_from(r).unwrap_or(i32::MAX));
+        }
     }
-
-    total + modifier
+    total.saturating_add(modifier)
 }
 
 /// Roll a single d20
@@ -292,5 +296,13 @@ mod tests {
         assert!(!is_critical(19));
         assert!(is_fumble(1));
         assert!(!is_fumble(2));
+    }
+
+    /// Extreme dice never overflow or panic (builder-set weapon dice)
+    #[test]
+    fn test_extreme_dice_saturate() {
+        assert_eq!(roll_dice(2, u32::MAX, i32::MAX), i32::MAX);
+        assert_eq!(roll_dice(3, 0, 0), 0, "no sides: nothing rolled");
+        assert!(roll_dice(1, 6, i32::MIN) <= i32::MIN + 6);
     }
 }
