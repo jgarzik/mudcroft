@@ -799,7 +799,9 @@ only `text` set. The acting user must be able to modify the attacker; a
 player attacker only as themselves and never from object code (so no
 script can make a player fight).
 
-**Returns** `{hit, critical, fumble, damage, killed, text, parts}`, or
+**Returns** `{hit, critical, fumble, damage, killed, text, parts}`
+(`damage` is the total; `parts` lists each damage part as `{type, rolled,
+applied}`: rolled with a critical's doubling, applied after resistances), or
 `nil` and the reason (not allowed, stunned, already fighting that target,
 or not ready: less than a round since the attacker's last blow).
 
@@ -1180,6 +1182,7 @@ of combat rules: the same rules as the built-in `attack` command (see
 
 - `Combat.can_attack(attacker_id, target_id)`: `true`, or `false` and the reason.
 - `Combat.initiate(attacker_id, target_id)` (and its alias `Combat.attack`): starts a fight, one blow now, rounds after. Returns `{success, message, blow}`; during a fight it switches target (no extra blow).
+- `Combat.attack_extended(attacker_id, target_id)`: the same, broken down by damage part: `{success, message, hit, critical, damage, parts, physical_damage, elemental_damage_rolled, elemental_damage_applied}` (the first part is the "physical" one, the others are summed as "elemental").
 - `Combat.deal_damage(target_id, amount, damage_type, source_id)`: resistances apply; returns `{success, damage, remaining_hp, killed, message}`.
 - `Combat.heal(target_id, amount)`: returns `{success, new_hp, message}`.
 - `Combat.apply_effect(target_id, effect, duration, magnitude, damage_type, period)`, `Combat.remove_effect(target_id, effect)`, `Combat.effects(target_id)`: the status effect functions.
@@ -1212,8 +1215,8 @@ Objects start with the defaults of their class and its ancestors. The
 | `living` | thing | `hp = 100`, `max_hp = 100`, `attack_bonus = 0`, `armor_class = 10`, `in_combat = false` |
 | `room` | thing | `exits = {}`, `lighting = "normal"`, `region_id = nil` |
 | `region` | thing | `environment_type = "dungeon"`, `danger_level = 1`, `ambient_sounds = {}` |
-| `weapon` | item | `damage_dice = "1d6"`, `damage_bonus = 0`, `damage_type = "physical"` |
-| `armor` | item | `armor_value = 0`, `slot = "body"` |
+| `weapon` | item | `slot = "weapon"`, `damage = "1d6"`, `damage_type = "physical"` (see equipment under [Built-in combat](#built-in-combat)) |
+| `armor` | item | `armor_class = 0`, `slot = "body"` |
 | `container` | item | `capacity = 10`, `locked = false` |
 | `player` | living | `access_level = "player"` |
 | `npc` | living | `aggro = false`, `respawn_time = nil` |
@@ -1232,7 +1235,7 @@ Which properties the server reads:
 | `hp`, `max_hp`, `armor_class`, `attack_bonus` (npc, player) | built-in combat |
 | `xp_value`, `respawn_seconds`, `home_room` (npc); `xp` (player) | death and respawn (see [Built-in combat](#built-in-combat)) |
 | `aggro`, `flee_threshold`, `faction`, `wander_seconds` (npc) | NPC behaviour (see [Built-in combat](#built-in-combat)) |
-| `slot`, `damage`, `damage_type`, `attack_bonus`, `armor_class`, `equipped_by` (item) | equipment (see [Built-in combat](#built-in-combat)) |
+| `slot`, `damage`, `damage_type`, `damage_parts`, `attack_bonus`, `armor_class`, `equipped_by` (item) | equipment (see [Built-in combat](#built-in-combat)) |
 
 All other properties, including `weight`, `value`, `lighting`,
 `capacity` and `locked`, are data for your own scripts.
@@ -1253,7 +1256,7 @@ The built-in `attack <name>` (or `kill`) command works like this:
 - A hit fires `on_damage`. A kill fires `on_death` (after `on_damage`).
 - **Fleeing:** the `flee` command (or [`game.flee`](#gamefleeid)) leaves through a random exit and ends your fight; your attackers stop once you are gone. It fails with the universe's `flee_fail_percent` chance (default 0), and never works while stunned.
 - **NPC scripts:** an NPC's code may define `ai_combat_tick` (run as its owner on each of its rounds, with `{object_id, room_id, target_id, hp}`) and `ai_idle_tick` (run when a player arrives in its room, `{reason = "arrival", arrived_id}`, or when it would wander, `{reason = "wander"}`). If the handler returns anything but `nil`, it replaces the built-in behaviour for that moment (the blow or flee, the aggro, the wander move); `nil`, no handler or an error falls back to the built-in behaviour. AI handlers whose moves set off more AI handlers are bounded: at most 4 deep and 32 calls per action (beyond that the built-in behaviour applies).
-- **Equipment**: `wield <item>` / `unwield`, `wear <item>` / `remove <item>`, `equipment` (or `eq`). An item names its slot in `slot`: `weapon` (an item with `damage` and no slot is one), `head`, `body`, `hands`, `feet`, `shield`, `neck` or `ring`; one item per slot (if marks say otherwise, only the first item of a slot, by id, counts; a clone of worn gear is not worn). A wielded weapon replaces the bare 1d6 with its `damage` dice (e.g. `"1d8"`, `"2d4+1"`; at most 100 dice of 1 to 1000 sides, modifier within ±1000, else the bare 1d6) of its `damage_type` (resistances apply) and adds its `attack_bonus`; each worn item adds its `armor_class` to the wearer's. Equipped items carry `equipped_by` (the wearer); anything that moves an item away (dropping, giving, death, a script) unequips it, and death policies treat gear like other belongings.
+- **Equipment**: `wield <item>` / `unwield`, `wear <item>` / `remove <item>`, `equipment` (or `eq`). An item names its slot in `slot`: `weapon` (an item with `damage` and no slot is one), `head`, `body`, `hands`, `feet`, `shield`, `neck` or `ring`; one item per slot (if marks say otherwise, only the first item of a slot, by id, counts; a clone of worn gear is not worn). A wielded weapon replaces the bare 1d6 with its `damage` dice (e.g. `"1d8"`, `"2d4+1"`; at most 100 dice of 1 to 1000 sides, modifier within ±1000, else the bare 1d6) of its `damage_type` (resistances apply) and adds its `attack_bonus`. A weapon with `damage_parts`, a list of up to 8 `{dice = "...", type = "..."}` (e.g. `{{dice = "1d8", type = "slashing"}, {dice = "1d6", type = "fire"}}`), deals all of them on a hit instead: each part is doubled on a critical and meets the target's resistance to its own type, and the attacker is told each part's share (`You hit dragon for 9 damage (6 slashing; 3 fire, resisted).`); each worn item adds its `armor_class` to the wearer's. Equipped items carry `equipped_by` (the wearer); anything that moves an item away (dropping, giving, death, a script) unequips it, and death policies treat gear like other belongings.
 - **NPC behaviour** (NPC properties):
   - `aggro = true`: attacks a player who arrives in its room (walking, `goto`, spawning or moved by Lua), and a player in a room it arrives in, at once (PvP rules don't apply to NPCs).
   - `flee_threshold` (a fraction of `max_hp`, e.g. `0.25`): below it, the NPC runs through a random exit on its turn instead of attacking, ending its fight.
@@ -1279,7 +1282,6 @@ These are not built yet. See the [roadmap](../../docs/roadmap.md).
 
 - **Unfired handlers:** `on_create`, `on_destroy`, `on_init`, `on_move` and `on_use` never fire on their own. Call the ones other than `on_create` and `on_destroy` with `game.use_object` (which refuses engine hooks), or start a heartbeat yourself.
 - **Missing player commands:** there is no `use` or `give` command. Add verbs with `game.add_action`.
-- **Combat gaps:** weapons deal one damage type (no elemental parts yet).
 - **Universe config:** keys such as `spawn_room` are not read by the server; use `setportal`.
 
 ---

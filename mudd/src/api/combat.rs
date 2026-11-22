@@ -223,7 +223,10 @@ pub async fn ready_to_strike(
 /// What one blow did, and what each party is told
 pub struct Blow {
     pub killed: bool,
+    /// Total damage dealt on a hit (all parts, after resistances)
     pub damage: Option<i32>,
+    /// Each damage part: type, as rolled, as applied
+    pub parts: Vec<crate::combat::engine::DamagePart>,
     /// For the attacker (a reply when the attacker typed the command)
     pub attacker_text: String,
     pub target_text: String,
@@ -268,11 +271,41 @@ pub async fn strike(
     let target_effects = state.effects.get(universe_id, &target.id).await;
     let mods = attack_mods(&attacker_effects, &target_effects, now);
     let d20 = crate::combat::roll_d20();
-    let damage_roll = match dice {
-        Some(roll) => roll.roll().max(0),
+    // The weapon's damage parts (damage_parts: at most 8 {dice, type}),
+    // else its one damage/damage_type, else a bare 1d6
+    let mut specs: Vec<(Option<crate::combat::DiceRoll>, DamageType)> = weapon
+        .and_then(|w| w.properties.get("damage_parts"))
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .take(8)
+                .filter_map(|p| {
+                    let dice = p
+                        .get("dice")
+                        .and_then(|d| d.as_str())
+                        .and_then(weapon_dice)?;
+                    let t = p
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| t.parse::<DamageType>().ok())
+                        .unwrap_or(DamageType::Physical);
+                    Some((Some(dice), t))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if specs.is_empty() {
+        specs.push((dice, dtype));
+    }
+    let roll = |spec: &Option<crate::combat::DiceRoll>| match spec {
+        Some(r) => r.roll().max(0),
         None => rand::rng().random_range(1..=6),
     };
-    let outcome = resolve_attack(&a, &d, &mods, d20, damage_roll, dtype, now);
+    let first = specs[0].1;
+    let damage_roll = roll(&specs[0].0);
+    let extra: Vec<(i32, DamageType)> = specs[1..].iter().map(|(d, t)| (roll(d), *t)).collect();
+    let mut outcome = resolve_attack(&a, &d, &mods, d20, damage_roll, first, now);
+    let parts = crate::combat::engine::add_damage_parts(&mut outcome, &d, first, &extra);
     let mut statements = attack_statements(universe_id, &target.id, &outcome)?;
     // When it last struck: a fight's first blow waits a full round after
     // the last one, whatever happened to the fight meanwhile
@@ -291,22 +324,45 @@ pub async fn strike(
 
     let (an, tn) = (name_of(attacker), name_of(target));
     let result = &outcome.result;
-    let damage = result.damage.as_ref().map(|d| d.final_damage);
+    let damage = result
+        .damage
+        .as_ref()
+        .map(|_| parts.iter().fold(0i32, |t, p| t.saturating_add(p.applied)));
+    // Several parts: each one's share, and the target's resistances
+    let breakdown = if parts.len() > 1 {
+        let shares: Vec<String> = parts
+            .iter()
+            .map(|p| {
+                if p.applied == 0 && p.rolled > 0 {
+                    format!("{}: {} is immune", p.dtype, tn)
+                } else if p.applied < p.rolled {
+                    format!("{} {}, resisted", p.applied, p.dtype)
+                } else if p.applied > p.rolled {
+                    format!("{} {}, vulnerable", p.applied, p.dtype)
+                } else {
+                    format!("{} {}", p.applied, p.dtype)
+                }
+            })
+            .collect();
+        format!(" ({})", shares.join("; "))
+    } else {
+        String::new()
+    };
     let mut mine = Vec::new();
     let target_text;
     if result.hit {
         let dmg = damage.unwrap_or(0);
         if result.critical {
             mine.push(format!(
-                "CRITICAL HIT! You strike {} for {} damage!",
-                tn, dmg
+                "CRITICAL HIT! You strike {} for {} damage{}!",
+                tn, dmg, breakdown
             ));
             if outcome.inflicts.is_some() {
                 mine.push(format!("{} is bleeding!", tn));
             }
             target_text = format!("{} critically hits you for {} damage!", an, dmg);
         } else {
-            mine.push(format!("You hit {} for {} damage.", tn, dmg));
+            mine.push(format!("You hit {} for {} damage{}.", tn, dmg, breakdown));
             target_text = format!("{} hits you for {} damage.", an, dmg);
         }
         if outcome.killed {
@@ -331,6 +387,7 @@ pub async fn strike(
     Ok(Blow {
         killed: outcome.killed,
         damage: if result.hit { damage } else { None },
+        parts,
         attacker_text: mine.join("\n"),
         target_text,
         room_text,
@@ -1709,8 +1766,12 @@ impl CombatEngine {
             fumble: blow.attacker_text.starts_with("You fumble"),
             damage: blow.damage.unwrap_or(0) as i64,
             killed: blow.killed,
+            parts: blow
+                .parts
+                .iter()
+                .map(|p| (p.dtype.to_string(), p.rolled as i64, p.applied as i64))
+                .collect(),
             text: blow.attacker_text,
-            parts: Vec::new(),
         })
     }
 

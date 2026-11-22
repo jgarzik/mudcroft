@@ -99,9 +99,9 @@ runs the game, gateways that relay to it, and failover. Planned:
 The Lua game-logic suite (`mudd/tests/lua/game_logic_tests.lua`) skips tests
 for features that do not exist yet; see its `SKIP` table. Planned:
 
-- **Elemental combat**: `Combat.attack_extended` with weapon elemental dice
-  and types, applying immunities, resistances and vulnerabilities, critical
-  hits doubling dice, and a weapon `on_hit` handler.
+- **Weapon `on_hit` handler**: weapons deal damage parts of several types
+  (`damage_parts`, `Combat.attack_extended`); a weapon's own code run on a
+  hit is not built.
 - **Region hooks**: `on_enter`/`on_leave` on the region when a player
   crosses region boundaries.
 - **An LPC-style `init()` cascade on moves.** `game.move_object` already

@@ -458,7 +458,9 @@ Two layers exist:
   ±1,000) and damage math saturates, so builder-set extremes cannot wrap. The `attack`
   command resolves a round with the pure `resolve_attack` (d20 + attack
   bonus against armor class, natural 20 a critical hit, natural 1 a fumble,
-  then 1d6 physical damage, doubled on a critical, then resistances) and
+  then 1d6 physical damage, or the wielded weapon's dice and type, or its
+  `damage_parts` each with its own type (`engine::add_damage_parts`),
+  doubled on a critical, then resistances) and
   commits it in the command's run (`api::combat::strike`): the target's new
   `hp` via `json_set` and any bleeding. Targets must
   be `npc`, a class derived from `npc`, or `monster`. Effects change the

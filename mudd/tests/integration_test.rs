@@ -222,7 +222,7 @@ async fn test_class_registry() {
 
     // Verify property resolution
     let props = registry.resolve_properties("u", "weapon");
-    assert!(props.contains_key("damage_dice")); // from weapon
+    assert!(props.contains_key("damage")); // from weapon
     assert!(props.contains_key("weight")); // from item
     assert!(props.contains_key("name")); // from thing
 

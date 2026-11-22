@@ -59,6 +59,39 @@ function Combat.attack(attacker_id, target_id)
     return Combat.initiate(attacker_id, target_id)
 end
 
+-- An attack with the wielded weapon's damage parts broken down: a weapon's
+-- damage_parts (e.g. {{dice = "1d8", type = "slashing"}, {dice = "1d6",
+-- type = "fire"}}) are each rolled, doubled on a critical, and meet the
+-- target's resistance to their own type.
+-- Returns {success, message, hit, critical, damage, parts,
+-- physical_damage, elemental_damage_rolled, elemental_damage_applied}:
+-- the first part is the "physical" one, the rest summed as "elemental".
+function Combat.attack_extended(attacker_id, target_id)
+    local r = Combat.initiate(attacker_id, target_id)
+    if not r.success then
+        return {success = false, message = r.message, hit = false}
+    end
+    local blow = r.blow
+    local parts = blow.parts or {}
+    local physical = parts[1] and parts[1].applied or blow.damage
+    local rolled, applied = 0, 0
+    for i = 2, #parts do
+        rolled = rolled + parts[i].rolled
+        applied = applied + parts[i].applied
+    end
+    return {
+        success = true,
+        message = blow.text,
+        hit = blow.hit,
+        critical = blow.critical,
+        damage = blow.damage,
+        parts = parts,
+        physical_damage = physical,
+        elemental_damage_rolled = rolled,
+        elemental_damage_applied = applied,
+    }
+end
+
 -- Damage of a type, after the target's resistances; a death follows the
 -- universe's policy. Returns {success, damage, remaining_hp, killed, message}
 function Combat.deal_damage(target_id, amount, damage_type, source_id)

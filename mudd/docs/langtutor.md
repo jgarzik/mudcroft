@@ -812,7 +812,7 @@ These are planned or partial; see the [roadmap](../../docs/roadmap.md).
 Don't build on them yet:
 
 - **Handlers that never fire on their own:** `on_init`, `on_create`, `on_destroy`, `on_move` and `on_use`. Call them with `game.use_object` if you need them, except `on_create` and `on_destroy`, which `use_object` refuses.
-- **Commands and combat:** there are no `use` or `give` player commands (add verbs instead), and a weapon deals one damage type.
+- **Commands:** there are no `use` or `give` player commands (add verbs instead).
 - **Universe config:** a key like `spawn_room` has no effect. Use `setportal` for the spawn room.
 
 ---

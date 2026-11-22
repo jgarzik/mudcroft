@@ -440,20 +440,19 @@ function test_define_custom_weapon_class()
     local handlers = game.store_code([[
         return {
             on_hit = function(args)
-                -- Elemental damage handled by Combat.attack_extended
                 return args.result
             end
         }
     ]])
 
+    -- Engine weapon fields: slot, damage (dice), damage_type; damage_parts
+    -- (a list of {dice, type}) adds elements per instance
     game.define_class("fire_sword", {
         parent = "weapon",
         properties = {
-            damage_dice = { type = "string", default = "1d8" },
-            damage_bonus = { type = "number", default = 1 },
-            damage_type = { type = "string", default = "physical" },
-            elemental_damage_dice = { type = "string", default = "1d6" },
-            elemental_damage_type = { type = "string", default = "fire" },
+            slot = { type = "string", default = "weapon" },
+            damage = { type = "string", default = "1d8+1" },
+            damage_type = { type = "string", default = "slashing" },
             code_hash = { type = "string", default = handlers }
         }
     })
@@ -462,8 +461,14 @@ function test_define_custom_weapon_class()
     Test.assert(class_info ~= nil, "fire_sword class should be defined")
     Test.assert_eq(class_info.parent, "weapon", "Parent should be weapon")
     -- get_class reports each property as its default value
-    Test.assert_eq(class_info.properties.damage_bonus, 1, "Default +1 damage")
+    Test.assert_eq(class_info.properties.damage, "1d8+1", "Default damage dice")
 end
+
+-- A Flamebrand: slashing plus fire, as damage parts
+local FLAMEBRAND_PARTS = {
+    { dice = "1d8+1", type = "slashing" },
+    { dice = "1d6", type = "fire" },
+}
 
 function test_create_fire_sword_instance()
     local actors = setup_test_world()
@@ -475,54 +480,44 @@ function test_create_fire_sword_instance()
     local sword = create(P("/dungeon/treasure-room/flamebrand"), "fire_sword", room.id, {
         name = "Flamebrand +1",
         description = "A sword wreathed in magical flames. The blade glows with inner fire.",
-        damage_dice = "1d8",
-        damage_bonus = 1,
-        damage_type = "physical",
-        elemental_damage_dice = "1d6",
-        elemental_damage_type = "fire",
+        damage_parts = FLAMEBRAND_PARTS,
         value = 500
     })
 
     Test.assert(sword ~= nil, "Fire sword should be created")
     Test.assert_eq(sword.class, "fire_sword", "Class should be fire_sword")
-    Test.assert_eq(sword.metadata.elemental_damage_type, "fire", "Elemental type should be fire")
+    Test.assert_eq(sword.metadata.damage_parts[2].type, "fire", "Second part is fire")
+end
+
+-- The player wields a fresh Flamebrand (elemental dice `fire_dice`) in a new
+-- room with `target_props`; returns the attack's result
+local function swing_flamebrand(slug, fire_dice, target_props)
+    local actors = setup_test_world()
+    act_as(actors.wizard)
+    local region = create(P("/arena"), "region", nil, { name = "Arena" })
+    local room = create(P("/arena/" .. slug), "room", region.id, { name = "Pit" })
+    create(P("/arena/" .. slug .. "-sword"), "fire_sword", actors.body, {
+        name = "Flamebrand +1",
+        damage_parts = { { dice = "1d8+1", type = "slashing" }, { dice = fire_dice, type = "fire" } },
+        equipped_by = actors.body,
+    })
+    -- armor_class 1: every roll but a natural 1 hits
+    target_props.armor_class = 1
+    local target = create(P("/arena/" .. slug .. "/target"), "npc", room.id, target_props)
+    game.move_object(actors.body, room.id)
+    act_as(actors.player)
+    local result = Combat.attack_extended(actors.body, target.id)
+    act_as(ACCOUNTS.admin)
+    game.stop_combat(target.id)
+    return result, target
 end
 
 function test_fire_sword_damage_against_normal_enemy()
-    local actors = setup_test_world()
-    act_as(actors.wizard)
-
-    -- Setup combat scenario
-    local region = create(P("/arena"), "region", nil, { name = "Arena" })
-    local room = create(P("/arena/combat-pit"), "room", region.id, { name = "Combat Pit" })
-
-    local sword = create(P("/arena/flamebrand"), "fire_sword", actors.body, {
-        name = "Flamebrand +1",
-        damage_dice = "1d8",
-        damage_bonus = 1,
-        elemental_damage_dice = "1d6",
-        elemental_damage_type = "fire"
-    })
-
-    local goblin = create(P("/arena/combat-pit/goblin"), "npc", room.id, {
-        name = "Goblin",
-        hp = 30,
-        armor_class = 12
-        -- No immunities, resistances, or vulnerabilities
-    })
-
-    -- Move player to room
-    game.move_object(actors.body, room.id)
-
-    -- Force a hit with known seed
-    game.set_rng_seed(12345)  -- Seed that produces hit
-
-    local initial_health = goblin.metadata.hp
-    local result = Combat.attack_extended(actors.body, goblin.id, sword.id)
-
+    local result, goblin = swing_flamebrand("goblin-pit", "1d6", { name = "Goblin", hp = 300, max_hp = 300 })
+    Test.assert(result.success, "attack starts: " .. tostring(result.message))
     if result.hit then
-        local updated_goblin = game.get_object(goblin.id)
-        Test.assert_gt(initial_health, updated_goblin.metadata.hp, "Goblin should take damage")
+        local updated = game.get_object(goblin.id)
+        Test.assert_eq(300 - updated.metadata.hp, result.damage, "HP drops by the total")
         Test.assert_gt(result.physical_damage, 0, "Physical damage should be dealt")
         Test.assert_gt(result.elemental_damage_rolled, 0, "Elemental damage should be rolled")
         Test.assert_eq(result.elemental_damage_applied, result.elemental_damage_rolled, "Full fire damage to normal enemy")
@@ -530,74 +525,25 @@ function test_fire_sword_damage_against_normal_enemy()
 end
 
 function test_fire_sword_against_fire_immune_enemy()
-    local actors = setup_test_world()
-    act_as(actors.wizard)
-
-    local region = create(P("/arena"), "region", nil, { name = "Arena" })
-    local room = create(P("/arena/fire-pit"), "room", region.id, { name = "Fire Pit" })
-
-    local sword = create(P("/arena/flamebrand"), "fire_sword", actors.body, {
-        name = "Flamebrand +1",
-        damage_dice = "1d8",
-        damage_bonus = 1,
-        elemental_damage_dice = "1d6",
-        elemental_damage_type = "fire"
+    local result, elemental = swing_flamebrand("fire-pit", "1d6", {
+        name = "Fire Elemental", hp = 300, max_hp = 300, resistances = { fire = "immune" },
     })
-
-    -- Fire elemental is immune to fire
-    local fire_elemental = create(P("/arena/fire-pit/elemental"), "npc", room.id, {
-        name = "Fire Elemental",
-        hp = 50,
-        armor_class = 13,
-        immunities = { fire = true }  -- IMMUNE TO FIRE
-    })
-
-    game.move_object(actors.body, room.id)
-    game.set_rng_seed(12345)
-
-    local initial_health = fire_elemental.metadata.hp
-    local result = Combat.attack_extended(actors.body, fire_elemental.id, sword.id)
-
+    Test.assert(result.success, "attack starts: " .. tostring(result.message))
     if result.hit then
         Test.assert_gt(result.physical_damage, 0, "Physical damage should be dealt")
         Test.assert_gt(result.elemental_damage_rolled, 0, "Fire damage was rolled")
         Test.assert_eq(result.elemental_damage_applied, 0, "Fire damage should be ZERO (immune)")
-
-        local updated = game.get_object(fire_elemental.id)
-        local damage_taken = initial_health - updated.metadata.hp
-        Test.assert_eq(damage_taken, result.physical_damage, "Only physical damage should be taken")
+        local taken = 300 - game.get_object(elemental.id).metadata.hp
+        Test.assert_eq(taken, result.physical_damage, "Only physical damage should be taken")
         Test.assert(string.find(result.message, "immune", 1, true), "Message should mention immunity")
     end
 end
 
 function test_fire_sword_against_fire_resistant_enemy()
-    local actors = setup_test_world()
-    act_as(actors.wizard)
-
-    local region = create(P("/arena"), "region", nil, { name = "Arena" })
-    local room = create(P("/arena/cave"), "room", region.id, { name = "Cave" })
-
-    local sword = create(P("/arena/flamebrand"), "fire_sword", actors.body, {
-        name = "Flamebrand +1",
-        damage_dice = "1d8",
-        damage_bonus = 1,
-        elemental_damage_dice = "2d6",  -- Larger dice to test halving
-        elemental_damage_type = "fire"
+    local result = swing_flamebrand("cave", "2d6", {
+        name = "Young Red Dragon", hp = 300, max_hp = 300, resistances = { fire = "resistant" },
     })
-
-    -- Red dragon resists fire
-    local dragon = create(P("/arena/cave/dragon"), "npc", room.id, {
-        name = "Young Red Dragon",
-        hp = 100,
-        armor_class = 18,
-        resistances = { fire = true }  -- RESISTANT TO FIRE (half damage)
-    })
-
-    game.move_object(actors.body, room.id)
-    game.set_rng_seed(12345)
-
-    local result = Combat.attack_extended(actors.body, dragon.id, sword.id)
-
+    Test.assert(result.success, "attack starts: " .. tostring(result.message))
     if result.hit then
         local expected_reduced = math.floor(result.elemental_damage_rolled / 2)
         Test.assert_eq(result.elemental_damage_applied, expected_reduced, "Fire damage should be halved")
@@ -629,10 +575,7 @@ local SPAWNER_CHEST_CODE = [[
             local sword = game.create_object(chest.parent_id .. "/flamebrand-" .. count, "fire_sword", chest.parent_id, {
                 name = "Flamebrand +1",
                 description = "A freshly materialized sword, flames dancing along its blade.",
-                damage_dice = "1d8",
-                damage_bonus = 1,
-                elemental_damage_dice = "1d6",
-                elemental_damage_type = "fire"
+                damage_parts = { { dice = "1d8+1", type = "slashing" }, { dice = "1d6", type = "fire" } },
             })
             if sword.error then
                 return { success = false, message = "spawn failed: " .. sword.error }
@@ -1490,13 +1433,8 @@ local TESTS = {
 
 -- Tests not run, with the reason. "BUG:" marks a server bug: the test
 -- asserts the correct behavior and should pass once the bug is fixed.
-local NO_ATTACK_EXTENDED = "damage_parts weapons and Combat.attack_extended are not built yet (phase 2)"
-
 local SKIP = {
     test_region_code_executes_on_enter = "region hooks are not built yet (roadmap phase 3)",
-    test_fire_sword_damage_against_normal_enemy = NO_ATTACK_EXTENDED,
-    test_fire_sword_against_fire_immune_enemy = NO_ATTACK_EXTENDED,
-    test_fire_sword_against_fire_resistant_enemy = NO_ATTACK_EXTENDED,
 }
 
 local function run_all_tests(section)
