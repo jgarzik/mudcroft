@@ -88,9 +88,7 @@ pub async fn process(state: &AppState, now: u64) {
                     }
                     Ok(effects) => effects,
                     Err(e) => {
-                        warn!("effects: loading {} failed: {}", entity, e);
-
-                        return Ok(None);
+                        return Err(format!("effects: loading {} failed: {}", entity, e));
                     }
                 };
                 let obj = match state.object_store.get(&universe, &entity).await {
@@ -101,9 +99,7 @@ pub async fn process(state: &AppState, now: u64) {
                         return Ok(None);
                     }
                     Err(e) => {
-                        warn!("effects: lookup of {} failed: {}", entity, e);
-
-                        return Ok(None);
+                        return Err(format!("effects: lookup of {} failed: {}", entity, e));
                     }
                 };
                 let is_player = obj.class == "player";
@@ -113,9 +109,7 @@ pub async fn process(state: &AppState, now: u64) {
                     match tick_statements(&universe, &entity, is_player, &effects, &outcome) {
                         Ok(s) => s,
                         Err(e) => {
-                            warn!("effects: {}: {}", entity, e);
-
-                            return Ok(None);
+                            return Err(format!("effects: {}: {}", entity, e));
                         }
                     };
                 let killer = outcome.events.iter().rev().find_map(|event| match event {

@@ -135,8 +135,18 @@ pub async fn equip(
     let Some(slot) = slot.filter(|_| fits) else {
         return error(format!("You can't {} {}.", verb, name_of(&item)));
     };
-    for old in equipped(state, universe_id, player).await {
-        if old.id != item.id && slot_of(&old).as_deref() == Some(slot.as_str()) {
+    // Every item marked as the player's in this slot, not only the one that
+    // counted (equipped() keeps one per slot)
+    let carried_items = state
+        .object_store
+        .get_contents(universe_id, player)
+        .await
+        .unwrap_or_default();
+    for old in carried_items {
+        if old.id != item.id
+            && old.get_string("equipped_by") == Some(player)
+            && slot_of(&old).as_deref() == Some(slot.as_str())
+        {
             if let Err(e) = set_wearer(state, universe_id, &old.id, None).await {
                 return error(format!("Could not {}: {}", verb, e));
             }

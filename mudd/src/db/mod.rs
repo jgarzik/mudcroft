@@ -97,7 +97,7 @@ pub const DEADLINES_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS deadlines (
         universe_id TEXT NOT NULL,
         object_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn', 'wander')),
+        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn', 'wander', 'delete')),
         due_at INTEGER NOT NULL,
         PRIMARY KEY (universe_id, object_id, kind),
         FOREIGN KEY (universe_id, object_id)

@@ -280,10 +280,14 @@ impl ObjectStore {
     ) -> Result<()> {
         // Never into itself: walk up from the destination (bounded)
         let mut at = new_parent_id.map(str::to_string);
-        for _ in 0..1000 {
-            let Some(cur) = at else { break };
+        let mut depth = 0;
+        while let Some(cur) = at {
             if cur == id {
                 anyhow::bail!("{} cannot be put inside itself", id);
+            }
+            depth += 1;
+            if depth > 1000 {
+                anyhow::bail!("{} is nested too deep", cur);
             }
             at = self.get(universe_id, &cur).await?.and_then(|o| o.parent_id);
         }

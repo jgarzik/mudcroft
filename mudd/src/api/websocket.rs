@@ -831,8 +831,14 @@ async fn handle_client_message(
                 },
             )
             .await;
-            // Finished (saved or not): a gateway stops tracking it
-            if let Some(id) = id {
+            // Finished: saved, or refused with an error (nothing kept). A
+            // command that failed to commit (e.g. leadership lost) gets no
+            // done, so a gateway retries it after the failover.
+            let finished = match &saved {
+                Ok(()) => true,
+                Err(e) => e == COMMAND_FAILED,
+            };
+            if let (true, Some(id)) = (finished, id) {
                 state
                     .connections
                     .send_to_player(universe_id, player_id, ServerMessage::Done { id })
@@ -1180,7 +1186,10 @@ async fn execute_command(
         )
         .await
         {
-            return reply;
+            // A failing shadow verb falls back to the built-in
+            if !matches!(reply, ServerMessage::Error { .. }) {
+                return reply;
+            }
         }
     }
 

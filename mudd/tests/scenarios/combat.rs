@@ -1463,8 +1463,16 @@ async fn test_equipment() {
         "{}",
         eq
     );
-    // The maul's fixed 10 damage (20 on a critical), never a d6
-    let hit = say(&mut adm, "attack dummy").await;
+    // The maul's fixed 10 damage (20 on a critical), never a d6 (a natural
+    // 1 always misses: take blows until one lands)
+    adm.drain().await;
+    let mut hit = String::new();
+    for _ in 0..10 {
+        hit = attack(&mut adm, "attack dummy").await;
+        if hit.contains(" damage") {
+            break;
+        }
+    }
     assert!(
         hit.contains("for 10 damage") || hit.contains("for 20 damage"),
         "{}",
@@ -1668,4 +1676,110 @@ async fn test_custom_verbs_beat_soft_builtins() {
     adm.expect_output_containing("You take down the painting")
         .await
         .expect("the room's verb ran");
+}
+
+/// Wielding replaces every weapon marked as the player's, not only the one
+/// that counted
+#[tokio::test]
+async fn test_wield_clears_shadowed_weapon() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "juggler".into(),
+        })
+        .await
+        .unwrap();
+    let me = adm.player_id().unwrap().to_string();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/items/a-axe", "item", "{me}", {{name = "axe", slot = "weapon", equipped_by = "{me}"}})
+               game.create_object("/items/b-bow", "item", "{me}", {{name = "bow", slot = "weapon", equipped_by = "{me}"}})
+               game.create_object("/items/c-club", "item", "{me}", {{name = "club", slot = "weapon"}})
+               return "ok""#,
+            me = me
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("wield club").await.unwrap();
+    adm.expect_output_containing("You wield club")
+        .await
+        .unwrap();
+    adm.drain().await;
+    adm.command("equipment").await.unwrap();
+    let eq = adm.expect_output_containing("Armor class").await.unwrap();
+    assert!(eq.contains("weapon: club"), "{}", eq);
+}
+
+/// A killing blow runs on_damage, then on_death, even for an NPC deleted
+/// for good (it is deleted after both)
+#[tokio::test]
+async fn test_hooks_order_on_kill_of_npc_deleted_for_good() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "chronicler".into(),
+        })
+        .await
+        .unwrap();
+    let out = eval_as(
+        &mut adm,
+        &format!(
+            r#"game.create_object("/items/ledger", "item", "{e}", {{name = "ledger", log = ""}})
+               local h = game.store_code([[
+                 local function note(w) local l = game.get_object("/items/ledger") game.update_object("/items/ledger", {{log = l.metadata.log .. w}}) end
+                 return {{ on_damage = function(a) note("D") end, on_death = function(a) note("X") end }}]])
+               game.create_object("/npcs/moth", "npc", "{e}", {{name = "moth", hp = 1, max_hp = 1, armor_class = 1, respawn_seconds = 0, code_hash = h}})
+               return "ready""#,
+            e = entrance
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ready", "{}", out);
+    attack_until_slain(&mut adm, "attack moth", "moth").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (log, moth): (String, i64) = sqlx::query_as(
+        "SELECT (SELECT json_extract(properties, '$.log') FROM objects WHERE universe_id = ?1 AND id = '/items/ledger'),
+                (SELECT COUNT(*) FROM objects WHERE universe_id = ?1 AND id = '/npcs/moth')",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(log.ends_with("DX"), "on_damage then on_death: {:?}", log);
+    assert_eq!(moth, 0, "deleted afterwards");
+}
+
+/// A shadowing verb that fails falls back to the built-in
+#[tokio::test]
+async fn test_failing_shadow_verb_falls_back() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "unbuggy".into(),
+        })
+        .await
+        .unwrap();
+    let me = adm.player_id().unwrap().to_string();
+    eval_as(
+        &mut adm,
+        &format!(
+            r#"local h = game.store_code([[return {{ broken = function(a) error("oops") end }}]])
+               game.create_object("/items/totem", "item", "{e}", {{name = "totem", fixed = true, code_hash = h}})
+               game.add_action("remove", "/items/totem", "broken")
+               game.create_object("/items/cap", "item", "{me}", {{name = "cap", slot = "head", equipped_by = "{me}"}})
+               return "ok""#,
+            e = entrance,
+            me = me
+        ),
+    )
+    .await;
+    adm.drain().await;
+    adm.command("remove cap").await.unwrap();
+    adm.expect_output_containing("You stop using cap")
+        .await
+        .expect("the built-in ran");
 }

@@ -478,7 +478,8 @@ Two layers exist:
   goes through `combat::death`, which applies the universe's policy
   (`player_death`: corpse, keep, drop; `npc_death`: corpse, drop, destroy),
   respawns players at once, takes an NPC out of the world until its
-  `respawn_seconds` (a `respawn` row in `deadlines`; 0 deletes it), and
+  `respawn_seconds` (a `respawn` row in `deadlines`; 0: a `delete` row due
+  at once, so its `on_death` runs on the object before it goes), and
   credits its killer's `xp`. Corpses are `/corpses/c-...` items with a
   `decay` row; decaying spills what is left into the room. Messages and the
   `on_death` hook follow the commit (`report_death`). Player against player

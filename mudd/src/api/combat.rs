@@ -140,6 +140,16 @@ pub async fn pvp_allowed(
     }
 }
 
+/// A weapon's damage dice if within bounds (at most 100 dice of 1 to 1000
+/// sides, modifier within +-1000); else None (the bare 1d6)
+pub fn weapon_dice(notation: &str) -> Option<crate::combat::DiceRoll> {
+    crate::combat::parse_dice(notation).ok().filter(|roll| {
+        roll.count <= 100
+            && (1..=1000).contains(&roll.sides)
+            && roll.modifier.unsigned_abs() <= 1000
+    })
+}
+
 /// What one blow did, and what each party is told
 pub struct Blow {
     pub killed: bool,
@@ -167,10 +177,7 @@ pub async fn strike(
     let weapon = super::equipment::weapon(&gear);
     let dice = weapon
         .and_then(|w| w.get_string("damage"))
-        .and_then(|n| crate::combat::parse_dice(n).ok())
-        .filter(|roll| {
-            roll.count <= 100 && (1..=1000).contains(&roll.sides) && roll.modifier.abs() <= 1000
-        });
+        .and_then(weapon_dice);
     let dtype = weapon
         .and_then(|w| w.get_string("damage_type"))
         .and_then(|t| t.parse::<DamageType>().ok())
@@ -528,8 +535,6 @@ pub struct Death {
     pub respawn: Option<String>,
     /// XP the killer gained
     pub xp: Option<i64>,
-    /// on_death already ran (an NPC deleted for good runs it first)
-    pub on_death_done: bool,
 }
 
 /// Move a player (in the current run) and, once it commits, put their
@@ -712,7 +717,6 @@ pub async fn death(
 
     let mut respawn = None;
     let mut xp = None;
-    let mut on_death_done = false;
     if player {
         // Back at full HP, at the respawn room (or where they fell)
         respawn = state
@@ -754,18 +758,19 @@ pub async fn death(
             .unwrap_or(DEFAULT_RESPAWN_S)
             .min(MAX_DELAY_S);
         if respawn_s == 0 {
-            // Its on_death runs while it still exists (its code and owner
-            // go with it), then it goes for good with whatever it holds
-            run_on_death(
-                state,
-                universe_id,
-                id,
-                room.as_deref(),
-                killer.map(|k| k.id.as_str()),
-            )
-            .await;
-            on_death_done = true;
-            delete_tree(state, universe_id, id, room.as_deref()).await?;
+            // Gone for good, but only once its on_death has run (after the
+            // commit, like every death report): out of the world now, then
+            // a `delete` deadline due at once deletes it with what it holds
+            store
+                .execute_batch(vec![
+                    crate::combat::engine::remove_from_room_statement(universe_id, id),
+                    statement(
+                        "INSERT OR REPLACE INTO deadlines (universe_id, object_id, kind, due_at)
+                         VALUES (?, ?, 'delete', ?)",
+                        vec![json!(universe_id), json!(id), json!(now)],
+                    ),
+                ])
+                .await?;
         } else {
             let home = victim
                 .get_string("home_room")
@@ -775,10 +780,9 @@ pub async fn death(
             if let Some(ref home) = home {
                 props.push(("home_room", json!(home)));
             }
-            // Fallback if the home room is gone by the respawn
-            if let Some(ref room) = room {
-                props.push(("died_in", json!(room)));
-            }
+            // Fallback if the home room is gone by the respawn (this
+            // death's room, or none)
+            props.push(("died_in", json!(room)));
             store
                 .execute_batch(vec![
                     crate::objects::ObjectStore::set_properties_statement(universe_id, id, &props)?,
@@ -807,7 +811,6 @@ pub async fn death(
         room,
         respawn,
         xp,
-        on_death_done,
     })
 }
 
@@ -867,16 +870,14 @@ pub async fn report_death(state: &AppState, universe_id: &str, d: &Death) {
         }
     }
     if !is_player(&d.victim) {
-        if !d.on_death_done {
-            run_on_death(
-                state,
-                universe_id,
-                id,
-                d.room.as_deref(),
-                d.killer.as_deref(),
-            )
-            .await;
-        }
+        run_on_death(
+            state,
+            universe_id,
+            id,
+            d.room.as_deref(),
+            d.killer.as_deref(),
+        )
+        .await;
         return;
     }
     state
@@ -1306,6 +1307,13 @@ async fn deadline(
                     return Ok(());
                 };
                 store.move_object(&u, &id, Some(&home)).await?;
+                store
+                    .execute_batch(vec![crate::objects::ObjectStore::set_properties_statement(
+                        &u,
+                        &id,
+                        &[("died_in", json!(null))],
+                    )?])
+                    .await?;
                 notes.push(Note::Room(
                     u.clone(),
                     home.clone(),
@@ -1313,6 +1321,10 @@ async fn deadline(
                     None,
                 ));
                 arrival(state, &u, &id, &home).await;
+            }
+            "delete" => {
+                // An NPC gone for good, after its death was reported
+                delete_tree(state, &u, &id, None).await?;
             }
             "wander" => {
                 // Opt-in (wander_seconds), and only while it lasts
@@ -1346,4 +1358,22 @@ async fn deadline(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_weapon_dice_bounds() {
+        assert!(weapon_dice("2d4+1").is_some());
+        assert!(
+            weapon_dice("1d6-2147483648").is_none(),
+            "no overflow on i32::MIN"
+        );
+        assert!(weapon_dice("1d6+1001").is_none());
+        assert!(weapon_dice("101d6").is_none());
+        assert!(weapon_dice("1d0").is_none());
+        assert!(weapon_dice("1d1001").is_none());
+    }
 }

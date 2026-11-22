@@ -363,6 +363,9 @@ fn tag_command(text: &str) -> (String, Option<InFlight>) {
 /// Commands sent to the primary and not yet answered `done`, oldest first
 type InFlightQueue = std::collections::VecDeque<InFlight>;
 
+/// Most commands waiting for their `done` (more are refused, never dropped)
+const MAX_IN_FLIGHT: usize = 64;
+
 /// If `text` is a `done` for a command in flight: removes it, and says
 /// whether the client should see it (only for ids the client chose)
 fn take_done(text: &str, in_flight: &mut InFlightQueue) -> bool {
@@ -452,9 +455,19 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                     Some(Ok(Message::Text(text))) => {
                         let (json, command) = tag_command(&text);
                         if let Some(command) = command {
-                            // Bounded: an unanswering primary is lost soon
-                            if in_flight.len() >= 64 {
-                                in_flight.pop_front();
+                            // Bounded: never drop one silently; refuse more
+                            if in_flight.len() >= MAX_IN_FLIGHT {
+                                let refused = send_json(
+                                    &mut socket,
+                                    &ServerMessage::Error {
+                                        message: "Too many commands waiting; slow down.".to_string(),
+                                    },
+                                )
+                                .await;
+                                if !refused {
+                                    break Outcome::ClientGone;
+                                }
+                                continue;
                             }
                             in_flight.push_back(command);
                         }
