@@ -753,6 +753,124 @@ pub async fn engine_hook(
     }
 }
 
+/// After a move (walking, goto, spawning, a Lua move, fleeing,
+/// wandering): the regions' on_leave/on_enter if the move crossed into
+/// another region, on_init on each object with code already in `to` (and
+/// on the newcomer, per object, if it has code), and the moved object's
+/// on_move. Engine hooks, as their objects' owners, within the action's
+/// hook budget.
+pub async fn move_extras(
+    state: &AppState,
+    universe_id: &str,
+    moved: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    actor: Option<&str>,
+) {
+    with_ai_budget(move_extras_inner(
+        state,
+        universe_id,
+        moved,
+        from,
+        to,
+        actor,
+    ))
+    .await
+}
+
+async fn move_extras_inner(
+    state: &AppState,
+    universe_id: &str,
+    moved: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    actor: Option<&str>,
+) {
+    let store = &state.object_store;
+    let get = |id: Option<&str>| {
+        let id = id.map(str::to_string);
+        async move {
+            match id {
+                Some(id) => store.get(universe_id, &id).await.ok().flatten(),
+                None => None,
+            }
+        }
+    };
+    let (from_room, to_room) = (get(from).await, get(to).await);
+    let region = |room: &Option<Object>| room.as_ref().and_then(region_of);
+    let (rf, rt) = (region(&from_room), region(&to_room));
+    let args = json!({ "moved_id": moved, "from": from, "to": to, "actor_id": actor });
+    if rf != rt {
+        for (region_id, handler) in [(rf, "on_leave"), (rt, "on_enter")] {
+            let Some(region_id) = region_id else { continue };
+            let is_region = match store.get(universe_id, &region_id).await {
+                Ok(Some(r)) => {
+                    r.code_hash.is_some()
+                        && state
+                            .classes
+                            .read()
+                            .await
+                            .is_a(universe_id, &r.class, "region")
+                }
+                _ => false,
+            };
+            if is_region {
+                engine_hook(
+                    state,
+                    universe_id,
+                    &region_id,
+                    to.map(str::to_string),
+                    handler,
+                    args.clone(),
+                )
+                .await;
+            }
+        }
+    }
+    let moved_obj = get(Some(moved)).await;
+    if let Some(to) = to {
+        let present = store
+            .get_contents(universe_id, to)
+            .await
+            .unwrap_or_default();
+        for p in present.iter().filter(|p| p.id != moved) {
+            if p.code_hash.is_some() {
+                engine_hook(
+                    state,
+                    universe_id,
+                    &p.id,
+                    Some(to.to_string()),
+                    "on_init",
+                    json!({ "arrived_id": moved, "actor_id": actor }),
+                )
+                .await;
+            }
+            if moved_obj.as_ref().is_some_and(|m| m.code_hash.is_some()) {
+                engine_hook(
+                    state,
+                    universe_id,
+                    moved,
+                    Some(to.to_string()),
+                    "on_init",
+                    json!({ "other_id": p.id, "actor_id": actor }),
+                )
+                .await;
+            }
+        }
+    }
+    if moved_obj.as_ref().is_some_and(|m| m.code_hash.is_some()) {
+        engine_hook(
+            state,
+            universe_id,
+            moved,
+            to.map(str::to_string),
+            "on_move",
+            args,
+        )
+        .await;
+    }
+}
+
 /// The exits of a room as (direction, destination)
 fn exits(room: &Object) -> Vec<(String, String)> {
     room.properties

@@ -619,3 +619,71 @@ async fn test_lua_move_records_safe_location() {
     .await;
     assert_eq!(safe, "/rooms/hub");
 }
+
+/// Crossing into another region runs the old region's on_leave and the new
+/// one's on_enter; arriving runs on_init on each object there with code
+/// (and on the newcomer, per object, if it has code); anything moved with
+/// code runs its on_move
+#[tokio::test]
+async fn test_region_init_and_move_hooks() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "regions_wiz").await;
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/items/journal", "item", nil, {name = "journal", log = ""})
+           local note = [[local function note(w) local j = game.get_object("/items/journal") game.update_object("/items/journal", {log = j.metadata.log .. w .. ";"}) end ]]
+           local forest = game.store_code(note .. [[return {
+             on_enter = function(a) note("enter-forest:" .. tostring(a.moved_id == a.actor_id)) end,
+             on_leave = function(a) note("leave-forest") end }]])
+           local town = game.store_code(note .. [[return {
+             on_enter = function(a) note("enter-town") end,
+             on_leave = function(a) note("leave-town") end }]])
+           local shopkeeper = game.store_code(note .. [[return {
+             on_init = function(a) note("init-shop:" .. tostring(a.arrived_id ~= nil)) end }]])
+           local wanderstone = game.store_code(note .. [[return {
+             on_move = function(a) note("moved-stone:" .. tostring(a.to)) end }]])
+           game.create_object("/d/forest", "region", nil, {name = "Forest", code_hash = forest})
+           game.create_object("/d/town", "region", nil, {name = "Town", code_hash = town})
+           game.create_object("/d/town/gate", "room", "/d/town", {name = "Town Gate", exits = {west = "/d/forest/edge"}})
+           game.create_object("/d/forest/edge", "room", "/d/forest", {name = "Forest Edge", exits = {east = "/d/town/gate"}})
+           game.create_object("/d/forest/edge/hermit", "npc", "/d/forest/edge", {name = "hermit", code_hash = shopkeeper})
+           game.create_object("/items/stone", "item", "/d/town/gate", {name = "stone", code_hash = wanderstone})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    wiz.drain().await;
+    wiz.command("goto /d/town/gate").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    wiz.drain().await;
+    wiz.command("west").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    eval(
+        &mut wiz,
+        r#"game.move_object("/items/stone", "/d/forest/edge") return "ok""#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let log: String = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.log') FROM objects WHERE universe_id = ? AND id = '/items/journal'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(
+        log.contains("leave-town;enter-forest:true;"),
+        "regions crossed: {}",
+        log
+    );
+    assert!(
+        log.contains("init-shop:true;"),
+        "on_init on the hermit: {}",
+        log
+    );
+    assert!(
+        log.contains("moved-stone:/d/forest/edge;"),
+        "on_move on the stone: {}",
+        log
+    );
+}

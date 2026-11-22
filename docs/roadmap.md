@@ -102,14 +102,8 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Weapon `on_hit` handler**: weapons deal damage parts of several types
   (`damage_parts`, `Combat.attack_extended`); a weapon's own code run on a
   hit is not built.
-- **Region hooks**: `on_enter`/`on_leave` on the region when a player
-  crosses region boundaries.
-- **An LPC-style `init()` cascade on moves.** `game.move_object` already
-  runs the containers' `on_leave`/`on_enter`; add `on_init` between
-  the newcomer and each object present, so objects can offer contextual
-  verbs ("get sword", "wield sword") and remove them on `on_move`.
-- **More lifecycle handlers**: `on_move`, `on_reset` (room respawn
-  timer), `on_disconnect` (`on_create` and `on_destroy` fire).
+- **More lifecycle handlers**: `on_reset` (room respawn timer),
+  `on_disconnect` (`on_create`, `on_destroy`, `on_init`, `on_move` fire).
 - **Persistent actions**: registered verbs are in memory and lost on restart.
 - **High-occupancy rooms**: above about 100 occupants, send an aggregated
   view (count, notable entities, sampled chat).

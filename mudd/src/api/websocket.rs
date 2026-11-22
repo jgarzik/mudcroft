@@ -1125,12 +1125,22 @@ impl Hook {
 /// object's owner (see scripting::invoke_handler); errors are logged.
 async fn run_hook(state: &AppState, universe_id: &str, hook: Hook) {
     // Entering a room: aggressive NPCs there notice (api/combat.rs)
-    if hook.method == "on_enter" {
-        if let (Some(room), Some(moved)) = (hook.room_id.as_deref(), hook.args["moved_id"].as_str())
-        {
-            super::combat::arrival(state, universe_id, moved, room).await;
+    let entered = if hook.method == "on_enter" {
+        match (hook.room_id.clone(), hook.args["moved_id"].as_str()) {
+            (Some(room), Some(moved)) => {
+                super::combat::arrival(state, universe_id, moved, &room).await;
+                Some((
+                    moved.to_string(),
+                    hook.args["from"].as_str().map(str::to_string),
+                    room,
+                    hook.args["actor_id"].as_str().map(str::to_string),
+                ))
+            }
+            _ => None,
         }
-    }
+    } else {
+        None
+    };
     if let Err(e) = scripting::invoke_handler(
         state,
         universe_id,
@@ -1142,6 +1152,18 @@ async fn run_hook(state: &AppState, universe_id: &str, hook: Hook) {
     .await
     {
         warn!("{} hook on {} failed: {}", hook.method, hook.object_id, e);
+    }
+    // Then regions crossed, on_init, on_move
+    if let Some((moved, from, to, actor)) = entered {
+        super::combat::move_extras(
+            state,
+            universe_id,
+            &moved,
+            from.as_deref(),
+            Some(&to),
+            actor.as_deref(),
+        )
+        .await;
     }
 }
 

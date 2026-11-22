@@ -284,6 +284,8 @@ const ENGINE_HOOKS: &[&str] = &[
     "on_destroy",
     "ai_idle_tick",
     "ai_combat_tick",
+    "on_init",
+    "on_move",
 ];
 
 impl GameApi {

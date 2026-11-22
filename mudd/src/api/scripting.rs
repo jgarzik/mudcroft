@@ -575,6 +575,29 @@ async fn handle_moved(
         super::combat::arrival(state, universe_id, object_id, room).await;
     }
 
+    run_move_hooks(state, universe_id, object_id, &from, &to, &moved_by, budget).await;
+    // Then regions crossed, on_init, on_move (their own hook budget)
+    super::combat::move_extras(
+        state,
+        universe_id,
+        object_id,
+        from.as_deref(),
+        to.as_deref(),
+        None,
+    )
+    .await;
+}
+
+/// The containers' on_leave / on_enter for a Lua move
+async fn run_move_hooks(
+    state: &AppState,
+    universe_id: &str,
+    object_id: &str,
+    from: &Option<String>,
+    to: &Option<String>,
+    moved_by: &Option<String>,
+    budget: &HookBudget,
+) {
     if budget.depth >= MAX_MOVE_HOOK_DEPTH {
         tracing::warn!(
             "move hooks for {} not run: nested {} deep",

@@ -439,6 +439,9 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 | `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
 | `on_create` | the object is created (`game.create_object`) or cloned (`game.clone_object`) with code attached | the new object | `room_id` |
 | `on_destroy` | the object is about to be deleted (`game.delete_object`, a death that deletes it, a decaying corpse) | the object, still there | `room_id` |
+| `on_enter` / `on_leave` (region) | a move crosses into (out of) the region: a room's region is its `region_id`, else its parent, of class `region` | the region | `moved_id`, `from`, `to`, `actor_id` |
+| `on_init` | something arrives where the object is (any move, as for `on_enter`) | each object with code already there, with `arrived_id`; and the newcomer, if it has code, once per object there, with `other_id` | `room_id`, `actor_id` |
+| `on_move` | the object is moved (any move) | the moved object | `from`, `to`, `moved_id`, `actor_id` |
 | any name | a `call_out` is due | the object | `room_id`, `args` (the string given to `call_out`, or `nil`) |
 | any name | a custom verb is typed | the verb's object | `actor_id`, `room_id`, `verb`, `args` (the rest of the line) |
 | any name | `game.use_object` is called | the used object | `actor_id`, `verb`, `target_id`, `code_hash` |
@@ -456,8 +459,8 @@ Hook details:
 - **Return values:** hook return values are ignored. Errors are logged on the server.
 - **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
   - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
-- **Engine-invoked hooks** (`on_create`, `on_destroy`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action: at most 4 deep (a hook's doing setting off another) and 32 calls; beyond it they are skipped (and logged).
-- **Unwired hooks:** region objects get no hooks. The class handler names `on_init`, `on_move` and `on_use` are **never fired by the server**; you can call them with `game.use_object`. `ai_idle_tick` and `ai_combat_tick` are fired for NPCs (see [Built-in combat](#built-in-combat)).
+- **Engine-invoked hooks** (region hooks, `on_init`, `on_move`, `on_create`, `on_destroy`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action: at most 4 deep (a hook's doing setting off another) and 32 calls; beyond it they are skipped (and logged). After a move they run after the room's `on_enter`.
+- **Unwired hooks:** the class handler name `on_use` is fired only by `game.use_object` (verb `"use"`).
 
 ### `parent(class_name, handler_name, args)`
 
@@ -1109,12 +1112,12 @@ if refused. Doesn't affect `math.random`.
 
 Calls a handler on another object's code.
 
-- `verb` picks the handler: `"use"` runs `on_use`, `"hit"` runs `on_hit`, `"look"` runs `on_look`, `"init"` runs `on_init`. Any other verb is used as the handler name.
+- `verb` picks the handler: `"use"` runs `on_use`, `"hit"` runs `on_hit`, `"look"` runs `on_look`. Any other verb is used as the handler name.
 - The handler gets `{object_id, actor_id, verb, code_hash, target_id}`.
 - It runs in a **fresh sandbox, as that object's owner**, with object-code limits. Its object context is that object, and its room context is the object's `parent_id`.
 - The caller's identity is never passed on.
 - `actor_id` is whatever the caller passed. Handlers must treat it as untrusted: it need not be the player who acted.
-- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`, `ai_idle_tick` and `ai_combat_tick`. Such calls return `nil`.
+- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`, `on_init`, `on_move`, `ai_idle_tick` and `ai_combat_tick`. Such calls return `nil`.
 - Nesting is limited to 8 levels, and one top-level execution may make at most 32 `use_object` calls in total, across all levels. Call 33 raises an error.
 
 **Returns** the handler's result as plain data: tables, strings, numbers
@@ -1289,7 +1292,7 @@ use the [`Combat`](#combat) library or your own code.
 
 These are not built yet. See the [roadmap](../../docs/roadmap.md).
 
-- **Unfired handlers:** `on_init`, `on_move` and `on_use` never fire on their own. Call them with `game.use_object`, or start a heartbeat yourself.
+- **Unfired handlers:** `on_use` fires only through `game.use_object`.
 - **Missing player commands:** there is no `use` or `give` command. Add verbs with `game.add_action`.
 - **Universe config:** keys such as `spawn_room` are not read by the server; use `setportal`.
 

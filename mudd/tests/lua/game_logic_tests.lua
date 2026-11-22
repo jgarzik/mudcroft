@@ -191,40 +191,8 @@ function test_region_with_attached_code()
     Test.assert(string.find(retrieved_code, "on_enter", 1, true), "Code should contain on_enter handler")
 end
 
-function test_region_code_executes_on_enter()
-    local actors = setup_test_world()
-    act_as(actors.wizard)
-
-    -- Create region with on_enter handler
-    local region_code = [[
-        return {
-            on_enter = function(args)
-                local region = game.get_object(args.object_id)
-                game.update_object(args.actor_id, { visited_haunted = true })
-                return "Welcome to " .. region.name
-            end
-        }
-    ]]
-    local code_hash = game.store_code(region_code)
-
-    local region = create(P("/haunted-forest"), "region", nil, {
-        name = "Haunted Forest",
-        code_hash = code_hash
-    })
-
-    -- Create room in region
-    local room = create(P("/haunted-forest/entrance"), "room", region.id, {
-        name = "Forest Entrance",
-        exits = {}
-    })
-
-    -- Move player into room (should trigger region's on_enter)
-    game.move_object(actors.body, room.id)
-
-    -- Verify handler executed
-    local updated_player = game.get_object(actors.body)
-    Test.assert(updated_player.metadata.visited_haunted == true, "on_enter handler should have set flag")
-end
+-- (A region's on_enter on crossing in: a scenario test,
+-- test_region_init_and_move_hooks, since move hooks run after a script.)
 
 function test_region_permission_check_wizard_required()
     local actors = setup_test_world()
@@ -1380,7 +1348,6 @@ local TESTS = {
     -- User Story 1: Region Creation
     { "regions", "test_region_creation_basic", test_region_creation_basic },
     { "regions", "test_region_with_attached_code", test_region_with_attached_code },
-    { "regions", "test_region_code_executes_on_enter", test_region_code_executes_on_enter },
     { "regions", "test_region_permission_check_wizard_required", test_region_permission_check_wizard_required },
 
     -- User Story 2: Fixed Objects
@@ -1434,7 +1401,6 @@ local TESTS = {
 -- Tests not run, with the reason. "BUG:" marks a server bug: the test
 -- asserts the correct behavior and should pass once the bug is fixed.
 local SKIP = {
-    test_region_code_executes_on_enter = "region hooks are not built yet (roadmap phase 3)",
 }
 
 local function run_all_tests(section)
