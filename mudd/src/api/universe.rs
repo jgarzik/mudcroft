@@ -140,14 +140,15 @@ pub fn router() -> Router<AppState> {
         .route("/universe/{id}/portal", post(set_portal))
 }
 
-fn error_response(status: StatusCode, error: impl Into<String>) -> axum::response::Response {
+type ApiError = (StatusCode, Json<ErrorResponse>);
+
+fn api_error(status: StatusCode, error: impl Into<String>) -> ApiError {
     (
         status,
         Json(ErrorResponse {
             error: error.into(),
         }),
     )
-        .into_response()
 }
 
 /// Authenticate the caller and require admin+ in universe `universe_id`
@@ -157,13 +158,11 @@ async fn universe_admin(
     state: &AppState,
     headers: &HeaderMap,
     universe_id: &str,
-) -> Result<(Account, crate::objects::UniverseInfo), axum::response::Response> {
-    let account = authenticate(headers, state)
-        .await
-        .map_err(IntoResponse::into_response)?;
+) -> Result<(Account, crate::objects::UniverseInfo), ApiError> {
+    let account = authenticate(headers, state).await?;
     // Normalize like create and /ws (ids are case-insensitive)
     let universe_id = validate_universe_id(universe_id).map_err(|e| {
-        error_response(
+        api_error(
             StatusCode::BAD_REQUEST,
             format!("Invalid universe ID: {}", e),
         )
@@ -171,13 +170,13 @@ async fn universe_admin(
     let universe = match state.object_store.get_universe(&universe_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return Err(error_response(
+            return Err(api_error(
                 StatusCode::NOT_FOUND,
                 format!("Universe not found: {}", universe_id),
             ))
         }
         Err(e) => {
-            return Err(error_response(
+            return Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Database error: {}", e),
             ))
@@ -188,7 +187,7 @@ async fn universe_admin(
         .get_access_level(&universe.id, &account.id)
         .await;
     if !level.can_admin() {
-        return Err(error_response(
+        return Err(api_error(
             StatusCode::FORBIDDEN,
             "Admin access or universe ownership required",
         ));
@@ -213,34 +212,38 @@ async fn set_portal(
 ) -> impl IntoResponse {
     let (_account, universe) = match universe_admin(&state, &headers, &universe_id).await {
         Ok(ok) => ok,
-        Err(response) => return response,
+        Err(e) => return e.into_response(),
     };
     let room = match state.object_store.get(&universe.id, &request.room_id).await {
         Ok(Some(room)) => room,
         Ok(None) => {
-            return error_response(
+            return api_error(
                 StatusCode::NOT_FOUND,
                 format!("Room not found: {}", request.room_id),
             )
+            .into_response()
         }
         Err(e) => {
-            return error_response(
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Database error: {}", e),
             )
+            .into_response()
         }
     };
     if room.class != "room" {
-        return error_response(
+        return api_error(
             StatusCode::BAD_REQUEST,
             format!("{} is not a room", request.room_id),
-        );
+        )
+        .into_response();
     }
     if let Err(e) = state.object_store.set_portal(&universe.id, &room.id).await {
-        return error_response(
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to set portal: {}", e),
-        );
+        )
+        .into_response();
     }
     Json(serde_json::json!({ "universe_id": universe.id, "room_id": room.id })).into_response()
 }
@@ -516,7 +519,7 @@ async fn run_script(
 ) -> impl IntoResponse {
     let (account, universe) = match universe_admin(&state, &headers, &universe_id).await {
         Ok(ok) => ok,
-        Err(response) => return response,
+        Err(e) => return e.into_response(),
     };
     let universe_id = universe.id.clone();
 
