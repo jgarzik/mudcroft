@@ -18,8 +18,8 @@ interface GameState {
   connectionStatus: ConnectionStatus
   playerId: string | null
   themeId: string
-  // The payment prompt on screen (not persisted)
-  pendingPayment: PaymentRequest | null
+  // Payment prompts waiting for an answer, oldest first (not persisted)
+  pendingPayments: PaymentRequest[]
 }
 
 interface GameActions {
@@ -34,7 +34,9 @@ interface GameActions {
   setConnectionStatus: (status: ConnectionStatus) => void
   setPlayerId: (id: string) => void
   setThemeId: (id: string) => void
-  setPendingPayment: (payment: PaymentRequest | null) => void
+  addPendingPayment: (payment: PaymentRequest) => void
+  removePendingPayment: (id: string) => void
+  clearPendingPayments: () => void
   clearMessages: () => void
 }
 
@@ -57,7 +59,7 @@ export const useGameStore = create<GameStore>()(
       connectionStatus: 'disconnected',
       playerId: null,
       themeId: DEFAULT_THEME_ID,
-      pendingPayment: null,
+      pendingPayments: [],
 
       // Auth actions
       login: (token, username) =>
@@ -105,8 +107,14 @@ export const useGameStore = create<GameStore>()(
       setThemeId: (id) =>
         set({ themeId: id }),
 
-      setPendingPayment: (payment) =>
-        set({ pendingPayment: payment }),
+      addPendingPayment: (payment) =>
+        set((state) => ({ pendingPayments: [...state.pendingPayments, payment] })),
+
+      removePendingPayment: (id) =>
+        set((state) => ({ pendingPayments: state.pendingPayments.filter((p) => p.id !== id) })),
+
+      clearPendingPayments: () =>
+        set({ pendingPayments: [] }),
 
       clearMessages: () =>
         set({ messages: [] }),

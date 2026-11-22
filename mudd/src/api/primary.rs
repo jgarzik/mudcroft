@@ -100,10 +100,17 @@ async fn handle_orphaned_sessions(state: AppState) {
     };
     for (universe, player, since) in online {
         // Not if they have a session or a disconnect pending here (that
-        // grace period stays in charge)
+        // grace period stays in charge); a reconnect meanwhile cancels it
+        let Some(gen) = state
+            .connections
+            .begin_orphaned_disconnect(&universe, &player)
+            .await
+        else {
+            continue;
+        };
         if !state
             .connections
-            .claim_orphaned_disconnect(&universe, &player)
+            .claim_expired_disconnect(&universe, &player, gen)
             .await
         {
             continue;

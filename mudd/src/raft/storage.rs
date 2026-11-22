@@ -94,6 +94,48 @@ async fn relaxed_sync(conn: &mut SqliteConnection) -> io::Result<()> {
     Ok(())
 }
 
+/// A pooled connection set to `synchronous = NORMAL`. It goes back to the
+/// pool only through `restore` (back to FULL); dropped any other way (an
+/// error, or the future cancelled) it is detached and closed, so no log
+/// append can ever run on it unsynced.
+struct RelaxedConn {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+}
+
+impl RelaxedConn {
+    async fn acquire(pool: &SqlitePool) -> io::Result<Self> {
+        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
+        relaxed_sync(&mut conn).await?;
+        Ok(Self { conn: Some(conn) })
+    }
+
+    fn conn(&mut self) -> &mut SqliteConnection {
+        self.conn
+            .as_mut()
+            .expect("connection present until restore")
+    }
+
+    /// Back to FULL, then back to the pool
+    async fn restore(mut self) -> io::Result<()> {
+        let mut conn = self.conn.take().expect("connection present until restore");
+        match full_sync(&mut conn).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                conn.detach();
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for RelaxedConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            conn.detach();
+        }
+    }
+}
+
 /// Back to the pool's default before the connection is returned
 async fn full_sync(conn: &mut SqliteConnection) -> io::Result<()> {
     sqlx::query("PRAGMA synchronous = FULL")
@@ -257,16 +299,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     /// (the next log append's sync carries it)
     async fn save_committed(&mut self, committed: Option<LogId>) -> io::Result<()> {
         let pool = self.pool.read().await;
-        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
-        relaxed_sync(&mut conn).await?;
-        let written = write_meta(&mut conn, "committed", &committed).await;
-        // Back to syncing before the connection returns to the pool (or
-        // never returns)
-        if let Err(e) = full_sync(&mut conn).await {
-            conn.detach();
-            return Err(e);
-        }
-        written
+        let mut conn = RelaxedConn::acquire(&pool).await?;
+        write_meta(conn.conn(), "committed", &committed).await?;
+        conn.restore().await
     }
 
     async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
@@ -697,11 +732,10 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         let mut replies = Vec::with_capacity(batch.len());
 
         let pool = self.pool.read().await;
-        let mut conn = pool.acquire().await.map_err(io::Error::other)?;
         // Not synced: the log entry already is (see relaxed_sync)
-        relaxed_sync(&mut conn).await?;
+        let mut conn = RelaxedConn::acquire(&pool).await?;
         let applied = async {
-            let mut tx = sqlx::Connection::begin(&mut *conn)
+            let mut tx = sqlx::Connection::begin(conn.conn())
                 .await
                 .map_err(io::Error::other)?;
             for (entry, responder) in batch {
@@ -725,12 +759,8 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         }
         .await;
         // Whatever happened, the connection goes back syncing: log appends
-        // use the same pool. If even that fails, it never goes back.
-        if full_sync(&mut conn).await.is_err() {
-            conn.detach();
-        } else {
-            drop(conn);
-        }
+        // use the same pool (RelaxedConn sees to it, even if cancelled)
+        conn.restore().await?;
         applied?;
 
         // No checkpoint here: in WAL mode a committed transaction is visible

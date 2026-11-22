@@ -143,6 +143,9 @@ async fn login(
         .unwrap_or("internal");
     let username = req.username.to_lowercase();
     let user_key = format!("{}|{}", username, client);
+    // A client with no recent failures for this name skips the slow queue
+    // below: attackers filling it cannot keep the owner out
+    let fresh_client = state.auth_by_user.fresh(&user_key);
     // Reserve before hashing (a burst cannot slip past a check made while
     // others are still hashing); a successful login gives the tokens back
     if let Err(retry) = state.auth_by_user.check(&user_key) {
@@ -157,7 +160,7 @@ async fn login(
     // try), rather than being refused, so the owner can still log in; a
     // queue longer than 10 is refused
     let global_ok = state.auth_by_user_global.check(&username).is_ok();
-    let _serialized = if global_ok {
+    let _serialized = if global_ok || fresh_client {
         None
     } else {
         let Some(lock) = state.auth_user_locks.get(&username, 10) else {

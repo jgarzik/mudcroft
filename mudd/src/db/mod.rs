@@ -93,6 +93,33 @@ const CREDITS_HOLDER_TRIGGER: &str = r#"
             END
             "#;
 
+/// The Raft members this database's node last applied (from `raft_meta`
+/// `last_membership`): (node id, address)
+pub async fn recorded_members(pool: &SqlitePool) -> Result<Vec<(i64, String)>> {
+    let json: Option<String> =
+        sqlx::query_scalar("SELECT value FROM raft_meta WHERE key = 'last_membership'")
+            .fetch_optional(pool)
+            .await?;
+    let Some(json) = json else {
+        return Ok(Vec::new());
+    };
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let mut members: Vec<(i64, String)> = value["membership"]["nodes"]
+        .as_object()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|(id, node)| {
+                    let addr = node["addr"].as_str().unwrap_or_default().to_string();
+                    id.parse().ok().map(|id| (id, addr))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    members.sort();
+    Ok(members)
+}
+
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
     pool: SqlitePool,
@@ -185,6 +212,18 @@ impl Database {
         }
         if version == 8 {
             sqlx::query(CLUSTER_NODES_TABLE).execute(&self.pool).await?;
+            // A cluster member already knows its members: record them, so
+            // their ids are never handed out again
+            for (node_id, addr) in recorded_members(&self.pool).await? {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO cluster_nodes (node_id, addr, added_at) VALUES (?, ?, ?)",
+                )
+                .bind(node_id)
+                .bind(addr)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&self.pool)
+                .await?;
+            }
             self.set_schema_version(9).await?;
             info!("Upgraded database schema 8 -> 9");
             version = 9;

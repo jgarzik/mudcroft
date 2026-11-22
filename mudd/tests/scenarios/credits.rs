@@ -411,3 +411,60 @@ async fn test_ambiguous_verb_target_cannot_ask_for_payment() {
     assert_eq!(balance(&server, "object", "/items/chest").await, 5);
     assert_eq!(balance(&server, "object", "/items/c").await, 0);
 }
+
+/// Once the handler has run, the payment stands even if it failed part way
+/// (it may already have handed something over); a handler that does not
+/// exist ran nothing, so the payment is refunded
+#[tokio::test]
+async fn test_payment_after_handler_failure() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = connect(
+        &server,
+        Role::Admin {
+            username: "fail_admin".into(),
+        },
+    )
+    .await;
+    let mut pl = connect(
+        &server,
+        Role::Player {
+            username: "unlucky".into(),
+        },
+    )
+    .await;
+    let pl_id = pl.account_id().to_string();
+    let out = eval(
+        &mut adm,
+        &format!(
+            r#"game.admin_grant_credits("{p}", 20)
+               local h = game.store_code([[return {{
+                 flaky = function(a) game.request_payment(4, "a flaky thing", "broken") return nil end,
+                 ghost = function(a) game.request_payment(4, "nothing", "nosuch") return nil end,
+                 broken = function(a) error("half way") end,
+               }}]])
+               game.create_object("/items/stall", "item", "{room}", {{name = "stall", fixed = true, code_hash = h}})
+               game.add_action("flaky", "/items/stall", "flaky")
+               game.add_action("ghost", "/items/stall", "ghost")
+               return "ok""#,
+            p = pl_id,
+            room = server.world().entrance_id
+        ),
+    )
+    .await;
+    assert_eq!(out["text"], "ok", "{}", out);
+
+    pl.drain().await;
+    pl.command("flaky stall").await.unwrap();
+    let (id, _) = prompt(&mut pl).await;
+    assert!(answer(&mut pl, &id, true).await.contains("went wrong"));
+    assert_eq!(
+        balance(&server, "account", &pl_id).await,
+        16,
+        "the payment stands"
+    );
+
+    pl.command("ghost stall").await.unwrap();
+    let (id, _) = prompt(&mut pl).await;
+    assert!(answer(&mut pl, &id, true).await.contains("returned"));
+    assert_eq!(balance(&server, "account", &pl_id).await, 16, "refunded");
+}

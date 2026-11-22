@@ -394,4 +394,51 @@ mod tests {
         .unwrap();
         assert_eq!(triggers, 1);
     }
+
+    /// Upgrading a cluster member's database to 9 records the members it
+    /// knows in cluster_nodes (so their ids are never reused)
+    #[tokio::test]
+    async fn test_upgrade_records_cluster_members() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("member.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            for sql in [
+                "DROP TABLE cluster_nodes",
+                "DROP TABLE online_players",
+                "DROP TABLE payment_requests",
+                "PRAGMA user_version = 8",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_membership', ?)")
+                .bind(r#"{"log_id":null,"membership":{"configs":[[1,3]],"nodes":{"1":{"addr":"a:1"},"3":{"addr":"c:3"}}}}"#)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.pool().close().await;
+        }
+        init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .unwrap();
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT node_id FROM cluster_nodes ORDER BY node_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ids, vec![1, 3]);
+    }
 }

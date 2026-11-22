@@ -417,6 +417,17 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 return;
             }
             Outcome::NotReady => {
+                if tokio::time::Instant::now() >= deadline {
+                    let _ = send_json(
+                        &mut socket,
+                        &ServerMessage::Error {
+                            message: "The world is unavailable (no primary). Try again later."
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             Outcome::Lost => {

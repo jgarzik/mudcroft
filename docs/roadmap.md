@@ -23,6 +23,11 @@ primary lifecycle, gateways, failover), with these gaps:
   when the primary dies may or may not have taken effect; the player is told
   and nothing is retried (one batch per command and command ids would fix
   it).
+- **A payment and its handler are separate changes.** Accepting a payment
+  moves the credits, then runs the object's handler (its own writes); a
+  crash in between leaves the player charged with nothing handed over, and
+  a handler failing part way keeps both its writes and the payment. One
+  batch per Lua run (below) would make them one change.
 - **Snapshots are held in memory whole.** A snapshot travels in 1 MiB
   chunks, but is built, sent and installed from one in-memory buffer (the
   whole game database) on each side (`mudd/src/raft/storage.rs`,

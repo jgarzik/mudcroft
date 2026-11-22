@@ -2319,9 +2319,13 @@ impl GameApi {
                             ],
                         ),
                         (
+                            // The cap is enforced in the insert itself
+                            // (concurrent requests cannot both pass a check)
                             "INSERT INTO payment_requests (id, universe_id, account_id, object_id,
                          handler, amount, reason, data, expires_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         WHERE (SELECT COUNT(*) FROM payment_requests
+                                WHERE universe_id = ? AND account_id = ? AND expires_at > ?) < ?"
                                 .to_string(),
                             vec![
                                 serde_json::json!(id),
@@ -2333,10 +2337,25 @@ impl GameApi {
                                 serde_json::json!(reason),
                                 serde_json::json!(data),
                                 serde_json::json!(expires),
+                                serde_json::json!(universe_id),
+                                serde_json::json!(account),
+                                serde_json::json!(now),
+                                serde_json::json!(crate::api::payments::MAX_PENDING_PER_PLAYER),
                             ],
                         ),
                     ]))
                 .map_err(mlua::Error::external)?;
+                let stored: Option<i64> = block_now(
+                    sqlx::query_scalar("SELECT 1 FROM payment_requests WHERE id = ?")
+                        .bind(&id)
+                        .fetch_optional(store.pool()),
+                )
+                .map_err(mlua::Error::external)?;
+                if stored.is_none() {
+                    return Err(mlua::Error::runtime(
+                        "this player already has too many unanswered payment requests",
+                    ));
+                }
                 let player = crate::player::PlayerManager::player_path(&account);
                 messages.confirm(
                     &player,

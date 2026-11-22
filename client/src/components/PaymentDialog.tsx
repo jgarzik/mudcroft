@@ -1,12 +1,27 @@
+import { useEffect, useState } from 'react'
 import { useGameStore } from '../store/gameStore'
+
+/** Buttons stay disabled this long after a prompt opens: an Enter or click
+ * meant for something else must not pay */
+const ARM_DELAY_MS = 600
 
 /**
  * A payment an object asked the player to confirm (game.request_payment).
- * Nothing is charged unless the player presses Pay.
+ * Nothing is charged unless the player presses Pay. Prompts are answered
+ * one at a time, oldest first.
  */
 export function PaymentDialog({ onAnswer }: { onAnswer: (id: string, accept: boolean) => void }) {
-  const payment = useGameStore((s) => s.pendingPayment)
+  const payment = useGameStore((s) => s.pendingPayments[0] ?? null)
+  const [armedFor, setArmedFor] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!payment) return
+    const timer = window.setTimeout(() => setArmedFor(payment.id), ARM_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [payment])
+
   if (!payment) return null
+  const armed = armedFor === payment.id
 
   return (
     <div
@@ -36,10 +51,16 @@ export function PaymentDialog({ onAnswer }: { onAnswer: (id: string, accept: boo
           {payment.text}
         </p>
         <div className="flex gap-4" style={{ justifyContent: 'flex-end' }}>
-          <button data-testid="payment-decline" onClick={() => onAnswer(payment.id, false)}>
+          {/* Focus starts on Decline: a stray Enter must not pay */}
+          <button
+            data-testid="payment-decline"
+            disabled={!armed}
+            onClick={() => onAnswer(payment.id, false)}
+            autoFocus
+          >
             Decline
           </button>
-          <button data-testid="payment-accept" onClick={() => onAnswer(payment.id, true)} autoFocus>
+          <button data-testid="payment-accept" disabled={!armed} onClick={() => onAnswer(payment.id, true)}>
             Pay {payment.amount} credits
           </button>
         </div>

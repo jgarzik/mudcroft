@@ -6,7 +6,9 @@
 //! (deleted through Raft: only one answer counts), the credits move from
 //! the player to the requesting object, and the object's handler runs (as
 //! its owner) with `{payment_id, amount, reason, data, actor_id}`. If the
-//! handler is missing or fails, the payment is refunded.
+//! handler does not exist the payment is refunded; once it has run the
+//! payment stands, even if it failed part way (it may already have handed
+//! something over).
 
 use serde_json::json;
 use tracing::warn;
@@ -101,6 +103,8 @@ pub async fn answer(
         "reason": reason,
         "data": data,
         "actor_id": player_id,
+        // For a refund (game.transfer_credits("object", actor_account, n))
+        "actor_account": account_id,
     });
     let result =
         super::scripting::invoke_handler(state, universe_id, &object_id, room_id, &handler, args)
@@ -110,11 +114,23 @@ pub async fn answer(
         Ok(Some(_)) => Some(ServerMessage::Output {
             text: format!("You pay {} credits.", amount),
         }),
-        // No such handler, or it failed: give the money back
-        failed => {
-            if let Err(e) = &failed {
-                warn!("payment {}: handler {} failed: {}", id, handler, e);
-            }
+        // The handler ran but failed: it may already have handed something
+        // over, so the payment stands (the object can refund with
+        // transfer_credits); see docs/roadmap.md for making both one change
+        Err(e) => {
+            warn!(
+                "payment {}: handler {} failed after payment: {}",
+                id, handler, e
+            );
+            Some(ServerMessage::Output {
+                text: format!(
+                    "Something went wrong after your payment of {} credits; tell the owner.",
+                    amount
+                ),
+            })
+        }
+        // No such handler: nothing ran, so the money goes back
+        Ok(None) => {
             if let Err(e) = state
                 .credits
                 .transfer(universe_id, &payee, &payer, amount)

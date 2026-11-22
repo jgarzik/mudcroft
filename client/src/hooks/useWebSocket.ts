@@ -2,6 +2,8 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useGameStore } from '../store/gameStore'
 import type { ServerMessage, ClientMessage } from '../types/messages'
 
+// How long a payment request stays open on the server
+const PAYMENT_DEADLINE_MS = 60_000
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`
 const PING_INTERVAL = 30000
 const RECONNECT_BASE_DELAY = 1000
@@ -25,7 +27,9 @@ export function useWebSocket() {
     setRoom,
     setPlayerId,
     setThemeId,
-    setPendingPayment,
+    addPendingPayment,
+    removePendingPayment,
+    clearPendingPayments,
   } = useGameStore()
 
   const cleanup = useCallback(() => {
@@ -83,13 +87,15 @@ export function useWebSocket() {
 
         case 'confirm':
           addMessage(msg.text, 'system')
-          setPendingPayment({ id: msg.id, text: msg.text, amount: msg.amount })
+          addPendingPayment({ id: msg.id, text: msg.text, amount: msg.amount })
+          // The server lets a minute pass before the request expires
+          window.setTimeout(() => removePendingPayment(msg.id), PAYMENT_DEADLINE_MS)
           break
       }
     } catch (err) {
       console.error('Failed to parse WebSocket message:', err)
     }
-  }, [addMessage, setRoom, setPlayerId, setThemeId, setPendingPayment])
+  }, [addMessage, setRoom, setPlayerId, setThemeId, addPendingPayment, removePendingPayment])
 
   const connect = useCallback(() => {
     if (!token || !universe || !isAuthenticated) return
@@ -123,6 +129,8 @@ export function useWebSocket() {
 
     ws.onclose = () => {
       setConnectionStatus('disconnected')
+      // Prompts belong to that session
+      clearPendingPayments()
       addMessage('Disconnected from server', 'system')
 
       // Schedule reconnect with exponential backoff, unless another
@@ -137,7 +145,7 @@ export function useWebSocket() {
         }, reconnectDelayRef.current)
       }
     }
-  }, [token, universe, isAuthenticated, cleanup, setConnectionStatus, addMessage, handleMessage])
+  }, [token, universe, isAuthenticated, cleanup, setConnectionStatus, addMessage, handleMessage, clearPendingPayments])
 
   const sendCommand = useCallback((text: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -152,8 +160,8 @@ export function useWebSocket() {
       const msg: ClientMessage = { type: 'confirm', id, accept }
       wsRef.current.send(JSON.stringify(msg))
     }
-    setPendingPayment(null)
-  }, [setPendingPayment])
+    removePendingPayment(id)
+  }, [removePendingPayment])
 
   const disconnect = useCallback(() => {
     cleanup()

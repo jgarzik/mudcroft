@@ -52,10 +52,13 @@ impl GlobalLevel {
 /// would leave the others different (use `mudd_admin cluster set-level`).
 pub async fn set_global_level(db_path: &Path, username: &str, level: GlobalLevel) -> Result<()> {
     let db = Database::open(&db_path.to_string_lossy()).await?;
-    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cluster_nodes")
+    let joined: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cluster_nodes")
         .fetch_one(db.pool())
         .await?;
-    if members > 0 {
+    // Also by the recorded membership (a cluster from an older schema has
+    // no cluster_nodes rows)
+    let members = crate::db::recorded_members(db.pool()).await?.len();
+    if joined > 0 || members > 1 {
         bail!(
             "this database belongs to a cluster: set levels through it with \
              `mudd_admin cluster ... set-level` instead"
@@ -186,5 +189,25 @@ mod tests {
         assert_eq!("admin".parse::<GlobalLevel>(), Ok(GlobalLevel::Admin));
         assert_eq!("none".parse::<GlobalLevel>(), Ok(GlobalLevel::None));
         assert!("wizard".parse::<GlobalLevel>().is_err());
+    }
+
+    /// A database whose recorded membership has several nodes belongs to a
+    /// cluster even if cluster_nodes is empty (a cluster upgraded from an
+    /// older schema): the offline tool refuses it
+    #[tokio::test]
+    async fn test_refuses_cluster_database_by_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db(&dir).await;
+        let db = Database::open(&path.to_string_lossy()).await.unwrap();
+        sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_membership', ?)")
+            .bind(r#"{"log_id":null,"membership":{"configs":[[1,2]],"nodes":{"1":{"addr":"a:1"},"2":{"addr":"b:2"}}}}"#)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        let err = set_global_level(&path, "alice", GlobalLevel::Admin)
+            .await
+            .expect_err("a cluster member's database");
+        assert!(err.to_string().contains("cluster"), "{}", err);
     }
 }
