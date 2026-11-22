@@ -33,6 +33,8 @@ const MIN_ROUND_MS: u64 = 1000;
 const MAX_ROUND_MS: u64 = 10_000;
 const DEFAULT_CORPSE_DECAY_S: u64 = 300;
 const DEFAULT_RESPAWN_S: u64 = 300;
+/// When an NPC gone for good is deleted if its death report never ran
+const DELETE_FALLBACK_MS: u64 = 60_000;
 /// Longest respawn or corpse decay (builder-set values are clamped)
 const MAX_DELAY_S: u64 = 30 * 24 * 60 * 60;
 /// Longest pause between wanders
@@ -703,6 +705,8 @@ pub struct Death {
     pub respawn: Option<String>,
     /// XP the killer gained
     pub xp: Option<i64>,
+    /// Gone for good: deleted by the report, after its on_death
+    pub delete_after: bool,
 }
 
 /// Move a player (in the current run) and, once it commits, put their
@@ -885,6 +889,7 @@ pub async fn death(
 
     let mut respawn = None;
     let mut xp = None;
+    let mut delete_after = false;
     if player {
         // Back at full HP, at the respawn room (or where they fell)
         respawn = state
@@ -926,16 +931,22 @@ pub async fn death(
             .unwrap_or(DEFAULT_RESPAWN_S)
             .min(MAX_DELAY_S);
         if respawn_s == 0 {
-            // Gone for good, but only once its on_death has run (after the
-            // commit, like every death report): out of the world now, then
-            // a `delete` deadline due at once deletes it with what it holds
+            // Gone for good, but only once its on_death has run: out of the
+            // world now; the death report deletes it after on_death. A
+            // `delete` deadline a minute away is the fallback, should the
+            // report never run (the server stopped in between).
+            delete_after = true;
             store
                 .execute_batch(vec![
                     crate::combat::engine::remove_from_room_statement(universe_id, id),
                     statement(
                         "INSERT OR REPLACE INTO deadlines (universe_id, object_id, kind, due_at)
                          VALUES (?, ?, 'delete', ?)",
-                        vec![json!(universe_id), json!(id), json!(now)],
+                        vec![
+                            json!(universe_id),
+                            json!(id),
+                            json!(now + DELETE_FALLBACK_MS),
+                        ],
                     ),
                 ])
                 .await?;
@@ -979,6 +990,7 @@ pub async fn death(
         room,
         respawn,
         xp,
+        delete_after,
     })
 }
 
@@ -1046,6 +1058,18 @@ pub async fn report_death(state: &AppState, universe_id: &str, d: &Death) {
             d.killer.as_deref(),
         )
         .await;
+        if d.delete_after {
+            // Now, after its on_death (with whatever it still holds)
+            let deleted = super::scripting::in_run(state, async {
+                delete_tree(state, universe_id, id, None)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            if let Err(e) = deleted {
+                warn!("deleting {} after its death: {} (the fallback will)", id, e);
+            }
+        }
         return;
     }
     state
