@@ -812,11 +812,17 @@ async fn handle_client_message(
                         &mut deferred,
                     )
                     .await;
+                    // A command that ends in an error keeps nothing it wrote
+                    // on the way (the error is still the reply)
+                    let failed = matches!(response, ServerMessage::Error { .. });
                     if !matches!(response, ServerMessage::Silent) {
                         state
                             .connections
                             .send_to_player(universe_id, player_id, response)
                             .await;
+                    }
+                    if failed {
+                        return Err(COMMAND_FAILED.to_string());
                     }
                     for hook in deferred {
                         run_hook(state, universe_id, hook).await;
@@ -825,13 +831,17 @@ async fn handle_client_message(
                 },
             )
             .await;
-            if let (Ok(()), Some(id)) = (&saved, id) {
+            // Finished (saved or not): a gateway stops tracking it
+            if let Some(id) = id {
                 state
                     .connections
                     .send_to_player(universe_id, player_id, ServerMessage::Done { id })
                     .await;
             }
-            if let Err(e) = saved {
+            if let Err(e) = saved.as_ref().map_err(|e| e.as_str()) {
+                if e == COMMAND_FAILED {
+                    return;
+                }
                 warn!("command by {} not saved: {}", player_id, e);
                 state
                     .connections
@@ -868,6 +878,9 @@ async fn handle_client_message(
         }
     }
 }
+
+/// A command whose reply was an error (already sent): its run is undone
+const COMMAND_FAILED: &str = "command failed";
 
 /// How long a command id is remembered (a retry comes within seconds)
 const COMMAND_ID_TTL_MS: i64 = 10 * 60 * 1000;
@@ -1147,10 +1160,11 @@ async fn execute_command(
     let verb = parts[0].to_lowercase();
 
     // Built-ins added later than custom verbs could exist under their names:
-    // for these, an object's or room's own verb comes first
+    // for these, an object's or room's own verb comes first (never for
+    // safety commands such as pvp or flee, and never with the wallet)
     let soft = matches!(
         verb.as_str(),
-        "wield" | "wear" | "unwield" | "remove" | "equipment" | "eq" | "pvp" | "flee"
+        "wield" | "wear" | "unwield" | "remove" | "equipment" | "eq"
     ) || (matches!(verb.as_str(), "get" | "take") && command.contains(" from "));
     if soft {
         let args = parts[1..].join(" ");
@@ -1162,6 +1176,7 @@ async fn execute_command(
             access_level,
             &verb,
             &args,
+            true,
         )
         .await
         {
@@ -1908,6 +1923,7 @@ async fn execute_command(
                     access_level,
                     &verb,
                     "",
+                    false,
                 )
                 .await
                 {
@@ -1928,6 +1944,7 @@ async fn execute_command(
                 access_level,
                 &verb,
                 &args,
+                false,
             )
             .await
             {
@@ -1948,6 +1965,7 @@ async fn execute_command(
 /// whose object name contains it wins; otherwise the first candidate does.
 /// The handler runs as the object's owner and gets {verb, args, actor_id,
 /// object_id, room_id}; a string result becomes the reply.
+#[allow(clippy::too_many_arguments)] // the dispatch context, one flag
 async fn dispatch_custom_verb(
     state: &AppState,
     universe_id: &str,
@@ -1956,6 +1974,7 @@ async fn dispatch_custom_verb(
     access_level: AccessLevel,
     verb: &str,
     args: &str,
+    shadows_builtin: bool,
 ) -> Option<ServerMessage> {
     let room_id = state.connections.get_room_id(universe_id, player_id).await;
 
@@ -2035,7 +2054,7 @@ async fn dispatch_custom_verb(
     // only one offering the verb, their exact name for it, or the single
     // match. Otherwise another builder's look-alike could capture the verb
     // and bill them; the handler still runs, with no paying player.
-    let (chosen, picked) = if objects(&candidates) == 1 {
+    let (chosen, mut picked) = if objects(&candidates) == 1 {
         (candidates[0].clone(), true)
     } else if objects(&exact) == 1 {
         (exact[0].clone(), true)
@@ -2045,6 +2064,11 @@ async fn dispatch_custom_verb(
         let first = exact.first().or(fuzzy.first()).unwrap_or(&candidates[0]);
         (first.clone(), false)
     };
+    // A verb shadowing a built-in (the player may have meant the built-in)
+    // never gets the player's wallet
+    if shadows_builtin {
+        picked = false;
+    }
 
     let handler_args = serde_json::json!({
         "verb": verb,

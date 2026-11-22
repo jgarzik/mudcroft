@@ -70,92 +70,105 @@ pub async fn process(state: &AppState, now: u64) {
 
         let mut processed = Vec::new();
         for ((universe, entity), _) in due {
-            // Work from the table, the source of truth, not the cache: the
-            // object may have been deleted (rows cascaded) and even recreated
-            let effects = match crate::combat::EffectRegistry::load_entity(
-                state.db.pool(),
-                &universe,
-                &entity,
-            )
-            .await
-            {
-                Ok(effects) if effects.is_empty() => {
-                    state.effects.cache_clear(&universe, &entity).await;
-                    continue;
-                }
-                Ok(effects) => effects,
-                Err(e) => {
-                    warn!("effects: loading {} failed: {}", entity, e);
-                    had_errors = true;
-                    continue;
-                }
-            };
-            let obj = match state.object_store.get(&universe, &entity).await {
-                Ok(Some(obj)) => obj,
-                Ok(None) => {
-                    // The object is gone, and its rows with it
-                    state.effects.cache_clear(&universe, &entity).await;
-                    continue;
-                }
-                Err(e) => {
-                    warn!("effects: lookup of {} failed: {}", entity, e);
-                    had_errors = true;
-                    continue;
-                }
-            };
-            let is_player = obj.class == "player";
-            let target = Combatant::from_object(&obj, if is_player { 100 } else { 10 });
-            let outcome = process_due(&target, &effects, now);
-            let entity_statements =
-                match tick_statements(&universe, &entity, is_player, &effects, &outcome) {
-                    Ok(s) => s,
+            // Each entity is a nested part: one that fails (a death that
+            // cannot be handled) is undone and logged, the others go on
+            let one = super::scripting::in_run(state, async {
+                // Work from the table, the source of truth, not the cache: the
+                // object may have been deleted (rows cascaded) and even recreated
+                let effects = match crate::combat::EffectRegistry::load_entity(
+                    state.db.pool(),
+                    &universe,
+                    &entity,
+                )
+                .await
+                {
+                    Ok(effects) if effects.is_empty() => {
+                        state.effects.cache_clear(&universe, &entity).await;
+                        return Ok(None);
+                    }
+                    Ok(effects) => effects,
                     Err(e) => {
-                        warn!("effects: {}: {}", entity, e);
-                        had_errors = true;
-                        continue;
+                        warn!("effects: loading {} failed: {}", entity, e);
+
+                        return Ok(None);
                     }
                 };
-            let killer = outcome.events.iter().rev().find_map(|event| match event {
-                TickEvent::Damage { effect, .. } => effects
-                    .all()
-                    .iter()
-                    .find(|e| e.effect_type == *effect)
-                    .and_then(|e| e.source_id.clone()),
-                _ => None,
-            });
-            // Written now (in this run), so a death below works from them
-            state
-                .object_store
-                .execute_batch(entity_statements)
-                .await
-                .map_err(|e| e.to_string())?;
-            // A death follows the universe's policy, as for any death
-            let death = if outcome.killed {
-                let killer_obj = match killer {
-                    Some(ref k) => state.object_store.get(&universe, k).await.ok().flatten(),
-                    None => None,
+                let obj = match state.object_store.get(&universe, &entity).await {
+                    Ok(Some(obj)) => obj,
+                    Ok(None) => {
+                        // The object is gone, and its rows with it
+                        state.effects.cache_clear(&universe, &entity).await;
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        warn!("effects: lookup of {} failed: {}", entity, e);
+
+                        return Ok(None);
+                    }
                 };
-                let dead = state
+                let is_player = obj.class == "player";
+                let target = Combatant::from_object(&obj, if is_player { 100 } else { 10 });
+                let outcome = process_due(&target, &effects, now);
+                let entity_statements =
+                    match tick_statements(&universe, &entity, is_player, &effects, &outcome) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("effects: {}: {}", entity, e);
+
+                            return Ok(None);
+                        }
+                    };
+                let killer = outcome.events.iter().rev().find_map(|event| match event {
+                    TickEvent::Damage { effect, .. } => effects
+                        .all()
+                        .iter()
+                        .find(|e| e.effect_type == *effect)
+                        .and_then(|e| e.source_id.clone()),
+                    _ => None,
+                });
+                // Written now (in this run), so a death below works from them
+                state
                     .object_store
-                    .get(&universe, &entity)
+                    .execute_batch(entity_statements)
                     .await
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or_else(|| obj.clone());
-                Some(
-                    super::combat::death(state, &universe, &dead, killer_obj.as_ref(), now)
+                    .map_err(|e| e.to_string())?;
+                // A death follows the universe's policy, as for any death
+                let death = if outcome.killed {
+                    let killer_obj = match killer {
+                        Some(ref k) => state.object_store.get(&universe, k).await.ok().flatten(),
+                        None => None,
+                    };
+                    let dead = state
+                        .object_store
+                        .get(&universe, &entity)
                         .await
-                        .map_err(|e| e.to_string())?,
-                )
-            } else {
-                None
-            };
-            processed.push(Processed {
-                universe,
-                entity,
-                is_player,
-                outcome,
-                death,
-            });
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_else(|| obj.clone());
+                    Some(
+                        super::combat::death(state, &universe, &dead, killer_obj.as_ref(), now)
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    None
+                };
+                Ok::<_, String>(Some(Processed {
+                    universe: universe.clone(),
+                    entity: entity.clone(),
+                    is_player,
+                    outcome,
+                    death,
+                }))
+            })
+            .await;
+            match one {
+                Ok(Some(p)) => processed.push(p),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("effects: {} not processed: {}", entity, e);
+                    had_errors = true;
+                }
+            }
         }
         for p in &processed {
             if p.outcome.killed {

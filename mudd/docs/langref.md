@@ -95,7 +95,7 @@ The context decides how some functions behave:
 
 ### One run, one change
 
-Each run (an `eval`, a script, a handler or hook, with everything it calls through `game.use_object`) is **one change**, and so is each command a player types, with every hook and verb handler it triggers: its writes are saved together, as one Raft entry, when it finishes without error. If it raises an error (or runs out of time or budget), **nothing it did is kept**: no object, property, verb, timer, effect or credit change, and no message is sent. A handler or hook that fails inside a command undoes only its own changes; the rest of the command stands. Within a run, reads see the run's own earlier writes. An error caught with `pcall` does not end the run; the writes made before it stand unless the run as a whole fails.
+Each run (an `eval`, a script, a handler or hook, with everything it calls through `game.use_object`) is **one change**, and so is each command a player types, with every hook and verb handler it triggers: its writes are saved together, as one Raft entry, when it finishes without error. If it raises an error (or runs out of time or budget), **nothing it did is kept**: no object, property, verb, timer, effect or credit change, and no message is sent. A handler or hook that fails inside a command undoes only its own changes; the rest of the command stands. A command whose reply is an error keeps nothing. Within a run, reads see the run's own earlier writes. An error caught with `pcall` does not end the run; the writes made before it stand unless the run as a whole fails.
 
 The one exception is a Venice call (`game.llm_chat`, `game.llm_image`), which is slow and outside the database: it is a **commit point**. The run's writes before it are saved as one change, its price (`venice_chat_cost`, `venice_image_cost`) is charged (and refunded if the call fails), and the rest of the run is a new change: an error after the call undoes only what came after it. To keep a run all-or-nothing, make Venice calls before changing anything.
 
@@ -610,7 +610,7 @@ this context. It needs the same permission as `add_action`. **Returns**
 
 ### How a typed verb is dispatched
 
-1. Built-in commands always win. These verbs can't be overridden: `look`, `l`, the directions and their abbreviations, `say`, `help`, `get`, `take`, `drop`, `inventory`, `inv`, `i`, `attack`, `kill`, `goto`, `setportal`, `eval` and `create`. For the "soft" built-ins `wield`, `wear`, `unwield`, `remove`, `equipment`, `eq`, `pvp`, `flee` and `get`/`take ... from ...`, a matching custom verb (below) comes first and the built-in runs only if none matches.
+1. Built-in commands always win. These verbs can't be overridden: `look`, `l`, the directions and their abbreviations, `say`, `help`, `get`, `take`, `drop`, `inventory`, `inv`, `i`, `attack`, `kill`, `goto`, `setportal`, `eval` and `create`. For the "soft" built-ins `wield`, `wear`, `unwield`, `remove`, `equipment`, `eq` and `get`/`take ... from ...`, a matching custom verb (below) comes first and the built-in runs only if none matches; such a handler never gets the player as payer (they may have meant the built-in). Safety commands (`pvp`, `flee`) can't be shadowed.
 2. The first word, lowercased, is the verb. The rest of the line is `args`.
 3. Candidates are collected in this order:
    - room actions registered for the player's room, but only for objects that are nearby;

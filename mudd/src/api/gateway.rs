@@ -9,10 +9,10 @@
 //!   ending the session, the primary has failed over: the player is told,
 //!   and the gateway reopens the session on the new primary. Each command
 //!   is sent with an id (the client's, or one the gateway assigns); the
-//!   primary answers `done` once it is saved. A command still unanswered
-//!   when the primary is lost is sent again, with the same id, to the new
-//!   primary, which does not run a command whose id it has already saved:
-//!   exactly once.
+//!   primary answers `done` once it has finished (saved or refused).
+//!   Commands still unanswered when the primary is lost are sent again, in
+//!   order and with the same ids, to the new primary, which does not run a
+//!   command whose id it has already saved: exactly once.
 //!
 //! The primary serves forwarded requests with its own router, and
 //! forwarded sessions exactly like local ones.
@@ -360,9 +360,12 @@ fn tag_command(text: &str) -> (String, Option<InFlight>) {
     (json.clone(), Some(InFlight { id, json, ours }))
 }
 
-/// If `text` is a `done` for the command in flight: clears it, and says
-/// whether the client should see it
-fn take_done(text: &str, in_flight: &mut Option<InFlight>) -> bool {
+/// Commands sent to the primary and not yet answered `done`, oldest first
+type InFlightQueue = std::collections::VecDeque<InFlight>;
+
+/// If `text` is a `done` for a command in flight: removes it, and says
+/// whether the client should see it (only for ids the client chose)
+fn take_done(text: &str, in_flight: &mut InFlightQueue) -> bool {
     if !text.contains("\"done\"") {
         return true;
     }
@@ -372,13 +375,12 @@ fn take_done(text: &str, in_flight: &mut Option<InFlight>) -> bool {
     if msg["type"] != "done" {
         return true;
     }
-    match in_flight {
-        Some(f) if msg["id"] == f.id.as_str() => {
-            let show = !f.ours;
-            *in_flight = None;
-            show
+    match in_flight.iter().position(|f| msg["id"] == f.id.as_str()) {
+        Some(i) => {
+            let f = in_flight.remove(i).expect("found above");
+            !f.ours
         }
-        _ => true,
+        None => true,
     }
 }
 
@@ -401,7 +403,7 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
     // The player was told about the current outage
     let mut notified = false;
     // The command sent and not yet saved: sent again after a failover
-    let mut in_flight: Option<InFlight> = None;
+    let mut in_flight = InFlightQueue::new();
     loop {
         let opened = match primary_addr(&state) {
             Some(addr) => transport::open_game_session(&addr, &security, &open)
@@ -430,12 +432,15 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 return;
             }
         };
-        // A command the lost primary may not have saved: again, same id
-        // (not run twice if it was)
-        let resent = match in_flight {
-            Some(ref f) => remote.send(&f.json).await,
-            None => true,
-        };
+        // Commands the lost primary may not have saved: again, in order,
+        // same ids (not run twice if they were)
+        let mut resent = true;
+        for f in &in_flight {
+            if !remote.send(&f.json).await {
+                resent = false;
+                break;
+            }
+        }
         // Whether this session got anything from the primary yet
         let mut live = false;
         let outcome = loop {
@@ -446,8 +451,12 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 incoming = socket.recv() => match incoming {
                     Some(Ok(Message::Text(text))) => {
                         let (json, command) = tag_command(&text);
-                        if command.is_some() {
-                            in_flight = command;
+                        if let Some(command) = command {
+                            // Bounded: an unanswering primary is lost soon
+                            if in_flight.len() >= 64 {
+                                in_flight.pop_front();
+                            }
+                            in_flight.push_back(command);
                         }
                         if !remote.send(&json).await {
                             break Outcome::Lost;
@@ -511,7 +520,7 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 let still_here = send_json(
                     &mut socket,
                     &ServerMessage::Output {
-                        text: if in_flight.is_some() {
+                        text: if !in_flight.is_empty() {
                             "The world shimmers as the servers change hands. Your last \
                              command will be retried."
                         } else {
@@ -527,5 +536,39 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every unanswered command stays queued (several in flight at once),
+    /// a done removes its own, and only client-chosen ids' dones are shown
+    #[test]
+    fn test_in_flight_queue() {
+        let mut q = InFlightQueue::new();
+        let (_, a) = tag_command(r#"{"type":"command","text":"get sword"}"#);
+        let (_, b) = tag_command(r#"{"type":"command","text":"n","id":"mine"}"#);
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(a.ours && !b.ours);
+        let a_id = a.id.clone();
+        q.push_back(a);
+        q.push_back(b);
+        assert_eq!(q.len(), 2, "both in flight");
+        assert!(
+            take_done(r#"{"type":"done","id":"mine"}"#, &mut q),
+            "client's id shown"
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, a_id, "the older one still queued");
+        let done = format!(r#"{{"type":"done","id":"{}"}}"#, a_id);
+        assert!(
+            !take_done(&done, &mut q),
+            "the gateway's own id is not shown"
+        );
+        assert!(q.is_empty());
+        assert!(take_done(r#"{"type":"output","text":"hi"}"#, &mut q));
+        assert!(tag_command(r#"{"type":"ping"}"#).1.is_none());
     }
 }
