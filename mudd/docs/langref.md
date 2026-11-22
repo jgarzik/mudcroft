@@ -96,7 +96,8 @@ The context decides how some functions behave:
 ### Sandbox limits
 
 Limits apply per execution. Each hook, verb, timer callback and `use_object`
-call is one execution.
+call is one execution, and one budget covers all of it: the universe
+libraries, the object code and the handler together.
 
 | Limit | Object code | `eval` and `run_script` |
 |---|---|---|
@@ -108,12 +109,12 @@ call is one execution.
 
 Exceeding a limit raises an error, for example `database query limit exceeded (101 > 100)`.
 
-The instruction, memory and call limits stop a script as soon as it
-exceeds them. The timeout works differently: it is checked only after a
-chunk finishes, and not at all for the handler call in object code. Rely
-on the instruction limit to stop runaway loops: it holds even for
-`while true do end`, and `pcall`/`xpcall` cannot catch it (once the limit
-is exceeded they re-raise instead of returning `false`).
+Every limit stops a script as soon as it is exceeded, while it runs: the
+instruction count and the wall-clock timeout are both checked every 1,000
+instructions. They hold even for `while true do end`, and `pcall`/`xpcall`
+cannot catch them (once a limit is hit they re-raise instead of returning
+`false`). Time spent inside a single `game.*` call is not interrupted; it
+is counted when control returns to Lua.
 
 Every `game.*` function counts as a database call except these:
 `add_action`, `remove_action`, `send`, `broadcast`, `broadcast_region`,

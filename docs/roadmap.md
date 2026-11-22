@@ -63,11 +63,6 @@ affected feature.
 - **Timer ownership.** `game.remove_call_out` cancels any timer id without
   checking that it belongs to the current object, and `game.set_heart_beat`
   returns `true` even without an object context (`mudd/src/lua/game_api.rs`).
-- **Wall-clock timeout is not enforced.** It is checked only after a chunk
-  finishes, and `Sandbox::call` never checks it (`mudd/src/lua/sandbox.rs`);
-  the instruction limit is the effective bound. The per-execution call budget
-  resets on every `Sandbox::execute`, so each universe library chunk, the
-  object code and the handler call get separate budgets.
 
 ### Accounts and permissions
 
@@ -163,8 +158,6 @@ Today `mudd` runs a single-node openraft cluster whose log carries plain SQL
   account; 60 Venice calls per minute per bot. Today only Venice has a
   per-account limiter (60 requests per minute), and the sandbox caps calls
   per execution.
-- A preemptive wall-clock timeout for Lua (today it is checked after the
-  run returns).
 
 ## Game Logic
 

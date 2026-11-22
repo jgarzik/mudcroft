@@ -362,13 +362,14 @@ heartbeat and clears its actions.
 | DB-backed `game.*` calls | 100 | 10,000 |
 | Venice calls | 5 | 5 |
 
-- Instructions are counted by a hook every 1,000 instructions; exceeding the
-  limit aborts the script.
+- A hook every 1,000 instructions counts instructions and checks the
+  wall-clock deadline; exceeding either raises an error (and again at every
+  later check), and the sandbox's `pcall`/`xpcall` re-raise it.
 - Memory is enforced by `Lua::set_memory_limit`.
-- Wall time is checked when the execution returns, so it reports a slow run
-  but does not interrupt one.
-- The call budget lives in the Lua state's app data and resets at each
-  `execute`. Every `game.*` function backed by the object store,
+- One budget (instructions, deadline, calls) starts when the sandbox is
+  created, and a sandbox is created per execution, so libraries, object
+  code and handler share it (`Sandbox::begin_execution` restarts it).
+- The call budget lives in the Lua state's app data. Every `game.*` function backed by the object store,
   permissions, credits, timers or classes charges one DB call;
   `llm_chat`/`llm_image` charge a Venice call. Exceeding a budget raises a
   Lua error.

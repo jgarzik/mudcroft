@@ -104,9 +104,37 @@ pub struct Sandbox {
     lua: Lua,
     config: SandboxConfig,
     metering: Metering,
-    instruction_count: Arc<AtomicU64>,
-    exceeded: Arc<AtomicBool>,
-    start_time: Option<Instant>,
+    limits: Arc<Limits>,
+}
+
+/// The per-execution budget, shared with the instruction hook and the
+/// sandbox's pcall/xpcall
+struct Limits {
+    /// Fixed reference point for the deadline
+    origin: Instant,
+    /// Deadline, in nanoseconds after `origin`
+    deadline_ns: AtomicU64,
+    instructions: AtomicU64,
+    max_instructions: u64,
+    timeout: Duration,
+    instructions_exceeded: AtomicBool,
+    timed_out: AtomicBool,
+}
+
+impl Limits {
+    fn begin(&self) {
+        self.instructions.store(0, Ordering::Relaxed);
+        self.instructions_exceeded.store(false, Ordering::Relaxed);
+        self.timed_out.store(false, Ordering::Relaxed);
+        let deadline = self.origin.elapsed() + self.timeout;
+        self.deadline_ns
+            .store(deadline.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Whether the execution must stop (either limit hit)
+    fn stopped(&self) -> bool {
+        self.instructions_exceeded.load(Ordering::Relaxed) || self.timed_out.load(Ordering::Relaxed)
+    }
 }
 
 impl Sandbox {
@@ -121,28 +149,38 @@ impl Sandbox {
         // Set memory limit
         lua.set_memory_limit(config.max_memory)?;
 
-        let instruction_count = Arc::new(AtomicU64::new(0));
-        let exceeded = Arc::new(AtomicBool::new(false));
+        let limits = Arc::new(Limits {
+            origin: Instant::now(),
+            deadline_ns: AtomicU64::new(0),
+            instructions: AtomicU64::new(0),
+            max_instructions: config.max_instructions,
+            timeout: config.timeout,
+            instructions_exceeded: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
+        });
+        // One budget per execution, starting now (begin_execution restarts it)
+        limits.begin();
 
-        // Set up instruction counting hook
-        let count_clone = instruction_count.clone();
-        let exceeded_clone = exceeded.clone();
-        let max_instructions = config.max_instructions;
-
+        // Every 1000 instructions: count, and check the wall clock, so both
+        // limits hold while code runs. Hitting either raises an error (a
+        // yield does nothing on the non-yieldable main thread), and every
+        // later check raises again, so a caught error cannot keep the
+        // script running; the sandbox's pcall/xpcall also re-raise it.
+        let hook_limits = limits.clone();
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(1000),
             move |_lua, _debug| {
-                let current = count_clone.fetch_add(1000, Ordering::Relaxed) + 1000;
-                if current > max_instructions {
-                    // Raise an error: yielding does nothing on the main
-                    // thread, which is not yieldable. Every later check
-                    // raises again, so even a caught error cannot keep the
-                    // script running; the sandbox's pcall/xpcall re-raise it.
-                    exceeded_clone.store(true, Ordering::Relaxed);
-                    Err(mlua::Error::runtime("instruction limit exceeded"))
-                } else {
-                    Ok(VmState::Continue)
+                let l = &hook_limits;
+                let current = l.instructions.fetch_add(1000, Ordering::Relaxed) + 1000;
+                if current > l.max_instructions {
+                    l.instructions_exceeded.store(true, Ordering::Relaxed);
+                    return Err(mlua::Error::runtime("instruction limit exceeded"));
                 }
+                if l.origin.elapsed().as_nanos() as u64 > l.deadline_ns.load(Ordering::Relaxed) {
+                    l.timed_out.store(true, Ordering::Relaxed);
+                    return Err(mlua::Error::runtime("execution timeout"));
+                }
+                Ok(VmState::Continue)
             },
         )?;
 
@@ -157,16 +195,26 @@ impl Sandbox {
 
         // Add safe utility functions
         Self::add_safe_globals(&lua)?;
-        Self::add_limit_aware_pcall(&lua, exceeded.clone())?;
+        Self::add_limit_aware_pcall(&lua, limits.clone())?;
 
         Ok(Self {
             lua,
             config,
             metering: Metering::new(),
-            instruction_count,
-            exceeded,
-            start_time: None,
+            limits,
         })
+    }
+
+    /// Start a fresh budget (instructions, deadline, call counts). A new
+    /// sandbox starts with one; libraries, code and handler run in it share
+    /// it. Call this only to reuse a sandbox for another execution.
+    pub fn begin_execution(&mut self) {
+        self.limits.begin();
+        self.metering.reset();
+        if let Some(mut budget) = self.lua.app_data_mut::<CallBudget>() {
+            budget.db_queries = 0;
+            budget.venice_calls = 0;
+        }
     }
 
     /// Remove dangerous global functions/tables
@@ -212,21 +260,21 @@ impl Sandbox {
     /// Replace pcall and xpcall with versions that catch ordinary errors but
     /// re-raise once the instruction limit is exceeded, so a script cannot
     /// catch the limit and keep running
-    fn add_limit_aware_pcall(lua: &Lua, exceeded: Arc<AtomicBool>) -> LuaResult<()> {
+    fn add_limit_aware_pcall(lua: &Lua, limits: Arc<Limits>) -> LuaResult<()> {
         use mlua::MultiValue;
 
         fn error_value(lua: &Lua, e: &mlua::Error) -> LuaResult<Value> {
             Ok(Value::String(lua.create_string(e.to_string())?))
         }
 
-        let flag = exceeded.clone();
+        let flag = limits.clone();
         let pcall = lua.create_function(move |lua, (f, args): (Function, MultiValue)| {
             match f.call::<MultiValue>(args) {
                 Ok(mut values) => {
                     values.push_front(Value::Boolean(true));
                     Ok(values)
                 }
-                Err(e) if flag.load(Ordering::Relaxed) => Err(e),
+                Err(e) if flag.stopped() => Err(e),
                 Err(e) => Ok(MultiValue::from_vec(vec![
                     Value::Boolean(false),
                     error_value(lua, &e)?,
@@ -235,7 +283,7 @@ impl Sandbox {
         })?;
         lua.globals().set("pcall", pcall)?;
 
-        let flag = exceeded;
+        let flag = limits;
         let xpcall = lua.create_function(
             move |lua, (f, handler, args): (Function, Function, MultiValue)| match f
                 .call::<MultiValue>(args)
@@ -244,7 +292,7 @@ impl Sandbox {
                     values.push_front(Value::Boolean(true));
                     Ok(values)
                 }
-                Err(e) if flag.load(Ordering::Relaxed) => Err(e),
+                Err(e) if flag.stopped() => Err(e),
                 Err(e) => {
                     let mut handled = handler.call::<MultiValue>(error_value(lua, &e)?)?;
                     handled.push_front(Value::Boolean(false));
@@ -288,67 +336,40 @@ impl Sandbox {
         self.run_metered(|lua| lua.load(code).into_function()?.call(args))
     }
 
-    /// Run `f` with instruction/time metering reset and enforced
+    /// Run `f` within the current budget (not reset per chunk)
     fn run_metered<R>(&mut self, f: impl FnOnce(&Lua) -> LuaResult<R>) -> Result<R, SandboxError> {
-        // Reset counters for this execution
-        self.instruction_count.store(0, Ordering::Relaxed);
-        self.exceeded.store(false, Ordering::Relaxed);
-        self.metering.reset();
-        if let Some(mut budget) = self.lua.app_data_mut::<CallBudget>() {
-            budget.db_queries = 0;
-            budget.venice_calls = 0;
-        }
-        self.start_time = Some(Instant::now());
-
-        // Compile and execute
+        let before = self.limits.instructions.load(Ordering::Relaxed);
         let result = f(&self.lua);
+        self.finish(before, result)
+    }
 
-        // Update metering
-        let instr = self.instruction_count.load(Ordering::Relaxed);
-        self.metering.add_instructions(instr);
+    /// Account for a run and map a limit hit to its error
+    fn finish<R>(&mut self, before: u64, result: LuaResult<R>) -> Result<R, SandboxError> {
+        let instr = self.limits.instructions.load(Ordering::Relaxed);
+        self.metering.add_instructions(instr.saturating_sub(before));
         self.metering.set_memory(self.lua.used_memory() as u64);
 
-        // Check if we exceeded limits
-        if self.exceeded.load(Ordering::Relaxed) {
+        if self.limits.instructions_exceeded.load(Ordering::Relaxed) {
             return Err(SandboxError::InstructionLimitExceeded(
                 instr,
                 self.config.max_instructions,
             ));
         }
-
-        // Check timeout
-        if let Some(start) = self.start_time {
-            if start.elapsed() > self.config.timeout {
-                return Err(SandboxError::Timeout(self.config.timeout));
-            }
+        if self.limits.timed_out.load(Ordering::Relaxed) {
+            return Err(SandboxError::Timeout(self.config.timeout));
         }
-
         result.map_err(SandboxError::from)
     }
 
-    /// Execute a Lua function with arguments
+    /// Execute a Lua function with arguments, within the current budget
     pub fn call<A, R>(&mut self, func: Function, args: A) -> Result<R, SandboxError>
     where
         A: mlua::IntoLuaMulti,
         R: mlua::FromLuaMulti,
     {
-        self.instruction_count.store(0, Ordering::Relaxed);
-        self.exceeded.store(false, Ordering::Relaxed);
-        self.start_time = Some(Instant::now());
-
+        let before = self.limits.instructions.load(Ordering::Relaxed);
         let result: LuaResult<R> = func.call(args);
-
-        let instr = self.instruction_count.load(Ordering::Relaxed);
-        self.metering.add_instructions(instr);
-
-        if self.exceeded.load(Ordering::Relaxed) {
-            return Err(SandboxError::InstructionLimitExceeded(
-                instr,
-                self.config.max_instructions,
-            ));
-        }
-
-        result.map_err(SandboxError::from)
+        self.finish(before, result)
     }
 
     /// Check if a global exists (for testing that dangerous globals are removed)
@@ -362,7 +383,7 @@ impl Sandbox {
 
     /// Get the current instruction count
     pub fn instruction_count(&self) -> u64 {
-        self.instruction_count.load(Ordering::Relaxed)
+        self.limits.instructions.load(Ordering::Relaxed)
     }
 
     /// Get current memory usage
@@ -478,6 +499,60 @@ mod tests {
                 result
             );
         }
+    }
+
+    /// Run `code` with a huge instruction limit and a short timeout on its
+    /// own thread; None if it is still running after the deadline
+    fn run_timed(code: &'static str) -> Option<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let config = SandboxConfig {
+                max_instructions: u64::MAX / 2,
+                timeout: Duration::from_millis(200),
+                ..Default::default()
+            };
+            let mut sandbox = Sandbox::new(config).unwrap();
+            let _ = tx.send(format!("{:?}", sandbox.execute::<()>(code)));
+        });
+        rx.recv_timeout(Duration::from_secs(10)).ok()
+    }
+
+    /// The wall-clock timeout stops code while it runs, even under pcall
+    #[test]
+    fn test_timeout_stops_running_code() {
+        for code in [
+            "while true do end",
+            "while true do pcall(function() while true do end end) end",
+        ] {
+            let result = run_timed(code).expect("the timeout did not stop it");
+            assert!(result.contains("Timeout"), "{}: {}", code, result);
+        }
+    }
+
+    /// One budget covers a whole execution: chunks run one after another in
+    /// a sandbox (libraries, then code) share it rather than each getting
+    /// their own
+    #[test]
+    fn test_budget_spans_the_execution() {
+        let config = SandboxConfig {
+            max_instructions: 30_000,
+            ..Default::default()
+        };
+        let mut sandbox = Sandbox::new(config).unwrap();
+        let chunk = "local s = 0 for i = 1, 4000 do s = s + i end";
+        assert!(sandbox.execute::<()>(chunk).is_ok(), "first chunk fits");
+        let mut failed = false;
+        for _ in 0..10 {
+            if sandbox.execute::<()>(chunk).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "repeated chunks must exhaust one shared budget");
+
+        // begin_execution starts a fresh budget
+        sandbox.begin_execution();
+        assert!(sandbox.execute::<()>(chunk).is_ok());
     }
 
     /// pcall still catches ordinary errors
