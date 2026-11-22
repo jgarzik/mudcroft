@@ -37,7 +37,7 @@ mudd/src/
 │   ├── actions.rs   # ActionRegistry (custom verbs)
 │   ├── messaging.rs # MessageQueue (per execution)
 │   └── metering.rs  # instruction/memory counters
-├── combat/          # dice, damage types, status effects, CombatManager, PvpPolicy
+├── combat/          # dice, damage types, status effects, engine (attacks), PvpPolicy
 ├── permissions/     # PermissionManager, AccessLevel, path grants
 ├── timers/          # TimerManager: call_out, heartbeats
 ├── credits/         # CreditManager: per-universe balances
@@ -61,7 +61,7 @@ and Raft metadata. Tables are created by `Database::run_migrations`
 | Accounts and worlds | `accounts`, `universes`, `universe_settings` (e.g. the portal room) |
 | Objects and code | `objects`, `code_store`, `core_lib_hashes` |
 | Classes | `classes`, `class_properties`, `class_handlers` |
-| Gameplay | `credits`, `timers`, `combat_state`, `active_effects` |
+| Gameplay | `credits`, `timers`, `active_effects` |
 | Permissions | `path_grants` |
 | Images | `image_store` |
 | Raft | `raft_log`, `raft_vote`, `raft_meta` |
@@ -71,7 +71,6 @@ accounts(id) <-- universes(owner_id), credits(player_id), path_grants(grantee_id
 universes(id) <-- objects(universe_id), credits, timers, path_grants, universe_settings
 objects(id)   <-- objects(parent_id)       -- containment
 code_store(hash) <-- objects(code_hash), universe config lib_hashes
-combat_state(entity_id) <-- active_effects(entity_id)
 ```
 
 `mudd` opens an existing database only (`Database::open`): it checks that the
@@ -97,8 +96,8 @@ upgrades live (`Database::upgrade`), and there are none yet.
 6. Build `AppState` (`api::router`): `ConnectionManager`, `ObjectStore`,
    `ClassRegistry`, `ActionRegistry`, `PermissionManager`, `PlayerManager`,
    `TimerManager`, `CreditManager`, `VeniceClient`, `ImageStore`,
-   `ThemeRegistry`, `CombatManager`.
-7. Load persisted state: timers, path grants, custom classes, combat states.
+   `ThemeRegistry`.
+7. Load persisted state: timers, path grants, custom classes.
    Failures are logged and startup continues. Access levels and credit
    balances load lazily into in-memory caches.
 8. Spawn the timer loop (`scripting::run_timer_loop`).
@@ -333,8 +332,7 @@ and a container must be in the same universe (composite foreign key). Every
 own, so Lua reads and writes cannot reach another universe's objects. The
 same `(universe, id)` keying applies to the in-memory state: sessions
 (`ConnectionManager`), heartbeats and call_out caps (`TimerManager`),
-contextual verbs (`ActionRegistry`), combat state (`CombatManager`) and
-Lua-defined classes (`ClassRegistry`; the built-in classes are global).
+contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; the built-in classes are global).
 
 - An account has a separate player object, `/players/p-<account>`, with its
   own inventory and HP, in each universe it visits, and may be connected to
@@ -430,14 +428,17 @@ applies to open sessions at once.
 
 Two layers exist:
 
-- **Rust** (`src/combat/`): `CombatManager` keeps HP, armor class and attack
-  bonus per entity, persisted in `combat_state`; status effects persist in
-  `active_effects`. The `attack` command uses it: d20 + attack bonus against
-  armor class, natural 20 is a critical hit, natural 1 a fumble, then 1d6
-  physical damage (doubled on a critical). Targets must be `npc`, a class
-  derived from `npc`, or `monster`. A slain
-  target is removed from the room. There is no `game.*` binding for this
-  layer.
+- **Rust** (`src/combat/engine.rs`): HP and combat stats have one home, the
+  combatant's object row: properties `hp`, `max_hp`, `armor_class`
+  (default 10), `attack_bonus` (default 0) and `resistances` (e.g.
+  `{fire = "resistant"}`), the same ones Lua reads and writes. The `attack`
+  command resolves a round with the pure `resolve_attack` (d20 + attack
+  bonus against armor class, natural 20 a critical hit, natural 1 a fumble,
+  then 1d6 physical damage, doubled on a critical, then resistances) and
+  commits it as **one atomic batch** (`attack_statements`): the target's new
+  `hp` via `json_set`, and on a kill its removal from the room. Targets must
+  be `npc`, a class derived from `npc`, or `monster`. Status effects persist
+  in `active_effects`.
 - **Lua mudlib** (`mudd/lib/combat.lua`): `Combat.initiate`, `Combat.attack`,
   `Combat.deal_damage`, `Combat.heal`, effects, working on object
   properties. `Commands.flee` lives in `lib/commands.lua`.

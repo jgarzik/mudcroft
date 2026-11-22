@@ -10,6 +10,8 @@ Mudcroft is a multi-user dungeon (MUD) game server in Rust (`mudd/`) with a Reac
 - WebSocket-based multiplayer gameplay
 - Raft (openraft) log over SQLite; single-node today, multi-node planned
 
+Design it as what it is: a specialized database server. The tables (written only through Raft) are the source of truth; in-memory maps are caches derived from them, never a second copy of state. One logical change (a combat round, an effect tick) is one atomic batch. State that lives only in memory (heartbeats, custom verbs today) is a flaw to fix.
+
 ## Build & Test Commands
 
 Server commands run from the `mudd/` directory:
@@ -68,7 +70,7 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
   - `libs.rs` - universe library loading (config `lib_hashes`)
   - `actions.rs` - ActionRegistry for custom verbs
   - `messaging.rs` - MessageQueue
-- **combat/** - dice, damage types, status effects, CombatManager, PvP policies
+- **combat/** - dice, damage types, status effects, `engine` (attack resolution over object rows: HP lives in the object's `hp` property), PvP policies
 - **raft/** - openraft storage/state machine (log entries are SQL requests), network, RaftWriter
 - **timers/** - call_out (one-shot, persisted) and heartbeat (recurring, in memory)
 - **permissions/** - LPMud-style path-based access control
@@ -87,11 +89,11 @@ scripts/start-testsrv.sh             # manual play-test server with a seeded wor
 - `use_object` is bounded: 8 levels deep, 32 calls per top-level execution.
 - Lua object writes (`create/update/delete/move/clone_object`) are permission-checked against the acting user; keep new `game.*` writes checked the same way and charge the call budget (`charge_db` / `charge_venice`).
 - Never splice user input into Lua source. Pass values with `Sandbox::execute_with_args` (the chunk's `...`).
-- Keep object code within the session's universe. Object ids are scoped per universe (`objects` PK `(universe_id, id)`), and every `ObjectStore` call, in-memory map (sessions, timers, actions, combat, classes) and message delivery takes the universe. Thread the universe through any new code rather than keying by object id alone.
+- Keep object code within the session's universe. Object ids are scoped per universe (`objects` PK `(universe_id, id)`), and every `ObjectStore` call, in-memory map (sessions, timers, actions, classes) and message delivery takes the universe. Thread the universe through any new code rather than keying by object id alone.
 
 ### Database
 
-One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, universe_members, credits, timers, path_grants, combat_state, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
+One SQLite file with tables: accounts, universes, universe_settings, objects, code_store, core_lib_hashes, classes, class_properties, class_handlers, universe_members, credits, timers, path_grants, active_effects, image_store, raft_log, raft_vote, raft_meta. Schema source: `mudd/src/db/mod.rs`; see `SCHEMA.md`.
 
 ### WebSocket Protocol
 

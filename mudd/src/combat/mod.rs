@@ -6,14 +6,15 @@
 //! - Damage types (fire, ice, poison, etc.)
 //! - Immunity, resistance, and vulnerability
 //! - Status effects (poisoned, stunned, etc.)
-//! - Combat state tracking
+//! - HP and combat stats on the object rows (engine)
 
 mod damage;
 mod dice;
 mod effects;
+pub mod engine;
 mod state;
 
 pub use damage::{DamageModifier, DamageResult, DamageType};
-pub use dice::{parse_dice, roll_dice, DiceRoll};
+pub use dice::{parse_dice, roll_d20, roll_dice, DiceRoll};
 pub use effects::{EffectRegistry, EffectType, EntityEffects, StatusEffect};
-pub use state::{AttackResult, CombatManager, CombatState, PvpPolicy};
+pub use state::{AttackResult, PvpPolicy};

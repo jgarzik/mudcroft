@@ -13,7 +13,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
@@ -69,6 +69,7 @@ impl Database {
     /// time. There are no upgrade steps yet, so anything older is refused:
     /// - 1 -> 2 (argon2id passwords, accounts.salt dropped): old salted
     ///   SHA-256 hashes cannot be converted, so there is no step.
+    /// - 2 -> 3 (combat_state dropped: HP lives on the object row).
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -400,23 +401,6 @@ impl Database {
         // Index for path grants lookup by grantee
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_path_grants_grantee ON path_grants(universe_id, grantee_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Combat state table (HP persistence)
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS combat_state (
-                universe_id TEXT NOT NULL,
-                entity_id TEXT NOT NULL,
-                hp INTEGER NOT NULL,
-                max_hp INTEGER NOT NULL,
-                armor_class INTEGER NOT NULL DEFAULT 10,
-                attack_bonus INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (universe_id, entity_id)
-            )
-            "#,
         )
         .execute(&self.pool)
         .await?;

@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::Account;
+use crate::combat::engine::{attack_statements, resolve_attack, Combatant};
 use crate::combat::DamageType;
 use crate::images::generate_room_image;
 use crate::permissions::AccessLevel;
@@ -1288,91 +1289,42 @@ async fn execute_command(
                 };
             }
 
-            // Get target HP (initialize combat state if needed)
-            let target_hp = target
-                .properties
-                .get("hp")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(10) as i32;
-            let target_max_hp = target
-                .properties
-                .get("max_hp")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(target_hp as i64) as i32;
-
-            // Initialize combat states if needed
-            if state
-                .combat
-                .get_state(universe_id, &target_id)
-                .await
-                .is_none()
-            {
-                state
-                    .combat
-                    .init_entity(universe_id, &target_id, target_max_hp)
-                    .await;
-                // Set current HP to match object property
-                if let Some(mut combat_state) =
-                    state.combat.get_state(universe_id, &target_id).await
-                {
-                    combat_state.hp = target_hp;
-                    state
-                        .combat
-                        .update_state(universe_id, &target_id, combat_state)
-                        .await;
-                }
-            }
-            if state
-                .combat
-                .get_state(universe_id, player_id)
-                .await
-                .is_none()
-            {
-                state
-                    .combat
-                    .init_entity(
-                        universe_id,
-                        player_id,
-                        100, // Default player HP
-                    )
-                    .await;
-            }
-
-            // Initiate combat
-            if let Err(e) = state
-                .combat
-                .initiate(universe_id, player_id, &target_id)
-                .await
-            {
+            // Stats come from the object rows, the single source of truth
+            let Ok(Some(attacker_obj)) = state.object_store.get(universe_id, player_id).await
+            else {
                 return ServerMessage::Error {
-                    message: format!("Combat error: {}", e),
+                    message: "You have no body to fight with.".to_string(),
                 };
-            }
+            };
+            let attacker = Combatant::from_object(&attacker_obj, 100);
+            let defender = Combatant::from_object(target, 10);
 
-            // Perform attack (basic 1d6 physical damage; the combat manager
-            // takes the rolled amount and doubles it on a critical)
+            // Basic 1d6 physical damage, doubled on a critical
+            let d20 = crate::combat::roll_d20();
             let damage_roll = {
                 use rand::RngExt;
                 rand::rng().random_range(1..=6)
             };
-            let attack_result = match state
-                .combat
-                .attack(
-                    universe_id,
-                    player_id,
-                    &target_id,
-                    damage_roll,
-                    DamageType::Physical,
-                )
-                .await
-            {
-                Ok(result) => result,
+            let outcome =
+                resolve_attack(&attacker, &defender, d20, damage_roll, DamageType::Physical);
+
+            // The round is one atomic batch: new HP, and removal on death
+            match attack_statements(universe_id, &target_id, &outcome) {
+                Ok(statements) if !statements.is_empty() => {
+                    if let Err(e) = state.object_store.execute_batch(statements).await {
+                        return ServerMessage::Error {
+                            message: format!("Attack failed: {}", e),
+                        };
+                    }
+                }
+                Ok(_) => {}
                 Err(e) => {
                     return ServerMessage::Error {
                         message: format!("Attack failed: {}", e),
                     };
                 }
-            };
+            }
+            let attack_result = &outcome.result;
 
             // Build result message
             let mut messages = Vec::new();
@@ -1402,8 +1354,7 @@ async fn execute_command(
                     ));
                 }
 
-                // Check if target is dead
-                if state.combat.is_dead(universe_id, &target_id).await {
+                if outcome.killed {
                     messages.push(format!("{} is slain!", target_display_name));
                     deferred.push(Hook::new(
                         &target_id,
@@ -1412,28 +1363,11 @@ async fn execute_command(
                         player_id,
                         serde_json::json!({ "killer_id": player_id }),
                     ));
-
-                    // End combat and remove target from room
-                    state.combat.end_combat(universe_id, player_id).await;
-                    state.combat.remove_entity(universe_id, &target_id).await;
-
-                    // Remove NPC from room (set parent_id to None)
-                    if let Ok(Some(mut dead_target)) =
-                        state.object_store.get(universe_id, &target_id).await
-                    {
-                        dead_target.parent_id = None;
-                        let _ = state.object_store.update(&dead_target).await;
-                    }
                 } else {
-                    // Show remaining HP
-                    if let Some(target_state) =
-                        state.combat.get_state(universe_id, &target_id).await
-                    {
-                        messages.push(format!(
-                            "{} has {} HP remaining.",
-                            target_display_name, target_state.hp
-                        ));
-                    }
+                    messages.push(format!(
+                        "{} has {} HP remaining.",
+                        target_display_name, outcome.target_hp
+                    ));
                 }
             } else if attack_result.fumble {
                 messages.push(format!(
@@ -1451,12 +1385,7 @@ async fn execute_command(
             // detailed result as this command's reply
             let attacker_name = display_name(state, universe_id, player_id).await;
             let mut seen = format!("{} attacks {}.", attacker_name, target_display_name);
-            if state
-                .combat
-                .get_state(universe_id, &target_id)
-                .await
-                .is_none()
-            {
+            if outcome.killed {
                 seen.push_str(&format!(" {} is slain!", target_display_name));
             }
             state

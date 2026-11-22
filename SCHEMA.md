@@ -3,7 +3,7 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 2):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 3):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). There are no upgrade steps yet,
 so an older database is refused with a "create a new database" error (from
@@ -219,21 +219,6 @@ Unique: `(universe_id, grantee_id, path_prefix)`. Index:
 Unique: `(universe_id, player_id)`.
 
 ## Combat
-
-### combat_state
-
-HP and combat stats for entities that have been in combat.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| universe_id | TEXT NOT NULL | No foreign key |
-| entity_id | TEXT NOT NULL | Object id (NPC or player) in that universe |
-| hp | INTEGER NOT NULL | |
-| max_hp | INTEGER NOT NULL | |
-| armor_class | INTEGER NOT NULL DEFAULT 10 | |
-| attack_bonus | INTEGER NOT NULL DEFAULT 0 | |
-
-Primary key: `(universe_id, entity_id)`.
 
 ### active_effects
 

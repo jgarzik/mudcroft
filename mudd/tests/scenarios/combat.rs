@@ -210,27 +210,38 @@ async fn test_npc_subclasses_are_attackable() {
     assert!(text.contains("Wolf"), "{}", text);
 }
 
-/// Combat state writes are replicated through Raft
+/// HP has one home, the object row: after a hit, the bat's `hp` property
+/// (what Lua sees) is the HP the attack reported, written in one Raft entry
 #[tokio::test]
-async fn test_combat_state_goes_through_raft() {
+async fn test_attack_writes_hp_to_the_object() {
     let server = TestServer::start().await.expect("Failed to start server");
-    let mut alice = player_in_passage(&server, "raft_fighter").await;
-    attack(&mut alice, "attack bat").await;
-
-    let entries: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM raft_log WHERE payload LIKE '%combat_state%'")
-            .fetch_one(server.pool())
-            .await
-            .unwrap();
-    assert!(
-        entries >= 2,
-        "attacker and bat state replicated, got {}",
-        entries
-    );
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM combat_state WHERE universe_id = ?")
+    let mut alice = player_in_passage(&server, "row_fighter").await;
+    let bat = server.world().bat_id.clone();
+    for _ in 0..30 {
+        let text = attack(&mut alice, "attack bat").await;
+        if text.contains("slain") {
+            return;
+        }
+        let Some(remaining) = text
+            .lines()
+            .find(|l| l.contains("HP remaining"))
+            .and_then(|l| l.split(" has ").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse::<i64>().ok())
+        else {
+            continue; // miss or fumble
+        };
+        let stored: serde_json::Value = sqlx::query_scalar(
+            "SELECT json_extract(properties, '$.hp') FROM objects WHERE universe_id = ? AND id = ?",
+        )
         .bind(server.universe_id())
+        .bind(&bat)
         .fetch_one(server.pool())
         .await
+        .map(|v: i64| serde_json::json!(v))
         .unwrap();
-    assert_eq!(rows, 2);
+        assert_eq!(stored, serde_json::json!(remaining), "{}", text);
+        return;
+    }
+    panic!("no hit landed in 30 attacks");
 }
