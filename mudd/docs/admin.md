@@ -55,9 +55,11 @@ mudd_init --version
 ### mudd_init
 
 Creates a new database, or upgrades an existing one in place. Running it again
-on the same database is safe. Schema upgrades live here, never in `mudd`;
-there are none yet, so today a re-run creates any missing tables and
-refreshes the core mudlib.
+on the same database is safe. Schema upgrades live here, never in `mudd`:
+the database records its schema version, `mudd` refuses a mismatch, and
+`mudd_init` upgrades older versions. There are no upgrade steps yet, so a
+database from before versioning is refused (create a new one); otherwise a
+re-run creates any missing tables and refreshes the core mudlib.
 
 ```
 mudd_init --database <PATH> [--lib-dir <DIR>] [--lib <FILE.lua>]... [--force]
@@ -432,6 +434,8 @@ versions (see [mudd_init](#mudd_init)).
 | `MUDD_ADMIN_USERNAME environment variable required for new database` | Set `MUDD_ADMIN_USERNAME` and `MUDD_ADMIN_PASSWORD` when creating a database. They are not needed for upgrades. |
 | `Admin password must be at least 8 characters` | Use a longer `MUDD_ADMIN_PASSWORD`. |
 | `Database is missing required table '<name>'` | Run `mudd_init` on the database to migrate it. |
+| `Database schema version N does not match this mudd (M). Run mudd_init to upgrade it.` | The database was made by a different version. Run `mudd_init` on it. |
+| `Database schema version N predates version M and there is no upgrade from it; create a new database` | (from `mudd_init`) No upgrade path exists from that version. Create a new database. |
 | `Database has no admin account. Run mudd_init to create a valid database.` | No account has `access_level` `admin` or `owner`. `mudd_init` will not add one to an existing database. Fix it with SQL: `UPDATE accounts SET access_level='admin' WHERE username='...'`. |
 | `--static-dir <dir> has no index.html (build the client first)` | Run `npm run build` in `client/`, or fix the path. |
 | `Address already in use` | Another process holds the `--bind` port. Pick another address or stop that process. |

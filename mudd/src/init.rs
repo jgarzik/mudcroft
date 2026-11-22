@@ -216,6 +216,45 @@ mod tests {
         assert_eq!(account.access_level, "admin");
     }
 
+    /// A database older than the current schema is refused by mudd and
+    /// (with no upgrade steps from its version) by mudd_init, with a clear
+    /// error instead of failing at runtime
+    #[tokio::test]
+    async fn test_old_schema_version_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Pretend it predates schema versioning
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            sqlx::query("PRAGMA user_version = 0")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.pool().close().await;
+        }
+
+        let err = Database::open(db_path.to_str().unwrap())
+            .await
+            .err()
+            .expect("mudd must refuse an old schema");
+        assert!(err.to_string().contains("schema version"), "{}", err);
+
+        let err = init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .expect_err("mudd_init has no upgrade from version 0");
+        assert!(err.to_string().contains("schema version 0"), "{}", err);
+    }
+
     #[tokio::test]
     async fn test_init_database_new_requires_credentials() {
         let temp_dir = TempDir::new().unwrap();

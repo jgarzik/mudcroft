@@ -9,6 +9,12 @@ use std::path::Path;
 use std::str::FromStr;
 use tracing::info;
 
+/// Schema version, stored in `PRAGMA user_version`. Bump it with every
+/// incompatible schema change and add the upgrade step from the previous
+/// version to `Database::upgrade` (mudd_init is the only place upgrades run;
+/// mudd refuses any other version).
+pub const SCHEMA_VERSION: i64 = 1;
+
 /// Database handle wrapping SQLite connection pool
 pub struct Database {
     pool: SqlitePool,
@@ -36,8 +42,47 @@ impl Database {
 
         let db = Self { pool };
         db.run_migrations().await?;
+        db.set_schema_version(SCHEMA_VERSION).await?;
 
         Ok(db)
+    }
+
+    /// The database's schema version (`PRAGMA user_version`)
+    pub async fn schema_version(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    async fn set_schema_version(&self, version: i64) -> Result<()> {
+        // PRAGMA takes no bound parameters; version is our own integer
+        sqlx::query(&format!("PRAGMA user_version = {}", version))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Bring an existing database up to SCHEMA_VERSION, one version at a
+    /// time. There are no upgrade steps yet: version 1 is the first schema
+    /// with a version, so anything older is refused.
+    async fn upgrade(&self) -> Result<()> {
+        let version = self.schema_version().await?;
+        if version > SCHEMA_VERSION {
+            bail!(
+                "Database schema version {} is newer than this mudd_init supports ({})",
+                version,
+                SCHEMA_VERSION
+            );
+        }
+        if version < SCHEMA_VERSION {
+            bail!(
+                "Database schema version {} predates version {} and there is no upgrade \
+                 from it; create a new database",
+                version,
+                SCHEMA_VERSION
+            );
+        }
+        Ok(())
     }
 
     /// Open an existing database for migration/upgrade
@@ -65,7 +110,8 @@ impl Database {
 
         let db = Self { pool };
 
-        // Run migrations to upgrade schema
+        // Upgrade to the current schema version, then create anything missing
+        db.upgrade().await?;
         db.run_migrations().await?;
 
         Ok(db)
@@ -106,6 +152,16 @@ impl Database {
 
     /// Validate that the database has required tables and an admin account
     pub async fn validate(&self) -> Result<()> {
+        let version = self.schema_version().await?;
+        if version != SCHEMA_VERSION {
+            bail!(
+                "Database schema version {} does not match this mudd ({}). Run mudd_init \
+                 to upgrade it.",
+                version,
+                SCHEMA_VERSION
+            );
+        }
+
         // Check required tables exist
         let required_tables = [
             "accounts",
