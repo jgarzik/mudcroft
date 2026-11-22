@@ -250,7 +250,8 @@ impl CreditManager {
     ) -> anyhow::Result<bool> {
         check_amount(amount)?;
         if from == to {
-            return Ok(true);
+            // Nothing moves, but the payer must still have the funds
+            return Ok(self.balance(universe_id, from).await? >= amount);
         }
         let mut statements = Self::debit_statements(universe_id, from, amount);
         statements.push(Self::credit_statement(universe_id, to, amount));
@@ -269,13 +270,17 @@ mod tests {
 
     async fn manager() -> CreditManager {
         let pool = test_pool().await;
-        sqlx::query(
-            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
-             VALUES ('acct', 'acct', 'x', 'admin', '2026-01-01')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        for name in ["acct", "alice", "bob"] {
+            sqlx::query(
+                "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+                 VALUES (?, ?, 'x', 'player', '2026-01-01')",
+            )
+            .bind(name)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         for u in ["u1", "u2"] {
             sqlx::query(
                 "INSERT INTO universes (id, name, owner_id, config, created_at)
@@ -287,6 +292,13 @@ mod tests {
             .await
             .unwrap();
         }
+        sqlx::query(
+            "INSERT INTO objects (id, universe_id, class, properties, created_at, updated_at)
+             VALUES ('/shops/till', 'u1', 'item', '{}', '2026-01-01', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         CreditManager::new(Some(pool), None)
     }
 
@@ -343,5 +355,35 @@ mod tests {
             assert!(credits.grant("u1", &alice(), bad).await.is_err());
             assert!(credits.deduct("u1", &alice(), bad).await.is_err());
         }
+    }
+
+    /// A transfer to oneself still requires the funds
+    #[tokio::test]
+    async fn test_self_transfer_checks_balance() {
+        let credits = manager().await;
+        assert!(!credits.transfer("u1", &alice(), &alice(), 5).await.unwrap());
+        credits.grant("u1", &alice(), 5).await.unwrap();
+        assert!(credits.transfer("u1", &alice(), &alice(), 5).await.unwrap());
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 5);
+    }
+
+    /// The table refuses a balance for a holder that does not exist (an
+    /// object deleted meanwhile, or in another universe; an unknown
+    /// account), so credits are never stranded
+    #[tokio::test]
+    async fn test_missing_holders_refused() {
+        let credits = manager().await;
+        let till = Holder::Object("/shops/till".into());
+        assert!(credits.grant("u1", &till, 5).await.is_ok());
+        assert!(credits.grant("u2", &till, 5).await.is_err());
+        assert!(credits
+            .grant("u1", &Holder::Account("ghost".into()), 5)
+            .await
+            .is_err());
+        // A transfer to a missing holder changes nothing
+        credits.grant("u1", &alice(), 10).await.unwrap();
+        let gone = Holder::Object("/shops/gone".into());
+        assert!(credits.transfer("u1", &alice(), &gone, 4).await.is_err());
+        assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 10);
     }
 }

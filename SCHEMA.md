@@ -222,7 +222,10 @@ transfer is all-or-nothing.
 | balance | INTEGER NOT NULL DEFAULT 0 | `CHECK (balance >= 0)` |
 
 Primary key: `(universe_id, holder_kind, holder_id)`. No foreign key (a holder
-may be an account or an object); deleting an object deletes its balance.
+may be an account or an object); instead the trigger `credits_holder_exists`
+aborts an insert whose holder does not exist (an unknown account, or no such
+object in the universe), in the same write. Deleting an object deletes its
+balance in the same batch.
 
 ## Combat
 

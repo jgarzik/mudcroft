@@ -351,7 +351,16 @@ impl StateMachine {
             {
                 Ok(result) => rows += result.rows_affected(),
                 Err(e) => {
-                    error!("SQL execution failed (rolling back the request): {}", e);
+                    // A constraint refusing a write (e.g. credits' balance
+                    // CHECK on an overdraft) is an expected outcome
+                    let message = e.to_string();
+                    if message.contains("CHECK constraint failed")
+                        || message.contains("credits holder does not exist")
+                    {
+                        debug!("request refused by a constraint (rolled back): {}", message);
+                    } else {
+                        error!("SQL execution failed (rolling back the request): {}", e);
+                    }
                     sqlx::query("ROLLBACK TO entry")
                         .execute(&mut *conn)
                         .await

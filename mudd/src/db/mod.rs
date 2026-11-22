@@ -303,6 +303,25 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        // A balance needs a holder that exists (credits has no foreign key,
+        // as holders are accounts or objects): checked in the same write,
+        // so credits can never land on an object deleted meanwhile
+        sqlx::query(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS credits_holder_exists
+            BEFORE INSERT ON credits
+            WHEN (NEW.holder_kind = 'account'
+                  AND NOT EXISTS (SELECT 1 FROM accounts WHERE id = NEW.holder_id))
+              OR (NEW.holder_kind = 'object'
+                  AND NOT EXISTS (SELECT 1 FROM objects
+                                  WHERE universe_id = NEW.universe_id AND id = NEW.holder_id))
+            BEGIN
+                SELECT RAISE(ABORT, 'credits holder does not exist');
+            END
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Classes defined per universe (built-in classes live in code; a
         // parent may be built-in, so it has no foreign key)
