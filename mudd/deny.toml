@@ -34,7 +34,14 @@ allow = [
 ]
 
 [bans]
-multiple-versions = "allow"
+# Duplicates (mostly from upstream crates) are reported, not fatal
+multiple-versions = "warn"
+# TLS is rustls only
+deny = [
+    { crate = "openssl", reason = "TLS is rustls only" },
+    { crate = "openssl-sys", reason = "TLS is rustls only" },
+    { crate = "native-tls", reason = "TLS is rustls only" },
+]
 wildcards = "deny"
 allow-wildcard-paths = true
 
