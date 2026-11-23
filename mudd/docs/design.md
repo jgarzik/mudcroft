@@ -376,15 +376,18 @@ args}`; only the primary runs this loop.
 Call_outs have no cache: the `timers` table is the only state. Scheduling
 inserts the row in the caller's run (the loop sees it once that run
 commits; at most 32 pending per object). Each due call_out fires as one
-run: it claims the call_out by deleting its row (one row: under the write
-lock, so a concurrent `remove_call_out`, which is the same delete, gets
-`false` once firing has begun), then runs the handler as a nested part.
-Success commits the claim and the handler's writes as one Raft entry; a
-failing handler keeps none of its writes while the claim commits (dropped,
-as in LPMud). If the commit is refused when applied (deterministic) the
-call_out is dropped; if the node is not the primary or Raft times out, the
-row stays, the loop pauses 500 ms and tries again, and after a failover the
-next primary fires it. Handler messages still reach players before the
+run: under the write lock it checks the row is still there (a gone one
+writes nothing), reads the object, claims the call_out by deleting its row
+(so a concurrent `remove_call_out`, which is the same delete, gets `false`
+once firing has begun), then runs the handler as a nested part. Success
+commits the claim and the handler's writes as one Raft entry; a handler
+that fails, or whose code cannot be loaded, keeps none of its writes while
+the claim commits (dropped, as in LPMud). A commit refused when applied
+(deterministic; a poisoned run reports its checkpoint's cause) drops it; a
+failure of its own (a failed read) pushes its `fire_at` back 5 s without
+holding up the rest; if the node is not the primary or Raft times out, the
+row stays, the loop pauses 500 ms, and after a failover the next primary
+fires it. Handler messages still reach players before the
 commit, so a call_out fired again after a crash may repeat them.
 
 Heartbeats are a cache of `heartbeats` (one write to set or remove; beats

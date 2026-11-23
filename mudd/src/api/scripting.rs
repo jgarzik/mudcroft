@@ -336,6 +336,10 @@ const TIMER_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 /// Most due call_outs fired per pass (each its own run)
 const CALL_OUT_BATCH: i64 = 64;
 
+/// How far a call_out is pushed back when firing it failed for a reason of
+/// its own (a failed read): it is retried then, without holding up others
+const CALL_OUT_RETRY_MS: i64 = 5_000;
+
 /// Fire due call_outs and heartbeats forever. Deadline-driven: the loop
 /// sleeps until the earliest call_out (from the table) or heartbeat, or
 /// until one is added, not on a fixed poll.
@@ -370,7 +374,7 @@ pub async fn run_timer_loop(state: AppState) {
         match state.timers.due_call_outs(now, CALL_OUT_BATCH).await {
             Ok(due) => {
                 for timer in due {
-                    if !fire_call_out(&state, &timer).await {
+                    if fire_call_out(&state, &timer).await == Fired::Pause {
                         tokio::time::sleep(TIMER_RETRY_PAUSE).await;
                         break;
                     }
@@ -396,39 +400,55 @@ fn timer_args(
     serde_json::json!({ "object_id": object_id, "room_id": room_id, "args": args })
 }
 
-/// Fire one due call_out as one run: claim it (delete its row: under the
-/// write lock, so cancel and fire are one decision and a call_out runs at
-/// most once), then run its handler as a nested part. Success commits the
-/// claim and the handler's writes as one Raft entry: never the timer gone
-/// without its effects, or the reverse. A handler that fails keeps none of
-/// its writes and the call_out is dropped (the claim commits), as in LPMud.
-/// False if nothing could be saved: the row stays (the loop pauses and
-/// tries again; after a failover the next primary fires it).
-async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> bool {
+/// What became of a due call_out
+#[derive(PartialEq)]
+enum Fired {
+    /// Ran, dropped, or gone already
+    Done,
+    /// Nothing could be saved here (not the primary, Raft timed out): stop
+    /// this pass and pause; its row is still stored
+    Pause,
+}
+
+/// Fire one due call_out as one run. Under the write lock (so cancel and
+/// fire are one decision and a call_out runs at most once) it checks the
+/// row is still there, reads the object, then claims the call_out by
+/// deleting its row and runs its handler as a nested part. Success commits
+/// the claim and the handler's writes as one Raft entry: never the timer
+/// gone without its effects, or the reverse. A handler that fails (or
+/// whose code cannot be loaded) keeps none of its writes and the call_out
+/// is dropped (the claim commits), as in LPMud; so is one whose change is
+/// refused when applied (the same on every try). A failure of its own (a
+/// failed read) pushes it back a few seconds without holding up the rest.
+async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> Fired {
     let what = format!("call_out {} on {}", timer.method, timer.object_id);
     let outcome = in_run_settled(state, Vec::new(), async {
+        let run = crate::db::run::current().ok_or("not in a run")?;
+        run.lock_writes().await.map_err(|e| e.to_string())?;
+        if !state
+            .timers
+            .is_stored(&timer.id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(()); // cancelled, or fired already: nothing to save
+        }
+        let obj = state
+            .object_store
+            .get(&timer.universe_id, &timer.object_id)
+            .await
+            .map_err(|e| format!("reading its object: {}", e))?;
         let (sql, params) = crate::timers::TimerManager::consume_statement(&timer.id);
-        let claimed = state
+        state
             .raft_writer
             .execute(sql, params)
             .await
             .map_err(|e| e.to_string())?;
-        if claimed.rows_affected != 1 {
-            return Ok(()); // cancelled, or fired already
-        }
-        let room_id = match state
-            .object_store
-            .get(&timer.universe_id, &timer.object_id)
-            .await
-        {
-            Ok(Some(obj)) => obj.parent_id,
-            // Gone (its delete cascades to its timers anyway)
-            Ok(None) => return Ok(()),
-            Err(e) => {
-                tracing::warn!("{}: reading its object failed (dropped): {}", what, e);
-                return Ok(());
-            }
+        // Gone: nothing to call (its delete cascades to its timers anyway)
+        let Some(obj) = obj else {
+            return Ok(());
         };
+        let room_id = obj.parent_id;
         let args = timer_args(&timer.object_id, &room_id, &timer.args);
         if let Err(e) = invoke_handler(
             state,
@@ -446,25 +466,45 @@ async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> bool {
     })
     .await;
     match outcome {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => Fired::Done,
         Ok(Err(e)) => {
-            // The claim itself could not be written: nothing ran
-            tracing::warn!("{}: not run, retried: {}", what, e);
-            false
+            // A failure of its own: nothing saved; retried a little later
+            tracing::warn!(
+                "{}: not run ({}), retried in {} ms",
+                what,
+                e,
+                CALL_OUT_RETRY_MS
+            );
+            let later = chrono::Utc::now().timestamp_millis() + CALL_OUT_RETRY_MS;
+            match state
+                .raft_writer
+                .execute(
+                    "UPDATE timers SET fire_at = ? WHERE id = ?",
+                    vec![serde_json::json!(later), serde_json::json!(timer.id)],
+                )
+                .await
+            {
+                Ok(_) => Fired::Done,
+                Err(e) => {
+                    tracing::warn!("{}: postponing it failed: {}", what, e);
+                    Fired::Pause
+                }
+            }
         }
         Err(e) if crate::raft::writer::is_apply_failure(&e) => {
             // Refused when applied: the same on every try, so dropped
-            tracing::warn!("{}: its change was refused (dropped): {}", what, e);
+            tracing::warn!("{}: its change was refused (dropped): {:#}", what, e);
             let (sql, params) = crate::timers::TimerManager::consume_statement(&timer.id);
             if let Err(e) = state.raft_writer.execute(sql, params).await {
                 tracing::warn!("{}: dropping it failed: {}", what, e);
+                return Fired::Pause;
             }
-            true
+            Fired::Done
         }
         Err(e) => {
             // Not the primary any more, or Raft timed out: still stored
-            tracing::warn!("{}: not saved, retried: {}", what, e);
-            false
+            tracing::warn!("{}: not saved, retried: {:#}", what, e);
+            Fired::Pause
         }
     }
 }

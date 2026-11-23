@@ -237,6 +237,10 @@ impl TimerManager {
     /// caller's run, and the timer loop sees it once that run commits.
     /// None if the object already has [`MAX_TIMERS_PER_OBJECT`] pending.
     pub async fn schedule(self: &Arc<Self>, timer: Timer) -> anyhow::Result<Option<String>> {
+        // Count under the write lock, so two runs cannot both pass the cap
+        if let Some(run) = crate::db::run::current() {
+            run.lock_writes().await?;
+        }
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM timers WHERE universe_id = ? AND object_id = ?",
         )
@@ -292,21 +296,6 @@ impl TimerManager {
         Ok(rows == 1)
     }
 
-    /// Delete all of an object's call_outs (with the object; its delete
-    /// cascades too)
-    pub async fn remove_timers_for_object(
-        &self,
-        universe_id: &str,
-        object_id: &str,
-    ) -> anyhow::Result<()> {
-        self.write(
-            "DELETE FROM timers WHERE universe_id = ? AND object_id = ?",
-            vec![serde_json::json!(universe_id), serde_json::json!(object_id)],
-        )
-        .await?;
-        Ok(())
-    }
-
     /// The statement that claims a due call_out for firing: the run that
     /// deletes its row (one row) is the one that runs it
     pub fn consume_statement(timer_id: &str) -> (&'static str, Vec<serde_json::Value>) {
@@ -314,6 +303,16 @@ impl TimerManager {
             "DELETE FROM timers WHERE id = ?",
             vec![serde_json::json!(timer_id)],
         )
+    }
+
+    /// Whether a call_out's row exists (read through the current run, so
+    /// under its write lock it is the truth)
+    pub async fn is_stored(&self, timer_id: &str) -> anyhow::Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM timers WHERE id = ?")
+            .bind(timer_id)
+            .fetch_optional(&mut *crate::db::run::reader(self.pool()?).await?)
+            .await?;
+        Ok(found.is_some())
     }
 
     /// Call_outs due at `now`, earliest first (then in the order made)
@@ -524,7 +523,7 @@ mod tests {
     }
 
     /// Each object (per universe) may have at most MAX_TIMERS_PER_OBJECT
-    /// pending; deleting one object's call_outs leaves the rest
+    /// pending
     #[tokio::test]
     async fn test_cap_and_cleanup_are_per_object() {
         let (mgr, pool) = manager().await;
@@ -550,8 +549,7 @@ mod tests {
                 .is_some(),
             "universe b's object has its own cap"
         );
-        mgr.remove_timers_for_object("b", "/clock").await.unwrap();
-        assert_eq!(stored(&pool).await, MAX_TIMERS_PER_OBJECT as i64);
+        assert_eq!(stored(&pool).await, MAX_TIMERS_PER_OBJECT as i64 + 1);
     }
 
     /// Due call_outs come earliest first and are only listed (claiming one
