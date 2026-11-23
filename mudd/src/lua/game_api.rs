@@ -2950,10 +2950,12 @@ fn run_handler_sandboxed(
     for (name, lib) in libs {
         sandbox
             .execute::<()>(lib)
+            .map_err(super::Sandbox::nested_error)
             .map_err(|e| format!("use_object: library {}: {}", name, e))?;
     }
     let handlers: Table = sandbox
         .execute(code)
+        .map_err(super::Sandbox::nested_error)
         .map_err(|e| format!("use_object: object code: {}", e))?;
     let Ok(func) = handlers.get::<Function>(handler) else {
         return Ok(None);
@@ -2961,6 +2963,7 @@ fn run_handler_sandboxed(
     let lua_args = json_to_lua(sandbox.lua(), args).map_err(|e| e.to_string())?;
     let value: Value = sandbox
         .call(func, lua_args)
+        .map_err(super::Sandbox::nested_error)
         .map_err(|e| format!("use_object: {}: {}", handler, e))?;
     lua_to_json(value)
         .map(Some)

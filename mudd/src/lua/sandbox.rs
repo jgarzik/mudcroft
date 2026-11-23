@@ -99,8 +99,9 @@ pub enum SandboxError {
     LuaError(#[from] mlua::Error),
 
     /// A native function panicked (a server bug): the script fails, the
-    /// task running it carries on
-    #[error("internal error: {0}")]
+    /// task running it carries on. The message is for the server log only;
+    /// scripts and players see "internal error".
+    #[error("internal error")]
     Panic(String),
 }
 
@@ -337,6 +338,17 @@ impl Sandbox {
         Ok(())
     }
 
+    /// The error a nested execution (game.use_object) hands its caller. A
+    /// panic is not an ordinary error there: it resumes unwinding, so it
+    /// passes through the caller's pcall and fails the whole top-level run
+    /// (whose writes then roll back), where the outer entry point catches it.
+    pub fn nested_error(e: SandboxError) -> SandboxError {
+        match e {
+            SandboxError::Panic(msg) => std::panic::resume_unwind(Box::new(msg)),
+            e => e,
+        }
+    }
+
     /// Get metering data
     pub fn metering(&self) -> &Metering {
         &self.metering
@@ -383,13 +395,6 @@ impl Sandbox {
         before: u64,
         result: Result<LuaResult<R>, String>,
     ) -> Result<R, SandboxError> {
-        let result = match result {
-            Ok(result) => result,
-            Err(panic) => {
-                self.metering.set_memory(self.lua.used_memory() as u64);
-                return Err(SandboxError::Panic(panic));
-            }
-        };
         let instr = self.limits.instructions.load(Ordering::Relaxed);
         self.metering.add_instructions(instr.saturating_sub(before));
         self.metering.set_memory(self.lua.used_memory() as u64);
@@ -407,7 +412,10 @@ impl Sandbox {
             self.limits.timed_out.store(true, Ordering::Relaxed);
             return Err(SandboxError::Timeout(self.config.timeout));
         }
-        result.map_err(SandboxError::from)
+        match result {
+            Ok(result) => result.map_err(SandboxError::from),
+            Err(panic) => Err(SandboxError::Panic(panic)),
+        }
     }
 
     /// Execute a Lua function with arguments, within the current budget
@@ -466,6 +474,33 @@ fn catch_panic<R>(f: impl FnOnce() -> LuaResult<R>) -> Result<LuaResult<R>, Stri
 mod tests {
     use super::*;
 
+    /// A panic inside a nested execution (game.use_object) fails the whole
+    /// top-level run, so its writes roll back: the caller's pcall cannot
+    /// catch it and carry on to commit a half-finished change
+    #[test]
+    fn test_nested_panic_not_swallowed_by_pcall() {
+        let mut outer = Sandbox::new(SandboxConfig::default()).unwrap();
+        let nested = outer
+            .lua()
+            .create_function(|_, ()| {
+                let mut inner = Sandbox::new(SandboxConfig::default()).unwrap();
+                let boom = inner
+                    .lua()
+                    .create_function(|_, ()| -> mlua::Result<()> { panic!("nested bug") })
+                    .unwrap();
+                inner.lua().globals().set("boom", boom).unwrap();
+                inner
+                    .execute::<()>("boom()")
+                    .map_err(|e| mlua::Error::runtime(Sandbox::nested_error(e)))
+            })
+            .unwrap();
+        outer.lua().globals().set("nested", nested).unwrap();
+        match outer.execute::<mlua::Value>("pcall(nested) return 1") {
+            Err(SandboxError::Panic(_)) => {}
+            other => panic!("expected the run to fail with Panic, got {other:?}"),
+        }
+    }
+
     /// A panic in a native (game.*) function fails the script with an
     /// error; it never unwinds into the task running it (the timer loop,
     /// a scheduler, a session), and pcall cannot swallow it
@@ -480,7 +515,14 @@ mod tests {
 
         for code in ["boom()", "pcall(boom) return 1", "return 1 + (boom() or 0)"] {
             match sandbox.execute::<mlua::Value>(code) {
-                Err(SandboxError::Panic(msg)) => assert!(msg.contains("native bug"), "{msg}"),
+                Err(e @ SandboxError::Panic(_)) => {
+                    // Details only in the server log
+                    assert_eq!(e.to_string(), "internal error");
+                    let SandboxError::Panic(msg) = e else {
+                        unreachable!()
+                    };
+                    assert!(msg.contains("native bug"), "{msg}");
+                }
                 other => panic!("{code}: expected Panic, got {other:?}"),
             }
         }
