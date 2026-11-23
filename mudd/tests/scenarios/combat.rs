@@ -919,15 +919,7 @@ async fn test_combat_rounds_and_retaliation() {
                 || t.starts_with("You fumble")
         })
         .count();
-    let theirs = heard
-        .iter()
-        .filter(|t| {
-            t.contains("ogre hits you")
-                || t.contains("ogre misses you")
-                || t.contains("ogre critically hits you")
-                || t.contains("ogre fumbles")
-        })
-        .count();
+    let theirs = heard.iter().filter(|t| struck_line(t, "ogre")).count();
     assert!(ours >= 2, "our rounds went on: {:?}", heard);
     assert!(theirs >= 2, "the ogre fought back: {:?}", heard);
     let fighting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM combat")
@@ -1258,6 +1250,43 @@ async fn test_take_from_respects_containers() {
         .expect("unlocked");
 }
 
+/// Whether `attacker` swung at us: every attack outcome (hit, critical, miss, fumble)
+fn struck_by(heard: &[String], attacker: &str) -> bool {
+    heard.iter().any(|t| struck_line(t, attacker))
+}
+
+fn struck_line(t: &str, attacker: &str) -> bool {
+    [
+        " hits you",
+        " critically hits you",
+        " misses you",
+        " fumbles an attack against you",
+    ]
+    .iter()
+    .any(|v| t.contains(&format!("{attacker}{v}")))
+}
+
+/// A fumble is still an attack: CI once heard only fumbles from an aggro wolf
+#[test]
+fn test_struck_by_counts_every_outcome() {
+    let heard: Vec<String> = [
+        "wolf fumbles an attack against you.",
+        "wolf attacks wanderer.",
+        "You miss wolf (rolled 7 vs AC 10).",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert!(struck_by(&heard, "wolf"));
+    for line in [
+        "wolf hits you for 3 damage.",
+        "wolf critically hits you for 9 damage!",
+        "wolf misses you.",
+    ] {
+        assert!(struck_line(line, "wolf"), "{line}");
+    }
+    assert!(!struck_by(&heard, "monk"));
+}
+
 /// An admin standing in the entrance, with 1 s combat rounds
 async fn arena_admin(server: &TestServer, name: &str) -> TestClient {
     let mut adm = server
@@ -1291,13 +1320,7 @@ async fn test_npc_aggro_on_arrival() {
     adm.drain().await;
     adm.command("north").await.unwrap();
     let heard = adm.outputs_within(Duration::from_millis(1500)).await;
-    assert!(
-        heard.iter().any(|t| t.contains("wolf hits you")
-            || t.contains("wolf misses you")
-            || t.contains("wolf critically")),
-        "the wolf attacked: {:?}",
-        heard
-    );
+    assert!(struck_by(&heard, "wolf"), "the wolf attacked: {:?}", heard);
 }
 
 /// An NPC below its flee_threshold runs instead of fighting
@@ -1353,9 +1376,7 @@ async fn test_npc_faction_assists() {
     adm.command("attack orc").await.unwrap();
     let heard = adm.outputs_within(Duration::from_millis(2500)).await;
     assert!(
-        heard.iter().any(|t| t.contains("brute hits you")
-            || t.contains("brute misses you")
-            || t.contains("brute critically")),
+        struck_by(&heard, "brute"),
         "the brute joined in: {:?}",
         heard
     );
@@ -1950,13 +1971,7 @@ async fn test_ai_overrides_and_attack_authority() {
     adm.command("attack monk").await.unwrap();
     let heard = adm.outputs_within(Duration::from_millis(2500)).await;
     assert!(heard.iter().any(|t| t.contains("meditates")), "{:?}", heard);
-    assert!(
-        !heard
-            .iter()
-            .any(|t| t.contains("monk hits you") || t.contains("monk misses you")),
-        "{:?}",
-        heard
-    );
+    assert!(!struck_by(&heard, "monk"), "{:?}", heard);
     eval_as(
         &mut adm,
         &format!(r#"game.stop_combat("{}") return "ok""#, me),
@@ -2033,9 +2048,7 @@ async fn test_tutorial_crypt_plays() {
     wiz.command("s").await.unwrap();
     let heard = wiz.outputs_within(Duration::from_millis(2500)).await;
     assert!(
-        heard.iter().any(|t| t.contains("skeleton guard hits you")
-            || t.contains("skeleton guard misses you")
-            || t.contains("skeleton guard critically")),
+        struck_by(&heard, "skeleton guard"),
         "the guard attacks on sight: {:?}",
         heard
     );
