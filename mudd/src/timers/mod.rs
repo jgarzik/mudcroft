@@ -249,36 +249,32 @@ impl TimerManager {
     /// caller's run, and the timer loop sees it once that run commits.
     /// None if the object already has [`MAX_TIMERS_PER_OBJECT`] pending.
     pub async fn schedule(self: &Arc<Self>, timer: Timer) -> anyhow::Result<Option<String>> {
-        // Count under the write lock, so two runs cannot both pass the cap
-        if let Some(run) = crate::db::run::current() {
-            run.lock_writes().await?;
-        }
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM timers WHERE universe_id = ? AND object_id = ?",
-        )
-        .bind(&timer.universe_id)
-        .bind(&timer.object_id)
-        .fetch_one(&mut *crate::db::run::reader(self.pool()?).await?)
-        .await?;
-        if pending >= MAX_TIMERS_PER_OBJECT as i64 {
+        // One statement, so the cap is exact whoever schedules at once
+        let added = self
+            .write(
+                "INSERT INTO timers (id, universe_id, object_id, method, fire_at, args)
+                 SELECT ?, ?, ?, ?, ?, ?
+                 WHERE (SELECT COUNT(*) FROM timers WHERE universe_id = ? AND object_id = ?) < ?",
+                vec![
+                    serde_json::json!(&timer.id),
+                    serde_json::json!(&timer.universe_id),
+                    serde_json::json!(&timer.object_id),
+                    serde_json::json!(&timer.method),
+                    serde_json::json!(timer.fire_at),
+                    serde_json::json!(&timer.args),
+                    serde_json::json!(&timer.universe_id),
+                    serde_json::json!(&timer.object_id),
+                    serde_json::json!(MAX_TIMERS_PER_OBJECT),
+                ],
+            )
+            .await?;
+        if added == 0 {
             warn!(
                 "Object {} already has {} pending timers; refusing call_out",
-                timer.object_id, pending
+                timer.object_id, MAX_TIMERS_PER_OBJECT
             );
             return Ok(None);
         }
-        self.write(
-            "INSERT INTO timers (id, universe_id, object_id, method, fire_at, args) VALUES (?, ?, ?, ?, ?, ?)",
-            vec![
-                serde_json::json!(&timer.id),
-                serde_json::json!(&timer.universe_id),
-                serde_json::json!(&timer.object_id),
-                serde_json::json!(&timer.method),
-                serde_json::json!(timer.fire_at),
-                serde_json::json!(&timer.args),
-            ],
-        )
-        .await?;
         // The loop may need to wake sooner, once the row is there to see
         let me = self.clone();
         crate::db::run::after_commit(move || async move { me.changed.notify_one() }).await;
@@ -469,15 +465,23 @@ impl TimerManager {
         )
         .fetch_all(&mut *crate::db::run::reader(pool).await?)
         .await?;
-        // A heartbeat already scheduled keeps its next beat (a rebuild after
-        // a failed run must not refire one that just beat)
+        // A heartbeat already scheduled keeps its next beat if it is still
+        // ahead (a rebuild after a failed run must not refire one that just
+        // beat); a stale one (a node primary again) is back on its schedule
+        let now = chrono::Utc::now().timestamp_millis();
         let mut heartbeats = self.heartbeats.write().await;
         let mut old = std::mem::take(&mut *heartbeats);
         for (universe_id, object_id, interval_ms, started_at) in rows {
             let interval_ms = interval_ms.max(0) as u64;
             let key = (universe_id, object_id);
             let hb = match old.remove(&key) {
-                Some(hb) if hb.interval_ms == interval_ms && hb.started_at == started_at => hb,
+                Some(hb)
+                    if hb.interval_ms == interval_ms
+                        && hb.started_at == started_at
+                        && hb.next_due > now =>
+                {
+                    hb
+                }
                 _ => HeartBeat::anchored(&key.0, &key.1, interval_ms, started_at),
             };
             heartbeats.insert(key, hb);
@@ -660,6 +664,25 @@ mod tests {
         let timer = mgr.due_call_outs(i64::MAX, 1).await.unwrap().pop().unwrap();
         assert!(mgr.retry_or_drop(&timer).await.unwrap(), "dropped at last");
         assert_eq!(stored(&pool).await, 0);
+    }
+
+    /// A node that becomes primary again rebuilds its heartbeats on their
+    /// schedule: a stale cached next beat (from before it stepped down) is
+    /// not kept, so they do not all fire at once
+    #[tokio::test]
+    async fn test_rebuild_drops_stale_next_beats() {
+        let (mgr, _pool) = manager().await;
+        mgr.set_heartbeat(HeartBeat::new("u", "/clock", 60_000))
+            .await
+            .unwrap();
+        let key = ("u".to_string(), "/clock".to_string());
+        mgr.heartbeats.write().await.get_mut(&key).unwrap().next_due -= 3_600_000;
+        mgr.load_from_db().await.unwrap();
+        let next = mgr.heartbeats.read().await[&key].next_due;
+        assert!(
+            next > chrono::Utc::now().timestamp_millis(),
+            "back on its schedule"
+        );
     }
 
     /// Heartbeats are per universe

@@ -382,14 +382,15 @@ writes nothing), reads the object, claims the call_out by deleting its row
 once firing has begun), then runs the handler as a nested part. Success
 commits the claim and the handler's writes as one Raft entry; a handler
 that fails, or whose code cannot be loaded, keeps none of its writes while
-the claim commits (dropped, as in LPMud). If nothing could be saved, or a
-read failed, it is retried rather than classified: `timers.attempts` counts
-the tries and pushes `fire_at` back 1 s, 2 s, 4 s ... (at most 5 minutes)
-without holding up the rest, and after 8 it is dropped with an error
-logged; if even that cannot be written (not the primary, Raft down) the
-loop pauses 500 ms, and after a failover the next primary fires it.
-Scheduling is always inside a run (Lua), whose write lock makes the 32 per
-object cap exact. Handler messages still reach players before the
+the claim commits (dropped, as in LPMud). If it failed before its handler
+ran (the claim or a read), it is retried rather than classified:
+`timers.attempts` counts the tries and pushes `fire_at` back 1 s, 2 s, 4 s
+... (at most 5 minutes) without holding up the rest, and after 8 it is
+dropped with an error logged. Once its handler has run, a failure to save
+drops it, so its messages and directly billed calls do not repeat. If even
+those writes fail (not the primary, Raft down) the loop pauses 500 ms, and
+after a failover the next primary fires it. The 32 per object cap is one
+conditional INSERT, so it is exact. Handler messages still reach players before the
 commit, so a call_out fired again after a crash may repeat them.
 
 Heartbeats are a cache of `heartbeats` (one write to set or remove; beats

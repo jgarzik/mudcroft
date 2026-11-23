@@ -399,11 +399,16 @@ enum Fired {
 /// the claim and the handler's writes as one Raft entry: never the timer
 /// gone without its effects, or the reverse. A handler that fails (or
 /// whose code cannot be loaded) keeps none of its writes and the call_out
-/// is dropped (the claim commits), as in LPMud. If nothing could be saved
-/// or a read failed, it is retried with a doubling wait and dropped after
-/// a few tries (`TimerManager::retry_or_drop`), without holding up the rest.
+/// is dropped (the claim commits), as in LPMud. If it failed before its
+/// handler ran (the claim or a read), it is retried with a doubling wait
+/// and dropped after a few tries (`TimerManager::retry_or_drop`), without
+/// holding up the rest; once its handler has run, a failure to save drops
+/// it (it runs at most once, save across a crash or failover).
 async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> Fired {
     let what = format!("call_out {} on {}", timer.method, timer.object_id);
+    // Once its handler has run, a failure to save is not retried here: its
+    // messages and directly billed calls are not to happen twice
+    let started = std::sync::atomic::AtomicBool::new(false);
     let outcome = in_run(state, async {
         let run = crate::db::run::current().ok_or("not in a run")?;
         run.lock_writes().await.map_err(|e| e.to_string())?;
@@ -432,6 +437,7 @@ async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> Fired 
         };
         let room_id = obj.parent_id;
         let args = timer_args(&timer.object_id, &room_id, &timer.args);
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = invoke_handler(
             state,
             &timer.universe_id,
@@ -449,7 +455,21 @@ async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> Fired 
     .await;
     match outcome {
         Ok(()) => Fired::Done,
-        // Nothing saved (or a read failed): tried again later, with a
+        Err(e) if started.load(std::sync::atomic::Ordering::SeqCst) => {
+            // Its handler ran but its change was not saved: dropped, so it
+            // runs at most once (if even the drop cannot be saved, the row
+            // stays and the next primary runs it, as after a crash)
+            tracing::error!("{}: ran but not saved (dropped): {}", what, e);
+            let (sql, params) = crate::timers::TimerManager::consume_statement(&timer.id);
+            match state.raft_writer.execute(sql, params).await {
+                Ok(_) => Fired::Done,
+                Err(write) => {
+                    tracing::warn!("{}: dropping it failed: {}", what, write);
+                    Fired::Pause
+                }
+            }
+        }
+        // Nothing ran (the claim or a read failed): tried again later, with a
         // doubling wait, and dropped after a few tries; whether the failure
         // passes or lasts need not be known
         Err(e) => match state.timers.retry_or_drop(timer).await {

@@ -740,13 +740,16 @@ running.
 Pending call_outs and heartbeats are saved to the database and survive a
 restart or failover.
 
-A call_out is used up in the same change as its handler's writes: it runs at
-most once, and its writes are saved with it. If the handler fails, none of
-its writes are kept and the call_out is dropped, not retried (as in LPMud).
-One that falls due while the server is down or changing primary fires once,
-late. One that cannot be saved (a server problem) is tried again a few
-times with growing waits, then dropped. Its messages reach players as the handler runs, so after a crash
-mid-change they may be shown again when it fires on the next primary.
+A call_out is used up in the same change as its handler's writes: its
+writes are saved with it, never twice. If the handler fails, none of its
+writes are kept and the call_out is dropped, not retried (as in LPMud); so
+is one whose handler ran but whose change could not be saved (a server
+problem). One that could not even start (a server problem) is tried again
+a few times with growing waits, then dropped. One that falls due while the
+server is down or changing primary fires once, late. Its handler runs once,
+except that a crash or failover in the middle of its change can make it run
+again on the next primary: its messages, which reach players as the handler
+runs, may then be shown twice.
 
 Deleting an object cancels both its call_outs and its heartbeat.
 
