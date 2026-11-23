@@ -100,14 +100,10 @@ impl ConnectionManager {
         (cancel_rx, disconnect_id)
     }
 
-    /// When a grace period expires: claim the disconnect for handling. True
-    /// only if it is still the pending one (`disconnect_id`) and the player has no
-    /// session, checked under the sessions lock so a reconnect that raced
-    /// past the cancel is never treated as gone.
     /// Start handling the disconnect of a player whose server was lost
     /// (recorded online, not connected here): records a pending disconnect
     /// (a reconnect cancels it, as during a grace period) and returns its
-    /// generation, for claim_expired_disconnect right before acting. None
+    /// disconnect id, for claim_expired_disconnect right before acting. None
     /// if they have a live session or a disconnect already pending here,
     /// which then stays in charge.
     pub async fn begin_orphaned_disconnect(
@@ -127,6 +123,10 @@ impl ConnectionManager {
         Some(disconnect_id)
     }
 
+    /// When a grace period expires: claim the disconnect for handling. True
+    /// only if it is still the pending one (`disconnect_id`) and the player
+    /// has no session, checked under the sessions lock so a reconnect that
+    /// raced past the cancel is never treated as gone.
     pub async fn claim_expired_disconnect(
         &self,
         universe_id: &str,
