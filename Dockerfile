@@ -1,26 +1,27 @@
 # syntax=docker/dockerfile:1
 
-
 # =============================================================================
-# Stage 1: Rust dependency planner (cargo-chef)
+# Stage 1: Rust toolchain plus cargo-chef, shared by planner and builder so
+# both always run the same cargo-chef
 # =============================================================================
-FROM rust:1-trixie AS rust-planner
+FROM rust:1-trixie AS rust-chef
 
 RUN cargo install cargo-chef --locked
-
 WORKDIR /mudd
+
+# =============================================================================
+# Stage 2: Rust dependency planner
+# =============================================================================
+FROM rust-chef AS rust-planner
+
 COPY mudd/Cargo.toml mudd/Cargo.lock ./
 COPY mudd/src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 # =============================================================================
-# Stage 2: Rust dependency cache and build
+# Stage 3: Rust dependency cache and build
 # =============================================================================
-FROM rust:1-trixie AS rust-builder
-
-RUN cargo install cargo-chef --locked
-
-WORKDIR /mudd
+FROM rust-chef AS rust-builder
 
 # Build dependencies (cached layer)
 COPY --from=rust-planner /mudd/recipe.json recipe.json
@@ -32,7 +33,7 @@ COPY mudd/src ./src
 RUN cargo build --locked --release --bin mudd --bin mudd_init --bin mudd_admin
 
 # =============================================================================
-# Stage 3: Node frontend build
+# Stage 4: Node frontend build
 # =============================================================================
 FROM node:24-trixie-slim AS node-builder
 
@@ -47,7 +48,7 @@ COPY client/ ./
 RUN npm run build
 
 # =============================================================================
-# Stage 4: Final runtime image
+# Stage 5: Final runtime image
 # =============================================================================
 FROM debian:trixie-slim AS runtime
 
