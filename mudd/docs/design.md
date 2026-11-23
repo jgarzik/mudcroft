@@ -579,7 +579,7 @@ cost the universe config's `venice_chat_cost` / `venice_image_cost` credits
 call and refunded if it fails; the rate limit is kept per universe and
 code owner, whoever pays. Room images are the operator's cost and charge nothing.
 
-Room images (`images/gen.rs`) use two steps:
+Room images (`images/generate.rs`) use two steps:
 
 1. A fast-tier chat call turns the theme's visual style plus the room's name,
    description and region environment type into an image prompt (no people,

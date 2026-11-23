@@ -92,16 +92,16 @@ impl ConnectionManager {
         player_id: &str,
     ) -> (tokio::sync::oneshot::Receiver<()>, u64) {
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let gen = self.next_conn_id();
+        let disconnect_id = self.next_conn_id();
         self.pending_disconnects
             .write()
             .await
-            .insert(key(universe_id, player_id), (gen, cancel_tx));
-        (cancel_rx, gen)
+            .insert(key(universe_id, player_id), (disconnect_id, cancel_tx));
+        (cancel_rx, disconnect_id)
     }
 
     /// When a grace period expires: claim the disconnect for handling. True
-    /// only if it is still the pending one (`gen`) and the player has no
+    /// only if it is still the pending one (`disconnect_id`) and the player has no
     /// session, checked under the sessions lock so a reconnect that raced
     /// past the cancel is never treated as gone.
     /// Start handling the disconnect of a player whose server was lost
@@ -121,22 +121,22 @@ impl ConnectionManager {
         if sessions.contains_key(&k) || pending.contains_key(&k) {
             return None;
         }
-        let gen = self.next_conn_id();
+        let disconnect_id = self.next_conn_id();
         let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
-        pending.insert(k, (gen, cancel_tx));
-        Some(gen)
+        pending.insert(k, (disconnect_id, cancel_tx));
+        Some(disconnect_id)
     }
 
     pub async fn claim_expired_disconnect(
         &self,
         universe_id: &str,
         player_id: &str,
-        gen: u64,
+        disconnect_id: u64,
     ) -> bool {
         let k = key(universe_id, player_id);
         let sessions = self.sessions.read().await;
         let mut pending = self.pending_disconnects.write().await;
-        if !pending.get(&k).is_some_and(|(g, _)| *g == gen) {
+        if !pending.get(&k).is_some_and(|(g, _)| *g == disconnect_id) {
             return false;
         }
         pending.remove(&k);
@@ -747,7 +747,7 @@ async fn handle_socket(
         return;
     }
     if !replaced {
-        let (cancel_rx, gen) = state
+        let (cancel_rx, disconnect_id) = state
             .connections
             .schedule_disconnect(&universe_id, &player_id_clone)
             .await;
@@ -764,7 +764,7 @@ async fn handle_socket(
                 _ = tokio::time::sleep(RECONNECT_GRACE_PERIOD) => {
                     // Grace period expired: handle the disconnect, unless
                     // the player is connected again
-                    if !state_clone.connections.claim_expired_disconnect(&universe_for_task, &player_id_for_task, gen).await {
+                    if !state_clone.connections.claim_expired_disconnect(&universe_for_task, &player_id_for_task, disconnect_id).await {
                         info!("Disconnect handling skipped for {} (connected again)", player_id_for_task);
                         return;
                     }
@@ -2644,17 +2644,29 @@ mod tests {
     #[tokio::test]
     async fn test_expired_disconnect_skips_connected_player() {
         let conns = ConnectionManager::new();
-        let (_rx, gen) = conns.schedule_disconnect("u", "p").await;
+        let (_rx, disconnect_id) = conns.schedule_disconnect("u", "p").await;
         // A new connection registers without having cancelled anything
         let (mut s, _s_rx) = session("p", "r", 4);
         s.universe_id = "u".into();
         conns.register(s).await;
-        assert!(!conns.claim_expired_disconnect("u", "p", gen).await);
+        assert!(
+            !conns
+                .claim_expired_disconnect("u", "p", disconnect_id)
+                .await
+        );
 
         // With nobody connected, the matching disconnect is claimed once
-        let (_rx, gen) = conns.schedule_disconnect("u", "q").await;
-        assert!(conns.claim_expired_disconnect("u", "q", gen).await);
-        assert!(!conns.claim_expired_disconnect("u", "q", gen).await);
+        let (_rx, disconnect_id) = conns.schedule_disconnect("u", "q").await;
+        assert!(
+            conns
+                .claim_expired_disconnect("u", "q", disconnect_id)
+                .await
+        );
+        assert!(
+            !conns
+                .claim_expired_disconnect("u", "q", disconnect_id)
+                .await
+        );
 
         // A newer scheduled disconnect is not claimed by an older one
         let (_rx, old) = conns.schedule_disconnect("u", "r").await;
