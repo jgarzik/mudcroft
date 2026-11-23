@@ -106,7 +106,10 @@ upgrades live (`Database::upgrade`), and there are none yet.
    committed before its term (`ensure_linearizable(ReadIndex)`), rebuilds
    its caches from the tables (timers and heartbeats, access levels and
    path grants, custom classes, status effects, custom verbs), then starts
-   both loops;
+   both loops (and the combat scheduler), each restarted with backoff if
+   it panics, so a server bug cannot silently stop them until a failover.
+   A panic inside a `game.*` function only fails that script
+   (`SandboxError::Panic`);
    on losing leadership it stops them and drops its caches of custom verbs.
    Deadlines are absolute, so whatever fell due during
    a failover runs at once, and only once. After the reconnect grace

@@ -79,6 +79,8 @@ regex = "1"
 tempfile = "3"
 
 [dev-dependencies]
+# Paused clock in tests (tokio::test(start_paused))
+tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.30"
 
 [target.'cfg(unix)'.dev-dependencies]

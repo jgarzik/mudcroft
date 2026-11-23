@@ -44,7 +44,8 @@ Each node watches `raft.metrics()` for `current_leader`.
    before its term.
 2. Rebuild every cache from its table: classes, access levels, status
    effects, timers and heartbeats, custom verbs.
-3. Start the timer loop and the effect scheduler. Timers and effects use
+3. Start the timer loop and the effect scheduler (each restarted with
+   backoff if it panics). Timers and effects use
    absolute deadlines, so anything due during the failover fires at once,
    and only once: the old primary's writes either committed (and the new
    primary sees them) or they did not.
