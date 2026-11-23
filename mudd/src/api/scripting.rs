@@ -101,23 +101,6 @@ pub async fn in_run_with<T, F>(
 where
     F: Future<Output = Result<T, String>>,
 {
-    match in_run_settled(state, prefix, f).await {
-        Ok(result) => result,
-        Err(e) => Err(format!("not saved: {}", e)),
-    }
-}
-
-/// [`in_run_with`], telling a failed commit (the outer `Err`: nothing was
-/// saved although `f` succeeded; see `raft::writer::is_apply_failure`)
-/// from `f`'s own error
-pub async fn in_run_settled<T, F>(
-    state: &AppState,
-    prefix: Vec<crate::db::run::Statement>,
-    f: F,
-) -> anyhow::Result<Result<T, String>>
-where
-    F: Future<Output = Result<T, String>>,
-{
     // A failed run's cache changes are undone by rebuilding from the tables
     let rebuilder = state.clone();
     let rebuild = move || async move {
@@ -142,7 +125,10 @@ where
     if matches!(outcome, Ok(Ok(_))) {
         state.combat_changed.notify_one();
     }
-    outcome
+    match outcome {
+        Ok(result) => result,
+        Err(e) => Err(format!("not saved: {:#}", e)),
+    }
 }
 
 /// Call handler `method` on an object's attached code (`code_hash`).
@@ -336,10 +322,6 @@ const TIMER_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 /// Most due call_outs fired per pass (each its own run)
 const CALL_OUT_BATCH: i64 = 64;
 
-/// How far a call_out is pushed back when firing it failed for a reason of
-/// its own (a failed read): it is retried then, without holding up others
-const CALL_OUT_RETRY_MS: i64 = 5_000;
-
 /// Fire due call_outs and heartbeats forever. Deadline-driven: the loop
 /// sleeps until the earliest call_out (from the table) or heartbeat, or
 /// until one is added, not on a fixed poll.
@@ -417,12 +399,12 @@ enum Fired {
 /// the claim and the handler's writes as one Raft entry: never the timer
 /// gone without its effects, or the reverse. A handler that fails (or
 /// whose code cannot be loaded) keeps none of its writes and the call_out
-/// is dropped (the claim commits), as in LPMud; so is one whose change is
-/// refused when applied (the same on every try). A failure of its own (a
-/// failed read) pushes it back a few seconds without holding up the rest.
+/// is dropped (the claim commits), as in LPMud. If nothing could be saved
+/// or a read failed, it is retried with a doubling wait and dropped after
+/// a few tries (`TimerManager::retry_or_drop`), without holding up the rest.
 async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> Fired {
     let what = format!("call_out {} on {}", timer.method, timer.object_id);
-    let outcome = in_run_settled(state, Vec::new(), async {
+    let outcome = in_run(state, async {
         let run = crate::db::run::current().ok_or("not in a run")?;
         run.lock_writes().await.map_err(|e| e.to_string())?;
         if !state
@@ -466,46 +448,31 @@ async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> Fired 
     })
     .await;
     match outcome {
-        Ok(Ok(())) => Fired::Done,
-        Ok(Err(e)) => {
-            // A failure of its own: nothing saved; retried a little later
-            tracing::warn!(
-                "{}: not run ({}), retried in {} ms",
-                what,
-                e,
-                CALL_OUT_RETRY_MS
-            );
-            let later = chrono::Utc::now().timestamp_millis() + CALL_OUT_RETRY_MS;
-            match state
-                .raft_writer
-                .execute(
-                    "UPDATE timers SET fire_at = ? WHERE id = ?",
-                    vec![serde_json::json!(later), serde_json::json!(timer.id)],
-                )
-                .await
-            {
-                Ok(_) => Fired::Done,
-                Err(e) => {
-                    tracing::warn!("{}: postponing it failed: {}", what, e);
-                    Fired::Pause
-                }
+        Ok(()) => Fired::Done,
+        // Nothing saved (or a read failed): tried again later, with a
+        // doubling wait, and dropped after a few tries; whether the failure
+        // passes or lasts need not be known
+        Err(e) => match state.timers.retry_or_drop(timer).await {
+            Ok(true) => {
+                tracing::error!(
+                    "{}: dropped after {} failed tries: {}",
+                    what,
+                    crate::timers::MAX_FIRE_ATTEMPTS,
+                    e
+                );
+                Fired::Done
             }
-        }
-        Err(e) if crate::raft::writer::is_apply_failure(&e) => {
-            // Refused when applied: the same on every try, so dropped
-            tracing::warn!("{}: its change was refused (dropped): {:#}", what, e);
-            let (sql, params) = crate::timers::TimerManager::consume_statement(&timer.id);
-            if let Err(e) = state.raft_writer.execute(sql, params).await {
-                tracing::warn!("{}: dropping it failed: {}", what, e);
-                return Fired::Pause;
+            Ok(false) => {
+                tracing::warn!("{}: not run, retried later: {}", what, e);
+                Fired::Done
             }
-            Fired::Done
-        }
-        Err(e) => {
-            // Not the primary any more, or Raft timed out: still stored
-            tracing::warn!("{}: not saved, retried: {:#}", what, e);
-            Fired::Pause
-        }
+            Err(write) => {
+                // Even that could not be saved: not the primary, or Raft is
+                // down; pause (its row is still stored)
+                tracing::warn!("{}: not run ({}), not postponed: {}", what, e, write);
+                Fired::Pause
+            }
+        },
     }
 }
 

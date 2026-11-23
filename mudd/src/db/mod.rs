@@ -378,18 +378,31 @@ impl Database {
         }
         if version == 14 {
             // Heartbeats keep their phase across restarts (an anchor, not a
-            // write per beat); existing ones are anchored at 0
-            let has: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('heartbeats') WHERE name = 'started_at'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            if has == 0 {
-                sqlx::query(
+            // write per beat; existing ones are anchored at 0), and a
+            // call_out counts its failed tries to fire
+            for (table, column, add) in [
+                (
+                    "heartbeats",
+                    "started_at",
                     "ALTER TABLE heartbeats ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0",
-                )
-                .execute(&self.pool)
-                .await?;
+                ),
+                (
+                    "timers",
+                    "attempts",
+                    "ALTER TABLE timers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                ),
+            ] {
+                let has: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+                        .bind(table)
+                        .bind(column)
+                        .fetch_one(&self.pool)
+                        .await?;
+                if has == 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(add))
+                        .execute(&self.pool)
+                        .await?;
+                }
             }
             self.set_schema_version(15).await?;
             info!("Upgraded database schema 14 -> 15");
@@ -705,6 +718,7 @@ impl Database {
                 method TEXT NOT NULL,
                 fire_at INTEGER NOT NULL,
                 args TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (universe_id, object_id)
                     REFERENCES objects(universe_id, id) ON DELETE CASCADE

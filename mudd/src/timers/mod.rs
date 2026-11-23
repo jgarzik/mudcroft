@@ -30,6 +30,8 @@ pub struct Timer {
     pub fire_at: i64,
     /// Arguments to pass to method (JSON)
     pub args: Option<String>,
+    /// Failed tries to fire it so far (stored: see TimerManager::retry_or_drop)
+    pub attempts: i64,
 }
 
 impl Timer {
@@ -50,6 +52,7 @@ impl Timer {
             fire_at: now
                 .saturating_add(delay_ms.clamp(MIN_TIMER_DELAY_MS, MAX_TIMER_DELAY_MS) as i64),
             args,
+            attempts: 0,
         }
     }
 
@@ -118,7 +121,9 @@ impl HeartBeat {
     pub fn next_after(started_at: i64, interval_ms: i64, now: i64) -> i64 {
         let interval_ms = interval_ms.max(1);
         if now < started_at {
-            return started_at;
+            // Not started yet (or set by a node whose clock ran ahead): at
+            // most one interval away
+            return started_at.min(now.saturating_add(interval_ms));
         }
         let k = (now - started_at) / interval_ms + 1;
         started_at.saturating_add(k.saturating_mul(interval_ms))
@@ -162,6 +167,13 @@ pub const MAX_HEARTBEAT_MS: u64 = 86_400_000;
 pub const MIN_TIMER_DELAY_MS: u64 = 100;
 /// Longest call_out delay (30 days)
 pub const MAX_TIMER_DELAY_MS: u64 = 30 * 86_400_000;
+/// Tries to fire a call_out (that could not be saved or read) before it is
+/// dropped
+pub const MAX_FIRE_ATTEMPTS: i64 = 8;
+/// First wait before trying a call_out again; doubles per attempt
+pub const RETRY_MIN_MS: i64 = 1_000;
+/// Longest wait between tries
+pub const RETRY_MAX_MS: i64 = 300_000;
 
 /// Timers. A call_out lives only in the `timers` table (no cache): the
 /// table decides, so scheduling, cancelling and firing are each one
@@ -317,8 +329,9 @@ impl TimerManager {
 
     /// Call_outs due at `now`, earliest first (then in the order made)
     pub async fn due_call_outs(&self, now: i64, limit: i64) -> anyhow::Result<Vec<Timer>> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>)> = sqlx::query_as(
-            "SELECT id, universe_id, object_id, method, fire_at, args FROM timers
+        type Row = (String, String, String, String, i64, Option<String>, i64);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, universe_id, object_id, method, fire_at, args, attempts FROM timers
              WHERE fire_at <= ? ORDER BY fire_at, rowid LIMIT ?",
         )
         .bind(now)
@@ -328,16 +341,40 @@ impl TimerManager {
         Ok(rows
             .into_iter()
             .map(
-                |(id, universe_id, object_id, method, fire_at, args)| Timer {
+                |(id, universe_id, object_id, method, fire_at, args, attempts)| Timer {
                     id,
                     universe_id,
                     object_id,
                     method,
                     fire_at,
                     args,
+                    attempts,
                 },
             )
             .collect())
+    }
+
+    /// A call_out could not be fired (nothing was saved, or what it read
+    /// failed): try it again after a wait that doubles per attempt, counted
+    /// on its row, or drop it after [`MAX_FIRE_ATTEMPTS`]. No failure needs
+    /// classifying as passing or lasting: a passing one succeeds on a later
+    /// try, a lasting one is dropped in bounded time. True if dropped.
+    pub async fn retry_or_drop(&self, timer: &Timer) -> anyhow::Result<bool> {
+        if timer.attempts + 1 >= MAX_FIRE_ATTEMPTS {
+            let (sql, params) = Self::consume_statement(&timer.id);
+            self.write(sql, params).await?;
+            return Ok(true);
+        }
+        let wait = RETRY_MIN_MS
+            .saturating_mul(1i64 << timer.attempts.clamp(0, 20))
+            .min(RETRY_MAX_MS);
+        let at = chrono::Utc::now().timestamp_millis().saturating_add(wait);
+        self.write(
+            "UPDATE timers SET attempts = attempts + 1, fire_at = ? WHERE id = ?",
+            vec![serde_json::json!(at), serde_json::json!(timer.id)],
+        )
+        .await?;
+        Ok(false)
     }
 
     /// Set a heartbeat for an object (interval clamped to
@@ -589,6 +626,42 @@ mod tests {
         assert_eq!(mgr.write(sql, params).await.unwrap(), 0, "only once");
     }
 
+    /// A call_out that could not be fired is retried after a wait that
+    /// doubles per attempt (counted on its row), and dropped after
+    /// MAX_FIRE_ATTEMPTS: no failure has to be classified as passing or not
+    #[tokio::test]
+    async fn test_retry_backs_off_then_drops() {
+        let (mgr, pool) = manager().await;
+        let id = mgr
+            .schedule(Timer::new("u", "/clock", "tick", 0, None))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut last_wait = 0;
+        for attempt in 1..MAX_FIRE_ATTEMPTS {
+            let timer = mgr.due_call_outs(i64::MAX, 1).await.unwrap().pop().unwrap();
+            assert_eq!(timer.attempts, attempt - 1);
+            let now = chrono::Utc::now().timestamp_millis();
+            assert!(!mgr.retry_or_drop(&timer).await.unwrap(), "retried");
+            let (attempts, fire_at): (i64, i64) =
+                sqlx::query_as("SELECT attempts, fire_at FROM timers WHERE id = ?")
+                    .bind(&id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(attempts, attempt);
+            let wait = fire_at - now;
+            assert!(
+                wait > last_wait || wait >= RETRY_MAX_MS - 50,
+                "{wait} after {last_wait}"
+            );
+            last_wait = wait;
+        }
+        let timer = mgr.due_call_outs(i64::MAX, 1).await.unwrap().pop().unwrap();
+        assert!(mgr.retry_or_drop(&timer).await.unwrap(), "dropped at last");
+        assert_eq!(stored(&pool).await, 0);
+    }
+
     /// Heartbeats are per universe
     #[tokio::test]
     async fn test_heartbeats_are_per_universe() {
@@ -643,6 +716,12 @@ mod tests {
             HeartBeat::next_after(now + 300, 1_000, now),
             now + 300,
             "not started yet"
+        );
+        // Started in the future by a node whose clock ran ahead: no more
+        // than one interval away here
+        assert_eq!(
+            HeartBeat::next_after(now + 7_200_000, 1_000, now),
+            now + 1_000
         );
     }
 

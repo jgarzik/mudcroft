@@ -199,11 +199,10 @@ impl RaftWriter {
         let response = self.raft.client_write(request).await.map_err(not_primary)?;
 
         if !response.data.success {
-            return Err(ApplyFailed(format!(
-                "Raft write failed: {}",
-                response.data.error.as_deref().unwrap_or("unknown error")
-            ))
-            .into());
+            if let Some(ref err) = response.data.error {
+                bail!("Raft write failed: {}", err);
+            }
+            bail!("Raft write failed (unknown error)");
         }
 
         Ok(response.data)
@@ -251,11 +250,10 @@ impl RaftWriter {
             .await
             .map_err(not_primary)?;
         if !response.data.success {
-            return Err(ApplyFailed(format!(
+            bail!(
                 "Batch failed: {}",
                 response.data.error.as_deref().unwrap_or("unknown error")
-            ))
-            .into());
+            );
         }
         Ok(())
     }
@@ -323,25 +321,6 @@ impl RaftWriter {
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow_watched().current_leader
     }
-}
-
-/// A write that reached the log but was refused when applied (an SQL error,
-/// the same on every node): retrying it fails the same way, unlike a write
-/// refused because this node is not (or no longer) the primary
-#[derive(Debug)]
-pub struct ApplyFailed(pub String);
-
-impl std::fmt::Display for ApplyFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ApplyFailed {}
-
-/// Whether `e` (or what caused it) is an [`ApplyFailed`]
-pub fn is_apply_failure(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<ApplyFailed>())
 }
 
 impl crate::db::run::Committer for RaftWriter {

@@ -409,7 +409,8 @@ mod tests {
         assert_eq!(triggers, 1);
     }
 
-    /// 14 -> 15 anchors heartbeats (started_at), keeping existing ones
+    /// 14 -> 15 anchors heartbeats (started_at), keeping existing ones, and
+    /// adds timers.attempts
     #[tokio::test]
     async fn test_upgrade_14_to_15() {
         let temp_dir = TempDir::new().unwrap();
@@ -431,6 +432,11 @@ mod tests {
                  CREATE TABLE heartbeats (universe_id TEXT NOT NULL, object_id TEXT NOT NULL,
                    interval_ms INTEGER NOT NULL, PRIMARY KEY (universe_id, object_id));
                  INSERT INTO heartbeats VALUES ('u', '/clock', 2000);
+                 ALTER TABLE timers RENAME TO timers_v15;
+                 CREATE TABLE timers (id TEXT PRIMARY KEY, universe_id TEXT NOT NULL,
+                   object_id TEXT NOT NULL, method TEXT NOT NULL, fire_at INTEGER NOT NULL,
+                   args TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+                 DROP TABLE timers_v15;
                  PRAGMA user_version = 14;",
             )
             .execute(db.pool())
@@ -449,6 +455,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((interval, started), (2000, 0));
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('timers') WHERE name = 'attempts'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempts, 1, "timers count their tries to fire");
     }
 
     /// 13 -> 14 rebuilds deadlines with every kind (an early version-13

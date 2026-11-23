@@ -270,6 +270,7 @@ one deletes its row in the same Raft batch as the handler's writes.
 | method | TEXT NOT NULL | Handler name |
 | fire_at | INTEGER NOT NULL | Unix time (ms) |
 | args | TEXT | JSON |
+| attempts | INTEGER NOT NULL DEFAULT 0 | Failed tries to fire it (saving or reading failed); dropped after 8, retried with a doubling wait before that |
 | created_at | TEXT NOT NULL DEFAULT (datetime('now')) | |
 
 Foreign key `(universe_id, object_id)` to `objects(universe_id, id)` ON DELETE

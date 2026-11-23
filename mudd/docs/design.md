@@ -382,12 +382,14 @@ writes nothing), reads the object, claims the call_out by deleting its row
 once firing has begun), then runs the handler as a nested part. Success
 commits the claim and the handler's writes as one Raft entry; a handler
 that fails, or whose code cannot be loaded, keeps none of its writes while
-the claim commits (dropped, as in LPMud). A commit refused when applied
-(deterministic; a poisoned run reports its checkpoint's cause) drops it; a
-failure of its own (a failed read) pushes its `fire_at` back 5 s without
-holding up the rest; if the node is not the primary or Raft times out, the
-row stays, the loop pauses 500 ms, and after a failover the next primary
-fires it. Handler messages still reach players before the
+the claim commits (dropped, as in LPMud). If nothing could be saved, or a
+read failed, it is retried rather than classified: `timers.attempts` counts
+the tries and pushes `fire_at` back 1 s, 2 s, 4 s ... (at most 5 minutes)
+without holding up the rest, and after 8 it is dropped with an error
+logged; if even that cannot be written (not the primary, Raft down) the
+loop pauses 500 ms, and after a failover the next primary fires it.
+Scheduling is always inside a run (Lua), whose write lock makes the 32 per
+object cap exact. Handler messages still reach players before the
 commit, so a call_out fired again after a crash may repeat them.
 
 Heartbeats are a cache of `heartbeats` (one write to set or remove; beats
