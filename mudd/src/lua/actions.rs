@@ -172,10 +172,10 @@ impl ActionRegistry {
         ))
         .await?;
         let mut actions = self.room_actions.write().await;
-        if let Some(room_entry) = actions.get_mut(&key(universe_id, room_id)) {
-            if let Some(verb_entry) = room_entry.get_mut(verb) {
-                verb_entry.retain(|a| a.object_id != object_id);
-            }
+        if let Some(room_entry) = actions.get_mut(&key(universe_id, room_id))
+            && let Some(verb_entry) = room_entry.get_mut(verb)
+        {
+            verb_entry.retain(|a| a.object_id != object_id);
         }
         Ok(())
     }

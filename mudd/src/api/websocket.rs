@@ -645,10 +645,9 @@ async fn handle_socket(
         // Send initial room description
         if let Some(room_msg) =
             build_room_message(&state, &universe_id, &room_id, Some(&account_id)).await
+            && let Ok(json) = serde_json::to_string(&room_msg)
         {
-            if let Ok(json) = serde_json::to_string(&room_msg) {
-                let _ = socket.send(json).await;
-            }
+            let _ = socket.send(json).await;
         }
 
         // Arriving in the world counts as entering the spawn room
@@ -687,11 +686,10 @@ async fn handle_socket(
                     quit = true;
                     break;
                 }
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if !socket.send(json).await {
+                if let Ok(json) = serde_json::to_string(&msg)
+                    && !socket.send(json).await {
                         break;
                     }
-                }
             }
             // Handle incoming messages from WebSocket
             result = socket.recv() => {
@@ -827,18 +825,18 @@ async fn handle_client_message(
             info!("Player {} command: {}", player_id, text);
             let id = id.filter(|id| !id.is_empty() && id.len() <= 64);
             // Already saved (a retry after a failover): not run again
-            if let Some(ref id) = id {
-                if command_applied(state, universe_id, player_id, id).await {
-                    state
-                        .connections
-                        .send_to_player(
-                            universe_id,
-                            player_id,
-                            ServerMessage::Done { id: id.clone() },
-                        )
-                        .await;
-                    return;
-                }
+            if let Some(ref id) = id
+                && command_applied(state, universe_id, player_id, id).await
+            {
+                state
+                    .connections
+                    .send_to_player(
+                        universe_id,
+                        player_id,
+                        ServerMessage::Done { id: id.clone() },
+                    )
+                    .await;
+                return;
             }
 
             // Echo the command back
@@ -1088,47 +1086,47 @@ pub(crate) async fn build_room_message(
         && account_id.is_some())
     .then(|| state.image_jobs.try_start(universe_id, room_id))
     .flatten();
-    if let Some(job) = job {
-        if let Some(acct_id) = account_id {
-            let venice = state.venice.clone();
-            let image_store = state.image_store.clone();
-            let object_store = state.object_store.clone();
-            let themes = state.themes.clone();
-            let room_id_owned = room_id.to_string();
-            let universe_owned = universe_id.to_string();
-            let account_id_owned = acct_id.to_string();
+    if let Some(job) = job
+        && let Some(acct_id) = account_id
+    {
+        let venice = state.venice.clone();
+        let image_store = state.image_store.clone();
+        let object_store = state.object_store.clone();
+        let themes = state.themes.clone();
+        let room_id_owned = room_id.to_string();
+        let universe_owned = universe_id.to_string();
+        let account_id_owned = acct_id.to_string();
 
-            // Spawn background task for image generation
-            tokio::spawn(async move {
-                // Held until the job ends, however it ends
-                let _job = job;
-                let theme = themes.get(DEFAULT_THEME_ID);
-                match generate_room_image(
-                    &venice,
-                    &image_store,
-                    &object_store,
-                    &universe_owned,
-                    &room_id_owned,
-                    &theme,
-                    &account_id_owned,
-                )
-                .await
-                {
-                    Ok(hash) => {
-                        info!(
-                            "Background image generation complete for room {}: {}",
-                            room_id_owned, hash
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Background image generation failed for room {}: {}",
-                            room_id_owned, e
-                        );
-                    }
+        // Spawn background task for image generation
+        tokio::spawn(async move {
+            // Held until the job ends, however it ends
+            let _job = job;
+            let theme = themes.get(DEFAULT_THEME_ID);
+            match generate_room_image(
+                &venice,
+                &image_store,
+                &object_store,
+                &universe_owned,
+                &room_id_owned,
+                &theme,
+                &account_id_owned,
+            )
+            .await
+            {
+                Ok(hash) => {
+                    info!(
+                        "Background image generation complete for room {}: {}",
+                        room_id_owned, hash
+                    );
                 }
-            });
-        }
+                Err(e) => {
+                    warn!(
+                        "Background image generation failed for room {}: {}",
+                        room_id_owned, e
+                    );
+                }
+            }
+        });
     }
 
     Some(ServerMessage::Room {
@@ -1279,12 +1277,11 @@ async fn execute_command(
     match verb.as_str() {
         "look" | "l" => {
             // Get player's current room
-            if let Some(room_id) = state.connections.get_room_id(universe_id, player_id).await {
-                if let Some(room_msg) =
+            if let Some(room_id) = state.connections.get_room_id(universe_id, player_id).await
+                && let Some(room_msg) =
                     build_room_message(state, universe_id, &room_id, Some(account_id)).await
-                {
-                    return room_msg;
-                }
+            {
+                return room_msg;
             }
             ServerMessage::Output {
                 text: "You are nowhere.".to_string(),

@@ -1274,10 +1274,10 @@ pub async fn removed_by_peers(
     for peer in peers {
         let client = PeerClient::new(peer.clone(), security.clone());
         let status = tokio::time::timeout(Duration::from_secs(5), client.status()).await;
-        if let Ok(Ok(status)) = status {
-            if status.leader.is_some() {
-                return !status.members.iter().any(|m| m.node_id == node_id);
-            }
+        if let Ok(Ok(status)) = status
+            && status.leader.is_some()
+        {
+            return !status.members.iter().any(|m| m.node_id == node_id);
         }
     }
     false

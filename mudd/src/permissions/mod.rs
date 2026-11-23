@@ -840,10 +840,10 @@ impl PermissionManager {
         }
 
         // 2. Owner check - you can always modify your own creations
-        if let Some(ref owner_id) = target.owner_id {
-            if owner_id == &user.account_id {
-                return PermissionResult::Allowed;
-            }
+        if let Some(ref owner_id) = target.owner_id
+            && owner_id == &user.account_id
+        {
+            return PermissionResult::Allowed;
         }
 
         // 3. Path grant check - builders with matching path grants
@@ -888,10 +888,10 @@ impl PermissionManager {
         }
 
         // Owner can move their own objects anywhere
-        if let Some(oid) = owner_id {
-            if oid == user.account_id {
-                return PermissionResult::Allowed;
-            }
+        if let Some(oid) = owner_id
+            && oid == user.account_id
+        {
+            return PermissionResult::Allowed;
         }
 
         // Need path grants on both source and destination

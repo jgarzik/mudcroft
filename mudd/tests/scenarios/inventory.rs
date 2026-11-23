@@ -188,10 +188,10 @@ async fn test_inventory_empty() {
         );
     } else if msg_type == "inventory" {
         // Special inventory message type
-        if let Some(items) = msg.get("items") {
-            if let Some(arr) = items.as_array() {
-                assert!(arr.is_empty(), "Inventory should be empty initially");
-            }
+        if let Some(items) = msg.get("items")
+            && let Some(arr) = items.as_array()
+        {
+            assert!(arr.is_empty(), "Inventory should be empty initially");
         }
     }
 }
@@ -249,18 +249,18 @@ async fn test_inventory_has_items() {
         );
     } else if msg_type == "inventory" {
         // Special inventory message
-        if let Some(items) = msg.get("items") {
-            if let Some(arr) = items.as_array() {
-                assert!(!arr.is_empty(), "Inventory should have items");
-                let has_sword = arr.iter().any(|i| {
-                    i.as_str()
+        if let Some(items) = msg.get("items")
+            && let Some(arr) = items.as_array()
+        {
+            assert!(!arr.is_empty(), "Inventory should have items");
+            let has_sword = arr.iter().any(|i| {
+                i.as_str()
+                    .is_some_and(|s| s.to_lowercase().contains("sword"))
+                    || i.get("name")
+                        .and_then(|n| n.as_str())
                         .is_some_and(|s| s.to_lowercase().contains("sword"))
-                        || i.get("name")
-                            .and_then(|n| n.as_str())
-                            .is_some_and(|s| s.to_lowercase().contains("sword"))
-                });
-                assert!(has_sword, "Inventory should contain sword");
-            }
+            });
+            assert!(has_sword, "Inventory should contain sword");
         }
     }
 }

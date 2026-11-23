@@ -146,10 +146,9 @@ pub async fn equip(
         if old.id != item.id
             && old.get_string("equipped_by") == Some(player)
             && slot_of(&old).as_deref() == Some(slot.as_str())
+            && let Err(e) = set_wearer(state, universe_id, &old.id, None).await
         {
-            if let Err(e) = set_wearer(state, universe_id, &old.id, None).await {
-                return error(format!("Could not {}: {}", verb, e));
-            }
+            return error(format!("Could not {}: {}", verb, e));
         }
     }
     if let Err(e) = set_wearer(state, universe_id, &item.id, Some(player)).await {

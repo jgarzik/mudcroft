@@ -87,13 +87,13 @@ impl Server {
     /// Create a new server instance
     /// Requires a pre-initialized database (created by mudd_init)
     pub async fn new(config: Config) -> Result<Self> {
-        if let Some(ref dir) = config.static_dir {
-            if !dir.join("index.html").is_file() {
-                anyhow::bail!(
-                    "--static-dir {} has no index.html (build the client first)",
-                    dir.display()
-                );
-            }
+        if let Some(ref dir) = config.static_dir
+            && !dir.join("index.html").is_file()
+        {
+            anyhow::bail!(
+                "--static-dir {} has no index.html (build the client first)",
+                dir.display()
+            );
         }
 
         // A node joining a cluster starts empty (mudd_init --empty)

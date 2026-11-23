@@ -203,10 +203,10 @@ impl Run {
             let rolled_back = sqlx::query("ROLLBACK").execute(&mut ***conn).await;
             // Back to the pool (a connection that failed to roll back is
             // closed instead, which rolls back)
-            if let Some(c) = conn.0.take() {
-                if rolled_back.is_err() {
-                    drop(c.detach());
-                }
+            if let Some(c) = conn.0.take()
+                && rolled_back.is_err()
+            {
+                drop(c.detach());
             }
             rolled_back?;
         }
@@ -238,15 +238,15 @@ impl Run {
         }
         let batch = self.batch();
         let kept = take(&self.kept);
-        if !batch.is_empty() {
-            if let Err(e) = self.committer.commit(batch).await {
-                // The run fails as a whole (settle undoes it: `dirty` stays
-                // set, so the caches are rebuilt); kept writes still stand
-                self.poisoned.store(true, Ordering::SeqCst);
-                take(&self.after);
-                *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = kept;
-                return Err(e);
-            }
+        if !batch.is_empty()
+            && let Err(e) = self.committer.commit(batch).await
+        {
+            // The run fails as a whole (settle undoes it: `dirty` stays
+            // set, so the caches are rebuilt); kept writes still stand
+            self.poisoned.store(true, Ordering::SeqCst);
+            take(&self.after);
+            *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = kept;
+            return Err(e);
         }
         self.dirty.store(false, Ordering::SeqCst);
         for f in take(&self.after) {
@@ -321,10 +321,10 @@ impl Run {
             // Everything in the open transaction is this part's
             let mut conn = self.conn.lock().await;
             let rolled_back = sqlx::query("ROLLBACK").execute(&mut ***conn).await;
-            if let Some(c) = conn.0.take() {
-                if rolled_back.is_err() {
-                    drop(c.detach());
-                }
+            if let Some(c) = conn.0.take()
+                && rolled_back.is_err()
+            {
+                drop(c.detach());
             }
             rolled_back?;
         }
@@ -387,10 +387,11 @@ impl Run {
             }
             committed
         };
-        if undone && !kept.is_empty() {
-            if let Err(e) = self.committer.commit(kept).await {
-                tracing::error!("committing a failed run's kept writes: {}", e);
-            }
+        if undone
+            && !kept.is_empty()
+            && let Err(e) = self.committer.commit(kept).await
+        {
+            tracing::error!("committing a failed run's kept writes: {}", e);
         }
         // Undone after writing: the caches hold changes the tables don't.
         // Committed after a nested part rebuilt them mid-run: anything that
@@ -479,14 +480,14 @@ where
     A: FnOnce() -> BoxFuture + Send + 'static,
 {
     fn drop(&mut self) {
-        if let (Some(run), Some(on_abort)) = (self.run.take(), self.on_abort.take()) {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if let Err(e) = run.settle(true, on_abort).await {
-                        tracing::error!("undoing a cancelled run: {}", e);
-                    }
-                });
-            }
+        if let (Some(run), Some(on_abort)) = (self.run.take(), self.on_abort.take())
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                if let Err(e) = run.settle(true, on_abort).await {
+                    tracing::error!("undoing a cancelled run: {}", e);
+                }
+            });
         }
     }
 }

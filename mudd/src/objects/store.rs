@@ -437,12 +437,11 @@ impl ObjectStore {
         let room = self.get(universe_id, room_id).await?;
         match room {
             Some(r) => {
-                if let Some(exits) = r.properties.get("exits") {
-                    if let Some(exits_obj) = exits.as_object() {
-                        if let Some(dest) = exits_obj.get(direction) {
-                            return Ok(dest.as_str().map(|s| s.to_string()));
-                        }
-                    }
+                if let Some(exits) = r.properties.get("exits")
+                    && let Some(exits_obj) = exits.as_object()
+                    && let Some(dest) = exits_obj.get(direction)
+                {
+                    return Ok(dest.as_str().map(|s| s.to_string()));
                 }
                 Ok(None)
             }
@@ -483,10 +482,10 @@ impl ObjectStore {
     ) -> Result<()> {
         let room = self.get(universe_id, room_id).await?;
         if let Some(mut r) = room {
-            if let Some(exits) = r.properties.get_mut("exits") {
-                if let Some(exits_obj) = exits.as_object_mut() {
-                    exits_obj.remove(direction);
-                }
+            if let Some(exits) = r.properties.get_mut("exits")
+                && let Some(exits_obj) = exits.as_object_mut()
+            {
+                exits_obj.remove(direction);
             }
             self.update(&r).await?;
         }

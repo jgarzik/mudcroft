@@ -563,24 +563,19 @@ async fn handle_moved(
     }
 
     // A player moved into a safe room respawns there (as for a walk)
-    if let Some(ref room) = to {
-        if object_id.starts_with("/players/") {
-            if let Ok(Some(player)) = state.object_store.get(universe_id, object_id).await {
-                if let Ok(true) = state
-                    .player_manager
-                    .is_safe_zone(universe_id, room, &player)
-                    .await
-                {
-                    if let Err(e) = state
-                        .player_manager
-                        .update_safe_location(universe_id, object_id, room)
-                        .await
-                    {
-                        tracing::warn!("safe location for {} not saved: {}", object_id, e);
-                    }
-                }
-            }
-        }
+    if let Some(ref room) = to
+        && object_id.starts_with("/players/")
+        && let Ok(Some(player)) = state.object_store.get(universe_id, object_id).await
+        && let Ok(true) = state
+            .player_manager
+            .is_safe_zone(universe_id, room, &player)
+            .await
+        && let Err(e) = state
+            .player_manager
+            .update_safe_location(universe_id, object_id, room)
+            .await
+    {
+        tracing::warn!("safe location for {} not saved: {}", object_id, e);
     }
 
     // Aggressive NPCs notice an arrival (and an aggressive NPC moved in
