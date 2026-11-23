@@ -33,10 +33,6 @@ allow = [
     "bzip2-1.0.6",
 ]
 
-[licenses.private]
-# mudd itself is `publish = false`
-ignore = true
-
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
