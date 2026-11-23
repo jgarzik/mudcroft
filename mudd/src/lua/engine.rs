@@ -98,6 +98,15 @@ pub trait Engine: Send + Sync {
         args: serde_json::Value,
     ) -> BoxFuture<'a, ()>;
 
+    /// Move an object as the engine does: a player's session follows (and
+    /// is shown the room)
+    fn relocate<'a>(
+        &'a self,
+        universe_id: &'a str,
+        id: &'a str,
+        to: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), String>>;
+
     /// Leave through a random exit, ending fights; returns the direction
     fn flee<'a>(
         &'a self,

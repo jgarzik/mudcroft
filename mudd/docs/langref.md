@@ -368,7 +368,8 @@ lacks Move permission.
 Copies an object to a new path. The copy keeps the original's properties
 and `code_hash`, and the acting user becomes its owner; since the copy's
 code would run as them, it keeps `code_hash` only if they own the original
-or may act as its owner. A copy with code runs its `on_create`.
+or may act as its owner (code with no owner: admins only). A copy with code
+runs its `on_create`.
 
 **Returns** the copy, `nil` if the source doesn't exist, or
 `{error = "..."}` if the source belongs to another universe, `new_path` is
@@ -441,10 +442,10 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 | `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
 | `on_create` | the object is created (`game.create_object`) or cloned (`game.clone_object`) with code attached | the new object | `room_id` |
 | `on_destroy` | the object is about to be deleted (`game.delete_object`, a death that deletes it, a decaying corpse) | the object, still there | `room_id` |
-| `on_enter` / `on_leave` (region) | a move crosses into (out of) the region: a room's region, for hooks, is its parent object of class `region` (not its `region_id`, which anyone may set on their room) | the region | `moved_id`, `from`, `to`, `actor_id` |
+| `on_enter` / `on_leave` (region) | a move crosses into (out of) the region: a room's region, for hooks, is its parent object of class `region` (not its `region_id`, which anyone may set on their room), and only if the room's owner is the region's owner or above it | the region | `moved_id`, `from`, `to`, `actor_id`, `moved_by` |
 | `on_init` | something arrives where the object is (any move, as for `on_enter`) | each object with code already there, with `arrived_id`; and the newcomer, if it has code, once per object there, with `other_id` | `room_id`, `actor_id` |
-| `on_move` | the object is moved (any move) | the moved object | `from`, `to`, `moved_id`, `actor_id` |
-| `on_reset` | every `reset_seconds` (a property: set it to start, remove it to stop) | the object, usually a room (to restock) | `room_id` |
+| `on_move` | the object is moved (any move: walking, goto, spawning, Lua moves, fleeing, wandering, respawning) | the moved object (first, before the region hooks and `on_init`) | `from`, `to`, `moved_id`, `actor_id`, `moved_by` |
+| `on_reset` | every `reset_seconds` (a property, a number of seconds, at least 1: set it to start, remove it to stop; only while the object has code) | the object, usually a room (to restock) | `room_id` |
 | `on_disconnect` | a player's disconnect grace period ends | the room they were in | `room_id`, `player_id` |
 | any name | a `call_out` is due | the object | `room_id`, `args` (the string given to `call_out`, or `nil`) |
 | any name | a custom verb is typed | the verb's object | `actor_id`, `room_id`, `verb`, `args` (the rest of the line) |
@@ -463,7 +464,7 @@ Hook details:
 - **Return values:** hook return values are ignored. Errors are logged on the server.
 - **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
   - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
-- **Engine-invoked hooks** (region hooks, `on_init`, `on_move`, `on_create`, `on_destroy`, `on_reset`, `on_disconnect`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action (a command or script run, or one NPC's turn): at most 4 deep (a hook's doing setting off another) and 32 calls; beyond it they are skipped (and logged). After a move they run after the room's `on_enter`.
+- **Engine-invoked hooks** (region hooks, `on_init`, `on_move`, `on_create`, `on_destroy`, `on_reset`, `on_disconnect`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action (a command or script run, or one NPC's turn), shared with move hooks: at most 4 deep (a hook's doing setting off another) and 32 calls, counting only code that defines the handler; beyond it they are skipped (and logged). After a move they run after the room's `on_enter`.
 - **Unwired hooks:** the class handler name `on_use` is fired only by `game.use_object` (verb `"use"`).
 
 ### `parent(class_name, handler_name, args)`

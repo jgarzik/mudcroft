@@ -772,3 +772,79 @@ async fn test_on_reset_and_on_disconnect() {
     assert!(resets >= 3, "on_reset ran about once a second: {}", resets);
     assert_eq!(left, shopper, "on_disconnect told the room");
 }
+
+/// Phase 3 review: a room placed under someone else's region does not fire
+/// its hooks; fleeing runs on_move; a crowded room's on_init does not
+/// starve the newcomer's on_move
+#[tokio::test]
+async fn test_move_hooks_after_review() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = server
+        .connect_as(crate::harness::Role::Admin {
+            username: "region_owner".into(),
+        })
+        .await
+        .unwrap();
+    let mut wiz = wizard(&server, "squatter").await;
+    // The admin's region, with code
+    adm.drain().await;
+    adm.command(
+        r#"eval game.create_object("/items/alarm", "item", nil, {name = "alarm", rings = 0, moves = 0})
+           local h = game.store_code([[return { on_enter = function(a)
+             local t = game.get_object("/items/alarm") game.update_object("/items/alarm", {rings = t.metadata.rings + 1})
+           end }]])
+           game.create_object("/d/palace", "region", nil, {name = "Palace", code_hash = h})
+           return "made""#,
+    )
+    .await
+    .unwrap();
+    adm.expect_output_containing("made").await.unwrap();
+    // The wizard puts a room of their own under it and walks in
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/rooms/squat", "room", "/d/palace", {name = "Squat"}) return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    wiz.drain().await;
+    wiz.command("goto /rooms/squat").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    // A coded walker moved into a crowded room still gets on_move, and
+    // fleeing runs on_move too
+    let out = eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_init = function(a) end,
+             on_move = function(a) local t = game.get_object("/items/alarm") end }]])
+           local mover = game.store_code([[return { on_move = function(a)
+             local l = game.get_object("/rooms/crowd/ledger") game.update_object("/rooms/crowd/ledger", {n = l.metadata.n + 1})
+           end }]])
+           game.create_object("/rooms/crowd", "room", nil, {name = "Crowd", exits = {east = "/rooms/out"}})
+           game.create_object("/rooms/out", "room", nil, {name = "Out", exits = {west = "/rooms/crowd"}})
+           game.create_object("/rooms/crowd/ledger", "item", "/rooms/crowd", {name = "ledger", n = 0})
+           for i = 1, 40 do game.create_object("/rooms/crowd/deco-" .. i, "item", "/rooms/crowd", {name = "deco", code_hash = h}) end
+           game.create_object("/items/walker", "item", nil, {name = "walker", code_hash = mover})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    eval(
+        &mut wiz,
+        r#"game.move_object("/items/walker", "/rooms/crowd") return "ok""#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (rings, n): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT json_extract(properties, '$.rings') FROM objects WHERE universe_id = ?1 AND id = '/items/alarm'),
+                (SELECT json_extract(properties, '$.n') FROM objects WHERE universe_id = ?1 AND id = '/rooms/crowd/ledger')",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rings, 0,
+        "a room under a region it has no authority over does not fire it"
+    );
+    assert_eq!(n, 1, "on_move ran despite the crowd's on_init");
+}

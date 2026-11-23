@@ -675,6 +675,12 @@ tokio::task_local! {
     static AI_BUDGET: (u32, std::sync::Arc<std::sync::atomic::AtomicU32>);
 }
 
+/// The current action's shared hook allowance, if inside one (move hooks
+/// draw on it too)
+pub(crate) fn hook_counter() -> Option<std::sync::Arc<std::sync::atomic::AtomicU32>> {
+    AI_BUDGET.try_with(|(_, left)| left.clone()).ok()
+}
+
 /// Run `f` with a fresh engine hook budget of its own (an NPC's turn)
 async fn fresh_ai_budget<F: std::future::Future>(f: F) -> F::Output {
     let fresh = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(MAX_AI_CALLS));
@@ -727,6 +733,12 @@ pub async fn engine_hook(
     if let Some(map) = args.as_object_mut() {
         map.insert("object_id".into(), object.into());
     }
+    // Only code that defines the handler is charged to the budget (a
+    // crowd without it costs nothing)
+    match super::scripting::object_code(state, object, universe_id).await {
+        Ok(Some((code, _))) if code.contains(handler) => {}
+        _ => return None,
+    }
     let (depth, left) = AI_BUDGET
         .try_with(|(d, left)| (*d, left.clone()))
         .unwrap_or_else(|_| {
@@ -773,15 +785,17 @@ pub async fn move_extras(
     from: Option<&str>,
     to: Option<&str>,
     actor: Option<&str>,
+    moved_by: Option<&str>,
 ) {
-    with_ai_budget(move_extras_inner(
+    Box::pin(with_ai_budget(move_extras_inner(
         state,
         universe_id,
         moved,
         from,
         to,
         actor,
-    ))
+        moved_by,
+    )))
     .await
 }
 
@@ -792,6 +806,7 @@ async fn move_extras_inner(
     from: Option<&str>,
     to: Option<&str>,
     actor: Option<&str>,
+    moved_by: Option<&str>,
 ) {
     let store = &state.object_store;
     let get = |id: Option<&str>| {
@@ -809,13 +824,39 @@ async fn move_extras_inner(
     // not let a room fire someone else's region hooks
     let region = |room: &Option<Object>| room.as_ref().and_then(|r| r.parent_id.clone());
     let (rf, rt) = (region(&from_room), region(&to_room));
-    let args = json!({ "moved_id": moved, "from": from, "to": to, "actor_id": actor });
+    let args = json!({ "moved_id": moved, "from": from, "to": to, "actor_id": actor, "moved_by": moved_by });
+    // The moved object's own on_move first (a crowd's on_init must not
+    // use up the budget before it), then the regions, then on_init
+    let moved_obj = get(Some(moved)).await;
+    if moved_obj.as_ref().is_some_and(|m| m.code_hash.is_some()) {
+        engine_hook(
+            state,
+            universe_id,
+            moved,
+            to.map(str::to_string),
+            "on_move",
+            args.clone(),
+        )
+        .await;
+    }
     if rf != rt {
-        for (region_id, handler) in [(rf, "on_leave"), (rt, "on_enter")] {
+        for (region_id, handler, room) in [(rf, "on_leave", &from_room), (rt, "on_enter", &to_room)]
+        {
             let Some(region_id) = region_id else { continue };
+            // The region's hooks run as its owner: only for a room whose
+            // owner has authority over the region's (the same, or above)
             let is_region = match store.get(universe_id, &region_id).await {
                 Ok(Some(r)) => {
-                    r.code_hash.is_some()
+                    let room_owner = room.as_ref().and_then(|x| x.owner_id.clone());
+                    let authorized = match (room_owner.as_deref(), r.owner_id.as_deref()) {
+                        (None, _) => true,
+                        (Some(ro), Some(go)) => {
+                            ro == go || state.permissions.can_act_as(universe_id, ro, go).await
+                        }
+                        (Some(_), None) => false,
+                    };
+                    authorized
+                        && r.code_hash.is_some()
                         && state
                             .classes
                             .read()
@@ -837,7 +878,6 @@ async fn move_extras_inner(
             }
         }
     }
-    let moved_obj = get(Some(moved)).await;
     if let Some(to) = to {
         let present = store
             .get_contents(universe_id, to)
@@ -867,17 +907,6 @@ async fn move_extras_inner(
                 .await;
             }
         }
-    }
-    if moved_obj.as_ref().is_some_and(|m| m.code_hash.is_some()) {
-        engine_hook(
-            state,
-            universe_id,
-            moved,
-            to.map(str::to_string),
-            "on_move",
-            args,
-        )
-        .await;
     }
 }
 
@@ -983,6 +1012,19 @@ async fn leave_via(
     ));
     // An aggressive NPC arriving attacks a player there (in this run)
     arrival(state, universe_id, &who.id, &to).await;
+    // Regions crossed, on_init, on_move (a player's move_player did them)
+    if !is_player(who) {
+        move_extras(
+            state,
+            universe_id,
+            &who.id,
+            Some(&from),
+            Some(&to),
+            None,
+            None,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -1008,10 +1050,17 @@ async fn move_player(
     player: &str,
     to: Option<&str>,
 ) -> anyhow::Result<()> {
+    let from = state
+        .object_store
+        .get(universe_id, player)
+        .await?
+        .and_then(|p| p.parent_id);
     state
         .object_store
         .move_object(universe_id, player, to)
         .await?;
+    // A move like any other: regions crossed, on_init, on_move
+    move_extras(state, universe_id, player, from.as_deref(), to, None, None).await;
     let (st, u, p, to) = (
         state.clone(),
         universe_id.to_string(),
@@ -1873,20 +1922,23 @@ async fn deadline(
                 let Some(every) = obj
                     .properties
                     .get("reset_seconds")
-                    .and_then(|v| v.as_u64())
-                    .filter(|s| *s > 0)
-                    .map(|s| s.min(MAX_DELAY_S))
+                    .and_then(|v| v.as_f64())
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .map(|s| s.clamp(1.0, MAX_DELAY_S as f64))
                 else {
                     return Ok(());
                 };
-                if obj.code_hash.is_some() {
-                    engine_hook(state, &u, &id, obj.parent_id.clone(), "on_reset", json!({})).await;
+                // Without code nothing would happen: stop (attaching code
+                // re-arms it, through the trigger)
+                if obj.code_hash.is_none() {
+                    return Ok(());
                 }
+                engine_hook(state, &u, &id, obj.parent_id.clone(), "on_reset", json!({})).await;
                 store
                     .execute_batch(vec![statement(
                         "INSERT OR REPLACE INTO deadlines (universe_id, object_id, kind, due_at)
                          VALUES (?, ?, 'reset', ?)",
-                        vec![json!(u), json!(id), json!(now + every * 1000)],
+                        vec![json!(u), json!(id), json!(now + (every * 1000.0) as u64)],
                     )])
                     .await?;
             }
@@ -2279,6 +2331,26 @@ impl Engine for CombatEngine {
                 .flatten()
                 .and_then(|o| o.parent_id);
             engine_hook(&self.state, universe_id, object, room, handler, args).await;
+        })
+    }
+
+    fn relocate<'a>(
+        &'a self,
+        universe_id: &'a str,
+        id: &'a str,
+        to: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let obj = self.object(universe_id, id).await?;
+            if is_player(&obj) {
+                move_player(&self.state, universe_id, id, to).await
+            } else {
+                self.state
+                    .object_store
+                    .move_object(universe_id, id, to)
+                    .await
+            }
+            .map_err(|e| e.to_string())
         })
     }
 

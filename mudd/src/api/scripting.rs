@@ -212,10 +212,15 @@ struct HookBudget {
 }
 
 impl HookBudget {
+    /// A fresh allowance, or, inside an action (a run, an engine hook),
+    /// that action's shared one: an engine hook's moves do not get a new
+    /// allowance each time
     fn new() -> Self {
         Self {
             depth: 0,
-            remaining: Arc::new(std::sync::atomic::AtomicU32::new(MAX_MOVE_HOOKS_PER_RUN)),
+            remaining: super::combat::hook_counter().unwrap_or_else(|| {
+                Arc::new(std::sync::atomic::AtomicU32::new(MAX_MOVE_HOOKS_PER_RUN))
+            }),
         }
     }
 
@@ -363,7 +368,7 @@ pub async fn run_timer_loop(state: AppState) {
 
 /// An object's attached code and its owner, if it has code (objects are
 /// looked up within the universe, so foreign objects never run here)
-async fn object_code(
+pub(crate) async fn object_code(
     state: &AppState,
     object_id: &str,
     universe_id: &str,
@@ -585,7 +590,7 @@ async fn handle_moved(
     }
 
     run_move_hooks(state, universe_id, object_id, &from, &to, &moved_by, budget).await;
-    // Then regions crossed, on_init, on_move (their own hook budget)
+    // Then regions crossed, on_init, on_move (within the action's budget)
     super::combat::move_extras(
         state,
         universe_id,
@@ -593,6 +598,7 @@ async fn handle_moved(
         from.as_deref(),
         to.as_deref(),
         None,
+        moved_by.as_deref(),
     )
     .await;
 }

@@ -388,7 +388,7 @@ mod tests {
             .await
             .expect("mudd_init upgrades 6 -> 13");
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 13);
+        assert_eq!(db.schema_version().await.unwrap(), 14);
         let tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('actions', 'cluster_nodes', 'online_players', 'payment_requests',
@@ -405,6 +405,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(triggers, 1);
+    }
+
+    /// 13 -> 14 rebuilds deadlines with every kind (an early version-13
+    /// table lacked some) and creates every trigger
+    #[tokio::test]
+    async fn test_upgrade_13_to_14() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("v13.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            for sql in [
+                "DROP TRIGGER reset_on_insert",
+                "DROP TRIGGER reset_on_update",
+                "DROP TABLE deadlines",
+                "CREATE TABLE deadlines (universe_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                   kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn', 'wander')),
+                   due_at INTEGER NOT NULL, PRIMARY KEY (universe_id, object_id, kind))",
+                "PRAGMA user_version = 13",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            db.pool().close().await;
+        }
+        init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .expect("mudd_init upgrades 13 -> 14");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), 14);
+        let table: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deadlines'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            table.contains("'reset'") && table.contains("'delete'"),
+            "{}",
+            table
+        );
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'
+             AND name IN ('reset_on_insert', 'reset_on_update', 'wander_on_insert', 'wander_on_update', 'unequip_on_move')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(triggers, 5);
     }
 
     /// Upgrading a cluster member's database to 9 records the members it

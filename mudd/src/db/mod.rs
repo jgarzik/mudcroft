@@ -14,7 +14,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -122,7 +122,7 @@ pub const DEADLINES_TABLE: &str = r#"
         INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
         VALUES (NEW.universe_id, NEW.id, 'reset', 0);
     END;
-    CREATE TRIGGER IF NOT EXISTS reset_on_update AFTER UPDATE OF properties ON objects
+    CREATE TRIGGER IF NOT EXISTS reset_on_update AFTER UPDATE OF properties, code_hash ON objects
     WHEN json_extract(NEW.properties, '$.reset_seconds') > 0
     BEGIN
         INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
@@ -271,6 +271,9 @@ impl Database {
     /// - 10 -> 11 (payment_requests table): in place.
     /// - 11 -> 12 (applied_commands table): in place.
     /// - 12 -> 13 (combat and deadlines tables): in place.
+    /// - 13 -> 14 (deadlines rebuilt with every kind and their triggers,
+    ///   applied_commands keyed per player, the equipment trigger): an
+    ///   early version-13 table lacked some kinds and triggers.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -343,6 +346,34 @@ impl Database {
             sqlx::raw_sql(EQUIPMENT_TRIGGER).execute(&self.pool).await?;
             self.set_schema_version(13).await?;
             info!("Upgraded database schema 12 -> 13");
+            version = 13;
+        }
+        if version == 13 {
+            let rebuild = format!(
+                "BEGIN;
+                 DROP TRIGGER IF EXISTS wander_on_insert;
+                 DROP TRIGGER IF EXISTS wander_on_update;
+                 DROP TRIGGER IF EXISTS reset_on_insert;
+                 DROP TRIGGER IF EXISTS reset_on_update;
+                 ALTER TABLE deadlines RENAME TO deadlines_v13;
+                 DROP INDEX IF EXISTS deadlines_due;
+                 {deadlines};
+                 INSERT INTO deadlines (universe_id, object_id, kind, due_at)
+                   SELECT universe_id, object_id, kind, due_at FROM deadlines_v13;
+                 DROP TABLE deadlines_v13;
+                 DROP TABLE IF EXISTS applied_commands;
+                 {applied};
+                 {equipment};
+                 COMMIT;",
+                deadlines = DEADLINES_TABLE,
+                applied = APPLIED_COMMANDS_TABLE,
+                equipment = EQUIPMENT_TRIGGER,
+            );
+            sqlx::raw_sql(sqlx::AssertSqlSafe(rebuild))
+                .execute(&self.pool)
+                .await?;
+            self.set_schema_version(14).await?;
+            info!("Upgraded database schema 13 -> 14");
             return Ok(());
         }
         if version < SCHEMA_VERSION {

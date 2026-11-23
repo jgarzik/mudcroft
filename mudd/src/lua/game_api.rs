@@ -836,15 +836,18 @@ impl GameApi {
                             engine
                                 .hook(&universe_id, &id, "on_destroy", serde_json::json!({}))
                                 .await;
+                            // (its room read again: the hook may have moved it;
+                            // a player's session follows)
+                            let room = store
+                                .get(&universe_id, &id)
+                                .await?
+                                .and_then(|o| o.parent_id);
                             for added in store.get_contents(&universe_id, &id).await? {
                                 if !before.contains(&added.id) {
-                                    store
-                                        .move_object(
-                                            &universe_id,
-                                            &added.id,
-                                            obj.parent_id.as_deref(),
-                                        )
-                                        .await?;
+                                    engine
+                                        .relocate(&universe_id, &added.id, room.as_deref())
+                                        .await
+                                        .map_err(anyhow::Error::msg)?;
                                 }
                             }
                         }
@@ -1010,16 +1013,25 @@ impl GameApi {
                                     // The copy is the cloner's, so its code
                                     // would run as them: kept only if they
                                     // may act as the original's owner
-                                    if let (Some(owner), Some(cloner)) =
-                                        (original.owner_id.as_deref(), user.as_deref())
-                                    {
-                                        if owner != cloner
-                                            && !permissions
-                                                .can_act_as(&universe_id, cloner, owner)
-                                                .await
-                                        {
-                                            cloned.code_hash = None;
-                                        }
+                                    let keep_code =
+                                        match (original.owner_id.as_deref(), user.as_deref()) {
+                                            (Some(owner), Some(cloner)) => {
+                                                owner == cloner
+                                                    || permissions
+                                                        .can_act_as(&universe_id, cloner, owner)
+                                                        .await
+                                            }
+                                            // Ownerless (system) code: admins only
+                                            (None, Some(cloner)) => {
+                                                permissions
+                                                    .get_access_level(&universe_id, cloner)
+                                                    .await
+                                                    >= AccessLevel::Admin
+                                            }
+                                            (_, None) => true,
+                                        };
+                                    if !keep_code {
+                                        cloned.code_hash = None;
                                     }
                                     cloned.owner_id = user.clone();
                                     cloned.created_at = chrono::Utc::now().to_rfc3339();
