@@ -3000,7 +3000,10 @@ fn parse_and_roll_dice(dice_str: &str, rng: &Arc<Mutex<StdRng>>) -> Result<i64, 
         let mod_val: i64 = rest[minus_pos + 1..]
             .parse()
             .map_err(|_| "Invalid modifier")?;
-        (&rest[..minus_pos], -mod_val)
+        (
+            &rest[..minus_pos],
+            mod_val.checked_neg().ok_or("Invalid modifier")?,
+        )
     } else {
         (rest, 0)
     };
@@ -3008,6 +3011,11 @@ fn parse_and_roll_dice(dice_str: &str, rng: &Arc<Mutex<StdRng>>) -> Result<i64, 
     let die_size: i64 = die_size_str.parse().map_err(|_| "Invalid die size")?;
     if !(1..=1000).contains(&die_size) {
         return Err("Die size must be between 1 and 1000".to_string());
+    }
+
+    // Bounded like the dice, so the total cannot overflow
+    if !(-1_000_000..=1_000_000).contains(&modifier) {
+        return Err("Modifier must be between -1000000 and 1000000".to_string());
     }
 
     // Roll the dice
@@ -3439,6 +3447,31 @@ impl GameApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// game.roll_dice takes notation from Lua: an extreme modifier is an
+    /// error, never an overflow panic (release builds check overflow)
+    #[test]
+    fn test_roll_dice_extreme_modifier() {
+        use rand::SeedableRng;
+        let rng = Arc::new(Mutex::new(StdRng::seed_from_u64(1)));
+        for notation in [
+            "1d6+9223372036854775807",
+            "100d1000+9223372036854775807",
+            "1d6-9223372036854775807",
+            "1d6--9223372036854775808",
+            "1d6+1000001",
+            "1d6-1000001",
+        ] {
+            assert!(
+                parse_and_roll_dice(notation, &rng).is_err(),
+                "{notation} accepted"
+            );
+        }
+        let v = parse_and_roll_dice("2d6+1000000", &rng).unwrap();
+        assert!((1_000_002..=1_000_012).contains(&v));
+        let v = parse_and_roll_dice("1d6-1000000", &rng).unwrap();
+        assert!((-999_999..=-999_994).contains(&v));
+    }
 
     /// Venice calls are rate-limited under the code's owner whoever pays:
     /// keyed by payer, every object (or player) would be a fresh bucket

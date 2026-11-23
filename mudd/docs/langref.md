@@ -1103,7 +1103,8 @@ nested `use_object` calls. `0` restores real time. Requires **wizard+**.
 #### `game.roll_dice(dice)`
 
 Rolls dice in `NdM`, `NdM+K` or `NdM-K` notation, for example `"2d6+3"`
-or `"d20"`. N is 1–100 (default 1) and M is 1–1000.
+or `"d20"`. N is 1–100 (default 1), M is 1–1000 and K is at most
+1000000.
 
 **Returns** the total. Raises an error for invalid notation.
 
