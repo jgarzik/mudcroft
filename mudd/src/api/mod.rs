@@ -16,7 +16,7 @@ mod websocket;
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use serde::Serialize;
 use tokio::sync::RwLock;
 
@@ -216,7 +216,7 @@ pub async fn router(
 /// What a front-end proxy would otherwise add: gzip for text (images and
 /// WebSocket upgrades pass through) and browser security headers
 fn with_web_layers(app: Router) -> Router {
-    use axum::http::{header, HeaderValue};
+    use axum::http::{HeaderValue, header};
     use tower_http::set_header::SetResponseHeaderLayer;
     app.layer(tower_http::compression::CompressionLayer::new())
         .layer(SetResponseHeaderLayer::if_not_present(

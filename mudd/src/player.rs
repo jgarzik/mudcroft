@@ -68,25 +68,23 @@ impl PlayerManager {
         universe_id: &str,
     ) -> Result<Option<String>> {
         // Check last safe location (verify room still exists)
-        if let Some(last_safe) = player.get_string("last_safe_location") {
-            if self
+        if let Some(last_safe) = player.get_string("last_safe_location")
+            && self
                 .object_store
                 .get(universe_id, last_safe)
                 .await?
                 .is_some()
-            {
-                return Ok(Some(last_safe.to_string()));
-            }
+        {
+            return Ok(Some(last_safe.to_string()));
         }
 
         // Check if player has a current location (parent_id) that's a valid room
-        if let Some(ref parent_id) = player.parent_id {
-            if let Some(room) = self.object_store.get(universe_id, parent_id).await? {
-                if room.class == "room" && self.is_safe_zone(universe_id, parent_id, player).await?
-                {
-                    return Ok(Some(parent_id.clone()));
-                }
-            }
+        if let Some(ref parent_id) = player.parent_id
+            && let Some(room) = self.object_store.get(universe_id, parent_id).await?
+            && room.class == "room"
+            && self.is_safe_zone(universe_id, parent_id, player).await?
+        {
+            return Ok(Some(parent_id.clone()));
         }
 
         // Fallback to universe portal, if its room still exists
@@ -107,16 +105,16 @@ impl PlayerManager {
         player: &Object,
     ) -> Result<bool> {
         // Check if room is player's workroom
-        if let Some(workroom_id) = player.get_string("workroom_id") {
-            if workroom_id == room_id {
-                return Ok(true);
-            }
+        if let Some(workroom_id) = player.get_string("workroom_id")
+            && workroom_id == room_id
+        {
+            return Ok(true);
         }
 
-        if let Some(room) = self.object_store.get(universe_id, room_id).await? {
-            if room.get_bool("is_portal").unwrap_or(false) {
-                return Ok(true);
-            }
+        if let Some(room) = self.object_store.get(universe_id, room_id).await?
+            && room.get_bool("is_portal").unwrap_or(false)
+        {
+            return Ok(true);
         }
 
         // Check if this room is the universe portal
@@ -232,18 +230,17 @@ impl PlayerManager {
             .await?;
 
         // Move player to last safe location or leave in place
-        if let Some(last_safe) = player.get_string("last_safe_location") {
-            if self
+        if let Some(last_safe) = player.get_string("last_safe_location")
+            && self
                 .object_store
                 .get(universe_id, last_safe)
                 .await?
                 .is_some()
-            {
-                self.object_store
-                    .move_object(universe_id, player_id, Some(last_safe))
-                    .await?;
-                info!("Moved disconnected player {} to safe location", player_id);
-            }
+        {
+            self.object_store
+                .move_object(universe_id, player_id, Some(last_safe))
+                .await?;
+            info!("Moved disconnected player {} to safe location", player_id);
         }
 
         Ok(())
@@ -309,15 +306,14 @@ impl PlayerManager {
     /// universe portal; None if there is neither (an error is a failed read)
     pub async fn respawn_room(&self, player: &Object, universe_id: &str) -> Result<Option<String>> {
         // Check workroom
-        if let Some(workroom_id) = player.get_string("workroom_id") {
-            if self
+        if let Some(workroom_id) = player.get_string("workroom_id")
+            && self
                 .object_store
                 .get(universe_id, workroom_id)
                 .await?
                 .is_some()
-            {
-                return Ok(Some(workroom_id.to_string()));
-            }
+        {
+            return Ok(Some(workroom_id.to_string()));
         }
 
         // Fallback to universe portal, if its room still exists

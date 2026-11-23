@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use openraft::async_runtime::WatchReceiver;
 use openraft::{BasicNode, ChangeMembers};
 use sqlx::SqlitePool;
@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use super::storage::{read_node_id, write_node_id};
 use super::transport::{self, ClusterNetwork, ClusterSecurity, ClusterService};
 use super::types::{NodeId, Request, Response};
-use super::{create_raft_node, GameRaft};
+use super::{GameRaft, create_raft_node};
 
 /// How long a new node keeps trying to join
 const JOIN_LIMIT: Duration = Duration::from_secs(120);

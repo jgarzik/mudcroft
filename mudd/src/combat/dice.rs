@@ -48,14 +48,18 @@ impl DiceRoll {
         (results, sum.saturating_add(self.modifier))
     }
 
-    /// Get the minimum possible result
+    /// Get the minimum possible result (saturating, like the rolls)
     pub fn min(&self) -> i32 {
-        self.count as i32 + self.modifier
+        i32::try_from(self.count)
+            .unwrap_or(i32::MAX)
+            .saturating_add(self.modifier)
     }
 
-    /// Get the maximum possible result
+    /// Get the maximum possible result (saturating, like the rolls)
     pub fn max(&self) -> i32 {
-        (self.count * self.sides) as i32 + self.modifier
+        i32::try_from(u64::from(self.count) * u64::from(self.sides))
+            .unwrap_or(i32::MAX)
+            .saturating_add(self.modifier)
     }
 
     /// Get the expected average (rounded down)
@@ -304,5 +308,10 @@ mod tests {
         assert_eq!(roll_dice(2, u32::MAX, i32::MAX), i32::MAX);
         assert_eq!(roll_dice(3, 0, 0), 0, "no sides: nothing rolled");
         assert!(roll_dice(1, 6, i32::MIN) <= i32::MIN + 6);
+        let huge = DiceRoll::new(u32::MAX, u32::MAX, i32::MAX);
+        assert_eq!(huge.min(), i32::MAX);
+        assert_eq!(huge.max(), i32::MAX);
+        let low = DiceRoll::new(1, 6, i32::MIN);
+        assert_eq!(low.min(), i32::MIN + 1);
     }
 }

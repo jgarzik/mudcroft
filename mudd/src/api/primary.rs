@@ -10,12 +10,12 @@
 
 use std::time::Duration;
 
-use openraft::async_runtime::WatchReceiver;
 use openraft::ReadPolicy;
+use openraft::async_runtime::WatchReceiver;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use super::{combat, effect_scheduler, scripting, AppState};
+use super::{AppState, combat, effect_scheduler, scripting};
 
 /// Run the lifecycle forever. `active` is true while this node is the
 /// active primary (caches rebuilt, schedulers running); game traffic is
@@ -103,7 +103,7 @@ async fn handle_orphaned_sessions(state: AppState) {
     for (universe, player, since) in online {
         // Not if they have a session or a disconnect pending here (that
         // grace period stays in charge); a reconnect meanwhile cancels it
-        let Some(gen) = state
+        let Some(disconnect_id) = state
             .connections
             .begin_orphaned_disconnect(&universe, &player)
             .await
@@ -112,7 +112,7 @@ async fn handle_orphaned_sessions(state: AppState) {
         };
         if !state
             .connections
-            .claim_expired_disconnect(&universe, &player, gen)
+            .claim_expired_disconnect(&universe, &player, disconnect_id)
             .await
         {
             continue;

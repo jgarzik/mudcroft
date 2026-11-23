@@ -1,7 +1,7 @@
 //! Game API exposed to Lua scripts
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 use parking_lot::Mutex;
@@ -128,16 +128,15 @@ impl VeniceBilling {
             self.owner.as_deref().unwrap_or("anonymous")
         );
         let result = call(key).await;
-        if result.is_err() && price > 0 {
-            if let Some(ref holder) = holder {
-                if let Err(e) = self
-                    .credits
-                    .grant_direct(&self.universe_id, holder, price)
-                    .await
-                {
-                    tracing::warn!("venice refund of {} to {:?} failed: {}", price, holder, e);
-                }
-            }
+        if result.is_err()
+            && price > 0
+            && let Some(ref holder) = holder
+            && let Err(e) = self
+                .credits
+                .grant_direct(&self.universe_id, holder, price)
+                .await
+        {
+            tracing::warn!("venice refund of {} to {:?} failed: {}", price, holder, e);
         }
         result
     }
@@ -619,24 +618,24 @@ impl GameApi {
                             {
                                 return Ok(Err(reason));
                             }
-                            if let Some(ref hash) = obj_clone.code_hash {
-                                if store.get_code(hash).await?.is_none() {
-                                    return Ok(Err(format!("unknown code_hash {}", hash)));
-                                }
+                            if let Some(ref hash) = obj_clone.code_hash
+                                && store.get_code(hash).await?.is_none()
+                            {
+                                return Ok(Err(format!("unknown code_hash {}", hash)));
                             }
                             store.create(&obj_clone).await?;
                             // Its own code's on_create (as its owner)
-                            if obj_clone.code_hash.is_some() {
-                                if let Some(ref engine) = create_engine {
-                                    engine
-                                        .hook(
-                                            &universe_id,
-                                            &obj_clone.id,
-                                            "on_create",
-                                            serde_json::json!({}),
-                                        )
-                                        .await;
-                                }
+                            if obj_clone.code_hash.is_some()
+                                && let Some(ref engine) = create_engine
+                            {
+                                engine
+                                    .hook(
+                                        &universe_id,
+                                        &obj_clone.id,
+                                        "on_create",
+                                        serde_json::json!({}),
+                                    )
+                                    .await;
                             }
                             Ok(Ok(()))
                         })
@@ -825,30 +824,30 @@ impl GameApi {
                     // Its own code's on_destroy first, while it still exists;
                     // anything it put inside goes to the object's room (a
                     // hook must not be able to block the deletion)
-                    if obj.code_hash.is_some() {
-                        if let Some(ref engine) = delete_engine {
-                            let before: std::collections::HashSet<String> = store
-                                .get_contents(&universe_id, &id)
-                                .await?
-                                .into_iter()
-                                .map(|o| o.id)
-                                .collect();
-                            engine
-                                .hook(&universe_id, &id, "on_destroy", serde_json::json!({}))
-                                .await;
-                            // (its room read again: the hook may have moved it;
-                            // a player's session follows)
-                            let room = store
-                                .get(&universe_id, &id)
-                                .await?
-                                .and_then(|o| o.parent_id);
-                            for added in store.get_contents(&universe_id, &id).await? {
-                                if !before.contains(&added.id) {
-                                    engine
-                                        .relocate(&universe_id, &added.id, room.as_deref())
-                                        .await
-                                        .map_err(anyhow::Error::msg)?;
-                                }
+                    if obj.code_hash.is_some()
+                        && let Some(ref engine) = delete_engine
+                    {
+                        let before: std::collections::HashSet<String> = store
+                            .get_contents(&universe_id, &id)
+                            .await?
+                            .into_iter()
+                            .map(|o| o.id)
+                            .collect();
+                        engine
+                            .hook(&universe_id, &id, "on_destroy", serde_json::json!({}))
+                            .await;
+                        // (its room read again: the hook may have moved it;
+                        // a player's session follows)
+                        let room = store
+                            .get(&universe_id, &id)
+                            .await?
+                            .and_then(|o| o.parent_id);
+                        for added in store.get_contents(&universe_id, &id).await? {
+                            if !before.contains(&added.id) {
+                                engine
+                                    .relocate(&universe_id, &added.id, room.as_deref())
+                                    .await
+                                    .map_err(anyhow::Error::msg)?;
                             }
                         }
                     }
@@ -1037,17 +1036,17 @@ impl GameApi {
                                     cloned.created_at = chrono::Utc::now().to_rfc3339();
                                     cloned.updated_at = cloned.created_at.clone();
                                     store.create(&cloned).await?;
-                                    if cloned.code_hash.is_some() {
-                                        if let Some(ref engine) = clone_engine {
-                                            engine
-                                                .hook(
-                                                    &universe_id,
-                                                    &cloned.id,
-                                                    "on_create",
-                                                    serde_json::json!({}),
-                                                )
-                                                .await;
-                                        }
+                                    if cloned.code_hash.is_some()
+                                        && let Some(ref engine) = clone_engine
+                                    {
+                                        engine
+                                            .hook(
+                                                &universe_id,
+                                                &cloned.id,
+                                                "on_create",
+                                                serde_json::json!({}),
+                                            )
+                                            .await;
                                     }
                                     Ok(Ok(Some(cloned)))
                                 }
@@ -1154,10 +1153,10 @@ impl GameApi {
 
                         for obj in objects {
                             // Apply filter if specified
-                            if let Some(ref class) = class_filter {
-                                if &obj.class != class {
-                                    continue;
-                                }
+                            if let Some(ref class) = class_filter
+                                && &obj.class != class
+                            {
+                                continue;
                             }
                             table.set(idx, object_to_lua(lua, &obj)?)?;
                             idx += 1;
@@ -1252,13 +1251,14 @@ impl GameApi {
                         let _defining = define_lock.lock().await;
                         let persister = {
                             let registry = classes.read().await;
-                            if let Some(existing) = registry.get_class(&class_universe, &name) {
-                                if existing.defined_by != caller && !is_admin {
-                                    return Err(format!(
-                                        "define_class: {} is already defined by another account",
-                                        name
-                                    ));
-                                }
+                            if let Some(existing) = registry.get_class(&class_universe, &name)
+                                && existing.defined_by != caller
+                                && !is_admin
+                            {
+                                return Err(format!(
+                                    "define_class: {} is already defined by another account",
+                                    name
+                                ));
                             }
                             registry.persister()
                         };
@@ -3000,7 +3000,10 @@ fn parse_and_roll_dice(dice_str: &str, rng: &Arc<Mutex<StdRng>>) -> Result<i64, 
         let mod_val: i64 = rest[minus_pos + 1..]
             .parse()
             .map_err(|_| "Invalid modifier")?;
-        (&rest[..minus_pos], -mod_val)
+        (
+            &rest[..minus_pos],
+            mod_val.checked_neg().ok_or("Invalid modifier")?,
+        )
     } else {
         (rest, 0)
     };
@@ -3008,6 +3011,11 @@ fn parse_and_roll_dice(dice_str: &str, rng: &Arc<Mutex<StdRng>>) -> Result<i64, 
     let die_size: i64 = die_size_str.parse().map_err(|_| "Invalid die size")?;
     if !(1..=1000).contains(&die_size) {
         return Err("Die size must be between 1 and 1000".to_string());
+    }
+
+    // Bounded like the dice, so the total cannot overflow
+    if !(-1_000_000..=1_000_000).contains(&modifier) {
+        return Err("Modifier must be between -1000000 and 1000000".to_string());
     }
 
     // Roll the dice
@@ -3439,6 +3447,31 @@ impl GameApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// game.roll_dice takes notation from Lua: an extreme modifier is an
+    /// error, never an overflow panic (release builds check overflow)
+    #[test]
+    fn test_roll_dice_extreme_modifier() {
+        use rand::SeedableRng;
+        let rng = Arc::new(Mutex::new(StdRng::seed_from_u64(1)));
+        for notation in [
+            "1d6+9223372036854775807",
+            "100d1000+9223372036854775807",
+            "1d6-9223372036854775807",
+            "1d6--9223372036854775808",
+            "1d6+1000001",
+            "1d6-1000001",
+        ] {
+            assert!(
+                parse_and_roll_dice(notation, &rng).is_err(),
+                "{notation} accepted"
+            );
+        }
+        let v = parse_and_roll_dice("2d6+1000000", &rng).unwrap();
+        assert!((1_000_002..=1_000_012).contains(&v));
+        let v = parse_and_roll_dice("1d6-1000000", &rng).unwrap();
+        assert!((-999_999..=-999_994).contains(&v));
+    }
 
     /// Venice calls are rate-limited under the code's owner whoever pays:
     /// keyed by payer, every object (or player) would be a fresh bucket

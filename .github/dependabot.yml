@@ -1,0 +1,46 @@
+version: 2
+
+# Weekly grouped updates; a new release must be a few days old before it is
+# proposed, so a compromised release has time to be noticed and yanked.
+# Security updates (enabled in repo settings) are not delayed or grouped.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: cargo
+    directory: /mudd
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /client
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm-minor:
+        update-types: [minor, patch]
+
+  # Base images use floating tags; this proposes new major versions
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ['*']

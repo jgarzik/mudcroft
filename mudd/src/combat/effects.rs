@@ -813,10 +813,12 @@ mod tests {
         assert!(registry.get("a", "/npcs/rat").await.can_act(now));
         let fresh = EffectRegistry::new();
         fresh.load_from_db(&pool).await.unwrap();
-        assert!(!fresh
-            .get("a", "/npcs/rat")
-            .await
-            .has(EffectType::Stunned, now));
+        assert!(
+            !fresh
+                .get("a", "/npcs/rat")
+                .await
+                .has(EffectType::Stunned, now)
+        );
     }
 
     /// Effects belong to an object: deleting it deletes them

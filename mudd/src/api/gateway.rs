@@ -20,18 +20,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Router;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use openraft::async_runtime::WatchReceiver;
 use tracing::{info, warn};
 
-use super::websocket::{ServerMessage, WsParams};
 use super::AppState;
+use super::websocket::{ServerMessage, WsParams};
 use crate::raft::transport::{
     self, GameFrame, GameHook, GameOpen, HttpHook, HttpRequest, HttpResponse, PeerClient,
 };
@@ -260,7 +260,7 @@ pub async fn ws_upgrade(ws: WebSocketUpgrade, params: WsParams, state: AppState)
             return plain(
                 StatusCode::BAD_REQUEST,
                 &format!("Invalid universe ID: {}", e),
-            )
+            );
         }
     };
     let Some((_, security)) = state.raft_writer.cluster().cloned() else {
@@ -285,13 +285,13 @@ pub async fn ws_upgrade(ws: WebSocketUpgrade, params: WsParams, state: AppState)
             return plain(
                 StatusCode::UNAUTHORIZED,
                 "A valid token is required: ?token=<token>",
-            )
+            );
         }
         Err(_) => {
             return plain(
                 StatusCode::BAD_GATEWAY,
                 "the primary did not answer; try again",
-            )
+            );
         }
     }
     let open = GameOpen { universe, token };

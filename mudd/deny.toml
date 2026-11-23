@@ -1,0 +1,51 @@
+# cargo-deny: supply-chain checks run in CI (`cargo deny check`).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Vulnerabilities and yanked crates always fail; unmaintained crates fail
+# only when the project itself depends on them directly.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # chrono is unmaintained (no vulnerability). Replace it with jiff or time.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained only; migration tracked" },
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+
+[bans]
+# Duplicates (mostly from upstream crates) are reported, not fatal
+multiple-versions = "warn"
+# TLS is rustls only
+deny = [
+    { crate = "openssl", reason = "TLS is rustls only" },
+    { crate = "openssl-sys", reason = "TLS is rustls only" },
+    { crate = "native-tls", reason = "TLS is rustls only" },
+]
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

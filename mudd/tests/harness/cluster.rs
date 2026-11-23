@@ -15,7 +15,7 @@ use anyhow::Result;
 use reqwest::Client;
 use tempfile::TempDir;
 
-use super::server::{die_with_parent, find_binary_path, log_tail, spawn_mudd, ChildGuard};
+use super::server::{ChildGuard, die_with_parent, find_binary_path, log_tail, spawn_mudd};
 
 /// A player's game connection to one node
 pub struct ClusterPlayer {

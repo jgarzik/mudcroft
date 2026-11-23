@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use super::{AppState, ServerMessage};
-use crate::combat::engine::{process_due, tick_statements, Combatant, TickEvent, TickOutcome};
+use crate::combat::engine::{Combatant, TickEvent, TickOutcome, process_due, tick_statements};
 use crate::combat::now_ms;
 
 /// Longest sleep with nothing due (a safety net; changes wake it sooner)

@@ -120,7 +120,7 @@ impl TestServer {
             {
                 Ok(child) => break (addr, child),
                 Err(e) if attempt < 3 && e.to_string().contains("exited during startup") => {
-                    continue
+                    continue;
                 }
                 Err(e) => return Err(e),
             }
@@ -359,43 +359,18 @@ impl TestServer {
     }
 }
 
-/// Find a binary path by name (e.g., "mudd" or "mudd_init")
-/// Uses the same build profile as the test: debug for `cargo test`, release for `cargo test --release`
+/// Path of one of this package's binaries ("mudd", "mudd_init", "mudd_admin").
+/// Cargo builds them for the integration tests with the same profile and
+/// target dir (honoring `CARGO_TARGET_DIR`) and passes their paths in
+/// `CARGO_BIN_EXE_<name>`, so a test never runs a stale or wrong binary.
 pub(super) fn find_binary_path(name: &str) -> Result<PathBuf> {
-    // Match the build profile of the test runner
-    #[cfg(debug_assertions)]
-    let candidates = [
-        // Debug build (matches `cargo test`)
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/debug/{}", name)),
-        // Workspace root debug
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../target/debug/{}", name)),
-    ];
-
-    #[cfg(not(debug_assertions))]
-    let candidates = [
-        // Release build (matches `cargo test --release`)
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/release/{}", name)),
-        // Workspace root release
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../target/release/{}", name)),
-    ];
-
-    for path in &candidates {
-        if path.exists() {
-            return Ok(path.clone());
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    let build_cmd = "cargo build";
-    #[cfg(not(debug_assertions))]
-    let build_cmd = "cargo build --release";
-
-    anyhow::bail!(
-        "Could not find {} binary. Run '{}' first. Searched: {:?}",
-        name,
-        build_cmd,
-        candidates
-    )
+    let path = match name {
+        "mudd" => env!("CARGO_BIN_EXE_mudd"),
+        "mudd_init" => env!("CARGO_BIN_EXE_mudd_init"),
+        "mudd_admin" => env!("CARGO_BIN_EXE_mudd_admin"),
+        other => anyhow::bail!("unknown binary {other}"),
+    };
+    Ok(PathBuf::from(path))
 }
 
 /// Raw WebSocket client for backward compatibility with existing tests
@@ -605,7 +580,9 @@ impl ChildGuard {
             return Ok(None);
         };
         // SAFETY: kill(2) on our own child's pid
-        if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == -1 {
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        if rc == -1 {
             return Err(std::io::Error::last_os_error());
         }
         let deadline = std::time::Instant::now() + timeout;
@@ -642,6 +619,7 @@ pub(super) fn die_with_parent(cmd: &mut Command) -> &mut Command {
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: prctl is async-signal-safe and touches no parent state.
+        #[allow(unsafe_code)]
         unsafe {
             cmd.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {

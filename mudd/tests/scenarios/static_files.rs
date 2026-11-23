@@ -23,11 +23,13 @@ async fn test_static_dir_serves_client_with_spa_fallback() {
 
     let index = server.get("/").await.unwrap();
     assert_eq!(index.status(), 200);
-    assert!(index
-        .text()
-        .await
-        .unwrap()
-        .contains("<title>Mudcroft</title>"));
+    assert!(
+        index
+            .text()
+            .await
+            .unwrap()
+            .contains("<title>Mudcroft</title>")
+    );
 
     let js = server.get("/assets/app.js").await.unwrap();
     assert_eq!(js.status(), 200);
@@ -37,11 +39,12 @@ async fn test_static_dir_serves_client_with_spa_fallback() {
     // Unknown non-API paths fall back to the client
     let spa = server.get("/some/client/route").await.unwrap();
     assert_eq!(spa.status(), 200);
-    assert!(spa
-        .text()
-        .await
-        .unwrap()
-        .contains("<title>Mudcroft</title>"));
+    assert!(
+        spa.text()
+            .await
+            .unwrap()
+            .contains("<title>Mudcroft</title>")
+    );
 
     // The API is unaffected
     let health = server.get("/health").await.unwrap();

@@ -1,6 +1,6 @@
 //! Object types and core structures
 
-use super::path::{validate_object_path, PathValidationError};
+use super::path::{PathValidationError, validate_object_path};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

@@ -23,8 +23,8 @@ use serde_json::json;
 use tracing::warn;
 
 use super::{AppState, ServerMessage};
-use crate::combat::engine::{attack_mods, attack_statements, resolve_attack, Combatant};
-use crate::combat::{now_ms, DamageType};
+use crate::combat::engine::{Combatant, attack_mods, attack_statements, resolve_attack};
+use crate::combat::{DamageType, now_ms};
 use crate::objects::Object;
 
 /// Round length when the universe sets none
@@ -650,15 +650,14 @@ async fn arrival_inner(
                 engage_at(state, universe_id, &npc.id, &mover.id, now, next).await?;
             }
         }
-    } else if aggressive(&mover) && !in_combat(state, universe_id, &mover.id).await? {
-        if let Some(player) = here.iter().find(|o| is_player(o) && alive(o)) {
-            if fight_allowed(state, universe_id, &mover, player)
-                .await
-                .is_ok()
-            {
-                engage_at(state, universe_id, &mover.id, &player.id, now, next).await?;
-            }
-        }
+    } else if aggressive(&mover)
+        && !in_combat(state, universe_id, &mover.id).await?
+        && let Some(player) = here.iter().find(|o| is_player(o) && alive(o))
+        && fight_allowed(state, universe_id, &mover, player)
+            .await
+            .is_ok()
+    {
+        engage_at(state, universe_id, &mover.id, &player.id, now, next).await?;
     }
     Ok(())
 }
@@ -965,10 +964,11 @@ async fn pick_exit(
     };
     let mut choices = Vec::new();
     for (dir, to) in exits(&room) {
-        if let Some(dest) = store.get(universe_id, &to).await? {
-            if dest.class == "room" && (!same_region || region_of(&dest) == region_of(&room)) {
-                choices.push((dir, to));
-            }
+        if let Some(dest) = store.get(universe_id, &to).await?
+            && dest.class == "room"
+            && (!same_region || region_of(&dest) == region_of(&room))
+        {
+            choices.push((dir, to));
         }
     }
     if choices.is_empty() {
@@ -1069,10 +1069,10 @@ async fn move_player(
     );
     crate::db::run::after_commit(move || async move {
         st.connections.update_room(&u, &p, to.clone()).await;
-        if let Some(room) = to {
-            if let Some(msg) = super::websocket::build_room_message(&st, &u, &room, None).await {
-                st.connections.send_to_player(&u, &p, msg).await;
-            }
+        if let Some(room) = to
+            && let Some(msg) = super::websocket::build_room_message(&st, &u, &room, None).await
+        {
+            st.connections.send_to_player(&u, &p, msg).await;
         }
     })
     .await;
@@ -1115,18 +1115,18 @@ pub async fn delete_tree(
     // Every on_destroy first (while everything still exists), deepest
     // first; a failing or skipped hook does not stop the deletion
     for victim in order.iter().rev() {
-        if let Some(obj) = store.get(universe_id, victim).await? {
-            if obj.code_hash.is_some() {
-                engine_hook(
-                    state,
-                    universe_id,
-                    victim,
-                    obj.parent_id.clone(),
-                    "on_destroy",
-                    json!({}),
-                )
-                .await;
-            }
+        if let Some(obj) = store.get(universe_id, victim).await?
+            && obj.code_hash.is_some()
+        {
+            engine_hook(
+                state,
+                universe_id,
+                victim,
+                obj.parent_id.clone(),
+                "on_destroy",
+                json!({}),
+            )
+            .await;
         }
     }
     // Then list the tree again (the hooks may have added to it or moved a
@@ -1412,19 +1412,19 @@ pub async fn report_death(state: &AppState, universe_id: &str, d: &Death) {
             )
             .await;
     }
-    if let (Some(killer), Some(xp)) = (d.killer.as_deref(), d.xp) {
-        if xp > 0 {
-            state
-                .connections
-                .send_to_player(
-                    universe_id,
-                    killer,
-                    ServerMessage::Output {
-                        text: format!("You gain {} experience.", xp),
-                    },
-                )
-                .await;
-        }
+    if let (Some(killer), Some(xp)) = (d.killer.as_deref(), d.xp)
+        && xp > 0
+    {
+        state
+            .connections
+            .send_to_player(
+                universe_id,
+                killer,
+                ServerMessage::Output {
+                    text: format!("You gain {} experience.", xp),
+                },
+            )
+            .await;
     }
     if !is_player(&d.victim) {
         run_on_death(
@@ -1885,11 +1885,11 @@ async fn deadline(
                 // out of the world (logged)
                 let mut home = None;
                 for key in ["home_room", "died_in"] {
-                    if let Some(room) = obj.get_string(key) {
-                        if store.get(&u, room).await?.is_some() {
-                            home = Some(room.to_string());
-                            break;
-                        }
+                    if let Some(room) = obj.get_string(key)
+                        && store.get(&u, room).await?.is_some()
+                    {
+                        home = Some(room.to_string());
+                        break;
                     }
                 }
                 let Some(home) = home else {
@@ -2151,12 +2151,14 @@ impl CombatEngine {
         let hp = who.hp.saturating_sub(dealt).max(0);
         state
             .object_store
-            .execute_batch(vec![crate::objects::ObjectStore::set_properties_statement(
-                u,
-                target_id,
-                &[("hp", json!(hp))],
-            )
-            .map_err(|e| e.to_string())?])
+            .execute_batch(vec![
+                crate::objects::ObjectStore::set_properties_statement(
+                    u,
+                    target_id,
+                    &[("hp", json!(hp))],
+                )
+                .map_err(|e| e.to_string())?,
+            ])
             .await
             .map_err(|e| e.to_string())?;
         let killed = was_alive && hp == 0;
@@ -2302,12 +2304,14 @@ impl Engine for CombatEngine {
                 .min(who.max_hp as i64);
             self.state
                 .object_store
-                .execute_batch(vec![crate::objects::ObjectStore::set_properties_statement(
-                    universe_id,
-                    target,
-                    &[("hp", json!(hp))],
-                )
-                .map_err(|e| e.to_string())?])
+                .execute_batch(vec![
+                    crate::objects::ObjectStore::set_properties_statement(
+                        universe_id,
+                        target,
+                        &[("hp", json!(hp))],
+                    )
+                    .map_err(|e| e.to_string())?,
+                ])
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(hp)

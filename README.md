@@ -100,3 +100,7 @@ install chromium`.
 - [playtest.md](playtest.md): manual play-testing
 - [docs/roadmap.md](docs/roadmap.md): planned work and known issues
 - [igor-history.md](igor-history.md): LP-MUD background
+
+## License
+
+MIT; see [LICENSE](LICENSE).

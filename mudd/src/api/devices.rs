@@ -118,12 +118,12 @@ impl DeviceTokens {
     /// Forget a token (logout, or replaced by a renewal)
     pub fn revoke(&self, token: &str) {
         let mut tokens = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(name) = tokens.index.remove(token) {
-            if let Some(mine) = tokens.by_account.get_mut(&name) {
-                mine.retain(|(t, _)| t != token);
-                if mine.is_empty() {
-                    tokens.by_account.remove(&name);
-                }
+        if let Some(name) = tokens.index.remove(token)
+            && let Some(mine) = tokens.by_account.get_mut(&name)
+        {
+            mine.retain(|(t, _)| t != token);
+            if mine.is_empty() {
+                tokens.by_account.remove(&name);
             }
         }
     }

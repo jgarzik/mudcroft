@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use mudd::admin::{set_global_level, GlobalLevel};
-use mudd::raft::transport::{PeerClient, RemoveReply, SetLevelReply};
+use mudd::admin::{GlobalLevel, set_global_level};
 use mudd::raft::ClusterSecurity;
+use mudd::raft::transport::{PeerClient, RemoveReply, SetLevelReply};
 
 /// Mudcroft offline administration
 #[derive(Parser, Debug)]

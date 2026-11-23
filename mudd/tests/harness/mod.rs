@@ -36,7 +36,7 @@ pub use client::Role;
 #[allow(unused_imports)]
 pub use client::TestClient;
 #[allow(unused_imports)]
-pub use cluster::{make_certs, ClusterCerts, ClusterPlayer, TestCluster};
+pub use cluster::{ClusterCerts, ClusterPlayer, TestCluster, make_certs};
 #[allow(unused_imports)]
 pub use server::{MuddTest, RawWsClient, TestServer};
 #[allow(unused_imports)]

@@ -2,6 +2,7 @@
   "name": "mudcroft-client",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,16 +19,16 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
-    "@playwright/test": "1.58.2",
+    "@playwright/test": "^1.65.1",
     "@types/node": "^22.20.5",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
-    "@vitejs/plugin-react": "^4.2.0",
+    "@vitejs/plugin-react": "^6.3.0",
     "eslint": "^9.39.5",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.14.0",
     "typescript": "^5.3.0",
     "typescript-eslint": "^8.73.0",
-    "vite": "^5.0.0"
+    "vite": "^8.3.8"
   }
 }

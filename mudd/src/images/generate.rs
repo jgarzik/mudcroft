@@ -166,12 +166,9 @@ Respond with ONLY the image prompt, no explanations or preamble."#,
     // Step 4: Record it on the room, in place: the room may have changed
     // during the seconds generation took
     object_store
-        .execute_batch(vec![store_image_statement(
-            universe_id,
-            room_id,
-            &image_hash,
-        )
-        .map_err(|e| e.to_string())?])
+        .execute_batch(vec![
+            store_image_statement(universe_id, room_id, &image_hash).map_err(|e| e.to_string())?,
+        ])
         .await
         .map_err(|e| format!("Failed to update room with image hash: {}", e))?;
 
@@ -213,7 +210,7 @@ mod tests {
 
         store
             .execute_batch(vec![
-                store_image_statement("u", "/rooms/a", "hash1").unwrap()
+                store_image_statement("u", "/rooms/a", "hash1").unwrap(),
             ])
             .await
             .unwrap();
@@ -224,7 +221,7 @@ mod tests {
 
         store
             .execute_batch(vec![
-                store_image_statement("u", "/rooms/a", "hash2").unwrap()
+                store_image_statement("u", "/rooms/a", "hash2").unwrap(),
             ])
             .await
             .unwrap();

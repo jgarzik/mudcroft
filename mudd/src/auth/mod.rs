@@ -34,7 +34,7 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
 /// Verify a password against a stored PHC hash (constant-time compare).
 /// A malformed stored hash never verifies. CPU-heavy, like hash_password.
 pub fn verify_password(password: &str, stored: &str) -> bool {
-    use argon2::password_hash::{phc::PasswordHash, PasswordVerifier};
+    use argon2::password_hash::{PasswordVerifier, phc::PasswordHash};
     let Ok(hash) = PasswordHash::new(stored) else {
         return false;
     };

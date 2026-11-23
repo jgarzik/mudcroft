@@ -123,5 +123,4 @@ Details: [docs/API.md](docs/API.md).
 
 ## License
 
-The repository does not include a license file. The Docker image declares
-`org.opencontainers.image.licenses="MIT"`.
+MIT; see [LICENSE](../LICENSE).

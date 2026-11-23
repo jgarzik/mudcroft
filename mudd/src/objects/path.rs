@@ -153,10 +153,10 @@ pub fn validate_object_path(path: &str) -> Result<String, PathValidationError> {
 /// assert_eq!(parent_path("/a"), None);
 /// ```
 pub fn parent_path(path: &str) -> Option<String> {
-    if let Some(last_slash) = path.rfind('/') {
-        if last_slash > 0 {
-            return Some(path[..last_slash].to_string());
-        }
+    if let Some(last_slash) = path.rfind('/')
+        && last_slash > 0
+    {
+        return Some(path[..last_slash].to_string());
     }
     None
 }

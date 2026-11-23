@@ -3,11 +3,11 @@
 //! GET /images/{hash} - Serve image by content hash
 
 use axum::{
+    Router,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::get,
-    Router,
 };
 
 use super::AppState;

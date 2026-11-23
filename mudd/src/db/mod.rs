@@ -4,7 +4,7 @@ pub mod run;
 #[cfg(test)]
 pub mod test_utils;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;

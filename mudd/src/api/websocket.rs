@@ -4,17 +4,17 @@ use std::collections::BTreeMap;
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
-use super::scripting::{self, ScriptContext};
 use super::AppState;
+use super::scripting::{self, ScriptContext};
 use crate::auth::accounts::Account;
 use crate::images::generate_room_image;
 use crate::permissions::AccessLevel;
@@ -92,22 +92,18 @@ impl ConnectionManager {
         player_id: &str,
     ) -> (tokio::sync::oneshot::Receiver<()>, u64) {
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let gen = self.next_conn_id();
+        let disconnect_id = self.next_conn_id();
         self.pending_disconnects
             .write()
             .await
-            .insert(key(universe_id, player_id), (gen, cancel_tx));
-        (cancel_rx, gen)
+            .insert(key(universe_id, player_id), (disconnect_id, cancel_tx));
+        (cancel_rx, disconnect_id)
     }
 
-    /// When a grace period expires: claim the disconnect for handling. True
-    /// only if it is still the pending one (`gen`) and the player has no
-    /// session, checked under the sessions lock so a reconnect that raced
-    /// past the cancel is never treated as gone.
     /// Start handling the disconnect of a player whose server was lost
     /// (recorded online, not connected here): records a pending disconnect
     /// (a reconnect cancels it, as during a grace period) and returns its
-    /// generation, for claim_expired_disconnect right before acting. None
+    /// disconnect id, for claim_expired_disconnect right before acting. None
     /// if they have a live session or a disconnect already pending here,
     /// which then stays in charge.
     pub async fn begin_orphaned_disconnect(
@@ -121,22 +117,26 @@ impl ConnectionManager {
         if sessions.contains_key(&k) || pending.contains_key(&k) {
             return None;
         }
-        let gen = self.next_conn_id();
+        let disconnect_id = self.next_conn_id();
         let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
-        pending.insert(k, (gen, cancel_tx));
-        Some(gen)
+        pending.insert(k, (disconnect_id, cancel_tx));
+        Some(disconnect_id)
     }
 
+    /// When a grace period expires: claim the disconnect for handling. True
+    /// only if it is still the pending one (`disconnect_id`) and the player
+    /// has no session, checked under the sessions lock so a reconnect that
+    /// raced past the cancel is never treated as gone.
     pub async fn claim_expired_disconnect(
         &self,
         universe_id: &str,
         player_id: &str,
-        gen: u64,
+        disconnect_id: u64,
     ) -> bool {
         let k = key(universe_id, player_id);
         let sessions = self.sessions.read().await;
         let mut pending = self.pending_disconnects.write().await;
-        if !pending.get(&k).is_some_and(|(g, _)| *g == gen) {
+        if !pending.get(&k).is_some_and(|(g, _)| *g == disconnect_id) {
             return false;
         }
         pending.remove(&k);
@@ -393,7 +393,7 @@ async fn admit(
             return Err((
                 StatusCode::BAD_REQUEST,
                 "Universe ID required in query param: ?universe=<id>".to_string(),
-            ))
+            ));
         }
     };
     match state.object_store.universe_exists(&universe_id).await {
@@ -402,7 +402,7 @@ async fn admit(
             return Err((
                 StatusCode::NOT_FOUND,
                 format!("Universe not found: {}", universe_id),
-            ))
+            ));
         }
         Err(e) => {
             warn!("Error checking universe: {}", e);
@@ -645,10 +645,9 @@ async fn handle_socket(
         // Send initial room description
         if let Some(room_msg) =
             build_room_message(&state, &universe_id, &room_id, Some(&account_id)).await
+            && let Ok(json) = serde_json::to_string(&room_msg)
         {
-            if let Ok(json) = serde_json::to_string(&room_msg) {
-                let _ = socket.send(json).await;
-            }
+            let _ = socket.send(json).await;
         }
 
         // Arriving in the world counts as entering the spawn room
@@ -687,11 +686,10 @@ async fn handle_socket(
                     quit = true;
                     break;
                 }
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if !socket.send(json).await {
+                if let Ok(json) = serde_json::to_string(&msg)
+                    && !socket.send(json).await {
                         break;
                     }
-                }
             }
             // Handle incoming messages from WebSocket
             result = socket.recv() => {
@@ -747,7 +745,7 @@ async fn handle_socket(
         return;
     }
     if !replaced {
-        let (cancel_rx, gen) = state
+        let (cancel_rx, disconnect_id) = state
             .connections
             .schedule_disconnect(&universe_id, &player_id_clone)
             .await;
@@ -764,7 +762,7 @@ async fn handle_socket(
                 _ = tokio::time::sleep(RECONNECT_GRACE_PERIOD) => {
                     // Grace period expired: handle the disconnect, unless
                     // the player is connected again
-                    if !state_clone.connections.claim_expired_disconnect(&universe_for_task, &player_id_for_task, gen).await {
+                    if !state_clone.connections.claim_expired_disconnect(&universe_for_task, &player_id_for_task, disconnect_id).await {
                         info!("Disconnect handling skipped for {} (connected again)", player_id_for_task);
                         return;
                     }
@@ -827,18 +825,18 @@ async fn handle_client_message(
             info!("Player {} command: {}", player_id, text);
             let id = id.filter(|id| !id.is_empty() && id.len() <= 64);
             // Already saved (a retry after a failover): not run again
-            if let Some(ref id) = id {
-                if command_applied(state, universe_id, player_id, id).await {
-                    state
-                        .connections
-                        .send_to_player(
-                            universe_id,
-                            player_id,
-                            ServerMessage::Done { id: id.clone() },
-                        )
-                        .await;
-                    return;
-                }
+            if let Some(ref id) = id
+                && command_applied(state, universe_id, player_id, id).await
+            {
+                state
+                    .connections
+                    .send_to_player(
+                        universe_id,
+                        player_id,
+                        ServerMessage::Done { id: id.clone() },
+                    )
+                    .await;
+                return;
             }
 
             // Echo the command back
@@ -1088,47 +1086,47 @@ pub(crate) async fn build_room_message(
         && account_id.is_some())
     .then(|| state.image_jobs.try_start(universe_id, room_id))
     .flatten();
-    if let Some(job) = job {
-        if let Some(acct_id) = account_id {
-            let venice = state.venice.clone();
-            let image_store = state.image_store.clone();
-            let object_store = state.object_store.clone();
-            let themes = state.themes.clone();
-            let room_id_owned = room_id.to_string();
-            let universe_owned = universe_id.to_string();
-            let account_id_owned = acct_id.to_string();
+    if let Some(job) = job
+        && let Some(acct_id) = account_id
+    {
+        let venice = state.venice.clone();
+        let image_store = state.image_store.clone();
+        let object_store = state.object_store.clone();
+        let themes = state.themes.clone();
+        let room_id_owned = room_id.to_string();
+        let universe_owned = universe_id.to_string();
+        let account_id_owned = acct_id.to_string();
 
-            // Spawn background task for image generation
-            tokio::spawn(async move {
-                // Held until the job ends, however it ends
-                let _job = job;
-                let theme = themes.get(DEFAULT_THEME_ID);
-                match generate_room_image(
-                    &venice,
-                    &image_store,
-                    &object_store,
-                    &universe_owned,
-                    &room_id_owned,
-                    &theme,
-                    &account_id_owned,
-                )
-                .await
-                {
-                    Ok(hash) => {
-                        info!(
-                            "Background image generation complete for room {}: {}",
-                            room_id_owned, hash
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Background image generation failed for room {}: {}",
-                            room_id_owned, e
-                        );
-                    }
+        // Spawn background task for image generation
+        tokio::spawn(async move {
+            // Held until the job ends, however it ends
+            let _job = job;
+            let theme = themes.get(DEFAULT_THEME_ID);
+            match generate_room_image(
+                &venice,
+                &image_store,
+                &object_store,
+                &universe_owned,
+                &room_id_owned,
+                &theme,
+                &account_id_owned,
+            )
+            .await
+            {
+                Ok(hash) => {
+                    info!(
+                        "Background image generation complete for room {}: {}",
+                        room_id_owned, hash
+                    );
                 }
-            });
-        }
+                Err(e) => {
+                    warn!(
+                        "Background image generation failed for room {}: {}",
+                        room_id_owned, e
+                    );
+                }
+            }
+        });
     }
 
     Some(ServerMessage::Room {
@@ -1279,12 +1277,11 @@ async fn execute_command(
     match verb.as_str() {
         "look" | "l" => {
             // Get player's current room
-            if let Some(room_id) = state.connections.get_room_id(universe_id, player_id).await {
-                if let Some(room_msg) =
+            if let Some(room_id) = state.connections.get_room_id(universe_id, player_id).await
+                && let Some(room_msg) =
                     build_room_message(state, universe_id, &room_id, Some(account_id)).await
-                {
-                    return room_msg;
-                }
+            {
+                return room_msg;
             }
             ServerMessage::Output {
                 text: "You are nowhere.".to_string(),
@@ -1799,7 +1796,7 @@ async fn execute_command(
                 Err(e) => {
                     return ServerMessage::Error {
                         message: format!("Attack failed: {}", e),
-                    }
+                    };
                 }
             }
 
@@ -1819,7 +1816,7 @@ async fn execute_command(
                     Err(e) => {
                         return ServerMessage::Error {
                             message: format!("Attack failed: {}", e),
-                        }
+                        };
                     }
                 };
             let death = if blow.killed {
@@ -1837,7 +1834,7 @@ async fn execute_command(
                     Err(e) => {
                         return ServerMessage::Error {
                             message: format!("Attack failed: {}", e),
-                        }
+                        };
                     }
                 }
             } else {
@@ -2046,7 +2043,7 @@ async fn execute_command(
                 Err(e) => {
                     return ServerMessage::Error {
                         message: format!("Could not change PvP: {}", e),
-                    }
+                    };
                 }
             };
             match state.object_store.execute_batch(vec![statement]).await {
@@ -2427,7 +2424,7 @@ fn parse_create_args(args: &str) -> Result<CreateParams, String> {
     let mut tokens: Vec<String> = Vec::new();
 
     // Helper to skip whitespace
-    fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
             chars.next();
         }
@@ -2644,17 +2641,29 @@ mod tests {
     #[tokio::test]
     async fn test_expired_disconnect_skips_connected_player() {
         let conns = ConnectionManager::new();
-        let (_rx, gen) = conns.schedule_disconnect("u", "p").await;
+        let (_rx, disconnect_id) = conns.schedule_disconnect("u", "p").await;
         // A new connection registers without having cancelled anything
         let (mut s, _s_rx) = session("p", "r", 4);
         s.universe_id = "u".into();
         conns.register(s).await;
-        assert!(!conns.claim_expired_disconnect("u", "p", gen).await);
+        assert!(
+            !conns
+                .claim_expired_disconnect("u", "p", disconnect_id)
+                .await
+        );
 
         // With nobody connected, the matching disconnect is claimed once
-        let (_rx, gen) = conns.schedule_disconnect("u", "q").await;
-        assert!(conns.claim_expired_disconnect("u", "q", gen).await);
-        assert!(!conns.claim_expired_disconnect("u", "q", gen).await);
+        let (_rx, disconnect_id) = conns.schedule_disconnect("u", "q").await;
+        assert!(
+            conns
+                .claim_expired_disconnect("u", "q", disconnect_id)
+                .await
+        );
+        assert!(
+            !conns
+                .claim_expired_disconnect("u", "q", disconnect_id)
+                .await
+        );
 
         // A newer scheduled disconnect is not claimed by an older one
         let (_rx, old) = conns.schedule_disconnect("u", "r").await;
