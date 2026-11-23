@@ -79,26 +79,49 @@ pub struct HeartBeat {
     pub universe_id: String,
     /// Interval between beats in milliseconds
     pub interval_ms: u64,
-    /// When the next beat is due (Unix ms; not stored: after a restart the
-    /// next beat is one interval away)
+    /// When it was set (Unix ms, stored): beats fall at started_at + k *
+    /// interval_ms, so a restart keeps the schedule
+    pub started_at: i64,
+    /// When the next beat is due (Unix ms; derived from started_at)
     pub next_due: i64,
     /// Method to call (defaults to "heart_beat")
     pub method: String,
 }
 
 impl HeartBeat {
-    /// Create a new heartbeat
+    /// Create a new heartbeat, started now
     pub fn new(universe_id: &str, object_id: &str, interval_ms: u64) -> Self {
+        Self::anchored(
+            universe_id,
+            object_id,
+            interval_ms,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+
+    /// A stored heartbeat started at `started_at`
+    pub fn anchored(universe_id: &str, object_id: &str, interval_ms: u64, started_at: i64) -> Self {
         let interval_ms = interval_ms.clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS);
+        let now = chrono::Utc::now().timestamp_millis();
         Self {
             object_id: object_id.to_string(),
             universe_id: universe_id.to_string(),
             interval_ms,
-            next_due: chrono::Utc::now()
-                .timestamp_millis()
-                .saturating_add(interval_ms as i64),
+            started_at,
+            next_due: Self::next_after(started_at, interval_ms as i64, now),
             method: "heart_beat".to_string(),
         }
+    }
+
+    /// The first beat strictly after `now` of a heartbeat started at
+    /// `started_at` (beats fall at started_at + k * interval_ms)
+    pub fn next_after(started_at: i64, interval_ms: i64, now: i64) -> i64 {
+        let interval_ms = interval_ms.max(1);
+        if now < started_at {
+            return started_at;
+        }
+        let k = (now - started_at) / interval_ms + 1;
+        started_at.saturating_add(k.saturating_mul(interval_ms))
     }
 
     /// Check if heartbeat is due to fire
@@ -106,13 +129,15 @@ impl HeartBeat {
         chrono::Utc::now().timestamp_millis() >= self.next_due
     }
 
-    /// After a beat: the next is one interval from now (a late server does
-    /// not fire a burst of missed beats)
+    /// After a beat: the next on its schedule after now (a late server
+    /// skips missed beats, never fires a burst)
     pub fn reset(&mut self) {
         self.interval_ms = self.interval_ms.clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS);
-        self.next_due = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_add(self.interval_ms as i64);
+        self.next_due = Self::next_after(
+            self.started_at,
+            self.interval_ms as i64,
+            chrono::Utc::now().timestamp_millis(),
+        );
     }
 }
 
@@ -316,12 +341,14 @@ impl TimerManager {
     pub async fn set_heartbeat(&self, mut heartbeat: HeartBeat) -> anyhow::Result<()> {
         heartbeat.reset(); // clamps the interval too
         self.write(
-            "INSERT INTO heartbeats (universe_id, object_id, interval_ms) VALUES (?, ?, ?)
-             ON CONFLICT (universe_id, object_id) DO UPDATE SET interval_ms = excluded.interval_ms",
+            "INSERT INTO heartbeats (universe_id, object_id, interval_ms, started_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT (universe_id, object_id) DO UPDATE SET interval_ms = excluded.interval_ms,
+               started_at = excluded.started_at",
             vec![
                 serde_json::json!(&heartbeat.universe_id),
                 serde_json::json!(&heartbeat.object_id),
                 serde_json::json!(heartbeat.interval_ms),
+                serde_json::json!(heartbeat.started_at),
             ],
         )
         .await?;
@@ -438,21 +465,22 @@ impl TimerManager {
         debug!("Loaded {} timers from database", timers.len());
         drop(timers);
 
-        // Heartbeats: the next beat is one interval from now
-        let rows: Vec<(String, String, i64)> =
-            sqlx::query_as("SELECT universe_id, object_id, interval_ms FROM heartbeats")
-                .fetch_all(&mut *crate::db::run::reader(pool).await?)
-                .await?;
-        // A heartbeat already scheduled keeps its next beat (rebuilds after
-        // a failed run must not shift every heartbeat)
+        // Heartbeats: the next beat on each one's schedule
+        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+            "SELECT universe_id, object_id, interval_ms, started_at FROM heartbeats",
+        )
+        .fetch_all(&mut *crate::db::run::reader(pool).await?)
+        .await?;
+        // A heartbeat already scheduled keeps its next beat (a rebuild after
+        // a failed run must not refire one that just beat)
         let mut heartbeats = self.heartbeats.write().await;
         let mut old = std::mem::take(&mut *heartbeats);
-        for (universe_id, object_id, interval_ms) in rows {
+        for (universe_id, object_id, interval_ms, started_at) in rows {
             let interval_ms = interval_ms.max(0) as u64;
             let key = (universe_id, object_id);
             let hb = match old.remove(&key) {
-                Some(hb) if hb.interval_ms == interval_ms => hb,
-                _ => HeartBeat::new(&key.0, &key.1, interval_ms),
+                Some(hb) if hb.interval_ms == interval_ms && hb.started_at == started_at => hb,
+                _ => HeartBeat::anchored(&key.0, &key.1, interval_ms, started_at),
             };
             heartbeats.insert(key, hb);
         }
@@ -650,6 +678,57 @@ mod tests {
             .unwrap();
         let beat = mgr.next_deadline().await.unwrap();
         assert!(beat < fire_at, "the heartbeat is due first");
+    }
+
+    /// Beats fall at started_at + k * interval: the next is the first such
+    /// time after now (missed ones are skipped, never fired in a burst)
+    #[test]
+    fn test_heartbeat_phase() {
+        let now = 1_000_000;
+        assert_eq!(HeartBeat::next_after(now - 2_500, 1_000, now), now + 500);
+        assert_eq!(
+            HeartBeat::next_after(now - 3_000, 1_000, now),
+            now + 1_000,
+            "strictly after"
+        );
+        assert_eq!(
+            HeartBeat::next_after(now + 300, 1_000, now),
+            now + 300,
+            "not started yet"
+        );
+    }
+
+    /// A restart (a new manager loading the table) keeps the schedule: the
+    /// next beat is not pushed a whole interval away
+    #[tokio::test]
+    async fn test_heartbeat_phase_survives_restart() {
+        let pool = crate::db::test_utils::test_pool().await;
+        for sql in [
+            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES ('acct', 'acct', 'x', 'player', '2026-01-01')",
+            "INSERT INTO universes (id, name, owner_id, config, created_at)
+             VALUES ('u', 'u', 'acct', '{}', '2026-01-01')",
+            "INSERT INTO objects (id, universe_id, class, properties, created_at, updated_at)
+             VALUES ('/clock', 'u', 'item', '{}', '2026-01-01', '2026-01-01')",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let day = MAX_HEARTBEAT_MS as i64;
+        let started = chrono::Utc::now().timestamp_millis() - day + 60_000;
+        sqlx::query("INSERT INTO heartbeats (universe_id, object_id, interval_ms, started_at) VALUES ('u', '/clock', ?, ?)")
+            .bind(day)
+            .bind(started)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mgr = TimerManager::new(Some(pool), None);
+        mgr.load_from_db().await.unwrap();
+        let next = mgr.next_deadline().await.unwrap();
+        assert_eq!(
+            next,
+            started + day,
+            "a daily beat due in a minute stays due in a minute"
+        );
     }
 
     /// Huge intervals and delays are clamped, never wrapped into the past

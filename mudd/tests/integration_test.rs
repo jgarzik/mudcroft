@@ -1000,6 +1000,7 @@ async fn test_timer_persistence() {
                 universe_id TEXT NOT NULL,
                 object_id TEXT NOT NULL,
                 interval_ms INTEGER NOT NULL,
+                started_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (universe_id, object_id)
             )",
         )

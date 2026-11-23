@@ -726,7 +726,7 @@ or `false` without an object context.
 
 - The interval is clamped to 100 ms through one day.
 - The callback receives `{object_id, room_id, args = nil}`.
-- Heartbeats are stored and resume after a server restart (the first beat one interval after startup).
+- Heartbeats are stored and keep their schedule across a server restart or failover: beats fall every interval from when `set_heart_beat` was called; beats missed meanwhile are skipped, not fired in a burst.
 
 **Returns** `true`. Without an object context it does nothing.
 
