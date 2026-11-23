@@ -367,16 +367,32 @@ contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; th
 
 ### Timer Loop
 
-`run_timer_loop` ticks every 100 ms. Each due `call_out` or heartbeat runs
-its method on the object's code (as the owner) with `{object_id, room_id,
-args}`. A heartbeat whose object no longer exists is removed. One-shot timers
-are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
-remove; beats write nothing), both reloaded whenever the node becomes
-primary (it alone runs this loop). The timer loop is
-deadline-driven: it sleeps until the earliest `fire_at` or next beat, and a
-new timer or heartbeat wakes it. An object may have at most 32 pending timers; heartbeat intervals are
-at least 100 ms. `game.delete_object` cancels the object's timers and
-heartbeat and clears its actions.
+`run_timer_loop` is deadline-driven: it sleeps until the earliest `call_out`
+(`SELECT MIN(fire_at) FROM timers`, indexed) or next heartbeat, and a
+`call_out` committed or a heartbeat set wakes it. A due callback runs its
+method on the object's code (as the owner) with `{object_id, room_id,
+args}`; only the primary runs this loop.
+
+Call_outs have no cache: the `timers` table is the only state. Scheduling
+inserts the row in the caller's run (the loop sees it once that run
+commits; at most 32 pending per object). Each due call_out fires as one
+run: it claims the call_out by deleting its row (one row: under the write
+lock, so a concurrent `remove_call_out`, which is the same delete, gets
+`false` once firing has begun), then runs the handler as a nested part.
+Success commits the claim and the handler's writes as one Raft entry; a
+failing handler keeps none of its writes while the claim commits (dropped,
+as in LPMud). If the commit is refused when applied (deterministic) the
+call_out is dropped; if the node is not the primary or Raft times out, the
+row stays, the loop pauses 500 ms and tries again, and after a failover the
+next primary fires it. Handler messages still reach players before the
+commit, so a call_out fired again after a crash may repeat them.
+
+Heartbeats are a cache of `heartbeats` (one write to set or remove; beats
+write nothing). Beats fall at `started_at + k * interval_ms`, so a restart
+or failover keeps the schedule; missed beats are skipped. A heartbeat whose
+object no longer exists is removed; intervals are at least 100 ms.
+`game.delete_object` cancels the object's timers and heartbeat (its rows
+cascade) and clears its actions.
 
 ## Lua Sandbox
 

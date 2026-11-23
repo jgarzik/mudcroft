@@ -865,8 +865,8 @@ impl GameApi {
                     // Nothing may keep running for (or be dispatched to) the
                     // deleted object, nor for a later object reusing its
                     // path. Its timer, heartbeat and effect rows went with
-                    // it (cascade); drop them from the caches too.
-                    timers.remove_timers_for_object(&universe_id, &id).await;
+                    // it (cascade); drop them from the caches too (call_outs
+                    // have none).
                     timers.remove_heartbeat(&universe_id, &id).await;
                     effects.cache_clear(&universe_id, &id).await;
                     // Its verb rows (and a room's) went with it (cascade)
@@ -2192,7 +2192,13 @@ impl GameApi {
                     match object_id {
                         Some(obj_id) => {
                             let timer = Timer::new(&universe_id, &obj_id, &method, delay_ms, args);
-                            timers.try_add_timer(timer).await.unwrap_or_default()
+                            match timers.schedule(timer).await {
+                                Ok(id) => id.unwrap_or_default(),
+                                Err(e) => {
+                                    tracing::warn!("call_out on {} not stored: {}", obj_id, e);
+                                    String::new()
+                                }
+                            }
                         }
                         None => String::new(),
                     }
@@ -2217,10 +2223,16 @@ impl GameApi {
                 return Ok(false);
             };
 
+            // The table decides: false if it is gone, not ours, or already
+            // firing (its run claimed the row first)
             let removed = block_now(async {
                 timers
-                    .remove_timer_owned(&timer_id, &universe_id, &object_id)
+                    .cancel(&timer_id, &universe_id, &object_id)
                     .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("remove_call_out {}: {}", timer_id, e);
+                        false
+                    })
             });
 
             Ok(removed)

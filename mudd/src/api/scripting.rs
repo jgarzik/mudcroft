@@ -101,6 +101,23 @@ pub async fn in_run_with<T, F>(
 where
     F: Future<Output = Result<T, String>>,
 {
+    match in_run_settled(state, prefix, f).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("not saved: {}", e)),
+    }
+}
+
+/// [`in_run_with`], telling a failed commit (the outer `Err`: nothing was
+/// saved although `f` succeeded; see `raft::writer::is_apply_failure`)
+/// from `f`'s own error
+pub async fn in_run_settled<T, F>(
+    state: &AppState,
+    prefix: Vec<crate::db::run::Statement>,
+    f: F,
+) -> anyhow::Result<Result<T, String>>
+where
+    F: Future<Output = Result<T, String>>,
+{
     // A failed run's cache changes are undone by rebuilding from the tables
     let rebuilder = state.clone();
     let rebuild = move || async move {
@@ -125,10 +142,7 @@ where
     if matches!(outcome, Ok(Ok(_))) {
         state.combat_changed.notify_one();
     }
-    match outcome {
-        Ok(result) => result,
-        Err(e) => Err(format!("not saved: {}", e)),
-    }
+    outcome
 }
 
 /// Call handler `method` on an object's attached code (`code_hash`).
@@ -278,15 +292,34 @@ fn invoke_handler_at<'a>(
         // One change (joins the caller's if inside one): a failing handler
         // keeps nothing
         in_run(state, async {
-            let queue = MessageQueue::shared();
-            let result = {
-                let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
-                call_handler(&mut sandbox, &code, method, &args)
+            // A panic (a server bug outside Lua) fails the handler inside its
+            // run, which is then undone as for any error (and, nested, only
+            // its own part)
+            let handler = async {
+                let queue = MessageQueue::shared();
+                let result = {
+                    let mut sandbox =
+                        prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
+                    call_handler(&mut sandbox, &code, method, &args)
+                };
+                if result.is_ok() {
+                    deliver_at(state, &queue, &ctx.universe_id, budget).await;
+                }
+                result
             };
-            if result.is_ok() {
-                deliver_at(state, &queue, &ctx.universe_id, budget).await;
+            match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(handler)).await
+            {
+                Ok(result) => result,
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    tracing::error!("handler {} on {} panicked: {}", method, object_id, msg);
+                    Err("internal error".to_string())
+                }
             }
-            result
         })
         .await
     })
@@ -296,9 +329,16 @@ fn invoke_handler_at<'a>(
 /// it sooner)
 const TIMER_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Fire due call_out timers and heartbeats forever. Deadline-driven: the
-/// loop sleeps until the earliest fire_at or heartbeat (or until one is
-/// added), not on a fixed poll.
+/// Pause after a call_out could not be saved or read (as the combat
+/// scheduler does), before trying again: its row is still stored
+const TIMER_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Most due call_outs fired per pass (each its own run)
+const CALL_OUT_BATCH: i64 = 64;
+
+/// Fire due call_outs and heartbeats forever. Deadline-driven: the loop
+/// sleeps until the earliest call_out (from the table) or heartbeat, or
+/// until one is added, not on a fixed poll.
 ///
 /// Each callback runs the named handler on the object's code (as the
 /// object's owner, see [`invoke_handler`]) with {object_id, room_id, args}.
@@ -310,9 +350,15 @@ pub async fn run_timer_loop(state: AppState) {
         tokio::pin!(changed);
         let now = chrono::Utc::now().timestamp_millis();
         let wait = match state.timers.next_deadline().await {
-            Some(due) if due <= now => std::time::Duration::ZERO,
-            Some(due) => std::time::Duration::from_millis((due - now) as u64).min(TIMER_IDLE_WAIT),
-            None => TIMER_IDLE_WAIT,
+            Ok(Some(due)) if due <= now => std::time::Duration::ZERO,
+            Ok(Some(due)) => {
+                std::time::Duration::from_millis((due - now) as u64).min(TIMER_IDLE_WAIT)
+            }
+            Ok(None) => TIMER_IDLE_WAIT,
+            Err(e) => {
+                tracing::warn!("timers: reading the next deadline failed: {}", e);
+                TIMER_RETRY_PAUSE
+            }
         };
         if !wait.is_zero() {
             tokio::select! {
@@ -320,49 +366,148 @@ pub async fn run_timer_loop(state: AppState) {
                 _ = &mut changed => continue,
             }
         }
-        for fired in state.timers.tick().await {
-            let room_id = match state
-                .object_store
-                .get(&fired.universe_id, &fired.object_id)
-                .await
-            {
-                Ok(Some(obj)) => obj.parent_id,
-                Ok(None) => {
-                    // Object is gone: stop its heartbeat too
-                    state
-                        .timers
-                        .remove_heartbeat(&fired.universe_id, &fired.object_id)
-                        .await;
-                    continue;
+        let now = chrono::Utc::now().timestamp_millis();
+        match state.timers.due_call_outs(now, CALL_OUT_BATCH).await {
+            Ok(due) => {
+                for timer in due {
+                    if !fire_call_out(&state, &timer).await {
+                        tokio::time::sleep(TIMER_RETRY_PAUSE).await;
+                        break;
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Timer object {} lookup failed: {}", fired.object_id, e);
-                    continue;
-                }
-            };
-            let args = serde_json::json!({
-                "object_id": fired.object_id,
-                "room_id": room_id,
-                "args": fired.args,
-            });
-            if let Err(e) = invoke_handler(
-                &state,
-                &fired.universe_id,
-                &fired.object_id,
-                room_id,
-                &fired.method,
-                args,
-            )
-            .await
-            {
-                tracing::warn!(
-                    "Timer {} on {} failed: {}",
-                    fired.method,
-                    fired.object_id,
-                    e
-                );
+            }
+            Err(e) => {
+                tracing::warn!("timers: reading due call_outs failed: {}", e);
+                tokio::time::sleep(TIMER_RETRY_PAUSE).await;
             }
         }
+        for fired in state.timers.tick_heartbeats().await {
+            fire_heart_beat(&state, &fired).await;
+        }
+    }
+}
+
+/// The callback's args: {object_id, room_id, args}
+fn timer_args(
+    object_id: &str,
+    room_id: &Option<String>,
+    args: &Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({ "object_id": object_id, "room_id": room_id, "args": args })
+}
+
+/// Fire one due call_out as one run: claim it (delete its row: under the
+/// write lock, so cancel and fire are one decision and a call_out runs at
+/// most once), then run its handler as a nested part. Success commits the
+/// claim and the handler's writes as one Raft entry: never the timer gone
+/// without its effects, or the reverse. A handler that fails keeps none of
+/// its writes and the call_out is dropped (the claim commits), as in LPMud.
+/// False if nothing could be saved: the row stays (the loop pauses and
+/// tries again; after a failover the next primary fires it).
+async fn fire_call_out(state: &AppState, timer: &crate::timers::Timer) -> bool {
+    let what = format!("call_out {} on {}", timer.method, timer.object_id);
+    let outcome = in_run_settled(state, Vec::new(), async {
+        let (sql, params) = crate::timers::TimerManager::consume_statement(&timer.id);
+        let claimed = state
+            .raft_writer
+            .execute(sql, params)
+            .await
+            .map_err(|e| e.to_string())?;
+        if claimed.rows_affected != 1 {
+            return Ok(()); // cancelled, or fired already
+        }
+        let room_id = match state
+            .object_store
+            .get(&timer.universe_id, &timer.object_id)
+            .await
+        {
+            Ok(Some(obj)) => obj.parent_id,
+            // Gone (its delete cascades to its timers anyway)
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                tracing::warn!("{}: reading its object failed (dropped): {}", what, e);
+                return Ok(());
+            }
+        };
+        let args = timer_args(&timer.object_id, &room_id, &timer.args);
+        if let Err(e) = invoke_handler(
+            state,
+            &timer.universe_id,
+            &timer.object_id,
+            room_id,
+            &timer.method,
+            args,
+        )
+        .await
+        {
+            tracing::warn!("{} failed (dropped): {}", what, e);
+        }
+        Ok(())
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            // The claim itself could not be written: nothing ran
+            tracing::warn!("{}: not run, retried: {}", what, e);
+            false
+        }
+        Err(e) if crate::raft::writer::is_apply_failure(&e) => {
+            // Refused when applied: the same on every try, so dropped
+            tracing::warn!("{}: its change was refused (dropped): {}", what, e);
+            let (sql, params) = crate::timers::TimerManager::consume_statement(&timer.id);
+            if let Err(e) = state.raft_writer.execute(sql, params).await {
+                tracing::warn!("{}: dropping it failed: {}", what, e);
+            }
+            true
+        }
+        Err(e) => {
+            // Not the primary any more, or Raft timed out: still stored
+            tracing::warn!("{}: not saved, retried: {}", what, e);
+            false
+        }
+    }
+}
+
+/// Fire one heartbeat beat (beats write nothing themselves; the handler
+/// runs as its own change)
+async fn fire_heart_beat(state: &AppState, fired: &crate::timers::TimerFired) {
+    let room_id = match state
+        .object_store
+        .get(&fired.universe_id, &fired.object_id)
+        .await
+    {
+        Ok(Some(obj)) => obj.parent_id,
+        Ok(None) => {
+            // Object is gone: stop its heartbeat too
+            state
+                .timers
+                .remove_heartbeat(&fired.universe_id, &fired.object_id)
+                .await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Timer object {} lookup failed: {}", fired.object_id, e);
+            return;
+        }
+    };
+    let args = timer_args(&fired.object_id, &room_id, &fired.args);
+    if let Err(e) = invoke_handler(
+        state,
+        &fired.universe_id,
+        &fired.object_id,
+        room_id,
+        &fired.method,
+        args,
+    )
+    .await
+    {
+        tracing::warn!(
+            "heart_beat {} on {} failed: {}",
+            fired.method,
+            fired.object_id,
+            e
+        );
     }
 }
 

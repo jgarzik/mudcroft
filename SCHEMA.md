@@ -259,7 +259,8 @@ deleting an object deletes its effects.
 
 ### timers
 
-Pending one-shot `game.call_out` timers.
+Pending one-shot `game.call_out` timers: the only state (no cache). Firing
+one deletes its row in the same Raft batch as the handler's writes.
 
 | Column | Type | Notes |
 |--------|------|-------|
