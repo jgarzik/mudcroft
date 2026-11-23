@@ -3,7 +3,7 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 14):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 15):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). The upgrade steps are
 6 -> 7 (adds the `credits_holder_exists` trigger), 7 -> 8 (adds the
@@ -277,14 +277,16 @@ CASCADE. Index: `idx_timers_fire_at (fire_at)`.
 ### heartbeats
 
 Recurring `game.set_heart_beat` heartbeats, one per object. Setting or
-removing one is a write; a beat is not (after a restart the next beat is one
-interval away).
+removing one is a write; a beat is not. Beats fall at `started_at + k *
+interval_ms`, so a restart or failover keeps the schedule (missed beats are
+skipped, never fired in a burst).
 
 | Column | Type | Notes |
 |--------|------|-------|
 | universe_id | TEXT NOT NULL | |
 | object_id | TEXT NOT NULL | Object whose `heart_beat` handler is called |
 | interval_ms | INTEGER NOT NULL | At least 100 |
+| started_at | INTEGER NOT NULL DEFAULT 0 | Unix time (ms) the heartbeat was set: its phase |
 
 Primary key: `(universe_id, object_id)`. Foreign key to `objects` ON DELETE
 CASCADE.

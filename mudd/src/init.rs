@@ -390,7 +390,7 @@ mod tests {
             .await
             .expect("mudd_init upgrades 6 -> 13");
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 14);
+        assert_eq!(db.schema_version().await.unwrap(), 15);
         let tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('actions', 'cluster_nodes', 'online_players', 'payment_requests',
@@ -407,6 +407,48 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(triggers, 1);
+    }
+
+    /// 14 -> 15 anchors heartbeats (started_at), keeping existing ones
+    #[tokio::test]
+    async fn test_upgrade_14_to_15() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("v14.db");
+        init_database(
+            &db_path,
+            Some("admin"),
+            Some("password123"),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+            // One batch on one connection (a version-14 heartbeats table)
+            sqlx::raw_sql(
+                "DROP TABLE heartbeats;
+                 CREATE TABLE heartbeats (universe_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                   interval_ms INTEGER NOT NULL, PRIMARY KEY (universe_id, object_id));
+                 INSERT INTO heartbeats VALUES ('u', '/clock', 2000);
+                 PRAGMA user_version = 14;",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            db.pool().close().await;
+        }
+        init_database(&db_path, None, None, HashMap::new(), None)
+            .await
+            .expect("mudd_init upgrades 14 -> 15");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), 15);
+        let (interval, started): (i64, i64) =
+            sqlx::query_as("SELECT interval_ms, started_at FROM heartbeats")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((interval, started), (2000, 0));
     }
 
     /// 13 -> 14 rebuilds deadlines with every kind (an early version-13
@@ -446,7 +488,7 @@ mod tests {
             .await
             .expect("mudd_init upgrades 13 -> 14");
         let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 14);
+        assert_eq!(db.schema_version().await.unwrap(), 15);
         let table: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deadlines'",
         )
