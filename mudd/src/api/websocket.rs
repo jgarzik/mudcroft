@@ -2427,7 +2427,7 @@ fn parse_create_args(args: &str) -> Result<CreateParams, String> {
     let mut tokens: Vec<String> = Vec::new();
 
     // Helper to skip whitespace
-    fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
             chars.next();
         }

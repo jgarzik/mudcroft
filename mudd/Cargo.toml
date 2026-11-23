@@ -83,3 +83,12 @@ tokio-tungstenite = "0.30"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[lints.rust]
+# src/ has no unsafe; the test harness opts in where it calls libc
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[profile.release]
+# Integer overflow (credits, HP, damage) panics instead of silently wrapping
+overflow-checks = true

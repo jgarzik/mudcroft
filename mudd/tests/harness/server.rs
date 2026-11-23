@@ -580,7 +580,9 @@ impl ChildGuard {
             return Ok(None);
         };
         // SAFETY: kill(2) on our own child's pid
-        if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == -1 {
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        if rc == -1 {
             return Err(std::io::Error::last_os_error());
         }
         let deadline = std::time::Instant::now() + timeout;
@@ -617,6 +619,7 @@ pub(super) fn die_with_parent(cmd: &mut Command) -> &mut Command {
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: prctl is async-signal-safe and touches no parent state.
+        #[allow(unsafe_code)]
         unsafe {
             cmd.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
