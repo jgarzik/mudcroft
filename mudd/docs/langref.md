@@ -716,9 +716,7 @@ return {
 
 Cancels one of the current object's own pending call_outs. **Returns**
 `true` if it was pending, `false` if it was not, belongs to another object,
-or there is no object context. A call_out that has started firing is no
-longer pending: cancelling it (even from its own handler) returns `false`
-and its handler runs to the end, as in LPMud.
+or there is no object context.
 
 #### `game.set_heart_beat(interval_ms)`
 
@@ -738,12 +736,6 @@ Stops the current object's heartbeat. **Returns** `true` if one was
 running.
 
 Pending call_outs and heartbeats are saved to the database and reloaded at startup.
-
-A call_out is used up in the same change as its handler's writes: it runs
-once. If the handler fails, none of its writes are kept and the call_out is
-dropped, not retried (as in LPMud). One that falls due while the server is
-down or changing primary fires once, late. A heartbeat skips beats it missed;
-a failing beat is logged and the heartbeat keeps going.
 
 Deleting an object cancels both its call_outs and its heartbeat.
 

@@ -101,28 +101,6 @@ pub async fn in_run_with<T, F>(
 where
     F: Future<Output = Result<T, String>>,
 {
-    match in_run_settled(state, prefix, f).await {
-        Ok(result) => result,
-        Err(e) => Err(format!("not saved: {}", e)),
-    }
-}
-
-/// [`in_run_with`], telling a failed commit (the outer `Err`: nothing was
-/// saved, though `f` succeeded) from `f`'s own error. Inside a run already
-/// `f` is a nested part and `prefix` must be empty (it leads only a
-/// top-level batch).
-pub async fn in_run_settled<T, F>(
-    state: &AppState,
-    prefix: Vec<crate::db::run::Statement>,
-    f: F,
-) -> Result<Result<T, String>, String>
-where
-    F: Future<Output = Result<T, String>>,
-{
-    debug_assert!(
-        prefix.is_empty() || crate::db::run::current().is_none(),
-        "a batch prefix only leads a top-level run"
-    );
     // A failed run's cache changes are undone by rebuilding from the tables
     let rebuilder = state.clone();
     let rebuild = move || async move {
@@ -147,7 +125,10 @@ where
     if matches!(outcome, Ok(Ok(_))) {
         state.combat_changed.notify_one();
     }
-    outcome.map_err(|e| e.to_string())
+    match outcome {
+        Ok(result) => result,
+        Err(e) => Err(format!("not saved: {}", e)),
+    }
 }
 
 /// Call handler `method` on an object's attached code (`code_hash`).
@@ -180,7 +161,6 @@ pub async fn invoke_handler(
         Origin {
             payer: None,
             hooks: HookBudget::new(),
-            prefix: Vec::new(),
         },
     )
     .await
@@ -208,33 +188,6 @@ pub async fn invoke_verb_handler(
         Origin {
             payer: payer.map(str::to_string),
             hooks: HookBudget::new(),
-            prefix: Vec::new(),
-        },
-    )
-    .await
-}
-
-/// invoke_handler for a fired call_out: `prefix` (its delete) leads the
-/// run's batch if the handler writes anything, so the timer is consumed
-/// in the same Raft entry as the handler's writes
-async fn invoke_timer_handler(
-    state: &AppState,
-    fired: &crate::timers::TimerFired,
-    room_id: Option<String>,
-    prefix: Vec<crate::db::run::Statement>,
-) -> Result<Result<Option<String>, String>, String> {
-    let args = timer_args(fired, &room_id);
-    invoke_handler_settled(
-        state,
-        &fired.universe_id,
-        &fired.object_id,
-        room_id,
-        &fired.method,
-        args,
-        Origin {
-            payer: None,
-            hooks: HookBudget::new(),
-            prefix,
         },
     )
     .await
@@ -293,9 +246,6 @@ struct Origin {
     payer: Option<String>,
     /// The move-hook allowance it may use
     hooks: HookBudget,
-    /// Statements leading the handler run's batch if it writes anything
-    /// (a fired call_out's delete: consumed with the handler's writes)
-    prefix: Vec<crate::db::run::Statement>,
 }
 
 /// invoke_handler at a hook nesting depth (move hooks run handlers that can
@@ -309,38 +259,13 @@ fn invoke_handler_at<'a>(
     args: serde_json::Value,
     origin: Origin,
 ) -> BoxFuture<'a, Result<Option<String>, String>> {
-    Box::pin(async move {
-        match invoke_handler_settled(state, universe_id, object_id, room_id, method, args, origin)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => Err(format!("not saved: {}", e)),
-        }
-    })
-}
-
-/// [`invoke_handler_at`], telling a failed commit (outer `Err`) from the
-/// handler's own error
-fn invoke_handler_settled<'a>(
-    state: &'a AppState,
-    universe_id: &'a str,
-    object_id: &'a str,
-    room_id: Option<String>,
-    method: &'a str,
-    args: serde_json::Value,
-    origin: Origin,
-) -> BoxFuture<'a, Result<Result<Option<String>, String>, String>> {
     let Origin {
         payer,
         hooks: budget,
-        prefix,
     } = origin;
     Box::pin(async move {
-        // A failed read is not the handler failing: nothing ran or was saved
-        let (code, owner_id) = match object_code(state, object_id, universe_id).await {
-            Ok(Some(found)) => found,
-            Ok(None) => return Ok(Ok(None)),
-            Err(e) => return Err(e),
+        let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
+            return Ok(None);
         };
         let ctx = ScriptContext {
             universe_id: universe_id.to_string(),
@@ -349,35 +274,19 @@ fn invoke_handler_settled<'a>(
             object_id: Some(object_id.to_string()),
             payer,
         };
-        let libs = match load_universe_lib_codes(state, universe_id).await {
-            Ok(libs) => libs,
-            Err(e) => return Err(e),
-        };
+        let libs = load_universe_lib_codes(state, universe_id).await?;
         // One change (joins the caller's if inside one): a failing handler
         // keeps nothing
-        in_run_settled(state, prefix, async {
-            // A panic (a server bug outside Lua) fails the handler inside
-            // its run, which then settles (undone) as for any error
-            let handler = async {
-                let queue = MessageQueue::shared();
-                let result = {
-                    let mut sandbox =
-                        prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
-                    call_handler(&mut sandbox, &code, method, &args)
-                };
-                if result.is_ok() {
-                    deliver_at(state, &queue, &ctx.universe_id, budget).await;
-                }
-                result
+        in_run(state, async {
+            let queue = MessageQueue::shared();
+            let result = {
+                let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
+                call_handler(&mut sandbox, &code, method, &args)
             };
-            match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(handler)).await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::error!("handler {} on {} panicked", method, object_id);
-                    Err("internal error".to_string())
-                }
+            if result.is_ok() {
+                deliver_at(state, &queue, &ctx.universe_id, budget).await;
             }
+            result
         })
         .await
     })
@@ -412,130 +321,48 @@ pub async fn run_timer_loop(state: AppState) {
             }
         }
         for fired in state.timers.tick().await {
-            match fired.timer_id.clone() {
-                Some(id) => fire_call_out(&state, &id, &fired).await,
-                None => fire_heart_beat(&state, &fired).await,
+            let room_id = match state
+                .object_store
+                .get(&fired.universe_id, &fired.object_id)
+                .await
+            {
+                Ok(Some(obj)) => obj.parent_id,
+                Ok(None) => {
+                    // Object is gone: stop its heartbeat too
+                    state
+                        .timers
+                        .remove_heartbeat(&fired.universe_id, &fired.object_id)
+                        .await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("Timer object {} lookup failed: {}", fired.object_id, e);
+                    continue;
+                }
+            };
+            let args = serde_json::json!({
+                "object_id": fired.object_id,
+                "room_id": room_id,
+                "args": fired.args,
+            });
+            if let Err(e) = invoke_handler(
+                &state,
+                &fired.universe_id,
+                &fired.object_id,
+                room_id,
+                &fired.method,
+                args,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Timer {} on {} failed: {}",
+                    fired.method,
+                    fired.object_id,
+                    e
+                );
             }
         }
-    }
-}
-
-/// The callback's args: {object_id, room_id, args}
-fn timer_args(fired: &crate::timers::TimerFired, room_id: &Option<String>) -> serde_json::Value {
-    serde_json::json!({
-        "object_id": fired.object_id,
-        "room_id": room_id,
-        "args": fired.args,
-    })
-}
-
-/// Fire a due call_out and consume it in the same change as its handler's
-/// writes. Once firing it can no longer be cancelled (as in LPMud), and the
-/// table decides whether it runs: a cached call_out whose row is gone
-/// (cancelled, or consumed already) does not. The handler's run carries the
-/// row's delete as its batch prefix, so a handler that writes commits both
-/// as one Raft entry: never the timer gone without its effects, or the
-/// reverse. (A handler that checkpoints, before a Venice call, commits the
-/// delete with its first part.) A handler that writes nothing, or fails
-/// (its writes discarded; dropped, not retried, as in LPMud), has the row
-/// deleted on its own. If nothing could be saved or read (a failed commit
-/// or read) the call_out stays pending and is tried again after a growing
-/// wait; after a crash or failover the next primary fires it.
-async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerFired) {
-    if !state.timers.begin_firing(id).await {
-        return; // cancelled meanwhile
-    }
-    if state.timers.settle_only(id) {
-        // Its handler already ran: only its row is left to delete
-        return settle_call_out(state, id).await;
-    }
-    let what = format!("call_out {} on {}", fired.method, fired.object_id);
-    match state.timers.is_stored(id).await {
-        Ok(true) => {}
-        Ok(false) => return state.timers.forget_timer(id).await,
-        Err(e) => {
-            tracing::warn!("{}: reading it failed, retried later: {}", what, e);
-            return state.timers.defer(id).await;
-        }
-    }
-    let room_id = match state
-        .object_store
-        .get(&fired.universe_id, &fired.object_id)
-        .await
-    {
-        Ok(Some(obj)) => obj.parent_id,
-        // Gone (deleting an object cancels its timers anyway)
-        Ok(None) => return settle_call_out(state, id).await,
-        Err(e) => {
-            tracing::warn!("{}: reading its object failed, retried later: {}", what, e);
-            return state.timers.defer(id).await;
-        }
-    };
-    let (sql, params) = crate::timers::TimerManager::consume_statement(id);
-    match invoke_timer_handler(state, fired, room_id, vec![(sql.to_string(), params)]).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!("{} failed (dropped): {}", what, e),
-        Err(e) => {
-            // Nothing was saved (or read): still pending
-            tracing::warn!("{}: not saved, retried later: {}", what, e);
-            return state.timers.defer(id).await;
-        }
-    }
-    settle_call_out(state, id).await;
-}
-
-/// After a call_out ran (or cannot): delete its row unless the handler's
-/// batch already did, then forget it. A failed delete is tried again later
-/// as a delete only: the handler never runs twice.
-async fn settle_call_out(state: &AppState, id: &str) {
-    if !matches!(state.timers.is_stored(id).await, Ok(false)) {
-        let (sql, params) = crate::timers::TimerManager::consume_statement(id);
-        if let Err(e) = state.raft_writer.execute(sql, params).await {
-            tracing::warn!("deleting call_out {}: {}", id, e);
-            return state.timers.defer_settle(id).await;
-        }
-    }
-    state.timers.forget_timer(id).await;
-}
-
-/// Fire one heartbeat beat (beats write nothing themselves; the handler
-/// runs as its own change)
-async fn fire_heart_beat(state: &AppState, fired: &crate::timers::TimerFired) {
-    let room_id = match state
-        .object_store
-        .get(&fired.universe_id, &fired.object_id)
-        .await
-    {
-        Ok(Some(obj)) => obj.parent_id,
-        Ok(None) => {
-            // Object is gone: stop its heartbeat too
-            state
-                .timers
-                .remove_heartbeat(&fired.universe_id, &fired.object_id)
-                .await;
-            return;
-        }
-        Err(e) => {
-            tracing::warn!("Timer object {} lookup failed: {}", fired.object_id, e);
-            return;
-        }
-    };
-    if let Err(e) = invoke_handler(
-        state,
-        &fired.universe_id,
-        &fired.object_id,
-        room_id.clone(),
-        &fired.method,
-        timer_args(fired, &room_id),
-    )
-    .await
-    {
-        tracing::warn!(
-            "heart_beat {} on {} failed: {}",
-            fired.method,
-            fired.object_id,
-            e
-        );
     }
 }
 
@@ -827,7 +654,6 @@ async fn run_move_hooks(
                 // A move hook is passive: nobody chose to run it, nobody pays
                 payer: None,
                 hooks: budget.deeper(),
-                prefix: Vec::new(),
             },
         )
         .await

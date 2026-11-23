@@ -367,23 +367,9 @@ contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; th
 
 ### Timer Loop
 
-`run_timer_loop` runs each due `call_out` (earliest first) or heartbeat on
-the object's code (as the owner) with `{object_id, room_id, args}`. A
-`call_out` is marked firing first (no longer cancellable, as in LPMud),
-runs only if its row still exists (the table decides; a stale cache entry
-for a cancelled or consumed one is dropped), and is consumed in the same
-Raft batch as its handler's writes: the row's delete is the handler run's
-batch prefix, so it commits only together with those writes (a handler that
-checkpoints commits it with its first part). A handler that writes nothing,
-or fails (its writes discarded; dropped, as in LPMud), has the row deleted
-on its own. If nothing could be saved or read (a failed commit or read) it
-stays pending and is tried again after a wait that doubles from 1 s to 5
-minutes; after a crash or failover its row remains and the next primary
-fires it. Cancelling and firing are one decision (`remove_call_out` returns
-`false` once firing has begun). A handler's messages reach players before
-its change commits, so a call_out fired again after a failed commit or a
-crash may repeat them.
-A heartbeat whose object no longer exists is removed. One-shot timers
+`run_timer_loop` ticks every 100 ms. Each due `call_out` or heartbeat runs
+its method on the object's code (as the owner) with `{object_id, room_id,
+args}`. A heartbeat whose object no longer exists is removed. One-shot timers
 are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
 remove; beats write nothing), both reloaded whenever the node becomes
 primary (it alone runs this loop). The timer loop is
