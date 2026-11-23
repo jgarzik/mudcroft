@@ -716,7 +716,9 @@ return {
 
 Cancels one of the current object's own pending call_outs. **Returns**
 `true` if it was pending, `false` if it was not, belongs to another object,
-or there is no object context.
+or there is no object context. A call_out that has started firing is no
+longer pending: cancelling it (even from its own handler) returns `false`
+and its handler runs to the end, as in LPMud.
 
 #### `game.set_heart_beat(interval_ms)`
 

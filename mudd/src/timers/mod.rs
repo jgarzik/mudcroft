@@ -153,6 +153,10 @@ pub struct TimerManager {
     raft_writer: Option<Arc<RaftWriter>>,
     /// Wakes the timer loop when a new deadline may be earlier
     changed: tokio::sync::Notify,
+    /// Call_outs the timer loop has started firing: no longer cancellable
+    /// and not reported again (kept apart from the cache, which rebuilds
+    /// replace)
+    firing: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl std::fmt::Debug for TimerManager {
@@ -173,6 +177,7 @@ impl TimerManager {
             pool,
             raft_writer,
             changed: tokio::sync::Notify::new(),
+            firing: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -260,22 +265,38 @@ impl TimerManager {
             .await
             .get(timer_id)
             .is_some_and(|t| t.universe_id == universe_id && t.object_id == object_id);
-        owned && self.remove_timer(timer_id).await
+        // Too late once it has started firing (as in LPMud)
+        owned && !self.is_firing(timer_id) && self.remove_timer(timer_id).await
     }
 
-    /// Forget a settled call_out (cache only: its row is already deleted)
+    /// Mark a due call_out as firing: from now on it cannot be cancelled
+    /// and is not reported again. False if it is not pending (cancelled,
+    /// settled) or already firing.
+    pub async fn begin_firing(&self, timer_id: &str) -> bool {
+        let timers = self.timers.read().await;
+        timers.contains_key(timer_id)
+            && self
+                .firing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(timer_id.to_string())
+    }
+
+    fn is_firing(&self, timer_id: &str) -> bool {
+        self.firing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(timer_id)
+    }
+
+    /// Forget a settled call_out (cache only: its row is deleted, or left
+    /// for the next rebuild to fire again)
     pub async fn forget_timer(&self, timer_id: &str) {
         self.timers.write().await.remove(timer_id);
-    }
-
-    /// Try a call_out again in `delay_ms` (cache only: the stored fire_at
-    /// is unchanged, so a restart fires it at once)
-    pub async fn retry_later(&self, timer_id: &str, delay_ms: i64) {
-        if let Some(t) = self.timers.write().await.get_mut(timer_id) {
-            t.fire_at = chrono::Utc::now()
-                .timestamp_millis()
-                .saturating_add(delay_ms);
-        }
+        self.firing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(timer_id);
     }
 
     /// Whether the call_out's row exists (the truth: a cached call_out
@@ -416,7 +437,11 @@ impl TimerManager {
 
         let mut due_timers: Vec<Timer> = {
             let timers = self.timers.read().await;
-            timers.values().filter(|t| t.is_due()).cloned().collect()
+            timers
+                .values()
+                .filter(|t| t.is_due() && !self.is_firing(&t.id))
+                .cloned()
+                .collect()
         };
         due_timers.sort_by_key(|t| t.fire_at);
         for timer in due_timers {
@@ -650,10 +675,12 @@ mod tests {
         // Reported, not removed: the timer loop forgets it once settled
         assert_eq!(manager.timer_count().await, 1);
         let id = fired[0].timer_id.clone().unwrap();
-        manager.retry_later(&id, 60_000).await;
-        assert!(manager.tick().await.is_empty(), "retried later, not now");
+        assert!(manager.begin_firing(&id).await, "fires once");
+        assert!(!manager.begin_firing(&id).await, "not twice");
+        assert!(manager.tick().await.is_empty(), "not reported while firing");
         manager.forget_timer(&id).await;
         assert_eq!(manager.timer_count().await, 0);
+        assert!(!manager.begin_firing(&id).await, "settled");
     }
 
     /// tick() reports a due call_out without consuming it: the row stays
@@ -688,6 +715,23 @@ mod tests {
             rows, 1,
             "the stored call_out is consumed only with its handler"
         );
+    }
+
+    /// Once a call_out has started firing it can no longer be cancelled
+    /// (as in LPMud, where the driver takes it off the pending list before
+    /// calling): remove_call_out says so instead of claiming a cancel
+    #[tokio::test]
+    async fn test_firing_call_out_cannot_be_cancelled() {
+        let mgr = TimerManager::new(None, None);
+        let id = mgr
+            .try_add_timer(Timer::new("a", "/bomb", "explode", 60_000, None))
+            .await
+            .unwrap();
+        assert!(mgr.begin_firing(&id).await);
+        assert!(!mgr.remove_timer_owned(&id, "a", "/bomb").await, "too late");
+        assert_eq!(mgr.timer_count().await, 1, "still settling");
+        mgr.forget_timer(&id).await;
+        assert!(!mgr.remove_timer_owned(&id, "a", "/bomb").await, "gone");
     }
 
     #[tokio::test]

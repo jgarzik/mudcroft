@@ -101,6 +101,28 @@ pub async fn in_run_with<T, F>(
 where
     F: Future<Output = Result<T, String>>,
 {
+    match in_run_settled(state, prefix, f).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("not saved: {}", e)),
+    }
+}
+
+/// [`in_run_with`], telling a failed commit (the outer `Err`: nothing was
+/// saved, though `f` succeeded) from `f`'s own error. Inside a run already
+/// `f` is a nested part and `prefix` must be empty (it leads only a
+/// top-level batch).
+pub async fn in_run_settled<T, F>(
+    state: &AppState,
+    prefix: Vec<crate::db::run::Statement>,
+    f: F,
+) -> Result<Result<T, String>, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    debug_assert!(
+        prefix.is_empty() || crate::db::run::current().is_none(),
+        "a batch prefix only leads a top-level run"
+    );
     // A failed run's cache changes are undone by rebuilding from the tables
     let rebuilder = state.clone();
     let rebuild = move || async move {
@@ -125,10 +147,7 @@ where
     if matches!(outcome, Ok(Ok(_))) {
         state.combat_changed.notify_one();
     }
-    match outcome {
-        Ok(result) => result,
-        Err(e) => Err(format!("not saved: {}", e)),
-    }
+    outcome.map_err(|e| e.to_string())
 }
 
 /// Call handler `method` on an object's attached code (`code_hash`).
@@ -203,9 +222,9 @@ async fn invoke_timer_handler(
     fired: &crate::timers::TimerFired,
     room_id: Option<String>,
     prefix: Vec<crate::db::run::Statement>,
-) -> Result<Option<String>, String> {
+) -> Result<Result<Option<String>, String>, String> {
     let args = timer_args(fired, &room_id);
-    invoke_handler_at(
+    invoke_handler_settled(
         state,
         &fired.universe_id,
         &fired.object_id,
@@ -290,14 +309,37 @@ fn invoke_handler_at<'a>(
     args: serde_json::Value,
     origin: Origin,
 ) -> BoxFuture<'a, Result<Option<String>, String>> {
+    Box::pin(async move {
+        match invoke_handler_settled(state, universe_id, object_id, room_id, method, args, origin)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => Err(format!("not saved: {}", e)),
+        }
+    })
+}
+
+/// [`invoke_handler_at`], telling a failed commit (outer `Err`) from the
+/// handler's own error
+fn invoke_handler_settled<'a>(
+    state: &'a AppState,
+    universe_id: &'a str,
+    object_id: &'a str,
+    room_id: Option<String>,
+    method: &'a str,
+    args: serde_json::Value,
+    origin: Origin,
+) -> BoxFuture<'a, Result<Result<Option<String>, String>, String>> {
     let Origin {
         payer,
         hooks: budget,
         prefix,
     } = origin;
     Box::pin(async move {
-        let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
-            return Ok(None);
+        let (code, owner_id) = match object_code(state, object_id, universe_id).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return Ok(Ok(None)),
+            Err(e) => return Ok(Err(e)),
         };
         let ctx = ScriptContext {
             universe_id: universe_id.to_string(),
@@ -306,10 +348,13 @@ fn invoke_handler_at<'a>(
             object_id: Some(object_id.to_string()),
             payer,
         };
-        let libs = load_universe_lib_codes(state, universe_id).await?;
+        let libs = match load_universe_lib_codes(state, universe_id).await {
+            Ok(libs) => libs,
+            Err(e) => return Ok(Err(e)),
+        };
         // One change (joins the caller's if inside one): a failing handler
         // keeps nothing
-        in_run_with(state, prefix, async {
+        in_run_settled(state, prefix, async {
             let queue = MessageQueue::shared();
             let result = {
                 let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
@@ -370,31 +415,29 @@ fn timer_args(fired: &crate::timers::TimerFired, room_id: &Option<String>) -> se
     })
 }
 
-/// How long a call_out waits before another try when its row or object
-/// could not be read (in memory only: the table is unchanged)
-const CALL_OUT_RETRY_MS: i64 = 1_000;
-
 /// Fire a due call_out and consume it in the same change as its handler's
-/// writes. The table decides: a call_out whose row is gone (cancelled, or
-/// consumed already) does not run. The handler's run carries the row's
-/// delete as its batch prefix, so if the handler writes, both commit as
-/// one Raft entry (one commit) and the timer is never gone without its
-/// effects, or the reverse. A handler that writes nothing, or fails (its
-/// writes discarded; dropped, not retried, as in LPMud), has the row
-/// deleted on its own. The call_out stays cached until settled; if
-/// nothing commits (a crash, a lost leadership) its row remains and the
-/// next primary fires it once. A read error retries it shortly instead.
+/// writes. Once firing it can no longer be cancelled (as in LPMud), and the
+/// table decides whether it runs: a cached call_out whose row is gone
+/// (cancelled, or consumed already) does not. The handler's run carries the
+/// row's delete as its batch prefix, so a handler that writes commits both
+/// as one Raft entry: never the timer gone without its effects, or the
+/// reverse. (A handler that checkpoints, before a Venice call, commits the
+/// delete with its first part.) A handler that writes nothing, or fails
+/// (its writes discarded; dropped, not retried, as in LPMud), has the row
+/// deleted on its own. If nothing could be saved or read (a crash, a lost
+/// leadership, a failed commit or read) the row stays and the call_out is
+/// fired again by the next primary, restart or cache rebuild.
 async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerFired) {
+    if !state.timers.begin_firing(id).await {
+        return; // cancelled meanwhile
+    }
+    let what = format!("call_out {} on {}", fired.method, fired.object_id);
     match state.timers.is_stored(id).await {
         Ok(true) => {}
-        Ok(false) => {
-            state.timers.forget_timer(id).await;
-            return;
-        }
+        Ok(false) => return state.timers.forget_timer(id).await,
         Err(e) => {
-            tracing::warn!("call_out {} on {}: {}", fired.method, fired.object_id, e);
-            state.timers.retry_later(id, CALL_OUT_RETRY_MS).await;
-            return;
+            tracing::warn!("{}: reading it failed, left for later: {}", what, e);
+            return state.timers.forget_timer(id).await;
         }
     }
     let room_id = match state
@@ -406,40 +449,33 @@ async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerF
         // Gone (deleting an object cancels its timers anyway)
         Ok(None) => return settle_call_out(state, id).await,
         Err(e) => {
-            tracing::warn!("call_out {} on {}: {}", fired.method, fired.object_id, e);
-            state.timers.retry_later(id, CALL_OUT_RETRY_MS).await;
-            return;
+            tracing::warn!("{}: reading its object failed, left for later: {}", what, e);
+            return state.timers.forget_timer(id).await;
         }
     };
     let (sql, params) = crate::timers::TimerManager::consume_statement(id);
     let run = invoke_timer_handler(state, fired, room_id, vec![(sql.to_string(), params)]);
     match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(
-            "call_out {} on {} failed (dropped): {}",
-            fired.method,
-            fired.object_id,
-            e
-        ),
-        Err(_) => tracing::error!(
-            "call_out {} on {} panicked (dropped)",
-            fired.method,
-            fired.object_id
-        ),
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(e))) => tracing::warn!("{} failed (dropped): {}", what, e),
+        Ok(Err(e)) => {
+            // Its writes and delete were not saved: the row stays
+            tracing::warn!("{}: not saved, left for later: {}", what, e);
+            return state.timers.forget_timer(id).await;
+        }
+        Err(_) => tracing::error!("{} panicked (dropped)", what),
     }
     settle_call_out(state, id).await;
 }
 
 /// After a call_out ran (or cannot): delete its row unless the handler's
-/// batch already did, then forget it. If the delete fails it stays cached
-/// and is tried again shortly (its row is the truth).
+/// batch already did, then forget it. A failed delete leaves the row, so
+/// the next primary, restart or cache rebuild fires it again.
 async fn settle_call_out(state: &AppState, id: &str) {
     if !matches!(state.timers.is_stored(id).await, Ok(false)) {
         let (sql, params) = crate::timers::TimerManager::consume_statement(id);
         if let Err(e) = state.raft_writer.execute(sql, params).await {
             tracing::warn!("deleting call_out {}: {}", id, e);
-            state.timers.retry_later(id, CALL_OUT_RETRY_MS).await;
-            return;
         }
     }
     state.timers.forget_timer(id).await;

@@ -369,14 +369,16 @@ contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; th
 
 `run_timer_loop` runs each due `call_out` (earliest first) or heartbeat on
 the object's code (as the owner) with `{object_id, room_id, args}`. A
-`call_out` runs only if its row still exists (the table decides; a stale
-cache entry for a cancelled or consumed one is dropped), and is consumed in
-the same Raft batch as its handler's writes: the row's delete is the
-handler run's batch prefix, so it commits only together with those writes.
-A handler that writes nothing, or fails (its writes discarded; dropped, as
-in LPMud), has the row deleted on its own. The timer stays cached until
-settled; if nothing commits (a crash, a lost leadership) its row remains and
-the next primary fires it once. A read error retries it a second later.
+`call_out` is marked firing first (no longer cancellable, as in LPMud),
+runs only if its row still exists (the table decides; a stale cache entry
+for a cancelled or consumed one is dropped), and is consumed in the same
+Raft batch as its handler's writes: the row's delete is the handler run's
+batch prefix, so it commits only together with those writes (a handler that
+checkpoints commits it with its first part). A handler that writes nothing,
+or fails (its writes discarded; dropped, as in LPMud), has the row deleted
+on its own. If nothing could be saved or read (a crash, a lost leadership, a
+failed commit or read) the row remains, and the next primary, restart or
+cache rebuild fires it again.
 A heartbeat whose object no longer exists is removed. One-shot timers
 are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
 remove; beats write nothing), both reloaded whenever the node becomes
