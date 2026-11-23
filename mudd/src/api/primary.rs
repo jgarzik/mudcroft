@@ -134,22 +134,42 @@ async fn handle_orphaned_sessions(state: AppState) {
             "primary: {} lost its server; handling the disconnect",
             player
         );
-        let room = state
-            .object_store
-            .get(&universe, &player)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|p| p.parent_id);
-        if let Err(e) = state
-            .player_manager
-            .finish_disconnect(&universe, &player, &since)
-            .await
-        {
-            warn!("primary: disconnect of {} failed: {}", player, e);
+        // Each player in a task of its own: a panic handling one is logged
+        // and the rest are still handled (aborted with this task)
+        let mut task = AbortOnDrop(tokio::spawn(finish_orphaned_disconnect(
+            state.clone(),
+            universe,
+            player.clone(),
+            since,
+        )));
+        if let Err(e) = (&mut task.0).await {
+            tracing::error!("primary: disconnect of {} panicked: {}", player, e);
         }
-        super::websocket::disconnect_hook(&state, &universe, &player, room).await;
     }
+}
+
+/// Finish the disconnect of a player whose server was lost (claimed)
+async fn finish_orphaned_disconnect(
+    state: AppState,
+    universe: String,
+    player: String,
+    since: String,
+) {
+    let room = state
+        .object_store
+        .get(&universe, &player)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|p| p.parent_id);
+    if let Err(e) = state
+        .player_manager
+        .finish_disconnect(&universe, &player, &since)
+        .await
+    {
+        warn!("primary: disconnect of {} failed: {}", player, e);
+    }
+    super::websocket::disconnect_hook(&state, &universe, &player, room).await;
 }
 
 /// Whether this node leads: its server state, not just current_leader (a
