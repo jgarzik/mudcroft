@@ -19,7 +19,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  NODE_VERSION: '24'
+  NODE_VERSION: '26'
 
 jobs:
   # Fast checks first

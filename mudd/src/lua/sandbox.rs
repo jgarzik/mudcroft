@@ -97,6 +97,12 @@ pub enum SandboxError {
 
     #[error("Lua error: {0}")]
     LuaError(#[from] mlua::Error),
+
+    /// A native function panicked (a server bug): the script fails, the
+    /// task running it carries on. The message is for the server log only;
+    /// scripts and players see "internal error".
+    #[error("internal error")]
+    Panic(String),
 }
 
 /// A sandboxed Lua execution environment
@@ -332,6 +338,17 @@ impl Sandbox {
         Ok(())
     }
 
+    /// The error a nested execution (game.use_object) hands its caller. A
+    /// panic is not an ordinary error there: it resumes unwinding, so it
+    /// passes through the caller's pcall and fails the whole top-level run
+    /// (whose writes then roll back), where the outer entry point catches it.
+    pub fn nested_error(e: SandboxError) -> SandboxError {
+        match e {
+            SandboxError::Panic(msg) => std::panic::resume_unwind(Box::new(msg)),
+            e => e,
+        }
+    }
+
     /// Get metering data
     pub fn metering(&self) -> &Metering {
         &self.metering
@@ -367,12 +384,17 @@ impl Sandbox {
     /// Run `f` within the current budget (not reset per chunk)
     fn run_metered<R>(&mut self, f: impl FnOnce(&Lua) -> LuaResult<R>) -> Result<R, SandboxError> {
         let before = self.limits.instructions.load(Ordering::Relaxed);
-        let result = f(&self.lua);
+        let lua = &self.lua;
+        let result = catch_panic(|| f(lua));
         self.finish(before, result)
     }
 
-    /// Account for a run and map a limit hit to its error
-    fn finish<R>(&mut self, before: u64, result: LuaResult<R>) -> Result<R, SandboxError> {
+    /// Account for a run and map a limit hit (or a caught panic) to its error
+    fn finish<R>(
+        &mut self,
+        before: u64,
+        result: Result<LuaResult<R>, String>,
+    ) -> Result<R, SandboxError> {
         let instr = self.limits.instructions.load(Ordering::Relaxed);
         self.metering.add_instructions(instr.saturating_sub(before));
         self.metering.set_memory(self.lua.used_memory() as u64);
@@ -390,7 +412,10 @@ impl Sandbox {
             self.limits.timed_out.store(true, Ordering::Relaxed);
             return Err(SandboxError::Timeout(self.config.timeout));
         }
-        result.map_err(SandboxError::from)
+        match result {
+            Ok(result) => result.map_err(SandboxError::from),
+            Err(panic) => Err(SandboxError::Panic(panic)),
+        }
     }
 
     /// Execute a Lua function with arguments, within the current budget
@@ -400,7 +425,7 @@ impl Sandbox {
         R: mlua::FromLuaMulti,
     {
         let before = self.limits.instructions.load(Ordering::Relaxed);
-        let result: LuaResult<R> = func.call(args);
+        let result = catch_panic(|| func.call(args));
         self.finish(before, result)
     }
 
@@ -429,9 +454,88 @@ impl Sandbox {
     }
 }
 
+/// Run Lua, catching a panic from a native function (mlua resumes a
+/// callback's panic once control is back in Rust). The panic becomes the
+/// script's error, so one bad call never kills the task running scripts.
+/// The sandbox is per execution and is dropped after the error.
+fn catch_panic<R>(f: impl FnOnce() -> LuaResult<R>) -> Result<LuaResult<R>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic".to_string());
+        tracing::error!("lua: native function panicked: {}", msg);
+        msg
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic inside a nested execution (game.use_object) fails the whole
+    /// top-level run, so its writes roll back: the caller's pcall cannot
+    /// catch it and carry on to commit a half-finished change
+    #[test]
+    fn test_nested_panic_not_swallowed_by_pcall() {
+        let mut outer = Sandbox::new(SandboxConfig::default()).unwrap();
+        let nested = outer
+            .lua()
+            .create_function(|_, ()| {
+                let mut inner = Sandbox::new(SandboxConfig::default()).unwrap();
+                let boom = inner
+                    .lua()
+                    .create_function(|_, ()| -> mlua::Result<()> { panic!("nested bug") })
+                    .unwrap();
+                inner.lua().globals().set("boom", boom).unwrap();
+                inner
+                    .execute::<()>("boom()")
+                    .map_err(|e| mlua::Error::runtime(Sandbox::nested_error(e)))
+            })
+            .unwrap();
+        outer.lua().globals().set("nested", nested).unwrap();
+        match outer.execute::<mlua::Value>("pcall(nested) return 1") {
+            Err(SandboxError::Panic(_)) => {}
+            other => panic!("expected the run to fail with Panic, got {other:?}"),
+        }
+    }
+
+    /// A panic in a native (game.*) function fails the script with an
+    /// error; it never unwinds into the task running it (the timer loop,
+    /// a scheduler, a session), and pcall cannot swallow it
+    #[test]
+    fn test_native_panic_is_an_error() {
+        let mut sandbox = Sandbox::new(SandboxConfig::default()).unwrap();
+        let boom = sandbox
+            .lua()
+            .create_function(|_, ()| -> mlua::Result<()> { panic!("native bug") })
+            .unwrap();
+        sandbox.lua().globals().set("boom", boom).unwrap();
+
+        for code in ["boom()", "pcall(boom) return 1", "return 1 + (boom() or 0)"] {
+            match sandbox.execute::<mlua::Value>(code) {
+                Err(e @ SandboxError::Panic(_)) => {
+                    // Details only in the server log
+                    assert_eq!(e.to_string(), "internal error");
+                    let SandboxError::Panic(msg) = e else {
+                        unreachable!()
+                    };
+                    assert!(msg.contains("native bug"), "{msg}");
+                }
+                other => panic!("{code}: expected Panic, got {other:?}"),
+            }
+        }
+        match sandbox.execute_with_args::<_, mlua::Value>("boom()", ()) {
+            Err(SandboxError::Panic(_)) => {}
+            other => panic!("execute_with_args: expected Panic, got {other:?}"),
+        }
+        let f: mlua::Function = sandbox.lua().globals().get("boom").unwrap();
+        match sandbox.call::<_, ()>(f, ()) {
+            Err(SandboxError::Panic(_)) => {}
+            other => panic!("call: expected Panic, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_sandbox_creation() {

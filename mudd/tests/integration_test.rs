@@ -989,6 +989,7 @@ async fn test_timer_persistence() {
                 method TEXT NOT NULL,
                 fire_at INTEGER NOT NULL,
                 args TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
         )
@@ -1000,6 +1001,7 @@ async fn test_timer_persistence() {
                 universe_id TEXT NOT NULL,
                 object_id TEXT NOT NULL,
                 interval_ms INTEGER NOT NULL,
+                started_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (universe_id, object_id)
             )",
         )
@@ -1007,7 +1009,7 @@ async fn test_timer_persistence() {
         .await
         .expect("Failed to create heartbeats table");
 
-        let timer_mgr = TimerManager::new(Some(pool.clone()), None);
+        let timer_mgr = TimerManager::shared(Some(pool.clone()), None);
         let timer = Timer::new(
             "u1",
             "obj1",
@@ -1015,9 +1017,11 @@ async fn test_timer_persistence() {
             60000,
             Some("test_args".to_string()),
         );
-        timer_mgr.add_timer(timer).await.expect("timer stored");
-
-        assert_eq!(timer_mgr.timer_count().await, 1);
+        timer_mgr
+            .schedule(timer)
+            .await
+            .expect("timer stored")
+            .expect("under the cap");
         // Pool dropped here
     }
 
@@ -1028,17 +1032,12 @@ async fn test_timer_persistence() {
             .await
             .expect("Failed to connect");
 
+        // call_outs live in the table: a new manager sees it at once
         let timer_mgr = TimerManager::new(Some(pool), None);
-        timer_mgr
-            .load_from_db()
-            .await
-            .expect("Failed to load timers");
-
-        assert_eq!(
-            timer_mgr.timer_count().await,
-            1,
-            "Timer should persist across restarts"
-        );
+        let far = chrono::Utc::now().timestamp_millis() + 120_000;
+        let due = timer_mgr.due_call_outs(far, 10).await.expect("read timers");
+        assert_eq!(due.len(), 1, "Timer should persist across restarts");
+        assert_eq!(due[0].args.as_deref(), Some("test_args"));
     }
 }
 

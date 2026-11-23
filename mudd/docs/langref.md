@@ -716,7 +716,9 @@ return {
 
 Cancels one of the current object's own pending call_outs. **Returns**
 `true` if it was pending, `false` if it was not, belongs to another object,
-or there is no object context.
+or there is no object context. A call_out that has started firing is no
+longer pending: cancelling it (even from its own handler) returns `false`,
+as in LPMud.
 
 #### `game.set_heart_beat(interval_ms)`
 
@@ -726,7 +728,7 @@ or `false` without an object context.
 
 - The interval is clamped to 100 ms through one day.
 - The callback receives `{object_id, room_id, args = nil}`.
-- Heartbeats are stored and resume after a server restart (the first beat one interval after startup).
+- Heartbeats are stored and keep their schedule across a server restart or failover: beats fall every interval from when `set_heart_beat` was called; beats missed meanwhile are skipped, not fired in a burst.
 
 **Returns** `true`. Without an object context it does nothing.
 
@@ -735,7 +737,19 @@ or `false` without an object context.
 Stops the current object's heartbeat. **Returns** `true` if one was
 running.
 
-Pending call_outs and heartbeats are saved to the database and reloaded at startup.
+Pending call_outs and heartbeats are saved to the database and survive a
+restart or failover.
+
+A call_out is used up in the same change as its handler's writes: its
+writes are saved with it, never twice. If the handler fails, none of its
+writes are kept and the call_out is dropped, not retried (as in LPMud); so
+is one whose handler ran but whose change could not be saved (a server
+problem). One that could not even start (a server problem) is tried again
+a few times with growing waits, then dropped. One that falls due while the
+server is down or changing primary fires once, late. Its handler runs once,
+except that a crash or failover in the middle of its change can make it run
+again on the next primary: its messages, which reach players as the handler
+runs, may then be shown twice.
 
 Deleting an object cancels both its call_outs and its heartbeat.
 

@@ -73,6 +73,9 @@ pub struct Run {
     /// A checkpoint failed to save: writes made before it are lost, so the
     /// run must fail as a whole (later writes are refused)
     poisoned: AtomicBool,
+    /// Why (the commit's own error, reported when the run settles, so a
+    /// caller can tell a refused batch from a lost leadership)
+    poison: std::sync::Mutex<Option<anyhow::Error>>,
     /// A nested part failed and rebuilt the caches mid-run: anything that
     /// refilled them meanwhile read committed state without this run's
     /// pending changes, so they are rebuilt again once the run commits
@@ -233,8 +236,7 @@ impl Run {
             anyhow::bail!("an earlier save in this run failed");
         }
         if let Err(e) = self.end_local().await {
-            self.poisoned.store(true, Ordering::SeqCst);
-            return Err(e);
+            return Err(self.poison_with(e));
         }
         let batch = self.batch();
         let kept = take(&self.kept);
@@ -243,10 +245,9 @@ impl Run {
         {
             // The run fails as a whole (settle undoes it: `dirty` stays
             // set, so the caches are rebuilt); kept writes still stand
-            self.poisoned.store(true, Ordering::SeqCst);
             take(&self.after);
             *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = kept;
-            return Err(e);
+            return Err(self.poison_with(e));
         }
         self.dirty.store(false, Ordering::SeqCst);
         for f in take(&self.after) {
@@ -255,6 +256,18 @@ impl Run {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.gate.lock().await.take();
         Ok(())
+    }
+
+    /// Mark the run failed because of `e`, kept for when it settles; the
+    /// caller gets its message
+    fn poison_with(&self, e: anyhow::Error) -> anyhow::Error {
+        let msg = format!("{:#}", e);
+        self.poisoned.store(true, Ordering::SeqCst);
+        self.poison
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(e);
+        anyhow::anyhow!(msg)
     }
 
     /// Run `f` nested in this run: if it fails, only its own writes are
@@ -370,7 +383,10 @@ impl Run {
         let outcome = if let Err(e) = ended {
             Err(e)
         } else if self.poisoned.load(Ordering::SeqCst) {
-            Err(anyhow::anyhow!("a save in this run failed"))
+            let cause = self.poison.lock().unwrap_or_else(|e| e.into_inner()).take();
+            Err(cause
+                .map(|e| e.context("a save in this run failed"))
+                .unwrap_or_else(|| anyhow::anyhow!("a save in this run failed")))
         } else if failed {
             Ok(())
         } else {
@@ -523,6 +539,7 @@ where
         began: AtomicBool::new(false),
         dirty: AtomicBool::new(false),
         poisoned: AtomicBool::new(false),
+        poison: std::sync::Mutex::new(None),
         rebuilt_mid_run: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         depth: AtomicU64::new(0),
@@ -785,6 +802,51 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
             Box::pin(async { anyhow::bail!("not the primary") })
         }
+    }
+
+    /// Refuses every commit with a typed error (a batch refused when applied)
+    #[derive(Debug)]
+    struct Refused;
+
+    impl std::fmt::Display for Refused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("refused when applied")
+        }
+    }
+
+    impl std::error::Error for Refused {}
+
+    struct RefuseTyped;
+
+    impl Committer for RefuseTyped {
+        fn commit<'a>(
+            &'a self,
+            _statements: Vec<Statement>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async { Err(Refused.into()) })
+        }
+    }
+
+    /// A run poisoned by a failed checkpoint reports why: the commit's own
+    /// error (so a caller can tell a refused batch from a lost leadership)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_poisoned_run_keeps_the_cause() {
+        let (pool, _) = setup().await;
+        let result: Result<std::result::Result<(), ()>> = scope(
+            &pool,
+            Arc::new(RefuseTyped),
+            Vec::new(),
+            async {
+                let run = current().unwrap();
+                run.execute(&[insert(1)]).await.unwrap();
+                assert!(run.checkpoint().await.is_err());
+                Ok(())
+            },
+            || async {},
+        )
+        .await;
+        let e = result.expect_err("the run failed to save");
+        assert!(e.chain().any(|c| c.is::<Refused>()), "{e:#}");
     }
 
     /// A checkpoint that fails to save poisons the run: later writes fail,

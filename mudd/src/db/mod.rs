@@ -14,7 +14,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -374,6 +374,38 @@ impl Database {
                 .await?;
             self.set_schema_version(14).await?;
             info!("Upgraded database schema 13 -> 14");
+            version = 14;
+        }
+        if version == 14 {
+            // Heartbeats keep their phase across restarts (an anchor, not a
+            // write per beat; existing ones are anchored at 0), and a
+            // call_out counts its failed tries to fire
+            for (table, column, add) in [
+                (
+                    "heartbeats",
+                    "started_at",
+                    "ALTER TABLE heartbeats ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "timers",
+                    "attempts",
+                    "ALTER TABLE timers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                ),
+            ] {
+                let has: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+                        .bind(table)
+                        .bind(column)
+                        .fetch_one(&self.pool)
+                        .await?;
+                if has == 0 {
+                    sqlx::query(sqlx::AssertSqlSafe(add))
+                        .execute(&self.pool)
+                        .await?;
+                }
+            }
+            self.set_schema_version(15).await?;
+            info!("Upgraded database schema 14 -> 15");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -686,6 +718,7 @@ impl Database {
                 method TEXT NOT NULL,
                 fire_at INTEGER NOT NULL,
                 args TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (universe_id, object_id)
                     REFERENCES objects(universe_id, id) ON DELETE CASCADE
@@ -696,12 +729,14 @@ impl Database {
         .await?;
 
         // Heartbeats (recurring): one row per object; a beat writes nothing
+        // (beats fall at started_at + k * interval_ms)
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS heartbeats (
                 universe_id TEXT NOT NULL,
                 object_id TEXT NOT NULL,
                 interval_ms INTEGER NOT NULL,
+                started_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (universe_id, object_id),
                 FOREIGN KEY (universe_id, object_id)
                     REFERENCES objects(universe_id, id) ON DELETE CASCADE

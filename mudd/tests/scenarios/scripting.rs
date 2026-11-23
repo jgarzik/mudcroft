@@ -322,6 +322,258 @@ async fn test_call_out_and_heart_beat_fire() {
     );
 }
 
+/// A call_out is consumed in the same change as its handler's writes: a
+/// handler that succeeds runs once and its writes stand; one that fails
+/// keeps none of its writes and is dropped, not retried (as in LPMud)
+#[tokio::test]
+async fn test_call_out_consumed_with_its_handler() {
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "consume_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local code = game.store_code([[return {{
+                 arm = function(a)
+                   game.call_out(0.2, "count")
+                   game.call_out(0.2, "fail")
+                 end,
+                 count = function(a)
+                   local o = game.get_object(a.object_id)
+                   game.update_object(a.object_id, {{count = (o.metadata.count or 0) + 1}})
+                 end,
+                 fail = function(a)
+                   game.update_object(a.object_id, {{failed_write = true}})
+                   error("handler bug")
+                 end,
+               }}]])
+               game.create_object("/items/counter", "item", "{room}", {{name = "counter", code_hash = code}})
+               game.use_object("/items/counter", "consume_wiz", "arm")
+               return true"#,
+            room = entrance
+        ),
+    )
+    .await;
+    // Wait until both have fired, then a little longer: a retried or
+    // duplicated one would run again
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && eval(
+            &mut wiz,
+            r#"return tostring(game.get_object("/items/counter").metadata.count)"#,
+        )
+        .await
+            == "nil"
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let count = eval(
+        &mut wiz,
+        r#"return game.get_object("/items/counter").metadata.count"#,
+    )
+    .await;
+    assert_eq!(count, "1", "the succeeding call_out ran once");
+    let failed = eval(
+        &mut wiz,
+        r#"return tostring(game.get_object("/items/counter").metadata.failed_write)"#,
+    )
+    .await;
+    assert_eq!(failed, "nil", "a failing handler keeps none of its writes");
+
+    drop(wiz);
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.db_path.display()))
+        .await
+        .unwrap();
+    let pending = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM timers")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while pending().await != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(pending().await, 0, "both call_outs consumed");
+    server.stop();
+}
+
+/// A server killed partway through a batch of due call_outs loses none of
+/// them and runs none twice: each is consumed only with its handler's
+/// writes, so after the restart the rest fire, exactly once each
+#[tokio::test]
+async fn test_call_outs_survive_a_crash_mid_batch() {
+    const N: usize = 24;
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "batch_wiz").await;
+    let notify = wiz.player_id().expect("player id").to_string();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local code = game.store_code([[return {{
+                 arm = function(a)
+                   for i = 1, {n} do game.call_out(0.5, "hit", tostring(i)) end
+                 end,
+                 hit = function(a)
+                   local o = game.get_object(a.object_id)
+                   local k = "k" .. a.args
+                   game.update_object(a.object_id, {{[k] = (o.metadata[k] or 0) + 1}})
+                   for _ = 1, 200000 do end
+                   game.send(o.metadata.notify, "hit " .. a.args)
+                 end,
+               }}]])
+               game.create_object("/items/batch", "item", "{room}",
+                 {{name = "batch", notify = "{notify}", code_hash = code}})
+               game.use_object("/items/batch", "batch_wiz", "arm")
+               return true"#,
+            n = N,
+            room = entrance,
+            notify = notify
+        ),
+    )
+    .await;
+    // A callback is running (its message goes out just before its change
+    // commits) and the rest of the batch has not run yet: kill the server
+    // now. Whether or not that callback committed, each call_out must end
+    // up applied exactly once.
+    wiz.expect_output_containing("hit ")
+        .await
+        .expect("first call_out fired");
+    server.stop();
+    drop(wiz);
+
+    server.start_again().await.expect("restart");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.db_path.display()))
+        .await
+        .unwrap();
+    let props = || async {
+        let json: String =
+            sqlx::query_scalar("SELECT properties FROM objects WHERE id = '/items/batch'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let p = props().await;
+        let done = (1..=N).filter(|i| p.get(format!("k{i}")).is_some()).count();
+        if done == N || tokio::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let p = props().await;
+    for i in 1..=N {
+        assert_eq!(
+            p.get(format!("k{i}")).and_then(|v| v.as_i64()),
+            Some(1),
+            "call_out {i} ran exactly once: {p}"
+        );
+    }
+}
+
+/// Cancelling and firing are one decision, made by the table: a call_out
+/// cancelled by an earlier callback never runs (and the cancel says true);
+/// a call_out that is already firing cannot be cancelled, even by itself
+#[tokio::test]
+async fn test_call_out_cancel_vs_fire() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "cancel_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local code = game.store_code([[return {{
+                 arm = function(a)
+                   local first = game.call_out(0.2, "first")
+                   local second = game.call_out(0.6, "second")
+                   game.update_object(a.object_id, {{second = second}})
+                 end,
+                 first = function(a)
+                   local o = game.get_object(a.object_id)
+                   game.update_object(a.object_id, {{
+                     cancelled = game.remove_call_out(o.metadata.second),
+                     self_cancel = game.remove_call_out(o.metadata.second .. "-none"),
+                   }})
+                 end,
+                 second = function(a)
+                   game.update_object(a.object_id, {{second_ran = true}})
+                 end,
+               }}]])
+               game.create_object("/items/fuse", "item", "{room}", {{name = "fuse", code_hash = code}})
+               game.use_object("/items/fuse", "cancel_wiz", "arm")
+               return true"#,
+            room = entrance
+        ),
+    )
+    .await;
+    let field = |f: &'static str| {
+        format!(r#"return tostring(game.get_object("/items/fuse").metadata.{f})"#)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while eval(&mut wiz, &field("cancelled")).await == "nil"
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        eval(&mut wiz, &field("cancelled")).await,
+        "true",
+        "the cancel took"
+    );
+    assert_eq!(
+        eval(&mut wiz, &field("self_cancel")).await,
+        "false",
+        "no such call_out"
+    );
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        eval(&mut wiz, &field("second_ran")).await,
+        "nil",
+        "a cancelled call_out never runs"
+    );
+}
+
+/// A handler cannot cancel its own call_out once it is firing
+#[tokio::test]
+async fn test_firing_call_out_cannot_cancel_itself() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "selfcancel_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local code = game.store_code([[return {{
+                 arm = function(a)
+                   game.update_object(a.object_id, {{me = game.call_out(0.2, "tick")}})
+                 end,
+                 tick = function(a)
+                   local o = game.get_object(a.object_id)
+                   game.update_object(a.object_id, {{self_cancel = game.remove_call_out(o.metadata.me)}})
+                 end,
+               }}]])
+               game.create_object("/items/tick", "item", "{room}", {{name = "ticker", code_hash = code}})
+               game.use_object("/items/tick", "selfcancel_wiz", "arm")
+               return true"#,
+            room = entrance
+        ),
+    )
+    .await;
+    let q = r#"return tostring(game.get_object("/items/tick").metadata.self_cancel)"#;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while eval(&mut wiz, q).await == "nil" && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        eval(&mut wiz, q).await,
+        "false",
+        "already firing: not pending"
+    );
+}
+
 /// Object code runs as the object's owner, never as the player who
 /// triggers it: a wizard's trap cannot borrow an admin's privileges.
 #[tokio::test]
