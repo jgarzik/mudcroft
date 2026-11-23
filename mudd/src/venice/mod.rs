@@ -255,9 +255,14 @@ pub struct VeniceClient {
 }
 
 impl VeniceClient {
-    /// Create a new Venice client
+    /// Create a new Venice client (key and URL from VENICE_API_KEY and
+    /// VENICE_API_URL)
     pub fn new() -> Self {
-        let api_key = std::env::var("VENICE_API_KEY").ok();
+        Self::with_key(std::env::var("VENICE_API_KEY").ok())
+    }
+
+    /// Create a client with an explicit API key (None: not configured)
+    fn with_key(api_key: Option<String>) -> Self {
         let base_url = std::env::var("VENICE_API_URL")
             .unwrap_or_else(|_| "https://api.venice.ai/api/v1".to_string());
 
@@ -475,9 +480,7 @@ mod tests {
 
     #[test]
     fn test_venice_client_not_configured() {
-        // Clear env var for test
-        std::env::remove_var("VENICE_API_KEY");
-        let client = VeniceClient::new();
-        assert!(!client.is_configured());
+        assert!(!VeniceClient::with_key(None).is_configured());
+        assert!(VeniceClient::with_key(Some("k".to_string())).is_configured());
     }
 }
