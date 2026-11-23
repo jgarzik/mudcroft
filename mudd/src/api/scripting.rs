@@ -336,10 +336,11 @@ fn invoke_handler_settled<'a>(
         prefix,
     } = origin;
     Box::pin(async move {
+        // A failed read is not the handler failing: nothing ran or was saved
         let (code, owner_id) = match object_code(state, object_id, universe_id).await {
             Ok(Some(found)) => found,
             Ok(None) => return Ok(Ok(None)),
-            Err(e) => return Ok(Err(e)),
+            Err(e) => return Err(e),
         };
         let ctx = ScriptContext {
             universe_id: universe_id.to_string(),
@@ -350,20 +351,33 @@ fn invoke_handler_settled<'a>(
         };
         let libs = match load_universe_lib_codes(state, universe_id).await {
             Ok(libs) => libs,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => return Err(e),
         };
         // One change (joins the caller's if inside one): a failing handler
         // keeps nothing
         in_run_settled(state, prefix, async {
-            let queue = MessageQueue::shared();
-            let result = {
-                let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
-                call_handler(&mut sandbox, &code, method, &args)
+            // A panic (a server bug outside Lua) fails the handler inside
+            // its run, which then settles (undone) as for any error
+            let handler = async {
+                let queue = MessageQueue::shared();
+                let result = {
+                    let mut sandbox =
+                        prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
+                    call_handler(&mut sandbox, &code, method, &args)
+                };
+                if result.is_ok() {
+                    deliver_at(state, &queue, &ctx.universe_id, budget).await;
+                }
+                result
             };
-            if result.is_ok() {
-                deliver_at(state, &queue, &ctx.universe_id, budget).await;
+            match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(handler)).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::error!("handler {} on {} panicked", method, object_id);
+                    Err("internal error".to_string())
+                }
             }
-            result
         })
         .await
     })
@@ -424,9 +438,9 @@ fn timer_args(fired: &crate::timers::TimerFired, room_id: &Option<String>) -> se
 /// reverse. (A handler that checkpoints, before a Venice call, commits the
 /// delete with its first part.) A handler that writes nothing, or fails
 /// (its writes discarded; dropped, not retried, as in LPMud), has the row
-/// deleted on its own. If nothing could be saved or read (a crash, a lost
-/// leadership, a failed commit or read) the row stays and the call_out is
-/// fired again by the next primary, restart or cache rebuild.
+/// deleted on its own. If nothing could be saved or read (a failed commit
+/// or read) the call_out stays pending and is tried again after a growing
+/// wait; after a crash or failover the next primary fires it.
 async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerFired) {
     if !state.timers.begin_firing(id).await {
         return; // cancelled meanwhile
@@ -436,8 +450,8 @@ async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerF
         Ok(true) => {}
         Ok(false) => return state.timers.forget_timer(id).await,
         Err(e) => {
-            tracing::warn!("{}: reading it failed, left for later: {}", what, e);
-            return state.timers.forget_timer(id).await;
+            tracing::warn!("{}: reading it failed, retried later: {}", what, e);
+            return state.timers.defer(id).await;
         }
     }
     let room_id = match state
@@ -449,33 +463,32 @@ async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerF
         // Gone (deleting an object cancels its timers anyway)
         Ok(None) => return settle_call_out(state, id).await,
         Err(e) => {
-            tracing::warn!("{}: reading its object failed, left for later: {}", what, e);
-            return state.timers.forget_timer(id).await;
+            tracing::warn!("{}: reading its object failed, retried later: {}", what, e);
+            return state.timers.defer(id).await;
         }
     };
     let (sql, params) = crate::timers::TimerManager::consume_statement(id);
-    let run = invoke_timer_handler(state, fired, room_id, vec![(sql.to_string(), params)]);
-    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await {
-        Ok(Ok(Ok(_))) => {}
-        Ok(Ok(Err(e))) => tracing::warn!("{} failed (dropped): {}", what, e),
-        Ok(Err(e)) => {
-            // Its writes and delete were not saved: the row stays
-            tracing::warn!("{}: not saved, left for later: {}", what, e);
-            return state.timers.forget_timer(id).await;
+    match invoke_timer_handler(state, fired, room_id, vec![(sql.to_string(), params)]).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!("{} failed (dropped): {}", what, e),
+        Err(e) => {
+            // Nothing was saved (or read): still pending
+            tracing::warn!("{}: not saved, retried later: {}", what, e);
+            return state.timers.defer(id).await;
         }
-        Err(_) => tracing::error!("{} panicked (dropped)", what),
     }
     settle_call_out(state, id).await;
 }
 
 /// After a call_out ran (or cannot): delete its row unless the handler's
-/// batch already did, then forget it. A failed delete leaves the row, so
-/// the next primary, restart or cache rebuild fires it again.
+/// batch already did, then forget it. A failed delete keeps it pending, to
+/// be tried again later.
 async fn settle_call_out(state: &AppState, id: &str) {
     if !matches!(state.timers.is_stored(id).await, Ok(false)) {
         let (sql, params) = crate::timers::TimerManager::consume_statement(id);
         if let Err(e) = state.raft_writer.execute(sql, params).await {
             tracing::warn!("deleting call_out {}: {}", id, e);
+            return state.timers.defer(id).await;
         }
     }
     state.timers.forget_timer(id).await;

@@ -153,11 +153,27 @@ pub struct TimerManager {
     raft_writer: Option<Arc<RaftWriter>>,
     /// Wakes the timer loop when a new deadline may be earlier
     changed: tokio::sync::Notify,
-    /// Call_outs the timer loop has started firing: no longer cancellable
-    /// and not reported again (kept apart from the cache, which rebuilds
-    /// replace)
-    firing: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Call_outs being fired, cancelled or retried later (kept apart from
+    /// the cache, which rebuilds replace)
+    flight: std::sync::Mutex<Flight>,
 }
+
+/// Where call_outs are between the cache and the table
+#[derive(Default)]
+struct Flight {
+    /// Started firing: no longer cancellable, not reported again
+    firing: std::collections::HashSet<String>,
+    /// Being cancelled (row delete in progress): never fired
+    cancelling: std::collections::HashSet<String>,
+    /// Firing failed to save or read: not before (Unix ms), attempts
+    deferred: std::collections::HashMap<String, (i64, u32)>,
+}
+
+/// First wait before firing a call_out again whose save or read failed;
+/// doubles per failure
+const RETRY_MIN_MS: i64 = 1_000;
+/// Longest wait between such tries
+const RETRY_MAX_MS: i64 = 300_000;
 
 impl std::fmt::Debug for TimerManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -177,7 +193,7 @@ impl TimerManager {
             pool,
             raft_writer,
             changed: tokio::sync::Notify::new(),
-            firing: std::sync::Mutex::new(std::collections::HashSet::new()),
+            flight: std::sync::Mutex::new(Flight::default()),
         }
     }
 
@@ -265,45 +281,102 @@ impl TimerManager {
             .await
             .get(timer_id)
             .is_some_and(|t| t.universe_id == universe_id && t.object_id == object_id);
-        // Too late once it has started firing (as in LPMud)
-        owned && !self.is_firing(timer_id) && self.remove_timer(timer_id).await
+        if !owned {
+            return false;
+        }
+        // One decision with begin_firing (both hold the cache lock): too
+        // late once it has started firing (as in LPMud); else it is out of
+        // the cache and marked cancelling (which outlasts a rebuild) before
+        // its row is deleted, so it can no longer fire
+        let timer = {
+            let mut timers = self.timers.write().await;
+            let mut flight = self.flight();
+            if flight.firing.contains(timer_id) {
+                return false;
+            }
+            flight.cancelling.insert(timer_id.to_string());
+            flight.deferred.remove(timer_id);
+            timers.remove(timer_id)
+        };
+        let deleted = self.delete_row(timer_id).await;
+        self.flight().cancelling.remove(timer_id);
+        if !deleted && let Some(timer) = timer {
+            // Still stored: still pending
+            self.timers
+                .write()
+                .await
+                .insert(timer_id.to_string(), timer);
+        }
+        deleted
+    }
+
+    fn flight(&self) -> std::sync::MutexGuard<'_, Flight> {
+        self.flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Delete a call_out's row; false if that failed
+    async fn delete_row(&self, timer_id: &str) -> bool {
+        let (sql, params) = Self::consume_statement(timer_id);
+        match self.write(sql, params).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to delete timer {} from DB: {}", timer_id, e);
+                false
+            }
+        }
     }
 
     /// Mark a due call_out as firing: from now on it cannot be cancelled
     /// and is not reported again. False if it is not pending (cancelled,
-    /// settled) or already firing.
+    /// being cancelled, settled) or already firing.
     pub async fn begin_firing(&self, timer_id: &str) -> bool {
         let timers = self.timers.read().await;
+        let mut flight = self.flight();
         timers.contains_key(timer_id)
-            && self
-                .firing
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(timer_id.to_string())
+            && !flight.cancelling.contains(timer_id)
+            && flight.firing.insert(timer_id.to_string())
     }
 
-    fn is_firing(&self, timer_id: &str) -> bool {
-        self.firing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(timer_id)
+    /// Firing could not be saved or read: the call_out stays pending (its
+    /// row is stored) and is tried again after a growing wait
+    pub async fn defer(&self, timer_id: &str) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut flight = self.flight();
+        flight.firing.remove(timer_id);
+        let attempts = flight.deferred.get(timer_id).map_or(0, |d| d.1);
+        let wait = RETRY_MIN_MS
+            .saturating_mul(1i64 << attempts.min(20))
+            .min(RETRY_MAX_MS);
+        flight.deferred.insert(
+            timer_id.to_string(),
+            (now.saturating_add(wait), attempts + 1),
+        );
+        drop(flight);
+        self.changed.notify_one();
     }
 
-    /// Forget a settled call_out (cache only: its row is deleted, or left
-    /// for the next rebuild to fire again)
+    /// When a call_out is next due: its fire_at, or later if deferred
+    fn due_at(&self, flight: &Flight, timer: &Timer) -> i64 {
+        flight
+            .deferred
+            .get(&timer.id)
+            .map_or(timer.fire_at, |d| d.0.max(timer.fire_at))
+    }
+
+    /// Forget a settled call_out (cache only: its row is deleted)
     pub async fn forget_timer(&self, timer_id: &str) {
         self.timers.write().await.remove(timer_id);
-        self.firing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(timer_id);
+        let mut flight = self.flight();
+        flight.firing.remove(timer_id);
+        flight.deferred.remove(timer_id);
     }
 
     /// Whether the call_out's row exists (the truth: a cached call_out
     /// whose row is gone was cancelled or consumed already)
     pub async fn is_stored(&self, timer_id: &str) -> anyhow::Result<bool> {
         let Some(ref pool) = self.pool else {
-            return Ok(true);
+            // No table (tests): the cache is all there is
+            return Ok(self.timers.read().await.contains_key(timer_id));
         };
         let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM timers WHERE id = ?")
             .bind(timer_id)
@@ -411,7 +484,15 @@ impl TimerManager {
 
     /// The earliest call_out or heartbeat deadline (Unix ms), if any
     pub async fn next_deadline(&self) -> Option<i64> {
-        let timers = self.timers.read().await.values().map(|t| t.fire_at).min();
+        let timers = {
+            let timers = self.timers.read().await;
+            let flight = self.flight();
+            timers
+                .values()
+                .filter(|t| !flight.firing.contains(&t.id))
+                .map(|t| self.due_at(&flight, t))
+                .min()
+        };
         let beats = self
             .heartbeats
             .read()
@@ -437,11 +518,15 @@ impl TimerManager {
 
         let mut due_timers: Vec<Timer> = {
             let timers = self.timers.read().await;
-            timers
-                .values()
-                .filter(|t| t.is_due() && !self.is_firing(&t.id))
-                .cloned()
-                .collect()
+            {
+                let now = chrono::Utc::now().timestamp_millis();
+                let flight = self.flight();
+                timers
+                    .values()
+                    .filter(|t| !flight.firing.contains(&t.id) && self.due_at(&flight, t) <= now)
+                    .cloned()
+                    .collect()
+            }
         };
         due_timers.sort_by_key(|t| t.fire_at);
         for timer in due_timers {
@@ -732,6 +817,50 @@ mod tests {
         assert_eq!(mgr.timer_count().await, 1, "still settling");
         mgr.forget_timer(&id).await;
         assert!(!mgr.remove_timer_owned(&id, "a", "/bomb").await, "gone");
+    }
+
+    /// Cancel and fire are one decision: whichever comes first wins, and
+    /// the other is told so
+    #[tokio::test]
+    async fn test_cancel_and_fire_exclude_each_other() {
+        let mgr = TimerManager::new(None, None);
+        let id = mgr
+            .try_add_timer(Timer::new("a", "/bomb", "explode", 60_000, None))
+            .await
+            .unwrap();
+        assert!(mgr.remove_timer_owned(&id, "a", "/bomb").await, "defused");
+        assert!(
+            !mgr.begin_firing(&id).await,
+            "a cancelled call_out never fires"
+        );
+    }
+
+    /// A call_out whose save or read failed is retried later with growing
+    /// waits, not at once (a deterministic failure must not spin) and not
+    /// forgotten (its row is still stored)
+    #[tokio::test]
+    async fn test_deferred_call_out_backs_off() {
+        let mgr = TimerManager::new(None, None);
+        let mut timer = Timer::new("a", "/clock", "tick", 0, None);
+        timer.fire_at = chrono::Utc::now().timestamp_millis() - 100;
+        let id = mgr.add_timer(timer).await.unwrap();
+        assert!(mgr.begin_firing(&id).await);
+        mgr.defer(&id).await;
+        assert_eq!(mgr.timer_count().await, 1, "kept");
+        assert!(mgr.tick().await.is_empty(), "not due again yet");
+        let next = mgr.next_deadline().await.unwrap();
+        assert!(
+            next > chrono::Utc::now().timestamp_millis(),
+            "deadline moved"
+        );
+        let first_wait = next - chrono::Utc::now().timestamp_millis();
+        assert!(mgr.begin_firing(&id).await, "may fire again");
+        mgr.defer(&id).await;
+        let second_wait =
+            mgr.next_deadline().await.unwrap() - chrono::Utc::now().timestamp_millis();
+        assert!(second_wait > first_wait, "{second_wait} > {first_wait}");
+        mgr.forget_timer(&id).await;
+        assert_eq!(mgr.next_deadline().await, None);
     }
 
     #[tokio::test]

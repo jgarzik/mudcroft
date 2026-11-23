@@ -376,9 +376,13 @@ Raft batch as its handler's writes: the row's delete is the handler run's
 batch prefix, so it commits only together with those writes (a handler that
 checkpoints commits it with its first part). A handler that writes nothing,
 or fails (its writes discarded; dropped, as in LPMud), has the row deleted
-on its own. If nothing could be saved or read (a crash, a lost leadership, a
-failed commit or read) the row remains, and the next primary, restart or
-cache rebuild fires it again.
+on its own. If nothing could be saved or read (a failed commit or read) it
+stays pending and is tried again after a wait that doubles from 1 s to 5
+minutes; after a crash or failover its row remains and the next primary
+fires it. Cancelling and firing are one decision (`remove_call_out` returns
+`false` once firing has begun). A handler's messages reach players before
+its change commits, so a call_out fired again after a failed commit or a
+crash may repeat them.
 A heartbeat whose object no longer exists is removed. One-shot timers
 are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
 remove; beats write nothing), both reloaded whenever the node becomes
