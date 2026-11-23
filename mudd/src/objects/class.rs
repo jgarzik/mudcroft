@@ -154,15 +154,16 @@ impl ClassRegistry {
         self.register(region);
 
         // weapon - inherits from item
+        // (the engine's weapon fields: api/equipment.rs, api/combat.rs)
         let mut weapon = ClassDef::new("weapon", Some("item"));
-        weapon.set_property("damage_dice", serde_json::json!("1d6"));
-        weapon.set_property("damage_bonus", serde_json::json!(0));
+        weapon.set_property("slot", serde_json::json!("weapon"));
+        weapon.set_property("damage", serde_json::json!("1d6"));
         weapon.set_property("damage_type", serde_json::json!("physical"));
         self.register(weapon);
 
         // armor - inherits from item
         let mut armor = ClassDef::new("armor", Some("item"));
-        armor.set_property("armor_value", serde_json::json!(0));
+        armor.set_property("armor_class", serde_json::json!(0));
         armor.set_property("slot", serde_json::json!("body"));
         self.register(armor);
 
@@ -362,15 +363,15 @@ impl ClassRegistry {
         );
         let class_rows: Vec<ClassRow> =
             sqlx::query_as("SELECT universe_id, name, parent, code_hash, defined_by FROM classes")
-                .fetch_all(pool)
+                .fetch_all(&mut *crate::db::run::reader(pool).await?)
                 .await?;
         let prop_rows: Vec<(String, String, String, String)> =
             sqlx::query_as("SELECT universe_id, class_name, key, value FROM class_properties")
-                .fetch_all(pool)
+                .fetch_all(&mut *crate::db::run::reader(pool).await?)
                 .await?;
         let handler_rows: Vec<(String, String, String)> =
             sqlx::query_as("SELECT universe_id, class_name, handler FROM class_handlers")
-                .fetch_all(pool)
+                .fetch_all(&mut *crate::db::run::reader(pool).await?)
                 .await?;
 
         // Replaces the universe classes: also used to rebuild the cache on
@@ -584,9 +585,10 @@ mod tests {
         assert!(props.contains_key("value"));
         assert!(props.contains_key("fixed"));
 
-        // Should have weapon properties
-        assert!(props.contains_key("damage_dice"));
-        assert!(props.contains_key("damage_bonus"));
+        // Should have weapon properties (the engine's fields)
+        assert!(props.contains_key("damage"));
+        assert!(props.contains_key("damage_type"));
+        assert_eq!(props.get("slot"), Some(&serde_json::json!("weapon")));
     }
 
     #[test]
@@ -632,7 +634,7 @@ mod tests {
         let props = registry.resolve_properties("u", "fire_sword");
         assert!(props.contains_key("elemental_damage"));
         assert!(props.contains_key("blade_type"));
-        assert!(props.contains_key("damage_dice"));
+        assert!(props.contains_key("damage"));
         assert!(props.contains_key("weight"));
         assert!(props.contains_key("name"));
     }

@@ -19,15 +19,9 @@ affected feature.
 Clusters work as described in `docs/cluster-design.md` (joining, the
 primary lifecycle, gateways, failover), with these gaps:
 
-- **Commands are not exactly-once across a failover.** A command in flight
-  when the primary dies may or may not have taken effect; the player is told
-  and nothing is retried (one batch per command and command ids would fix
-  it).
-- **A payment and its handler are separate changes.** Accepting a payment
-  moves the credits, then runs the object's handler (its own writes); a
-  crash in between leaves the player charged with nothing handed over, and
-  a handler failing part way keeps both its writes and the payment. One
-  batch per Lua run (below) would make them one change.
+- **Players on the primary itself are not retried.** A player connected
+  directly to the primary that dies reconnects; a command in flight then is
+  lost unless the client resends it with its `id` (the web client does not).
 - **Device tokens can run out.** The in-memory store holds 200,000 (10 per
   account). Registering about 20,000 accounts fills it. Live tokens are
   never evicted (expired ones are swept out when room is needed, and an
@@ -47,11 +41,8 @@ Clusters are built (see [cluster-design.md](cluster-design.md)): `--join`
 membership, a TLS cluster port with a shared secret, a single primary that
 runs the game, gateways that relay to it, and failover. Planned:
 
-- **One batch per Lua run.** Each `game.*` write is its own Raft entry
-  today. Collecting a whole execution's writes into one entry would make
-  each command atomic and, with a command id recorded in the batch, let a
-  gateway retry a command interrupted by a failover exactly once. Typed log
-  entries could replace raw SQL at the same time:
+- **Typed log entries** instead of raw SQL (each command is one entry,
+  with its id: `mudd/src/db/run.rs`, `applied_commands`):
 
   ```rust
   pub enum GameLogEntry {
@@ -108,40 +99,14 @@ runs the game, gateways that relay to it, and failover. Planned:
 The Lua game-logic suite (`mudd/tests/lua/game_logic_tests.lua`) skips tests
 for features that do not exist yet; see its `SKIP` table. Planned:
 
-- **Elemental combat**: `Combat.attack_extended` with weapon elemental dice
-  and types, applying immunities, resistances and vulnerabilities, critical
-  hits doubling dice, and a weapon `on_hit` handler.
-- **Combat rounds and state**: `in_combat`, `attacking`, `attackers` and a
-  round counter on living objects; heartbeat-driven rounds; auto-retaliation;
-  combat stops when the target dies or leaves; picking a new target.
-- **PvP policy enforcement** in `Combat.initiate`/`can_attack`: disabled,
-  arena-only (`is_arena` rooms), flagged (`pvp_on`/`pvp_off` commands),
-  open. Today the Rust `PvpPolicy` exists but nothing checks it.
-- **Flee ends combat**: `Commands.flee` moves the player but there is no
-  combat state to leave.
-- **Status effects in combat**: stun and paralysis skip turns, stat
-  modifiers apply to rolls, effects tick down per round
-  (`Combat.process_statuses`).
-- **NPC AI**: `ai_idle_tick` (aggro on sight, wandering) and
-  `ai_combat_tick` (flee below `flee_threshold`, assist allies). Class `npc`
-  only names these handlers.
-- **Death handling**: player respawn at bind point with optional death
-  penalty; NPC loot drop, XP award and scheduled respawn.
-- **Equipment**: wield/unwield, wear/remove, armor slots.
-- **Region hooks**: `on_enter`/`on_leave` on the region when a player
-  crosses region boundaries.
-- **An LPC-style `init()` cascade on moves.** `game.move_object` already
-  runs the containers' `on_leave`/`on_enter`; add `on_init` between
-  the newcomer and each object present, so objects can offer contextual
-  verbs ("get sword", "wield sword") and remove them on `on_move`.
-- **More lifecycle handlers**: `on_create`, `on_destroy`, `on_move`,
-  `on_reset` (room respawn timer), `on_disconnect`.
+- **Weapon `on_hit` handler**: weapons deal damage parts of several types
+  (`damage_parts`, `Combat.attack_extended`); a weapon's own code run on a
+  hit is not built.
 - **Persistent actions**: registered verbs are in memory and lost on restart.
 - **High-occupancy rooms**: above about 100 occupants, send an aggregated
   view (count, notable entities, sampled chat).
-- **Player commands**: `who`, `quit`, `give`/`use` as server commands (the
-  mudlib has `Commands.give` and `Commands.use`), global commands
-  registered from Lua.
+- **Global commands** registered from Lua (`who`, `quit`, `give`, `use`
+  are built in).
 
 ## Lua API
 

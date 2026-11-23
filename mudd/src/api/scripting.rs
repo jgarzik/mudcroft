@@ -59,23 +59,76 @@ pub async fn run_lua(
     config: SandboxConfig,
 ) -> Result<String, String> {
     let libs = load_universe_lib_codes(state, &ctx.universe_id).await?;
-    let queue = MessageQueue::shared();
-
-    let result = {
-        let mut sandbox = prepare(state, ctx, &queue, &libs, config)?;
-        let value: Result<Value, _> = if args.is_empty() {
-            // `execute` also accepts bare expressions (e.g. `1 + 2`)
-            sandbox.execute(code)
-        } else {
-            sandbox.execute_with_args(code, mlua::Variadic::from_iter(args))
+    // One change: a failing run keeps nothing (see db::run)
+    in_run(state, async {
+        let queue = MessageQueue::shared();
+        let result = {
+            let mut sandbox = prepare(state, ctx, &queue, &libs, config)?;
+            let value: Result<Value, _> = if args.is_empty() {
+                // `execute` also accepts bare expressions (e.g. `1 + 2`)
+                sandbox.execute(code)
+            } else {
+                sandbox.execute_with_args(code, mlua::Variadic::from_iter(args))
+            };
+            value
+                .map(|v| lua_value_to_string(&v))
+                .map_err(|e| e.to_string())
         };
-        value
-            .map(|v| lua_value_to_string(&v))
-            .map_err(|e| e.to_string())
-    };
+        // Messages (and the hooks moves trigger) only if the run succeeded
+        if result.is_ok() {
+            deliver(state, &queue, &ctx.universe_id).await;
+        }
+        result
+    })
+    .await
+}
 
-    deliver(state, &queue, &ctx.universe_id).await;
-    result
+/// Run `f` as one change (db::run): its writes are one Raft batch, kept
+/// only if it succeeds. A failed commit becomes the run's error.
+pub async fn in_run<T, F>(state: &AppState, f: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    in_run_with(state, Vec::new(), f).await
+}
+
+/// [`in_run`] with statements leading the batch (if anything is written)
+pub async fn in_run_with<T, F>(
+    state: &AppState,
+    prefix: Vec<crate::db::run::Statement>,
+    f: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    // A failed run's cache changes are undone by rebuilding from the tables
+    let rebuilder = state.clone();
+    let rebuild = move || async move {
+        if let Err(e) = super::primary::rebuild_caches(&rebuilder).await {
+            tracing::error!("rebuilding caches after a failed run: {}", e);
+        }
+    };
+    let committer: std::sync::Arc<dyn crate::db::run::Committer> = state.raft_writer.clone();
+    // One engine hook budget for the whole run (its moves, creates, ...)
+    // (boxed: the run's future is large, and runs nest)
+    let outcome = super::combat::with_ai_budget(Box::pin(crate::db::run::scope(
+        state.db.pool(),
+        committer,
+        prefix,
+        f,
+        rebuild,
+    )))
+    .await;
+    // A committed run may have added a fight or a deadline (some come from
+    // triggers, e.g. wander_seconds): the combat scheduler looks again
+    // (one indexed query)
+    if matches!(outcome, Ok(Ok(_))) {
+        state.combat_changed.notify_one();
+    }
+    match outcome {
+        Ok(result) => result,
+        Err(e) => Err(format!("not saved: {}", e)),
+    }
 }
 
 /// Call handler `method` on an object's attached code (`code_hash`).
@@ -159,10 +212,15 @@ struct HookBudget {
 }
 
 impl HookBudget {
+    /// A fresh allowance, or, inside an action (a run, an engine hook),
+    /// that action's shared one: an engine hook's moves do not get a new
+    /// allowance each time
     fn new() -> Self {
         Self {
             depth: 0,
-            remaining: Arc::new(std::sync::atomic::AtomicU32::new(MAX_MOVE_HOOKS_PER_RUN)),
+            remaining: super::combat::hook_counter().unwrap_or_else(|| {
+                Arc::new(std::sync::atomic::AtomicU32::new(MAX_MOVE_HOOKS_PER_RUN))
+            }),
         }
     }
 
@@ -217,15 +275,20 @@ fn invoke_handler_at<'a>(
             payer,
         };
         let libs = load_universe_lib_codes(state, universe_id).await?;
-        let queue = MessageQueue::shared();
-
-        let result = {
-            let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
-            call_handler(&mut sandbox, &code, method, &args)
-        };
-
-        deliver_at(state, &queue, &ctx.universe_id, budget).await;
-        result
+        // One change (joins the caller's if inside one): a failing handler
+        // keeps nothing
+        in_run(state, async {
+            let queue = MessageQueue::shared();
+            let result = {
+                let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
+                call_handler(&mut sandbox, &code, method, &args)
+            };
+            if result.is_ok() {
+                deliver_at(state, &queue, &ctx.universe_id, budget).await;
+            }
+            result
+        })
+        .await
     })
 }
 
@@ -305,7 +368,7 @@ pub async fn run_timer_loop(state: AppState) {
 
 /// An object's attached code and its owner, if it has code (objects are
 /// looked up within the universe, so foreign objects never run here)
-async fn object_code(
+pub(crate) async fn object_code(
     state: &AppState,
     object_id: &str,
     universe_id: &str,
@@ -372,6 +435,9 @@ fn prepare(
     game_api.set_room_context(ctx.room_id.clone());
     game_api.set_object_context(ctx.object_id.clone());
     game_api.set_payer(ctx.payer.clone());
+    game_api.set_engine(Arc::new(super::combat::CombatEngine {
+        state: state.clone(),
+    }));
 
     let mut sandbox =
         Sandbox::new(config).map_err(|e| format!("Failed to create sandbox: {}", e))?;
@@ -517,6 +583,36 @@ async fn handle_moved(
         }
     }
 
+    // Aggressive NPCs notice an arrival (and an aggressive NPC moved in
+    // notices players), whatever moved it
+    if let Some(ref room) = to {
+        super::combat::arrival(state, universe_id, object_id, room).await;
+    }
+
+    run_move_hooks(state, universe_id, object_id, &from, &to, &moved_by, budget).await;
+    // Then regions crossed, on_init, on_move (within the action's budget)
+    super::combat::move_extras(
+        state,
+        universe_id,
+        object_id,
+        from.as_deref(),
+        to.as_deref(),
+        None,
+        moved_by.as_deref(),
+    )
+    .await;
+}
+
+/// The containers' on_leave / on_enter for a Lua move
+async fn run_move_hooks(
+    state: &AppState,
+    universe_id: &str,
+    object_id: &str,
+    from: &Option<String>,
+    to: &Option<String>,
+    moved_by: &Option<String>,
+    budget: &HookBudget,
+) {
     if budget.depth >= MAX_MOVE_HOOK_DEPTH {
         tracing::warn!(
             "move hooks for {} not run: nested {} deep",

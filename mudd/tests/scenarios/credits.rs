@@ -412,9 +412,9 @@ async fn test_ambiguous_verb_target_cannot_ask_for_payment() {
     assert_eq!(balance(&server, "object", "/items/c").await, 0);
 }
 
-/// Once the handler has run, the payment stands even if it failed part way
-/// (it may already have handed something over); a handler that does not
-/// exist ran nothing, so the payment is refunded
+/// A payment and its handler are one change: if the handler fails, nothing
+/// is kept (no charge, none of the handler's writes) but the request is
+/// used up; a handler that does not exist charges nothing either
 #[tokio::test]
 async fn test_payment_after_handler_failure() {
     let server = TestServer::start().await.expect("server");
@@ -440,7 +440,10 @@ async fn test_payment_after_handler_failure() {
                local h = game.store_code([[return {{
                  flaky = function(a) game.request_payment(4, "a flaky thing", "broken") return nil end,
                  ghost = function(a) game.request_payment(4, "nothing", "nosuch") return nil end,
-                 broken = function(a) error("half way") end,
+                 broken = function(a)
+                   game.update_object("/items/stall", {{sold = true}})
+                   error("half way")
+                 end,
                }}]])
                game.create_object("/items/stall", "item", "{room}", {{name = "stall", fixed = true, code_hash = h}})
                game.add_action("flaky", "/items/stall", "flaky")
@@ -456,15 +459,25 @@ async fn test_payment_after_handler_failure() {
     pl.drain().await;
     pl.command("flaky stall").await.unwrap();
     let (id, _) = prompt(&mut pl).await;
-    assert!(answer(&mut pl, &id, true).await.contains("went wrong"));
-    assert_eq!(
-        balance(&server, "account", &pl_id).await,
-        16,
-        "the payment stands"
-    );
+    let reply = answer(&mut pl, &id, true).await;
+    assert!(reply.contains("not charged"), "{}", reply);
+    assert_eq!(balance(&server, "account", &pl_id).await, 20, "no charge");
+    let sold: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.sold') FROM objects WHERE id = '/items/stall'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(sold, None, "the handler's write was not kept");
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_requests")
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+    assert_eq!(pending, 0, "the request is used up");
 
     pl.command("ghost stall").await.unwrap();
     let (id, _) = prompt(&mut pl).await;
-    assert!(answer(&mut pl, &id, true).await.contains("returned"));
-    assert_eq!(balance(&server, "account", &pl_id).await, 16, "refunded");
+    let reply = answer(&mut pl, &id, true).await;
+    assert!(reply.contains("not charged"), "{}", reply);
+    assert_eq!(balance(&server, "account", &pl_id).await, 20, "no charge");
 }

@@ -15,7 +15,7 @@ use openraft::ReadPolicy;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use super::{effect_scheduler, scripting, AppState};
+use super::{combat, effect_scheduler, scripting, AppState};
 
 /// Run the lifecycle forever. `active` is true while this node is the
 /// active primary (caches rebuilt, schedulers running); game traffic is
@@ -46,6 +46,7 @@ pub async fn run(state: AppState, active: watch::Sender<bool>) {
         let timer_loop = tokio::spawn(scripting::run_timer_loop(state.clone()));
         let recovery = tokio::spawn(handle_orphaned_sessions(state.clone()));
         let effect_loop = tokio::spawn(effect_scheduler::run_effect_scheduler(state.clone()));
+        let combat_loop = tokio::spawn(combat::run_combat_scheduler(state.clone()));
         // The term this activation belongs to: a later term means another
         // node may have led meanwhile (watch notifications can merge a lost
         // and regained leadership), so the caches must be rebuilt
@@ -73,6 +74,7 @@ pub async fn run(state: AppState, active: watch::Sender<bool>) {
         active.send_replace(false);
         timer_loop.abort();
         effect_loop.abort();
+        combat_loop.abort();
         recovery.abort();
         // The next primary has the verbs (they are in the table)
         state.actions.clear_all().await;
@@ -119,6 +121,13 @@ async fn handle_orphaned_sessions(state: AppState) {
             "primary: {} lost its server; handling the disconnect",
             player
         );
+        let room = state
+            .object_store
+            .get(&universe, &player)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|p| p.parent_id);
         if let Err(e) = state
             .player_manager
             .finish_disconnect(&universe, &player, &since)
@@ -126,6 +135,7 @@ async fn handle_orphaned_sessions(state: AppState) {
         {
             warn!("primary: disconnect of {} failed: {}", player, e);
         }
+        super::websocket::disconnect_hook(&state, &universe, &player, room).await;
     }
 }
 
@@ -137,7 +147,7 @@ fn leading(m: &openraft::RaftMetrics<crate::raft::TypeConfig>, me: crate::raft::
 }
 
 /// Rebuild every cache game logic reads from its table
-async fn rebuild_caches(state: &AppState) -> anyhow::Result<()> {
+pub(crate) async fn rebuild_caches(state: &AppState) -> anyhow::Result<()> {
     state.timers.load_from_db().await?;
     state.permissions.reset().await?;
     state.classes.write().await.load_from_db().await?;

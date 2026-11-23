@@ -90,8 +90,14 @@ The context decides how some functions behave:
 - `eval` shows the chunk's return value as text. Strings, numbers and booleans print as-is, `nil` prints `nil`, and a table prints `[table]`. Return a string to see table contents.
 - `eval` accepts a bare expression too: `eval 1 + 2` prints `3`.
 - The web client sends one line at a time. Separate statements with spaces or `;`.
-- Messages from `game.send`, `game.broadcast` and `game.broadcast_region` are queued and delivered **after the script finishes**, in the order they were queued. A script that raises an error still delivers the messages it queued before the error.
+- Messages from `game.send`, `game.broadcast` and `game.broadcast_region` are queued and delivered **after the script finishes**, in the order they were queued. A script that raises an error delivers none of them (see [One run, one change](#one-run-one-change)).
 - A custom verb's return value is the player's reply. See [Custom verbs](#custom-verbs).
+
+### One run, one change
+
+Each run (an `eval`, a script, a handler or hook, with everything it calls through `game.use_object`) is **one change**, and so is each command a player types, with every hook and verb handler it triggers: its writes are saved together, as one Raft entry, when it finishes without error. If it raises an error (or runs out of time or budget), **nothing it did is kept**: no object, property, verb, timer, effect or credit change, and no message is sent. A handler or hook that fails inside a command undoes only its own changes; the rest of the command stands. A command whose reply is an error keeps nothing. Within a run, reads see the run's own earlier writes. An error caught with `pcall` does not end the run; the writes made before it stand unless the run as a whole fails.
+
+The one exception is a Venice call (`game.llm_chat`, `game.llm_image`), which is slow and outside the database: it is a **commit point**. The run's writes before it are saved as one change, its price (`venice_chat_cost`, `venice_image_cost`) is charged (and refunded if the call fails), and the rest of the run is a new change: an error after the call undoes only what came after it. To keep a run all-or-nothing, make Venice calls before changing anything.
 
 ### Sandbox limits
 
@@ -174,6 +180,13 @@ for object code, or the `game.set_actor` override if one is set.
 | [`apply_effect(target_id, type, duration, magnitude, damage_type, period)`](#gameapply_effecttarget_id-type-duration-magnitude-damage_type-period) | `true` | Modify on the target |
 | [`remove_effect(target_id, type)`](#gameremove_effecttarget_id-type) | boolean | Modify on the target |
 | [`get_effects(target_id)`](#gameget_effectstarget_id) | list of effects | — |
+| [`can_attack(attacker_id, target_id)`](#gamecan_attackattacker_id-target_id) | `true` or `false, reason` | — |
+| [`attack(attacker_id, target_id)`](#gameattackattacker_id-target_id) | blow table or `nil, reason` | control the attacker (players: themselves, never object code) |
+| [`combat_state(id)`](#gamecombat_stateid) | state table | — |
+| [`damage(target_id, amount, type, source_id)`](#gamedamagetarget_id-amount-type-source_id) | `{damage, hp, killed}` or `nil, reason` | Modify on the target |
+| [`heal(target_id, amount)`](#gamehealtarget_id-amount) | new HP or `nil, reason` | Modify on the target |
+| [`stop_combat(id)`](#gamestop_combatid) | fighters stopped or `nil, reason` | Modify on it |
+| [`flee(id)`](#gamefleeid) | direction or `nil, reason` | Move on it (players: themselves, never object code) |
 | [`set_actor(account_id)`](#gameset_actoraccount_id) | boolean | wizard+, target below caller |
 | [`get_actor()`](#gameget_actor) | account ID or `nil` | — |
 | [`check_permission(action, target_id, is_fixed, owner_id)`](#gamecheck_permissionaction-target_id-is_fixed-owner_id) | `{allowed, error}` | — |
@@ -263,7 +276,7 @@ See [Attaching code](#attaching-code).
 local sword = game.create_object("/d/keep/armory/sword", "weapon", "/d/keep/armory", {
     name = "Iron Sword",
     description = "A sturdy iron blade.",
-    damage_dice = "1d8",
+    damage = "1d8",
 })
 if sword.error then return sword.error end
 return sword.id   -- "/d/keep/armory/sword"
@@ -324,6 +337,8 @@ error if the acting user lacks Delete permission.
 #### `game.move_object(id, new_parent_id)`
 
 Sets the object's container. Pass `nil` to take it out of any container.
+An object can never be put inside itself, directly or through what it
+contains: such a move raises an error.
 
 ```lua
 game.move_object("/d/keep/armory/sword", args.actor_id)   -- into a player's inventory
@@ -351,7 +366,10 @@ lacks Move permission.
 #### `game.clone_object(id, new_path, new_parent_id)`
 
 Copies an object to a new path. The copy keeps the original's properties
-and `code_hash`, and the acting user becomes its owner.
+and `code_hash`, and the acting user becomes its owner; since the copy's
+code would run as them, it keeps `code_hash` only if they own the original
+or may act as its owner (code with no owner: admins only). A copy with code
+runs its `on_create`.
 
 **Returns** the copy, `nil` if the source doesn't exist, or
 `{error = "..."}` if the source belongs to another universe, `new_path` is
@@ -422,6 +440,13 @@ game.update_object("/d/keep/hall", {code_hash = nil}) -- detach
 | `on_damage` | the `attack` command hits | the target NPC | `actor_id`, `room_id`, `attacker_id`, `damage` |
 | `on_death` | the `attack` command kills | the target NPC | `actor_id`, `room_id`, `killer_id` |
 | `heart_beat` | the heartbeat set by `game.set_heart_beat` is due | the object | `room_id`, `args` (always `nil`) |
+| `on_create` | the object is created (`game.create_object`) or cloned (`game.clone_object`) with code attached | the new object | `room_id` |
+| `on_destroy` | the object is about to be deleted (`game.delete_object`, a death that deletes it, a decaying corpse) | the object, still there | `room_id` |
+| `on_enter` / `on_leave` (region) | a move crosses into (out of) the region: a room's region, for hooks, is its parent object of class `region` (not its `region_id`, which anyone may set on their room), and only if the room's owner is the region's owner or above it | the region | `moved_id`, `from`, `to`, `actor_id`, `moved_by` |
+| `on_init` | something arrives where the object is (any move, as for `on_enter`) | each object with code already there, with `arrived_id`; and the newcomer, if it has code, once per object there, with `other_id` | `room_id`, `actor_id` |
+| `on_move` | the object is moved (any move: walking, goto, spawning, Lua moves, fleeing, wandering, respawning) | the moved object (first, before the region hooks and `on_init`) | `from`, `to`, `moved_id`, `actor_id`, `moved_by` |
+| `on_reset` | every `reset_seconds` (a property, a number of seconds, at least 1: set it to start, remove it to stop; only while the object has code) | the object, usually a room (to restock) | `room_id` |
+| `on_disconnect` | a player's disconnect grace period ends | the room they were in | `room_id`, `player_id` |
 | any name | a `call_out` is due | the object | `room_id`, `args` (the string given to `call_out`, or `nil`) |
 | any name | a custom verb is typed | the verb's object | `actor_id`, `room_id`, `verb`, `args` (the rest of the line) |
 | any name | `game.use_object` is called | the used object | `actor_id`, `verb`, `target_id`, `code_hash` |
@@ -439,7 +464,8 @@ Hook details:
 - **Return values:** hook return values are ignored. Errors are logged on the server.
 - **Moves from Lua:** `game.move_object` runs `on_leave`/`on_enter` after the script ends, with `moved_id` and `moved_by` but no `actor_id`, so a hook that rewards or punishes `actor_id` fires only for a player's own move.
   - This includes the core `take`, `drop` and `give` commands, which move items with `game.move_object`: dropping a sword runs the room's `on_enter` with `moved_id` = the sword. **Room hooks must allow `actor_id` to be `nil`** (`if not a.actor_id then return end` for player-only effects); `game.send(nil, ...)` raises an error.
-- **Unwired hooks:** region objects get no hooks. The class handler names `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` are **never fired by the server**. You can still call all of them except `on_create` and `on_destroy` with `game.use_object`.
+- **Engine-invoked hooks** (region hooks, `on_init`, `on_move`, `on_create`, `on_destroy`, `on_reset`, `on_disconnect`, `ai_idle_tick`, `ai_combat_tick`) run as the object's owner within a budget per action (a command or script run, or one NPC's turn), shared with move hooks: at most 4 deep (a hook's doing setting off another) and 32 calls, counting only code that defines the handler; beyond it they are skipped (and logged). After a move they run after the room's `on_enter`.
+- **Unwired hooks:** the class handler name `on_use` is fired only by `game.use_object` (verb `"use"`).
 
 ### `parent(class_name, handler_name, args)`
 
@@ -602,7 +628,7 @@ this context. It needs the same permission as `add_action`. **Returns**
 
 ### How a typed verb is dispatched
 
-1. Built-in commands always win. These verbs can't be overridden: `look`, `l`, the directions and their abbreviations, `say`, `help`, `get`, `take`, `drop`, `inventory`, `inv`, `i`, `attack`, `kill`, `goto`, `setportal`, `eval` and `create`.
+1. Built-in commands always win. These verbs can't be overridden: `look`, `l`, the directions and their abbreviations, `say`, `help`, `get`, `take`, `drop`, `inventory`, `inv`, `i`, `attack`, `kill`, `goto`, `setportal`, `eval` and `create`. For the "soft" built-ins `wield`, `wear`, `unwield`, `remove`, `equipment`, `eq`, `who`, `give`, `use` and `get`/`take ... from ...`, a matching custom verb (below) comes first and the built-in runs only if none matches; such a handler never gets the player as payer (they may have meant the built-in). Safety commands (`pvp`, `flee`) can't be shadowed.
 2. The first word, lowercased, is the verb. The rest of the line is `args`.
 3. Candidates are collected in this order:
    - room actions registered for the player's room, but only for objects that are nearby;
@@ -728,12 +754,10 @@ effect given a damage type) deals its magnitude in damage per pulse, after
 the target's resistances, and `regenerating` heals it (up to `max_hp`).
 Pulses change the target's `hp` property. A player is told each pulse
 (`You take 3 poison damage (poisoned).`) and when an effect ends
-(`You are no longer poisoned.`). Damage that brings HP to 0 kills: an NPC
-leaves the room (onlookers hear `<name> dies.`) and its `on_death` runs, with
-`killer_id` set to whoever applied the effect (an attacker's critical hit
-causes bleeding); a player drops what they carried where they died and
-respawns at once (full HP, at the respawn room, or where they fell if the
-universe has none yet), all in one atomic change. Within one pass, all damage is
+(`You are no longer poisoned.`). Damage that brings HP to 0 kills, as any
+death does (see [Built-in combat](#built-in-combat): the universe's death
+policies, respawns, XP), with `killer_id` set to whoever applied the effect
+(an attacker's critical hit causes bleeding), all in one atomic change. Within one pass, all damage is
 applied before any healing, and healing cannot revive the dead. If the
 server falls behind (or was down), the missed pulses are applied together.
 
@@ -765,6 +789,71 @@ Modify permission on the target.
 **Returns** a list of `{type, remaining, magnitude, damage_type, period}`
 tables: `remaining` is whole seconds left, rounded up; `damage_type` and
 `period` are `nil` for effects that do not pulse.
+
+### Combat engine
+
+The rules of [Built-in combat](#built-in-combat), callable from Lua (the
+`Combat` library wraps these). Each runs in the current run, so a script's
+fights, damage and deaths are part of its one change.
+
+#### `game.can_attack(attacker_id, target_id)`
+
+**Returns** `true` if `attacker_id` may fight `target_id` now (combat
+setting; the attacker a player or a creature, the target a creature or a
+player the PvP rules allow; both alive and in the same room), else `false`
+and the reason. A creature is anything living that is not a player (an
+`npc`, or a class derived from `npc` or `living`), or a `monster`; `aggro`
+only makes creatures attack.
+
+#### `game.attack(attacker_id, target_id)`
+
+One blow now, and the fight starts (both sides) if it is not on; during a
+fight it switches target instead (no extra blow), returning a blow with
+only `text` set. The acting user must be able to modify the attacker; a
+player attacker only as themselves and never from object code (so no
+script can make a player fight).
+
+**Returns** `{hit, critical, fumble, damage, killed, text, parts}`
+(`damage` is the total; `parts` lists each damage part as `{type, rolled,
+applied}`: rolled with a critical's doubling, applied after resistances), or
+`nil` and the reason (not allowed, stunned, already fighting that target,
+or not ready: less than a round since the attacker's last blow).
+
+#### `game.combat_state(id)`
+
+**Returns** `{in_combat, attacking, attackers, next_round_at}`: whom `id`
+attacks, who attacks it (a list), and when its next round is due (ms since
+epoch).
+
+#### `game.damage(target_id, amount, type, source_id)`
+
+Deals `amount` (0 to 1,000,000) damage of `type` (default `physical`) after
+the target's resistances. Reaching 0 HP is a death (the universe's policy),
+with `source_id` (optional) as the killer, who is credited (XP): the caller
+must control the source as for an attacker. Needs Modify permission on the
+target, which must not be a dead NPC waiting to respawn (the same for
+`game.heal`).
+
+**Returns** `{damage, hp, killed}` (`damage` as applied), or `nil` and the
+reason.
+
+#### `game.heal(target_id, amount)`
+
+Heals up to `max_hp`. Needs Modify permission on the target. **Returns**
+the new HP, or `nil` and the reason.
+
+#### `game.stop_combat(id)`
+
+Ends every fight `id` is in, as fighter or target (a peace spell, a
+referee). Needs Modify permission on it. **Returns** how many fighters
+stopped, or `nil` and the reason.
+
+#### `game.flee(id)`
+
+Leaves through a random exit, ending `id`'s fight (see Fleeing under
+[Built-in combat](#built-in-combat)). Needs Move permission; a player only
+as themselves, never from object code. **Returns** the direction, or `nil`
+and the reason.
 
 ---
 
@@ -895,11 +984,11 @@ They are shown `Pay <amount> credits for <reason>?` (a dialog in the web
 client; text clients type `yes` or `no`) and have a minute to answer. If they
 accept and can afford it, the credits move to this object and its `handler`
 runs (as the object's owner) with `{payment_id, amount, reason, data,
-actor_id, actor_account}`; its return value is the player's reply. If the handler does
-not exist the payment is refunded; once it has run, the payment stands even
-if it fails part way (it may already have handed something over), so write
-handlers that check first and change things last, and refund with
-`game.transfer_credits("object", args.actor_account, ...)` if needed. Declining, or not answering,
+actor_id, actor_account}`; its return value is the player's reply. The payment and
+the handler are one change: if the handler raises an error (or does not
+exist), neither is kept, the player is not charged, and the request is used
+up. To give money back after a successful handler, use
+`game.transfer_credits("object", args.actor_account, ...)`. Declining, or not answering,
 changes nothing. `data` is an optional string (up to 4096 bytes); `reason`
 is cut to 200 characters; `handler` cannot be private or an engine hook.
 
@@ -1028,12 +1117,12 @@ if refused. Doesn't affect `math.random`.
 
 Calls a handler on another object's code.
 
-- `verb` picks the handler: `"use"` runs `on_use`, `"hit"` runs `on_hit`, `"look"` runs `on_look`, `"init"` runs `on_init`. Any other verb is used as the handler name.
+- `verb` picks the handler: `"use"` runs `on_use`, `"hit"` runs `on_hit`, `"look"` runs `on_look`. Any other verb is used as the handler name.
 - The handler gets `{object_id, actor_id, verb, code_hash, target_id}`.
 - It runs in a **fresh sandbox, as that object's owner**, with object-code limits. Its object context is that object, and its room context is the object's `parent_id`.
 - The caller's identity is never passed on.
 - `actor_id` is whatever the caller passed. Handlers must treat it as untrusted: it need not be the player who acted.
-- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create` and `on_destroy`. Such calls return `nil`.
+- Private handlers can't be called: names starting with `_`, and the engine hooks `on_enter`, `on_leave`, `on_damage`, `on_death`, `heart_beat`, `on_create`, `on_destroy`, `on_init`, `on_move`, `on_reset`, `on_disconnect`, `ai_idle_tick` and `ai_combat_tick`. Such calls return `nil`.
 - Nesting is limited to 8 levels, and one top-level execution may make at most 32 `use_object` calls in total, across all levels. Call 33 raises an error.
 
 **Returns** the handler's result as plain data: tables, strings, numbers
@@ -1057,8 +1146,10 @@ Merges the top-level keys of `config` into the universe config. Requires
 **admin+**. **Returns** `true`, or `false` if refused.
 
 The server reads these config keys: `lib_hashes`, which maps library
-names to code hashes (see [Core library](#core-library)), and the Venice
-prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)). Other keys are
+names to code hashes (see [Core library](#core-library)), the Venice
+prices `venice_chat_cost` and `venice_image_cost` (see [Venice AI](#venice-ai)), and the
+combat settings `combat`, `combat_round_ms`, `pvp_policy`, `flee_fail_percent`, `player_death`, `npc_death` and `corpse_decay_s` (see
+[Built-in combat](#built-in-combat)). Other keys are
 yours to read with `get_universe()`. Use the `setportal` command to set
 the spawn room; config keys don't affect it.
 
@@ -1093,26 +1184,32 @@ the onlookers' broadcast excludes the player.
 that are `fixed` or living (`game.is_a(id, "living")`: NPCs, players and
 their subclasses).
 
-The library also defines `Commands.give`, `Commands.look`, `Commands.flee`,
-`Commands.say` and `Commands.use`, but no player command calls them.
+`Commands.flee` wraps [`game.flee`](#gamefleeid) (the built-in `flee`
+command uses the same engine call); like it, it moves a player only when
+that player is the one acting (an `eval` of theirs), never from object code.
+The `give` and `use` commands call `Commands.give` and `Commands.use`
+(which returns `{success, message}`; an `on_use` returning a string makes
+the message). The library also defines `Commands.look` and `Commands.say`,
+which no player command calls.
 
 ### `Combat`
 
-A Lua combat helper that stores HP in object properties. It is separate
-from the built-in `attack` command (see [Built-in combat](#built-in-combat)).
+Thin wrappers over the server's combat engine (the [combat
+functions](#combat-engine) and status effects), which is the single source
+of combat rules: the same rules as the built-in `attack` command (see
+[Built-in combat](#built-in-combat)).
 
-- `Combat.attack(attacker_id, defender_id, weapon_id)`
-- `Combat.deal_damage(target_id, amount, damage_type)`: applies `metadata.resistances[damage_type]` as a percentage.
-- `Combat.heal(target_id, amount)`
-- `Combat.apply_effect(target_id, effect, duration_secs, strength)` and `Combat.remove_effect(target_id, effect)`
-- `Combat.process_effects(id)`: call it from a heartbeat; poison and burn deal damage, regen heals.
-- `Combat.is_dead(id)` and `Combat.get_stats(id)`
-- Constants:
-  - `Combat.DAMAGE_TYPES`: `physical`, `fire`, `ice`, `lightning`, `poison`, `holy`, `dark`
-  - `Combat.EFFECTS`: `stun`, `poison`, `burn`, `freeze`, `bleed`, `regen`
+- `Combat.can_attack(attacker_id, target_id)`: `true`, or `false` and the reason.
+- `Combat.initiate(attacker_id, target_id)` (and its alias `Combat.attack`): starts a fight, one blow now, rounds after. Returns `{success, message, blow}`; during a fight it switches target (no extra blow).
+- `Combat.attack_extended(attacker_id, target_id)`: the same, broken down by damage part: `{success, message, hit, critical, damage, parts, physical_damage, elemental_damage_rolled, elemental_damage_applied}` (the first part is the "physical" one, the others are summed as "elemental").
+- `Combat.deal_damage(target_id, amount, damage_type, source_id)`: resistances apply; returns `{success, damage, remaining_hp, killed, message}`.
+- `Combat.heal(target_id, amount)`: returns `{success, new_hp, message}`.
+- `Combat.apply_effect(target_id, effect, duration, magnitude, damage_type, period)`, `Combat.remove_effect(target_id, effect)`, `Combat.effects(target_id)`: the status effect functions.
+- `Combat.state(id)`: `game.combat_state`. `Combat.stop(id)`: `game.stop_combat`. `Combat.flee(id)`: `{success, message, direction}`.
+- `Combat.is_dead(id)`: gone, at 0 HP, or out of the world (an NPC waiting to respawn). `Combat.get_stats(id)`: `{hp, max_hp, armor_class, attack_bonus, resistances, effects, state}` with the engine's defaults.
+- Constants: `Combat.PVP_POLICIES`, `Combat.DAMAGE_TYPES` (the engine's damage types), `Combat.EFFECTS` (the status effect types).
 
-These functions write object properties as the acting user, so they need
-Modify permission on the target.
+Each needs the same permission as the `game.*` function it wraps.
 
 ### `Utils`
 
@@ -1137,8 +1234,8 @@ Objects start with the defaults of their class and its ancestors. The
 | `living` | thing | `hp = 100`, `max_hp = 100`, `attack_bonus = 0`, `armor_class = 10`, `in_combat = false` |
 | `room` | thing | `exits = {}`, `lighting = "normal"`, `region_id = nil` |
 | `region` | thing | `environment_type = "dungeon"`, `danger_level = 1`, `ambient_sounds = {}` |
-| `weapon` | item | `damage_dice = "1d6"`, `damage_bonus = 0`, `damage_type = "physical"` |
-| `armor` | item | `armor_value = 0`, `slot = "body"` |
+| `weapon` | item | `slot = "weapon"`, `damage = "1d6"`, `damage_type = "physical"` (see equipment under [Built-in combat](#built-in-combat)) |
+| `armor` | item | `armor_class = 0`, `slot = "body"` |
 | `container` | item | `capacity = 10`, `locked = false` |
 | `player` | living | `access_level = "player"` |
 | `npc` | living | `aggro = false`, `respawn_time = nil` |
@@ -1154,9 +1251,13 @@ Which properties the server reads:
 | `region_id` (room), `environment_type` (region) | style hint for those generated pictures |
 | `is_portal` (room) | marks a safe room, where returning players respawn |
 | `last_safe_location`, `workroom_id` (player) | where a returning player respawns |
-| `hp`, `max_hp` (npc) | seed the `attack` command's combat state |
+| `hp`, `max_hp`, `armor_class`, `attack_bonus` (npc, player) | built-in combat |
+| `xp_value`, `respawn_seconds`, `home_room` (npc); `xp` (player) | death and respawn (see [Built-in combat](#built-in-combat)) |
+| `aggro`, `flee_threshold`, `faction`, `wander_seconds` (npc) | NPC behaviour (see [Built-in combat](#built-in-combat)) |
+| `reset_seconds` (any, usually a room) | runs its `on_reset` that often (see [When handlers run](#when-handlers-run)) |
+| `slot`, `damage`, `damage_type`, `damage_parts`, `attack_bonus`, `armor_class`, `equipped_by` (item) | equipment (see [Built-in combat](#built-in-combat)) |
 
-All other properties, including `weight`, `value`, `lighting`, `aggro`, `respawn_time`, the weapon and armor fields,
+All other properties, including `weight`, `value`, `lighting`,
 `capacity` and `locked`, are data for your own scripts.
 
 ---
@@ -1165,13 +1266,26 @@ All other properties, including `weight`, `value`, `lighting`, `aggro`, `respawn
 
 The built-in `attack <name>` (or `kill`) command works like this:
 
-- It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`.
+- A universe chooses whether there is fighting at all with its `combat` config: `on` (default), `npc_only` (creatures only, no player against player whatever `pvp_policy` says) or `off` (a social universe: no attacks, no aggro, no rounds; status effects still work).
+- It targets an object in the room whose class is `npc`, a class derived from `npc` (for example with `game.define_class`), or `monster`, or another player as the universe config's `pvp_policy` allows: `arena` (the default: only in a room with `is_arena = true`), `flagged` (both players typed `pvp on`), `open`, or `disabled`. A fight between players ends as soon as the policy no longer allows it.
 - HP lives in the objects' properties: `hp`, `max_hp`, `armor_class` (default 10), `attack_bonus` (default 0) and `resistances` (e.g. `{fire = "resistant"}`, also `immune` and `vulnerable`). An attack reads them and writes the target's new `hp` back, as one atomic change.
 - Each attack is a d20 roll plus `attack_bonus` against the target's `armor_class`. A hit deals 1d6 physical damage, doubled on a natural 20 (a critical hit), then the target's resistances. A natural 1 always misses.
 - Status effects count: a stunned or paralyzed attacker cannot attack; a blinded attacker or an invisible target is -4 to hit, a stunned or paralyzed target +4; `strengthened`/`weakened` on the attacker and `exposed`/`protected` on the target add or subtract their magnitude from the damage roll.
 - A critical hit that does not kill makes the target **bleed**: 2 physical damage per second for 3 seconds.
-- NPCs don't fight back. Write that in Lua (see the [tutorial](langtutor.md)).
-- A hit fires `on_damage`. A kill fires `on_death` and removes the NPC from the room (`parent_id = nil`) without deleting it.
+- **Rounds.** The first blow lands at once; then each fighter strikes again every `combat_round_ms` (universe config, default 3000, 1000 to 10000) until the fight ends, without further commands. The target fights back. A fight ends when either side dies or they are no longer in the same room (walk away to flee); a fighter whose target is gone turns on someone still fighting it. Attacking someone else switches target; retyping `attack` during a fight adds no blow (rounds set the pace), and a fight's first blow waits a full round after the fighter's last one (`last_blow_at`), so fleeing and coming back, or stopping and restarting a fight, adds none either. A stunned or paralyzed fighter loses its turn.
+- A hit fires `on_damage`. A kill fires `on_death` (after `on_damage`).
+- **Fleeing:** the `flee` command (or [`game.flee`](#gamefleeid)) leaves through a random exit and ends your fight; your attackers stop once you are gone. It fails with the universe's `flee_fail_percent` chance (default 0), and never works while stunned.
+- **NPC scripts:** an NPC's code may define `ai_combat_tick` (run as its owner on each of its rounds, with `{object_id, room_id, target_id, hp}`) and `ai_idle_tick` (run when a player arrives in its room, `{reason = "arrival", arrived_id}`, or when it would wander, `{reason = "wander"}`). If the handler returns anything but `nil`, it replaces the built-in behaviour for that moment (the blow or flee, the aggro, the wander move); `nil`, no handler or an error falls back to the built-in behaviour. AI handlers whose moves set off more AI handlers are bounded: at most 4 deep and 32 calls per action (beyond that the built-in behaviour applies).
+- **Equipment**: `wield <item>` / `unwield`, `wear <item>` / `remove <item>`, `equipment` (or `eq`). An item names its slot in `slot`: `weapon` (an item with `damage` and no slot is one), `head`, `body`, `hands`, `feet`, `shield`, `neck` or `ring`; one item per slot (if marks say otherwise, only the first item of a slot, by id, counts; a clone of worn gear is not worn). A wielded weapon replaces the bare 1d6 with its `damage` dice (e.g. `"1d8"`, `"2d4+1"`; at most 100 dice of 1 to 1000 sides, modifier within ±1000, else the bare 1d6) of its `damage_type` (resistances apply) and adds its `attack_bonus`. A weapon with `damage_parts`, a list of up to 8 `{dice = "...", type = "..."}` (e.g. `{{dice = "1d8", type = "slashing"}, {dice = "1d6", type = "fire"}}`), deals all of them on a hit instead (a part whose `type` is not a damage type is ignored; no `type` means physical): each part is doubled on a critical and meets the target's resistance to its own type, and the attacker is told each part's share (`You hit dragon for 9 damage (6 slashing; 3 fire, resisted).`); each worn item adds its `armor_class` to the wearer's. Equipped items carry `equipped_by` (the wearer); anything that moves an item away (dropping, giving, death, a script) unequips it, and death policies treat gear like other belongings.
+- **NPC behaviour** (NPC properties):
+  - `aggro = true`: attacks a player who arrives in its room (walking, `goto`, spawning or moved by Lua), and a player in a room it arrives in, at once (PvP rules don't apply to NPCs).
+  - `flee_threshold` (a fraction of `max_hp`, e.g. `0.25`): below it, the NPC runs through a random exit on its turn instead of attacking, ending its fight.
+  - `faction` (a name): NPCs of the same faction in the room join a fight against one of their own (when it is attacked).
+  - `wander_seconds`: about that often (randomized ±50%) the NPC takes a random exit to a room of the same region (the room's `region_id`, else its parent), never while fighting. Setting it starts the wandering; removing it stops it.
+- **Deaths** follow the universe config:
+  - `player_death`: `corpse` (default: what the player carries is left in a corpse where they died), `keep` (nothing is lost) or `drop` (on the floor). The player respawns at once, at full HP, in their workroom or the universe's spawn room.
+  - `npc_death`: `corpse` (default), `drop` or `destroy` (its belongings are deleted). The NPC leaves the world (`parent_id = nil`, HP restored) and comes back to its `home_room` (default: where it died; if that room is gone, where it died, recorded in `died_in`) after its `respawn_seconds` (default 300; `0` deletes it for good, with everything it still holds, after its `on_death` has run). A player who kills it gains its `xp_value` (default its `max_hp`) in their `xp` property.
+  - Corpses decay after `corpse_decay_s` (universe config, default 300), spilling what is left into the room. `get <item> from corpse` (or `get all from corpse`) takes things out. It works on corpses, objects of class `container` (or derived from it) and objects with `open_container = true`, never while their `locked` is true.
 
 The Rust combat engine knows these damage types: `physical`, `slashing`,
 `piercing`, `bludgeoning`, `fire`, `cold` (alias `ice`), `lightning`,
@@ -1186,11 +1300,8 @@ use the [`Combat`](#combat) library or your own code.
 
 These are not built yet. See the [roadmap](../../docs/roadmap.md).
 
-- **Unfired handlers:** `on_create`, `on_destroy`, `on_init`, `on_move`, `on_use`, `ai_idle_tick` and `ai_combat_tick` never fire on their own. Call the ones other than `on_create` and `on_destroy` with `game.use_object` (which refuses engine hooks), or start a heartbeat yourself.
-- **Unused NPC properties:** `aggro` and `respawn_time` do nothing.
-- **Missing player commands:** there is no `use`, `give` or `flee` command. Add verbs with `game.add_action`.
-- **Combat gaps:** the server has no NPC counter-attacks and no PvP. Lua has no bindings to the combat engine.
-- **Universe config:** keys such as `pvp_mode` or `spawn_room` are not read by the server.
+- **Unfired handlers:** `on_use` fires only through `game.use_object`.
+- **Universe config:** keys such as `spawn_room` are not read by the server; use `setportal`.
 
 ---
 

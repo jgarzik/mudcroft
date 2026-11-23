@@ -7,9 +7,12 @@
 //! - a game connection is relayed to a session on the primary (one cluster
 //!   connection per player). If that connection drops without the primary
 //!   ending the session, the primary has failed over: the player is told,
-//!   and the gateway reopens the session on the new primary. A command in
-//!   flight at that moment may or may not have taken effect; it is never
-//!   retried.
+//!   and the gateway reopens the session on the new primary. Each command
+//!   is sent with an id (the client's, or one the gateway assigns); the
+//!   primary answers `done` once it has finished (saved or refused).
+//!   Commands still unanswered when the primary is lost are sent again, in
+//!   order and with the same ids, to the new primary, which does not run a
+//!   command whose id it has already saved: exactly once.
 //!
 //! The primary serves forwarded requests with its own router, and
 //! forwarded sessions exactly like local ones.
@@ -330,6 +333,60 @@ enum Outcome {
     NotReady,
 }
 
+/// The command sent to the primary and not yet answered `done`
+struct InFlight {
+    id: String,
+    /// The JSON sent (resent as is after a failover)
+    json: String,
+    /// The gateway assigned the id: its `done` is not the client's business
+    ours: bool,
+}
+
+/// A client message to forward: a command gets an id if it has none
+/// (returned as the command now in flight)
+fn tag_command(text: &str) -> (String, Option<InFlight>) {
+    let Ok(mut msg) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (text.to_string(), None);
+    };
+    if msg["type"] != "command" {
+        return (text.to_string(), None);
+    }
+    let (id, ours) = match msg["id"].as_str() {
+        Some(id) if !id.is_empty() && id.len() <= 64 => (id.to_string(), false),
+        _ => (format!("gw-{}", uuid::Uuid::new_v4()), true),
+    };
+    msg["id"] = serde_json::Value::String(id.clone());
+    let json = msg.to_string();
+    (json.clone(), Some(InFlight { id, json, ours }))
+}
+
+/// Commands sent to the primary and not yet answered `done`, oldest first
+type InFlightQueue = std::collections::VecDeque<InFlight>;
+
+/// Most commands waiting for their `done` (more are refused, never dropped)
+const MAX_IN_FLIGHT: usize = 64;
+
+/// If `text` is a `done` for a command in flight: removes it, and says
+/// whether the client should see it (only for ids the client chose)
+fn take_done(text: &str, in_flight: &mut InFlightQueue) -> bool {
+    if !text.contains("\"done\"") {
+        return true;
+    }
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
+        return true;
+    };
+    if msg["type"] != "done" {
+        return true;
+    }
+    match in_flight.iter().position(|f| msg["id"] == f.id.as_str()) {
+        Some(i) => {
+            let f = in_flight.remove(i).expect("found above");
+            !f.ours
+        }
+        None => true,
+    }
+}
+
 async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
     match serde_json::to_string(msg) {
         Ok(json) => socket.send(Message::Text(json.into())).await.is_ok(),
@@ -348,6 +405,8 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
     let mut deadline = tokio::time::Instant::now() + PRIMARY_WAIT;
     // The player was told about the current outage
     let mut notified = false;
+    // The command sent and not yet saved: sent again after a failover
+    let mut in_flight = InFlightQueue::new();
     loop {
         let opened = match primary_addr(&state) {
             Some(addr) => transport::open_game_session(&addr, &security, &open)
@@ -376,13 +435,43 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 return;
             }
         };
+        // Commands the lost primary may not have saved: again, in order,
+        // same ids (not run twice if they were)
+        let mut resent = true;
+        for f in &in_flight {
+            if !remote.send(&f.json).await {
+                resent = false;
+                break;
+            }
+        }
         // Whether this session got anything from the primary yet
         let mut live = false;
         let outcome = loop {
+            if !resent {
+                break Outcome::NotReady;
+            }
             tokio::select! {
                 incoming = socket.recv() => match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !remote.send(&text).await {
+                        let (json, command) = tag_command(&text);
+                        if let Some(command) = command {
+                            // Bounded: never drop one silently; refuse more
+                            if in_flight.len() >= MAX_IN_FLIGHT {
+                                let refused = send_json(
+                                    &mut socket,
+                                    &ServerMessage::Error {
+                                        message: "Too many commands waiting; slow down.".to_string(),
+                                    },
+                                )
+                                .await;
+                                if !refused {
+                                    break Outcome::ClientGone;
+                                }
+                                continue;
+                            }
+                            in_flight.push_back(command);
+                        }
+                        if !remote.send(&json).await {
                             break Outcome::Lost;
                         }
                     }
@@ -395,7 +484,9 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                             live = true;
                             notified = false;
                         }
-                        if socket.send(Message::Text(text.into())).await.is_err() {
+                        if take_done(&text, &mut in_flight)
+                            && socket.send(Message::Text(text.into())).await.is_err()
+                        {
                             break Outcome::ClientGone;
                         }
                     }
@@ -442,9 +533,13 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 let still_here = send_json(
                     &mut socket,
                     &ServerMessage::Output {
-                        text: "The world shimmers as the servers change hands. Your last \
-                               command may not have taken effect."
-                            .to_string(),
+                        text: if !in_flight.is_empty() {
+                            "The world shimmers as the servers change hands. Your last \
+                             command will be retried."
+                        } else {
+                            "The world shimmers as the servers change hands."
+                        }
+                        .to_string(),
                     },
                 )
                 .await;
@@ -454,5 +549,39 @@ async fn relay(mut socket: WebSocket, state: AppState, open: GameOpen) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every unanswered command stays queued (several in flight at once),
+    /// a done removes its own, and only client-chosen ids' dones are shown
+    #[test]
+    fn test_in_flight_queue() {
+        let mut q = InFlightQueue::new();
+        let (_, a) = tag_command(r#"{"type":"command","text":"get sword"}"#);
+        let (_, b) = tag_command(r#"{"type":"command","text":"n","id":"mine"}"#);
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(a.ours && !b.ours);
+        let a_id = a.id.clone();
+        q.push_back(a);
+        q.push_back(b);
+        assert_eq!(q.len(), 2, "both in flight");
+        assert!(
+            take_done(r#"{"type":"done","id":"mine"}"#, &mut q),
+            "client's id shown"
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, a_id, "the older one still queued");
+        let done = format!(r#"{{"type":"done","id":"{}"}}"#, a_id);
+        assert!(
+            !take_done(&done, &mut q),
+            "the gateway's own id is not shown"
+        );
+        assert!(q.is_empty());
+        assert!(take_done(r#"{"type":"output","text":"hi"}"#, &mut q));
+        assert!(tag_command(r#"{"type":"ping"}"#).1.is_none());
     }
 }

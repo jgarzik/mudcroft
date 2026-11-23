@@ -619,3 +619,306 @@ async fn test_lua_move_records_safe_location() {
     .await;
     assert_eq!(safe, "/rooms/hub");
 }
+
+/// Crossing into another region runs the old region's on_leave and the new
+/// one's on_enter; arriving runs on_init on each object there with code
+/// (and on the newcomer, per object, if it has code); anything moved with
+/// code runs its on_move
+#[tokio::test]
+async fn test_region_init_and_move_hooks() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "regions_wiz").await;
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/items/journal", "item", nil, {name = "journal", log = ""})
+           local note = [[local function note(w) local j = game.get_object("/items/journal") game.update_object("/items/journal", {log = j.metadata.log .. w .. ";"}) end ]]
+           local forest = game.store_code(note .. [[return {
+             on_enter = function(a) note("enter-forest:" .. tostring(a.moved_id == a.actor_id)) end,
+             on_leave = function(a) note("leave-forest") end }]])
+           local town = game.store_code(note .. [[return {
+             on_enter = function(a) note("enter-town") end,
+             on_leave = function(a) note("leave-town") end }]])
+           local shopkeeper = game.store_code(note .. [[return {
+             on_init = function(a) note("init-shop:" .. tostring(a.arrived_id ~= nil)) end }]])
+           local wanderstone = game.store_code(note .. [[return {
+             on_move = function(a) note("moved-stone:" .. tostring(a.to)) end }]])
+           game.create_object("/d/forest", "region", nil, {name = "Forest", code_hash = forest})
+           game.create_object("/d/town", "region", nil, {name = "Town", code_hash = town})
+           game.create_object("/d/town/gate", "room", "/d/town", {name = "Town Gate", exits = {west = "/d/forest/edge"}})
+           game.create_object("/d/forest/edge", "room", "/d/forest", {name = "Forest Edge", exits = {east = "/d/town/gate"}})
+           game.create_object("/d/forest/edge/hermit", "npc", "/d/forest/edge", {name = "hermit", code_hash = shopkeeper})
+           game.create_object("/items/stone", "item", "/d/town/gate", {name = "stone", code_hash = wanderstone})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    wiz.drain().await;
+    wiz.command("goto /d/town/gate").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    wiz.drain().await;
+    wiz.command("west").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    eval(
+        &mut wiz,
+        r#"game.move_object("/items/stone", "/d/forest/edge") return "ok""#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let log: String = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.log') FROM objects WHERE universe_id = ? AND id = '/items/journal'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(
+        log.contains("leave-town;enter-forest:true;"),
+        "regions crossed: {}",
+        log
+    );
+    assert!(
+        log.contains("init-shop:true;"),
+        "on_init on the hermit: {}",
+        log
+    );
+    assert!(
+        log.contains("moved-stone:/d/forest/edge;"),
+        "on_move on the stone: {}",
+        log
+    );
+}
+
+/// A room naming a region in its region_id (without being inside it) does
+/// not fire that region's hooks: only the room's parent region does
+#[tokio::test]
+async fn test_region_hooks_not_spoofed_by_region_id() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "spoof_wiz").await;
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/items/tripwire", "item", nil, {name = "tripwire", hits = 0})
+           local h = game.store_code([[return { on_enter = function(a)
+             local t = game.get_object("/items/tripwire")
+             game.update_object("/items/tripwire", {hits = t.metadata.hits + 1})
+           end }]])
+           game.create_object("/d/vault", "region", nil, {name = "Vault", code_hash = h})
+           game.create_object("/rooms/fake", "room", nil, {name = "Fake", region_id = "/d/vault"})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    wiz.drain().await;
+    wiz.command("goto /rooms/fake").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hits: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.hits') FROM objects WHERE universe_id = ? AND id = '/items/tripwire'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(hits, 0, "the vault's hook did not fire");
+}
+
+/// A room with reset_seconds runs its on_reset that often (to restock); the
+/// room a player was in gets on_disconnect when their grace period ends
+#[tokio::test]
+async fn test_on_reset_and_on_disconnect() {
+    let server = TestServer::start().await.expect("server");
+    let mut wiz = wizard(&server, "reset_wiz").await;
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/items/tally", "item", nil, {name = "tally", resets = 0, left = ""})
+           local h = game.store_code([[return {
+             on_reset = function(a)
+               local t = game.get_object("/items/tally")
+               game.update_object("/items/tally", {resets = t.metadata.resets + 1})
+             end,
+             on_disconnect = function(a)
+               game.update_object("/items/tally", {left = a.player_id})
+             end }]])
+           game.create_object("/rooms/shop", "room", nil, {name = "Shop", reset_seconds = 1, code_hash = h})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    let mut pl = server
+        .connect_as(crate::harness::Role::Player {
+            username: "shopper".into(),
+        })
+        .await
+        .unwrap();
+    let shopper = pl.player_id().unwrap().to_string();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"game.move_object("{}", "/rooms/shop") return "ok""#,
+            shopper
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    pl.close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+    let (resets, left): (i64, String) = sqlx::query_as(
+        "SELECT json_extract(properties, '$.resets'), json_extract(properties, '$.left')
+         FROM objects WHERE universe_id = ? AND id = '/items/tally'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!(resets >= 3, "on_reset ran about once a second: {}", resets);
+    assert_eq!(left, shopper, "on_disconnect told the room");
+}
+
+/// Phase 3 review: a room placed under someone else's region does not fire
+/// its hooks; fleeing runs on_move; a crowded room's on_init does not
+/// starve the newcomer's on_move
+#[tokio::test]
+async fn test_move_hooks_after_review() {
+    let server = TestServer::start().await.expect("server");
+    let mut adm = server
+        .connect_as(crate::harness::Role::Admin {
+            username: "region_owner".into(),
+        })
+        .await
+        .unwrap();
+    let mut wiz = wizard(&server, "squatter").await;
+    // The admin's region, with code
+    adm.drain().await;
+    adm.command(
+        r#"eval game.create_object("/items/alarm", "item", nil, {name = "alarm", rings = 0, moves = 0})
+           local h = game.store_code([[return { on_enter = function(a)
+             local t = game.get_object("/items/alarm") game.update_object("/items/alarm", {rings = t.metadata.rings + 1})
+           end }]])
+           game.create_object("/d/palace", "region", nil, {name = "Palace", code_hash = h})
+           return "made""#,
+    )
+    .await
+    .unwrap();
+    adm.expect_output_containing("made").await.unwrap();
+    // The wizard puts a room of their own under it and walks in
+    let out = eval(
+        &mut wiz,
+        r#"game.create_object("/rooms/squat", "room", "/d/palace", {name = "Squat"}) return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    wiz.drain().await;
+    wiz.command("goto /rooms/squat").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    // A coded walker moved into a crowded room still gets on_move, and
+    // fleeing runs on_move too
+    let out = eval(
+        &mut wiz,
+        r#"local h = game.store_code([[return {
+             on_init = function(a) end,
+             on_move = function(a) local t = game.get_object("/items/alarm") end }]])
+           local mover = game.store_code([[return { on_move = function(a)
+             local l = game.get_object("/rooms/crowd/ledger") game.update_object("/rooms/crowd/ledger", {n = l.metadata.n + 1})
+           end }]])
+           game.create_object("/rooms/crowd", "room", nil, {name = "Crowd", exits = {east = "/rooms/out"}})
+           game.create_object("/rooms/out", "room", nil, {name = "Out", exits = {west = "/rooms/crowd"}})
+           game.create_object("/rooms/crowd/ledger", "item", "/rooms/crowd", {name = "ledger", n = 0})
+           for i = 1, 40 do game.create_object("/rooms/crowd/deco-" .. i, "item", "/rooms/crowd", {name = "deco", code_hash = h}) end
+           game.create_object("/items/walker", "item", nil, {name = "walker", code_hash = mover})
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(out, "ok");
+    eval(
+        &mut wiz,
+        r#"game.move_object("/items/walker", "/rooms/crowd") return "ok""#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (rings, n): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT json_extract(properties, '$.rings') FROM objects WHERE universe_id = ?1 AND id = '/items/alarm'),
+                (SELECT json_extract(properties, '$.n') FROM objects WHERE universe_id = ?1 AND id = '/rooms/crowd/ledger')",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rings, 0,
+        "a room under a region it has no authority over does not fire it"
+    );
+    assert_eq!(n, 1, "on_move ran despite the crowd's on_init");
+}
+
+/// who lists the players in the universe; give hands an item over; use runs
+/// an item's on_use; quit leaves at once (the room's on_disconnect fires
+/// without the grace period)
+#[tokio::test]
+async fn test_player_commands_who_give_use_quit() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "giver").await;
+    let mut friend = server
+        .connect_as(crate::harness::Role::Player {
+            username: "receiver".into(),
+        })
+        .await
+        .unwrap();
+    let friend_id = friend.player_id().unwrap().to_string();
+    let me = wiz.player_id().unwrap().to_string();
+    let out = eval(
+        &mut wiz,
+        &format!(
+            r#"game.create_object("/items/token", "item", "{me}", {{name = "token"}})
+               local h = game.store_code([[return {{ on_use = function(a) return "The lamp glows." end }}]])
+               game.create_object("/items/lamp", "item", "{me}", {{name = "lamp", code_hash = h}})
+               local r = game.store_code([[return {{ on_disconnect = function(a) game.update_object("/rooms/lobby/ledger", {{farewell = a.player_id}}) end }}]])
+               game.create_object("/rooms/lobby", "room", nil, {{name = "Lobby", code_hash = r}})
+               game.create_object("/rooms/lobby/ledger", "item", "/rooms/lobby", {{name = "ledger"}})
+               game.move_object("{f}", "/rooms/lobby")
+               return "ok""#,
+            me = me,
+            f = friend_id
+        ),
+    )
+    .await;
+    assert_eq!(out, "ok");
+    let _ = &entrance;
+    wiz.drain().await;
+    wiz.command("goto /rooms/lobby").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    wiz.drain().await;
+    wiz.command("who").await.unwrap();
+    let who = wiz.expect_output_containing("receiver").await.unwrap();
+    assert!(who.contains("giver"), "{}", who);
+    wiz.drain().await;
+    wiz.command("give token to receiver").await.unwrap();
+    wiz.expect_output_containing("You give token to receiver")
+        .await
+        .unwrap();
+    friend
+        .expect_output_containing("gives you token")
+        .await
+        .expect("told");
+    wiz.drain().await;
+    wiz.command("use lamp").await.unwrap();
+    wiz.expect_output_containing("The lamp glows")
+        .await
+        .unwrap();
+    // The receiver quits: on_disconnect at once
+    friend.drain().await;
+    friend.command("quit").await.unwrap();
+    friend.expect_output_containing("Goodbye").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let farewell: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.farewell') FROM objects WHERE universe_id = ? AND id = '/rooms/lobby/ledger'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        farewell.as_deref(),
+        Some(friend_id.as_str()),
+        "on_disconnect without the grace period"
+    );
+}

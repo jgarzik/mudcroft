@@ -565,3 +565,68 @@ async fn test_cluster_set_level() {
         text
     );
 }
+
+/// A command in flight when the primary dies is retried on the new primary
+/// by the gateway, and takes effect exactly once
+#[tokio::test]
+async fn test_gateway_retries_interrupted_command() {
+    let mut cluster = TestCluster::start(3).await.expect("cluster");
+    cluster.seed_world(0, "retry-world").await.expect("seed");
+    let (_, token) = cluster.register(1, "persistent").await.expect("register");
+    let limit = Duration::from_secs(10);
+    cluster
+        .add_script(
+            "abacus.lua",
+            r#"
+local h = game.store_code([[return { tally = function(a)
+  local o = game.get_object("/items/abacus")
+  game.update_object("/items/abacus", {n = (o.metadata.n or 0) + 1})
+  return "Click."
+end }]])
+game.create_object("/items/abacus", "item", "/rooms/cave-entrance", {name = "abacus", fixed = true, code_hash = h})
+return tostring(game.add_action("tally", "/items/abacus", "tally"))
+"#,
+        )
+        .unwrap();
+    assert_eq!(
+        cluster
+            .run_script(0, "retry-world", "abacus.lua")
+            .await
+            .unwrap(),
+        "true"
+    );
+    cluster
+        .add_script(
+            "count.lua",
+            r#"local o = game.get_object("/items/abacus") return tostring(o.metadata.n or 0)"#,
+        )
+        .unwrap();
+    let mut player = ClusterPlayer::connect(&cluster.nodes[1], "retry-world", &token)
+        .await
+        .expect("connect to gateway");
+    player
+        .wait_for("Cave Entrance", limit)
+        .await
+        .expect("spawned");
+
+    // The primary dies with the command just sent (unanswered)
+    player.command("tally abacus").await.unwrap();
+    cluster.stop(0);
+    player
+        .wait_for("change hands", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| panic!("{}\n{}", e, cluster.logs()));
+    player
+        .wait_for("Click.", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| panic!("the command was retried: {}\n{}", e, cluster.logs()));
+    let mut count = String::new();
+    for _ in 0..50 {
+        if let Ok(c) = cluster.run_script(1, "retry-world", "count.lua").await {
+            count = c;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(count, "1", "exactly once");
+}

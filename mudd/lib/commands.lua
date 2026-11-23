@@ -43,6 +43,65 @@ function Commands.take(player_id, item_name)
     return {success = true, message = string.format("You take %s.", name)}
 end
 
+-- Take an item out of a container (a corpse, a chest) in the room or in
+-- the player's inventory. item_name "all" takes everything takeable.
+-- Returns {success: bool, message: string}
+function Commands.take_from(player_id, item_name, container_name)
+    local player = game.get_object(player_id)
+    if not player then
+        return {success = false, message = "Player not found"}
+    end
+    local room_id = player.parent_id
+    if not room_id then
+        return {success = false, message = "You are nowhere"}
+    end
+    local container = game.present(container_name, room_id) or game.present(container_name, player_id)
+    if not container or game.is_a(container.id, "living") then
+        return {success = false, message = "You don't see that here"}
+    end
+    -- Containers and corpses only (or an object that opts in), never locked
+    local meta = container.metadata or {}
+    if not (game.is_a(container.id, "container") or meta.corpse or meta.open_container) then
+        return {success = false, message = "You can't take things out of that"}
+    end
+    if meta.locked then
+        return {success = false, message = string.format("The %s is locked", container.name or container_name)}
+    end
+    local takeable = function(item)
+        return not (item.metadata and item.metadata.fixed) and not game.is_a(item.id, "living")
+    end
+    local items = {}
+    if item_name == "all" then
+        for _, item in ipairs(game.all_inventory(container.id)) do
+            if takeable(item) then
+                table.insert(items, item)
+            end
+        end
+        if #items == 0 then
+            return {success = false, message = "There is nothing to take"}
+        end
+    else
+        local item = game.present(item_name, container.id)
+        if not item then
+            return {success = false, message = "That isn't in there"}
+        end
+        if not takeable(item) then
+            return {success = false, message = "You can't take that"}
+        end
+        items = {item}
+    end
+    local names = {}
+    for _, item in ipairs(items) do
+        game.move_object(item.id, player_id)
+        table.insert(names, item.name or item_name)
+    end
+    local what = table.concat(names, ", ")
+    local from = container.name or container_name
+    local player_name = player.name or "Someone"
+    game.broadcast(room_id, string.format("%s takes %s from %s.", player_name, what, from), player_id)
+    return {success = true, message = string.format("You take %s from %s.", what, from)}
+end
+
 -- Drop an item from player inventory into the current room
 -- Returns {success: bool, message: string}
 function Commands.drop(player_id, item_name)
@@ -185,46 +244,15 @@ function Commands.look(player_id, target_name)
     return {success = true, description = desc}
 end
 
--- Flee from combat
+-- Flee: leave through a random exit, ending one's fight (the engine's
+-- game.flee; the universe's flee_fail_percent may make it fail)
 -- Returns {success: bool, message: string}
 function Commands.flee(player_id)
-    local player = game.get_object(player_id)
-    if not player then
-        return {success = false, message = "Player not found"}
+    local dir, why = game.flee(player_id)
+    if not dir then
+        return {success = false, message = why}
     end
-
-    local room_id = player.parent_id
-    if not room_id then
-        return {success = false, message = "You are nowhere"}
-    end
-
-    local room = game.get_object(room_id)
-    if not room then
-        return {success = false, message = "Cannot flee"}
-    end
-
-    -- Find available exits
-    local exits = room.metadata and room.metadata.exits or {}
-    local exit_list = {}
-    for dir, dest in pairs(exits) do
-        table.insert(exit_list, {dir = dir, dest = dest})
-    end
-
-    if #exit_list == 0 then
-        return {success = false, message = "There's nowhere to flee to!"}
-    end
-
-    -- Pick random exit
-    local idx = math.random(1, #exit_list)
-    local escape = exit_list[idx]
-
-    -- Move player
-    game.move_object(player_id, escape.dest)
-
-    local player_name = player.name or "Someone"
-    game.broadcast(room_id, string.format("%s flees %s!", player_name, escape.dir), player_id)
-
-    return {success = true, message = string.format("You flee %s!", escape.dir)}
+    return {success = true, message = string.format("You flee %s!", dir)}
 end
 
 -- Say something to the room
@@ -305,14 +333,14 @@ function Commands.use(player_id, item_name, target_name)
         end
     end
 
-    -- Try to use the object
-    if game.use_object then
-        local result = game.use_object(item.id, player_id, "use", target_id)
-        if result then
-            return result
-        end
+    -- Its on_use (as its owner); a string reply is the message
+    local result = game.use_object(item.id, player_id, "use", target_id)
+    if type(result) == "table" then
+        return result
     end
-
+    if result ~= nil and result ~= "nil" then
+        return {success = true, message = tostring(result)}
+    end
     return {success = false, message = "You can't use that."}
 end
 

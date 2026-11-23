@@ -163,9 +163,66 @@ pub fn resolve_attack(
     }
 }
 
-/// The statements that make an attack's outcome durable, to commit as one
-/// batch: the target's new HP and, if it died, its removal from the room
-/// and the end of its status effects
+/// One part of a hit's damage: its type, as rolled (doubled on a
+/// critical) and as applied (after the target's resistances)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamagePart {
+    pub dtype: DamageType,
+    pub rolled: i32,
+    pub applied: i32,
+    /// The target's resistance to this type
+    pub modifier: super::DamageModifier,
+}
+
+/// A weapon's further damage parts (after the first, which resolve_attack
+/// applies): on a hit each part is doubled on a critical and meets the
+/// target's resistance to its own type. Updates the outcome (HP, a death,
+/// no bleeding on a death) and returns every part's breakdown, the first
+/// included.
+pub fn add_damage_parts(
+    outcome: &mut AttackOutcome,
+    target: &Combatant,
+    first: DamageType,
+    extra: &[(i32, DamageType)],
+) -> Vec<DamagePart> {
+    let mut parts = Vec::new();
+    let Some(ref dmg) = outcome.result.damage else {
+        return parts;
+    };
+    let crit = outcome.result.critical;
+    parts.push(DamagePart {
+        dtype: first,
+        rolled: if crit {
+            dmg.base_damage.saturating_mul(2)
+        } else {
+            dmg.base_damage
+        },
+        applied: dmg.final_damage,
+        modifier: dmg.modifier,
+    });
+    for &(roll, dtype) in extra {
+        let d = target.profile.calculate_damage(roll.max(0), dtype, crit);
+        parts.push(DamagePart {
+            dtype,
+            rolled: if crit {
+                roll.max(0).saturating_mul(2)
+            } else {
+                roll.max(0)
+            },
+            applied: d.final_damage,
+            modifier: d.modifier,
+        });
+        outcome.target_hp = outcome.target_hp.saturating_sub(d.final_damage).max(0);
+    }
+    outcome.killed = outcome.result.hit && outcome.target_hp <= 0;
+    if outcome.killed {
+        outcome.inflicts = None;
+    }
+    parts
+}
+
+/// The statements that make an attack's outcome durable: the target's new
+/// HP and any effect it inflicted (a death is handled by api::combat::death)
 pub fn attack_statements(
     universe_id: &str,
     target_id: &str,
@@ -184,13 +241,6 @@ pub fn attack_statements(
             universe_id,
             target_id,
             effect,
-        ));
-    }
-    if outcome.killed {
-        statements.push(remove_from_room_statement(universe_id, target_id));
-        statements.push(super::EffectRegistry::clear_statement(
-            universe_id,
-            target_id,
         ));
     }
     Ok(statements)
@@ -323,13 +373,10 @@ pub fn tick_statements(
     before: &EntityEffects,
     outcome: &TickOutcome,
 ) -> anyhow::Result<Vec<(String, Vec<serde_json::Value>)>> {
+    let _ = is_player;
     let mut statements = Vec::new();
-    if outcome.killed {
-        statements.push(EffectRegistry::clear_statement(universe_id, entity_id));
-        if !is_player {
-            statements.push(remove_from_room_statement(universe_id, entity_id));
-        }
-    } else {
+    // A death (effects cleared, removal or respawn) is api::combat::death's
+    if !outcome.killed {
         for effect in before.all() {
             let after = outcome
                 .effects
@@ -550,13 +597,10 @@ mod tests {
         ));
         let out = process_due(&weak, &lethal, 1_000);
         assert!(out.killed && out.hp == 0);
+        // A death writes only the HP here (api::combat::death does the rest)
         let statements = tick_statements("u", "/npcs/x", false, &lethal, &out).unwrap();
-        assert!(statements
-            .iter()
-            .any(|(sql, _)| sql.contains("DELETE FROM active_effects")));
-        assert!(statements
-            .iter()
-            .any(|(sql, _)| sql.contains("parent_id = NULL")));
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].0.contains("json_set"));
     }
 
     #[test]
@@ -679,5 +723,81 @@ mod tests {
             assert!(out.killed, "order {} must not decide death", heal_first);
             assert_eq!(out.hp, 0);
         }
+    }
+
+    /// Extra damage parts: per-type resistance, critical doubling, a death
+    #[test]
+    fn test_add_damage_parts() {
+        let attacker = combatant(serde_json::json!({}));
+        let target = combatant(serde_json::json!({
+            "hp": 40, "armor_class": 1,
+            "resistances": {"fire": "immune", "cold": "resistant", "acid": "vulnerable"}
+        }));
+        let mods = AttackMods::default();
+        let mut out = resolve_attack(&attacker, &target, &mods, 10, 4, DamageType::Slashing, 0);
+        assert!(out.result.hit);
+        let parts = add_damage_parts(
+            &mut out,
+            &target,
+            DamageType::Slashing,
+            &[
+                (6, DamageType::Fire),
+                (6, DamageType::Cold),
+                (3, DamageType::Acid),
+            ],
+        );
+        let applied: Vec<i32> = parts.iter().map(|p| p.applied).collect();
+        assert_eq!(applied, vec![4, 0, 3, 6]);
+        assert_eq!(out.target_hp, 40 - 13);
+        assert!(!out.killed);
+
+        // A critical doubles every part
+        let mut crit = resolve_attack(&attacker, &target, &mods, 20, 4, DamageType::Slashing, 0);
+        let parts = add_damage_parts(
+            &mut crit,
+            &target,
+            DamageType::Slashing,
+            &[(5, DamageType::Acid)],
+        );
+        assert_eq!(parts[1].rolled, 10);
+        assert_eq!(parts[1].applied, 20);
+        // ... and an extra part can kill (no bleeding then)
+        assert_eq!(crit.target_hp, 40 - 8 - 20);
+        let weak = combatant(serde_json::json!({"hp": 5, "armor_class": 1}));
+        let mut out = resolve_attack(&attacker, &weak, &mods, 10, 1, DamageType::Slashing, 0);
+        add_damage_parts(
+            &mut out,
+            &weak,
+            DamageType::Slashing,
+            &[(10, DamageType::Fire)],
+        );
+        assert!(out.killed && out.target_hp == 0 && out.inflicts.is_none());
+    }
+
+    /// A part halved to 0 is resisted, not immune: the part carries its
+    /// modifier
+    #[test]
+    fn test_damage_part_modifier() {
+        let attacker = combatant(serde_json::json!({}));
+        let target = combatant(serde_json::json!({
+            "hp": 40, "armor_class": 1, "resistances": {"fire": "resistant"}
+        }));
+        let mut out = resolve_attack(
+            &attacker,
+            &target,
+            &AttackMods::default(),
+            10,
+            4,
+            DamageType::Slashing,
+            0,
+        );
+        let parts = add_damage_parts(
+            &mut out,
+            &target,
+            DamageType::Slashing,
+            &[(1, DamageType::Fire)],
+        );
+        assert_eq!(parts[1].applied, 0);
+        assert_eq!(parts[1].modifier, crate::combat::DamageModifier::Resistant);
     }
 }

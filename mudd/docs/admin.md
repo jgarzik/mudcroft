@@ -363,8 +363,9 @@ on the primary. When the primary fails (or steps down), a new one is
 elected, rebuilds its caches from the tables and takes over timers and
 effects; players on gateways see "The world shimmers as the servers change
 hands" and land back in the world within about a second; players connected
-to the old primary itself reconnect. A command in flight at that moment may
-or may not have taken effect (it is never retried). Put a load balancer in
+to the old primary itself reconnect. A command in flight at that moment is
+sent again by the gateway to the new primary, which runs it unless it was
+already saved: it takes effect exactly once. Put a load balancer in
 front of all nodes' HTTP ports.
 
 Raft timing: heartbeat 100 ms, election timeout 400-800 ms once the cluster

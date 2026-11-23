@@ -1,5 +1,6 @@
 //! Database module - SQLite with shared and per-universe schemas
 
+pub mod run;
 #[cfg(test)]
 pub mod test_utils;
 
@@ -13,7 +14,7 @@ use tracing::info;
 /// incompatible schema change and add the upgrade step from the previous
 /// version to `Database::upgrade` (mudd_init is the only place upgrades run;
 /// mudd refuses any other version).
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Custom verbs (`game.add_action`): room-scoped (any nearby object's verb
 /// in a room) or object-scoped (follows the object). They go with their
@@ -57,6 +58,88 @@ const ONLINE_PLAYERS_TABLE: &str = r#"
         FOREIGN KEY (universe_id, player_id)
             REFERENCES objects(universe_id, id) ON DELETE CASCADE
     )
+"#;
+
+/// Commands saved with an id (a gateway's, or a client's): a command sent
+/// again with the same id (a retry after a failover) is not run twice.
+/// Written in the command's own batch; rows past their deadline are deleted
+/// by later such batches.
+pub const APPLIED_COMMANDS_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS applied_commands (
+        universe_id TEXT NOT NULL,
+        player_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (universe_id, player_id, command_id)
+    )
+"#;
+
+/// Who is fighting whom: one row per fighter (its current target), with the
+/// absolute time of its next round. Goes with the fighter.
+pub const COMBAT_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS combat (
+        universe_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        next_round_at INTEGER NOT NULL,
+        PRIMARY KEY (universe_id, entity_id),
+        FOREIGN KEY (universe_id, entity_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS combat_due ON combat (next_round_at)
+"#;
+
+/// World events due at an absolute time: a corpse decaying, an NPC
+/// respawning or wandering. Goes with the object. An object given a
+/// positive `wander_seconds` gets a wander deadline due at once (time 0, so
+/// every replica applies the same row); the scheduler then reschedules it.
+pub const DEADLINES_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS deadlines (
+        universe_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('decay', 'respawn', 'wander', 'delete', 'reset')),
+        due_at INTEGER NOT NULL,
+        PRIMARY KEY (universe_id, object_id, kind),
+        FOREIGN KEY (universe_id, object_id)
+            REFERENCES objects(universe_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS deadlines_due ON deadlines (due_at);
+    CREATE TRIGGER IF NOT EXISTS wander_on_insert AFTER INSERT ON objects
+    WHEN json_extract(NEW.properties, '$.wander_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'wander', 0);
+    END;
+    CREATE TRIGGER IF NOT EXISTS wander_on_update AFTER UPDATE OF properties ON objects
+    WHEN json_extract(NEW.properties, '$.wander_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'wander', 0);
+    END;
+    CREATE TRIGGER IF NOT EXISTS reset_on_insert AFTER INSERT ON objects
+    WHEN json_extract(NEW.properties, '$.reset_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'reset', 0);
+    END;
+    CREATE TRIGGER IF NOT EXISTS reset_on_update AFTER UPDATE OF properties, code_hash ON objects
+    WHEN json_extract(NEW.properties, '$.reset_seconds') > 0
+    BEGIN
+        INSERT OR IGNORE INTO deadlines (universe_id, object_id, kind, due_at)
+        VALUES (NEW.universe_id, NEW.id, 'reset', 0);
+    END
+"#;
+
+/// Equipped gear names its wearer (`equipped_by`); anything that moves it
+/// (drop, give, death, a script) unequips it
+pub const EQUIPMENT_TRIGGER: &str = r#"
+    CREATE TRIGGER IF NOT EXISTS unequip_on_move AFTER UPDATE OF parent_id ON objects
+    WHEN OLD.parent_id IS NOT NEW.parent_id
+     AND json_extract(NEW.properties, '$.equipped_by') IS NOT NULL
+    BEGIN
+        UPDATE objects SET properties = json_remove(properties, '$.equipped_by')
+        WHERE universe_id = NEW.universe_id AND id = NEW.id;
+    END
 "#;
 
 /// Payments a player has been asked to confirm (game.request_payment):
@@ -186,6 +269,11 @@ impl Database {
     /// - 8 -> 9 (cluster_nodes table: node ids never reused): in place.
     /// - 9 -> 10 (online_players table): in place.
     /// - 10 -> 11 (payment_requests table): in place.
+    /// - 11 -> 12 (applied_commands table): in place.
+    /// - 12 -> 13 (combat and deadlines tables): in place.
+    /// - 13 -> 14 (deadlines rebuilt with every kind and their triggers,
+    ///   applied_commands keyed per player, the equipment trigger): an
+    ///   early version-13 table lacked some kinds and triggers.
     async fn upgrade(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version > SCHEMA_VERSION {
@@ -242,6 +330,50 @@ impl Database {
                 .await?;
             self.set_schema_version(11).await?;
             info!("Upgraded database schema 10 -> 11");
+            version = 11;
+        }
+        if version == 11 {
+            sqlx::query(APPLIED_COMMANDS_TABLE)
+                .execute(&self.pool)
+                .await?;
+            self.set_schema_version(12).await?;
+            info!("Upgraded database schema 11 -> 12");
+            version = 12;
+        }
+        if version == 12 {
+            sqlx::raw_sql(COMBAT_TABLE).execute(&self.pool).await?;
+            sqlx::raw_sql(DEADLINES_TABLE).execute(&self.pool).await?;
+            sqlx::raw_sql(EQUIPMENT_TRIGGER).execute(&self.pool).await?;
+            self.set_schema_version(13).await?;
+            info!("Upgraded database schema 12 -> 13");
+            version = 13;
+        }
+        if version == 13 {
+            let rebuild = format!(
+                "BEGIN;
+                 DROP TRIGGER IF EXISTS wander_on_insert;
+                 DROP TRIGGER IF EXISTS wander_on_update;
+                 DROP TRIGGER IF EXISTS reset_on_insert;
+                 DROP TRIGGER IF EXISTS reset_on_update;
+                 ALTER TABLE deadlines RENAME TO deadlines_v13;
+                 DROP INDEX IF EXISTS deadlines_due;
+                 {deadlines};
+                 INSERT INTO deadlines (universe_id, object_id, kind, due_at)
+                   SELECT universe_id, object_id, kind, due_at FROM deadlines_v13;
+                 DROP TABLE deadlines_v13;
+                 DROP TABLE IF EXISTS applied_commands;
+                 {applied};
+                 {equipment};
+                 COMMIT;",
+                deadlines = DEADLINES_TABLE,
+                applied = APPLIED_COMMANDS_TABLE,
+                equipment = EQUIPMENT_TRIGGER,
+            );
+            sqlx::raw_sql(sqlx::AssertSqlSafe(rebuild))
+                .execute(&self.pool)
+                .await?;
+            self.set_schema_version(14).await?;
+            info!("Upgraded database schema 13 -> 14");
             return Ok(());
         }
         if version < SCHEMA_VERSION {
@@ -320,8 +452,11 @@ impl Database {
             .create_if_missing(false)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(30))
-            .shared_cache(true);
+            // No shared cache: under it SQLite skips the busy handler while
+            // another connection of the cache is in a transaction, so
+            // concurrent writers (runs, Raft's log and apply) fail at once
+            // with "database is locked" instead of waiting
+            .busy_timeout(std::time::Duration::from_secs(30));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(10)
@@ -359,6 +494,9 @@ impl Database {
             "cluster_nodes",
             "online_players",
             "payment_requests",
+            "applied_commands",
+            "combat",
+            "deadlines",
             "raft_log",
             "raft_vote",
             "raft_meta",
@@ -581,6 +719,12 @@ impl Database {
         sqlx::query(PAYMENT_REQUESTS_TABLE)
             .execute(&self.pool)
             .await?;
+        sqlx::query(APPLIED_COMMANDS_TABLE)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(COMBAT_TABLE).execute(&self.pool).await?;
+        sqlx::raw_sql(DEADLINES_TABLE).execute(&self.pool).await?;
+        sqlx::raw_sql(EQUIPMENT_TRIGGER).execute(&self.pool).await?;
 
         // Path grants table (for path-based permission delegation)
         sqlx::query(

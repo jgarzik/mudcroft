@@ -5,10 +5,10 @@
 //! the player. When the player accepts in time, the request is claimed
 //! (deleted through Raft: only one answer counts), the credits move from
 //! the player to the requesting object, and the object's handler runs (as
-//! its owner) with `{payment_id, amount, reason, data, actor_id}`. If the
-//! handler does not exist the payment is refunded; once it has run the
-//! payment stands, even if it failed part way (it may already have handed
-//! something over).
+//! its owner) with `{payment_id, amount, reason, data, actor_id}`. Transfer
+//! and handler are one change (db::run): if the handler fails, or does not
+//! exist, neither is kept and the player is not charged; the claim stands
+//! either way, so a request is answered once.
 
 use serde_json::json;
 use tracing::warn;
@@ -45,105 +45,103 @@ pub async fn answer(
     .bind(now)
     .bind(id)
     .bind(id)
-    .fetch_optional(state.db.pool())
+    .fetch_optional(&mut *crate::db::run::reader(state.db.pool()).await.ok()?)
     .await
     .ok()
     .flatten();
     let (id, object_id, handler, amount, reason, data) = row?;
 
-    // Claim it: only one answer counts, and only in time
-    let claimed = state
-        .raft_writer
-        .execute(
-            "DELETE FROM payment_requests WHERE id = ? AND expires_at > ?",
-            vec![json!(id), json!(now)],
+    // One change: claim, transfer and handler. The claim stands whatever
+    // happens (one answer per request); a failing (or missing) handler
+    // undoes the transfer and its own writes
+    let outcome = super::scripting::in_run(state, async {
+        let claimed = state
+            .raft_writer
+            .execute_kept(
+                "DELETE FROM payment_requests WHERE id = ? AND expires_at > ?",
+                vec![json!(id), json!(now)],
+            )
+            .await;
+        match claimed {
+            Ok(r) if r.success && r.rows_affected == 1 => {}
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                warn!("payment {}: claiming failed: {}", id, e);
+                return Ok(Some(ServerMessage::Error {
+                    message: "The payment could not be processed; try again.".to_string(),
+                }));
+            }
+        }
+        if !accept {
+            return Ok(Some(ServerMessage::Output {
+                text: format!("You decline to pay {} credits.", amount),
+            }));
+        }
+
+        let payer = Holder::Account(account_id.to_string());
+        let payee = Holder::Object(object_id.clone());
+        match state
+            .credits
+            .transfer(universe_id, &payer, &payee, amount)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Some(ServerMessage::Output {
+                    text: format!("You don't have {} credits.", amount),
+                }))
+            }
+            Err(e) => {
+                warn!("payment {}: transfer failed: {}", id, e);
+                return Err("the transfer failed".to_string());
+            }
+        }
+
+        let room_id = state.connections.get_room_id(universe_id, player_id).await;
+        let args = json!({
+            "payment_id": id,
+            "amount": amount,
+            "reason": reason,
+            "data": data,
+            "actor_id": player_id,
+            // For a refund (game.transfer_credits("object", actor_account, n))
+            "actor_account": account_id,
+        });
+        let result = super::scripting::invoke_handler(
+            state,
+            universe_id,
+            &object_id,
+            room_id,
+            &handler,
+            args,
         )
         .await;
-    match claimed {
-        Ok(r) if r.success && r.rows_affected == 1 => {}
-        Ok(_) => return None,
-        Err(e) => {
-            warn!("payment {}: claiming failed: {}", id, e);
-            return Some(ServerMessage::Error {
-                message: "The payment could not be processed; try again.".to_string(),
-            });
-        }
-    }
-    if !accept {
-        return Some(ServerMessage::Output {
-            text: format!("You decline to pay {} credits.", amount),
-        });
-    }
-
-    let payer = Holder::Account(account_id.to_string());
-    let payee = Holder::Object(object_id.clone());
-    match state
-        .credits
-        .transfer(universe_id, &payer, &payee, amount)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Some(ServerMessage::Output {
-                text: format!("You don't have {} credits.", amount),
-            })
-        }
-        Err(e) => {
-            warn!("payment {}: transfer failed: {}", id, e);
-            return Some(ServerMessage::Error {
-                message: "The payment could not be processed.".to_string(),
-            });
-        }
-    }
-
-    let room_id = state.connections.get_room_id(universe_id, player_id).await;
-    let args = json!({
-        "payment_id": id,
-        "amount": amount,
-        "reason": reason,
-        "data": data,
-        "actor_id": player_id,
-        // For a refund (game.transfer_credits("object", actor_account, n))
-        "actor_account": account_id,
-    });
-    let result =
-        super::scripting::invoke_handler(state, universe_id, &object_id, room_id, &handler, args)
-            .await;
-    match result {
-        Ok(Some(text)) if text != "nil" && !text.is_empty() => Some(ServerMessage::Output { text }),
-        Ok(Some(_)) => Some(ServerMessage::Output {
-            text: format!("You pay {} credits.", amount),
-        }),
-        // The handler ran but failed: it may already have handed something
-        // over, so the payment stands (the object can refund with
-        // transfer_credits); see docs/roadmap.md for making both one change
-        Err(e) => {
-            warn!(
-                "payment {}: handler {} failed after payment: {}",
-                id, handler, e
-            );
-            Some(ServerMessage::Output {
-                text: format!(
-                    "Something went wrong after your payment of {} credits; tell the owner.",
-                    amount
-                ),
-            })
-        }
-        // No such handler: nothing ran, so the money goes back
-        Ok(None) => {
-            if let Err(e) = state
-                .credits
-                .transfer(universe_id, &payee, &payer, amount)
-                .await
-            {
-                warn!("payment {}: refund failed: {}", id, e);
+        match result {
+            Ok(Some(text)) if text != "nil" && !text.is_empty() => {
+                Ok(Some(ServerMessage::Output { text }))
             }
-            Some(ServerMessage::Output {
-                text: format!(
-                    "Something went wrong; your {} credits were returned.",
-                    amount
-                ),
-            })
+            Ok(Some(_)) => Ok(Some(ServerMessage::Output {
+                text: format!("You pay {} credits.", amount),
+            })),
+            Err(e) => {
+                warn!("payment {}: handler {} failed: {}", id, handler, e);
+                Err(e)
+            }
+            Ok(None) => {
+                warn!("payment {}: no handler {}", id, handler);
+                Err(format!("no handler {}", handler))
+            }
         }
+    })
+    .await;
+    match outcome {
+        Ok(message) => message,
+        // Nothing but the claim was kept
+        Err(_) => Some(ServerMessage::Output {
+            text: format!(
+                "Something went wrong; you were not charged the {} credits.",
+                amount
+            ),
+        }),
     }
 }

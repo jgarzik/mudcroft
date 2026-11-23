@@ -149,7 +149,16 @@ impl CreditManager {
     }
 
     async fn execute(&self, statements: Vec<Statement>) -> anyhow::Result<()> {
+        self.execute_as(statements, false).await
+    }
+
+    /// `direct`: committed now, on its own, even inside a run (which must
+    /// not hold the write lock then: see db::run::Run::checkpoint)
+    async fn execute_as(&self, statements: Vec<Statement>, direct: bool) -> anyhow::Result<()> {
         if let Some(ref raft_writer) = self.raft_writer {
+            if direct {
+                return raft_writer.execute_batch_direct(statements).await;
+            }
             return raft_writer.execute_batch(statements).await;
         }
         let Some(ref pool) = self.pool else {
@@ -182,14 +191,14 @@ impl CreditManager {
             Holder::Account(id) => {
                 sqlx::query_scalar("SELECT 1 FROM accounts WHERE id = ?")
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(&mut *crate::db::run::reader(pool).await?)
                     .await?
             }
             Holder::Object(id) => {
                 sqlx::query_scalar("SELECT 1 FROM objects WHERE universe_id = ? AND id = ?")
                     .bind(universe_id)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(&mut *crate::db::run::reader(pool).await?)
                     .await?
             }
         };
@@ -208,7 +217,7 @@ impl CreditManager {
         .bind(universe_id)
         .bind(holder.kind())
         .bind(holder.id())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *crate::db::run::reader(pool).await?)
         .await?;
         Ok(balance.unwrap_or(0))
     }
@@ -223,6 +232,43 @@ impl CreditManager {
         check_amount(amount)?;
         self.execute(vec![Self::credit_statement(universe_id, holder, amount)])
             .await
+    }
+
+    /// Payment for something outside the database (a Venice call): like
+    /// [`Self::deduct`], but committed now against committed balances, so it
+    /// stands whatever the current run does next. The run must have
+    /// checkpointed first.
+    pub async fn deduct_direct(
+        &self,
+        universe_id: &str,
+        holder: &Holder,
+        amount: i64,
+    ) -> anyhow::Result<bool> {
+        check_amount(amount)?;
+        match self
+            .execute_as(Self::debit_statements(universe_id, holder, amount), true)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(e) if is_overdraft(&e) || is_missing_holder(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The refund of a [`Self::deduct_direct`] (the call failed): committed
+    /// now too
+    pub async fn grant_direct(
+        &self,
+        universe_id: &str,
+        holder: &Holder,
+        amount: i64,
+    ) -> anyhow::Result<()> {
+        check_amount(amount)?;
+        self.execute_as(
+            vec![Self::credit_statement(universe_id, holder, amount)],
+            true,
+        )
+        .await
     }
 
     /// Spend `amount` from a holder's balance. `Ok(false)` if it does not

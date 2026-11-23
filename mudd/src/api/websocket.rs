@@ -16,8 +16,6 @@ use tracing::{info, warn};
 use super::scripting::{self, ScriptContext};
 use super::AppState;
 use crate::auth::accounts::Account;
-use crate::combat::engine::{attack_mods, attack_statements, resolve_attack, Combatant};
-use crate::combat::DamageType;
 use crate::images::generate_room_image;
 use crate::permissions::AccessLevel;
 use crate::theme::DEFAULT_THEME_ID;
@@ -335,10 +333,17 @@ pub enum ServerMessage {
     /// is about to close; clients must not reconnect automatically
     #[serde(rename = "replaced")]
     Replaced { message: String },
+    /// A command sent with an id has been saved (or had been already)
+    #[serde(rename = "done")]
+    Done { id: String },
     /// No reply: the command already said everything it had to (e.g. a verb
     /// handler that only used game.send). Never sent to clients.
     #[serde(skip)]
     Silent,
+    /// End this session now (the player quit): the session loop stops and
+    /// handles the disconnect at once. Never sent to clients.
+    #[serde(skip)]
+    Quit,
 }
 
 /// Messages sent from client to server
@@ -347,7 +352,13 @@ pub enum ServerMessage {
 pub enum ClientMessage {
     /// Player command input
     #[serde(rename = "command")]
-    Command { text: String },
+    Command {
+        text: String,
+        /// Optional, up to 64 characters: answered with `done` once saved,
+        /// and never run twice (a gateway sets it to retry after failover)
+        #[serde(default)]
+        id: Option<String>,
+    },
     /// Ping to keep connection alive
     #[serde(rename = "ping")]
     Ping,
@@ -664,12 +675,18 @@ async fn handle_socket(
     }
 
     // Main loop: handle incoming messages and outgoing messages
+    // Set when the player quit (no grace period)
+    let mut quit = false;
     loop {
         tokio::select! {
             // Handle outgoing messages from our channel. The channel closes
             // when a newer connection for this player replaces us.
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
+                if matches!(msg, ServerMessage::Quit) {
+                    quit = true;
+                    break;
+                }
                 if let Ok(json) = serde_json::to_string(&msg) {
                     if !socket.send(json).await {
                         break;
@@ -710,6 +727,25 @@ async fn handle_socket(
 
     // Grace period before handling disconnect, so a reconnect does not drop
     // inventory
+    // Quit: the disconnect is handled now, without the grace period
+    if quit && !replaced {
+        let room = state
+            .object_store
+            .get(&universe_id, &player_id_clone)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|p| p.parent_id);
+        if let Err(e) = state
+            .player_manager
+            .finish_disconnect(&universe_id, &player_id_clone, &online_since)
+            .await
+        {
+            warn!("Error handling player quit: {}", e);
+        }
+        disconnect_hook(&state, &universe_id, &player_id_clone, room).await;
+        return;
+    }
     if !replaced {
         let (cancel_rx, gen) = state
             .connections
@@ -732,9 +768,11 @@ async fn handle_socket(
                         info!("Disconnect handling skipped for {} (connected again)", player_id_for_task);
                         return;
                     }
+                    let room = state_clone.object_store.get(&universe_for_task, &player_id_for_task).await.ok().flatten().and_then(|p| p.parent_id);
                     if let Err(e) = state_clone.player_manager.finish_disconnect(&universe_for_task, &player_id_for_task, &since_for_task).await {
                         warn!("Error handling player disconnect: {}", e);
                     }
+                    disconnect_hook(&state_clone, &universe_for_task, &player_id_for_task, room).await;
                     info!("Disconnect handling completed for {} (grace period expired)", player_id_for_task);
                 }
                 _ = cancel_rx => {
@@ -743,6 +781,35 @@ async fn handle_socket(
                 }
             }
         });
+    }
+}
+
+/// The room a player was in gets on_disconnect when their grace period
+/// ends (an engine hook, as the room's owner)
+pub(crate) async fn disconnect_hook(
+    state: &AppState,
+    universe_id: &str,
+    player_id: &str,
+    room: Option<String>,
+) {
+    let Some(room) = room else { return };
+    let has_code = state
+        .object_store
+        .get(universe_id, &room)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.code_hash.is_some());
+    if has_code {
+        super::combat::engine_hook(
+            state,
+            universe_id,
+            &room,
+            Some(room.clone()),
+            "on_disconnect",
+            serde_json::json!({ "player_id": player_id }),
+        )
+        .await;
     }
 }
 
@@ -756,8 +823,23 @@ async fn handle_client_message(
     msg: ClientMessage,
 ) {
     match msg {
-        ClientMessage::Command { text } => {
+        ClientMessage::Command { text, id } => {
             info!("Player {} command: {}", player_id, text);
+            let id = id.filter(|id| !id.is_empty() && id.len() <= 64);
+            // Already saved (a retry after a failover): not run again
+            if let Some(ref id) = id {
+                if command_applied(state, universe_id, player_id, id).await {
+                    state
+                        .connections
+                        .send_to_player(
+                            universe_id,
+                            player_id,
+                            ServerMessage::Done { id: id.clone() },
+                        )
+                        .await;
+                    return;
+                }
+            }
 
             // Echo the command back
             state
@@ -773,26 +855,70 @@ async fn handle_client_message(
 
             // Parse and execute the command; hooks it triggers that should
             // follow the reply (e.g. on_enter after the room description)
-            // run once the reply is queued
-            let mut deferred = Vec::new();
-            let response = execute_command(
+            // run once the reply is queued. The whole command, hooks
+            // included, is one change (db::run): one Raft entry.
+            let saved = super::scripting::in_run_with(
                 state,
-                universe_id,
-                player_id,
-                account_id,
-                access_level,
-                &text,
-                &mut deferred,
+                command_marker(universe_id, player_id, id.as_deref()),
+                async {
+                    let mut deferred = Vec::new();
+                    let response = execute_command(
+                        state,
+                        universe_id,
+                        player_id,
+                        account_id,
+                        access_level,
+                        &text,
+                        &mut deferred,
+                    )
+                    .await;
+                    // A command that ends in an error keeps nothing it wrote
+                    // on the way (the error is still the reply)
+                    let failed = matches!(response, ServerMessage::Error { .. });
+                    if !matches!(response, ServerMessage::Silent) {
+                        state
+                            .connections
+                            .send_to_player(universe_id, player_id, response)
+                            .await;
+                    }
+                    if failed {
+                        return Err(COMMAND_FAILED.to_string());
+                    }
+                    for hook in deferred {
+                        run_hook(state, universe_id, hook).await;
+                    }
+                    Ok::<(), String>(())
+                },
             )
             .await;
-            if !matches!(response, ServerMessage::Silent) {
+            // Finished: saved, or refused with an error (nothing kept). A
+            // command that failed to commit (e.g. leadership lost) gets no
+            // done, so a gateway retries it after the failover.
+            let finished = match &saved {
+                Ok(()) => true,
+                Err(e) => e == COMMAND_FAILED,
+            };
+            if let (true, Some(id)) = (finished, id) {
                 state
                     .connections
-                    .send_to_player(universe_id, player_id, response)
+                    .send_to_player(universe_id, player_id, ServerMessage::Done { id })
                     .await;
             }
-            for hook in deferred {
-                run_hook(state, universe_id, hook).await;
+            if let Err(e) = saved.as_ref().map_err(|e| e.as_str()) {
+                if e == COMMAND_FAILED {
+                    return;
+                }
+                warn!("command by {} not saved: {}", player_id, e);
+                state
+                    .connections
+                    .send_to_player(
+                        universe_id,
+                        player_id,
+                        ServerMessage::Error {
+                            message: "Your last command could not be saved.".to_string(),
+                        },
+                    )
+                    .await;
             }
         }
         ClientMessage::Ping => {
@@ -817,6 +943,60 @@ async fn handle_client_message(
                 .await;
         }
     }
+}
+
+/// A command whose reply was an error (already sent): its run is undone
+const COMMAND_FAILED: &str = "command failed";
+
+/// How long a command id is remembered (a retry comes within seconds)
+const COMMAND_ID_TTL_MS: i64 = 10 * 60 * 1000;
+
+/// Whether this player's command with this id was saved already (ids are
+/// per player: nobody can claim another player's)
+async fn command_applied(state: &AppState, universe_id: &str, player_id: &str, id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM applied_commands
+         WHERE universe_id = ? AND player_id = ? AND command_id = ?",
+    )
+    .bind(universe_id)
+    .bind(player_id)
+    .bind(id)
+    .fetch_optional(state.db.pool())
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Statements leading a command's batch when it has an id: the id is
+/// recorded with it (a duplicate fails the batch), and ids past their
+/// deadline go
+fn command_marker(
+    universe_id: &str,
+    player_id: &str,
+    id: Option<&str>,
+) -> Vec<crate::db::run::Statement> {
+    let Some(id) = id else {
+        return Vec::new();
+    };
+    let now = crate::combat::now_ms() as i64;
+    vec![
+        (
+            "DELETE FROM applied_commands WHERE universe_id = ? AND expires_at < ?".to_string(),
+            vec![universe_id.into(), now.into()],
+        ),
+        (
+            "INSERT INTO applied_commands (universe_id, player_id, command_id, expires_at)
+             VALUES (?, ?, ?, ?)"
+                .to_string(),
+            vec![
+                universe_id.into(),
+                player_id.into(),
+                id.into(),
+                (now + COMMAND_ID_TTL_MS).into(),
+            ],
+        ),
+    ]
 }
 
 /// Everything after a command's verb, verbatim apart from surrounding
@@ -1004,6 +1184,23 @@ impl Hook {
 /// Run an object hook triggered by a player. The hook runs as the
 /// object's owner (see scripting::invoke_handler); errors are logged.
 async fn run_hook(state: &AppState, universe_id: &str, hook: Hook) {
+    // Entering a room: aggressive NPCs there notice (api/combat.rs)
+    let entered = if hook.method == "on_enter" {
+        match (hook.room_id.clone(), hook.args["moved_id"].as_str()) {
+            (Some(room), Some(moved)) => {
+                super::combat::arrival(state, universe_id, moved, &room).await;
+                Some((
+                    moved.to_string(),
+                    hook.args["from"].as_str().map(str::to_string),
+                    room,
+                    hook.args["actor_id"].as_str().map(str::to_string),
+                ))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     if let Err(e) = scripting::invoke_handler(
         state,
         universe_id,
@@ -1015,6 +1212,19 @@ async fn run_hook(state: &AppState, universe_id: &str, hook: Hook) {
     .await
     {
         warn!("{} hook on {} failed: {}", hook.method, hook.object_id, e);
+    }
+    // Then regions crossed, on_init, on_move
+    if let Some((moved, from, to, actor)) = entered {
+        super::combat::move_extras(
+            state,
+            universe_id,
+            &moved,
+            from.as_deref(),
+            Some(&to),
+            actor.as_deref(),
+            None,
+        )
+        .await;
     }
 }
 
@@ -1037,6 +1247,34 @@ async fn execute_command(
     }
 
     let verb = parts[0].to_lowercase();
+
+    // Built-ins added later than custom verbs could exist under their names:
+    // for these, an object's or room's own verb comes first (never for
+    // safety commands such as pvp or flee, and never with the wallet)
+    let soft = matches!(
+        verb.as_str(),
+        "wield" | "wear" | "unwield" | "remove" | "equipment" | "eq" | "who" | "give" | "use"
+    ) || (matches!(verb.as_str(), "get" | "take") && command.contains(" from "));
+    if soft {
+        let args = parts[1..].join(" ");
+        if let Some(reply) = dispatch_custom_verb(
+            state,
+            universe_id,
+            player_id,
+            account_id,
+            access_level,
+            &verb,
+            &args,
+            true,
+        )
+        .await
+        {
+            // A failing shadow verb falls back to the built-in
+            if !matches!(reply, ServerMessage::Error { .. }) {
+                return reply;
+            }
+        }
+    }
 
     match verb.as_str() {
         "look" | "l" => {
@@ -1174,7 +1412,7 @@ async fn execute_command(
         "help" => {
             let mut text = String::from(
                 "Commands: look, north/south/east/west/up/down, say <message>, \
-                 get/take <item>, drop <item>, inventory/i, attack/kill <target>, help. \
+                 get/take <item> [from <container>], drop <item>, inventory/i, give <item> to <someone>, use <item> [on <target>], attack/kill <target>, flee, wield/wear/remove/equipment, pvp on/off, who, quit, help. \
                  Objects may offer their own verbs (e.g. 'pull lever').",
             );
             if access_level >= AccessLevel::Builder {
@@ -1196,6 +1434,22 @@ async fn execute_command(
                     message: "Take what?".to_string(),
                 };
             };
+
+            // "get <item> from <container>" takes out of a container
+            if let Some((item, container)) = item_name.split_once(" from ") {
+                return execute_lua_with_args(
+                    state,
+                    universe_id,
+                    account_id,
+                    "local pid, item, from = ...; return Commands.take_from(pid, item, from).message",
+                    vec![
+                        player_id.to_string(),
+                        item.trim().to_string(),
+                        container.trim().to_string(),
+                    ],
+                )
+                .await;
+            }
 
             // Execute Commands.take() via Lua
             // Arguments are passed as values, never spliced into the source
@@ -1461,23 +1715,19 @@ async fn execute_command(
                 .unwrap_or("something")
                 .to_string();
 
-            // Check if target is attackable (NPC or PvP-flagged player)
-            // Any npc, including subclasses defined with define_class
-            let is_npc = target.class == "monster"
-                || state
-                    .classes
-                    .read()
-                    .await
-                    .is_a(universe_id, &target.class, "npc");
-            if !is_npc {
+            // The engine's rules (combat setting, creatures, PvP)
+            let Ok(Some(me)) = state.object_store.get(universe_id, player_id).await else {
                 return ServerMessage::Error {
-                    message: format!("You can't attack {}.", target_display_name),
+                    message: "You have no body to fight with.".to_string(),
                 };
+            };
+            if let Err(reason) = super::combat::fight_allowed(state, universe_id, &me, target).await
+            {
+                return ServerMessage::Error { message: reason };
             }
 
-            // Serialize with the effect scheduler and effect writes, and
-            // read the target again under the lock: HP must not be computed
-            // from a stale row
+            // Serialized with every HP and effect writer; the target is read
+            // again under it: HP must not be computed from a stale row
             let _writes = state.effects.write_guard().await;
             let Ok(Some(target)) = state.object_store.get(universe_id, &target_id).await else {
                 return ServerMessage::Error {
@@ -1510,141 +1760,302 @@ async fn execute_command(
                     message: "You have no body to fight with.".to_string(),
                 };
             };
-            let attacker = Combatant::from_object(&attacker_obj, 100);
-            let defender = Combatant::from_object(target, 10);
 
-            // Status effects: a stunned or paralyzed attacker cannot act;
-            // others change to-hit and damage
+            // A stunned or paralyzed attacker cannot act
             let now = crate::combat::now_ms();
-            let attacker_effects = state.effects.get(universe_id, player_id).await;
-            let target_effects = state.effects.get(universe_id, &target_id).await;
-            if !attacker_effects.can_act(now) {
+            if !state.effects.get(universe_id, player_id).await.can_act(now) {
                 return ServerMessage::Error {
                     message: "You are stunned and cannot act.".to_string(),
                 };
             }
-            let mods = attack_mods(&attacker_effects, &target_effects, now);
 
-            // Basic 1d6 physical damage, doubled on a critical
-            let d20 = crate::combat::roll_d20();
-            let damage_roll = {
-                use rand::RngExt;
-                rand::rng().random_range(1..=6)
-            };
-            let outcome = resolve_attack(
-                &attacker,
-                &defender,
-                &mods,
-                d20,
-                damage_roll,
-                DamageType::Physical,
-                now,
-            );
-
-            // The round is one atomic batch: new HP, and removal on death
-            match attack_statements(universe_id, &target_id, &outcome) {
-                Ok(statements) if !statements.is_empty() => {
-                    if let Err(e) = state.object_store.execute_batch(statements).await {
-                        return ServerMessage::Error {
+            // Already fighting: rounds set the pace, so retyping attack only
+            // switches target (no extra blow)
+            match super::combat::current_target(state, universe_id, player_id).await {
+                Ok(Some(current)) if current == target_id => {
+                    return ServerMessage::Output {
+                        text: format!("You are already fighting {}.", target_display_name),
+                    };
+                }
+                Ok(Some(_)) => {
+                    return match super::combat::retarget(
+                        state,
+                        universe_id,
+                        player_id,
+                        &target_id,
+                        now,
+                    )
+                    .await
+                    {
+                        Ok(()) => ServerMessage::Output {
+                            text: format!("You turn to fight {}.", target_display_name),
+                        },
+                        Err(e) => ServerMessage::Error {
                             message: format!("Attack failed: {}", e),
-                        };
+                        },
+                    };
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return ServerMessage::Error {
+                        message: format!("Attack failed: {}", e),
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
+            }
+
+            // Paced: a full round since the last blow (fleeing and coming
+            // back cannot add blows)
+            if !super::combat::ready_to_strike(state, universe_id, &attacker_obj, now).await {
+                return ServerMessage::Output {
+                    text: "You are not ready to strike again.".to_string(),
+                };
+            }
+
+            // The first blow now; then a round each way every
+            // combat_round_ms until the fight ends (api/combat.rs)
+            let blow =
+                match super::combat::strike(state, universe_id, &attacker_obj, target, now).await {
+                    Ok(blow) => blow,
+                    Err(e) => {
+                        return ServerMessage::Error {
+                            message: format!("Attack failed: {}", e),
+                        }
+                    }
+                };
+            let death = if blow.killed {
+                let dead = state
+                    .object_store
+                    .get(universe_id, &target_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| target.clone());
+                match super::combat::death(state, universe_id, &dead, Some(&attacker_obj), now)
+                    .await
+                {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        return ServerMessage::Error {
+                            message: format!("Attack failed: {}", e),
+                        }
+                    }
+                }
+            } else {
+                if let Err(e) =
+                    super::combat::engage(state, universe_id, player_id, &target_id, now).await
+                {
                     return ServerMessage::Error {
                         message: format!("Attack failed: {}", e),
                     };
                 }
-            }
-            if outcome.killed {
-                state.effects.cache_clear(universe_id, &target_id).await;
-            }
-            if let Some(ref bleed) = outcome.inflicts {
-                state
-                    .effects
-                    .cache_add(universe_id, &target_id, bleed.clone())
-                    .await;
-            }
-            let attack_result = &outcome.result;
-
-            // Build result message
-            let mut messages = Vec::new();
-
-            if attack_result.hit {
-                let damage = attack_result
-                    .damage
-                    .as_ref()
-                    .map(|d| d.final_damage)
-                    .unwrap_or(0);
-                deferred.push(Hook::new(
+                None
+            };
+            drop(_writes);
+            if let Some(damage) = blow.damage {
+                let hook = Hook::new(
                     &target_id,
                     Some(&room_id),
                     "on_damage",
                     player_id,
                     serde_json::json!({ "attacker_id": player_id, "damage": damage }),
-                ));
-                if attack_result.critical {
-                    messages.push(format!(
-                        "CRITICAL HIT! You strike {} for {} damage!",
-                        target_display_name, damage
-                    ));
-                    if outcome.inflicts.is_some() {
-                        messages.push(format!("{} is bleeding!", target_display_name));
-                    }
+                );
+                // A killing blow's on_damage runs before on_death
+                if death.is_some() {
+                    run_hook(state, universe_id, hook).await;
                 } else {
-                    messages.push(format!(
-                        "You hit {} for {} damage.",
-                        target_display_name, damage
-                    ));
+                    deferred.push(hook);
                 }
-
-                if outcome.killed {
-                    messages.push(format!("{} is slain!", target_display_name));
-                    deferred.push(Hook::new(
-                        &target_id,
-                        Some(&room_id),
-                        "on_death",
-                        player_id,
-                        serde_json::json!({ "killer_id": player_id }),
-                    ));
-                } else {
-                    messages.push(format!(
-                        "{} has {} HP remaining.",
-                        target_display_name, outcome.target_hp
-                    ));
-                }
-            } else if attack_result.fumble {
-                messages.push(format!(
-                    "You fumble your attack against {}!",
-                    target_display_name
-                ));
-            } else {
-                messages.push(format!(
-                    "You miss {} (rolled {} vs AC {}).",
-                    target_display_name, attack_result.attack_total, attack_result.target_ac
-                ));
             }
 
-            // Onlookers get a third-person summary; the attacker gets the
-            // detailed result as this command's reply
-            let attacker_name = display_name(state, universe_id, player_id).await;
-            let mut seen = format!("{} attacks {}.", attacker_name, target_display_name);
-            if outcome.killed {
-                seen.push_str(&format!(" {} is slain!", target_display_name));
-            }
+            // Onlookers get a third-person summary; the attacker the details
             state
                 .connections
                 .broadcast_room_except(
                     universe_id,
                     &room_id,
                     Some(player_id),
-                    ServerMessage::Output { text: seen },
+                    ServerMessage::Output {
+                        text: blow.room_text,
+                    },
                 )
                 .await;
-
+            state
+                .connections
+                .send_to_player(
+                    universe_id,
+                    player_id,
+                    ServerMessage::Output {
+                        text: blow.attacker_text,
+                    },
+                )
+                .await;
+            if let Some(ref d) = death {
+                super::combat::report_death(state, universe_id, d).await;
+            }
+            ServerMessage::Silent
+        }
+        "wield" => {
+            super::equipment::equip(
+                state,
+                universe_id,
+                player_id,
+                args_after_verb(command),
+                true,
+            )
+            .await
+        }
+        "wear" => {
+            super::equipment::equip(
+                state,
+                universe_id,
+                player_id,
+                args_after_verb(command),
+                false,
+            )
+            .await
+        }
+        "unwield" => super::equipment::unequip(state, universe_id, player_id, None).await,
+        "remove" => {
+            super::equipment::unequip(
+                state,
+                universe_id,
+                player_id,
+                Some(args_after_verb(command)),
+            )
+            .await
+        }
+        "equipment" | "eq" => super::equipment::list(state, universe_id, player_id).await,
+        "flee" => {
+            use crate::lua::engine::Engine;
+            let engine = super::combat::CombatEngine {
+                state: state.clone(),
+            };
+            match engine.flee(universe_id, player_id).await {
+                Ok(dir) => ServerMessage::Output {
+                    text: format!("You flee {}!", dir),
+                },
+                Err(reason) => ServerMessage::Output { text: reason },
+            }
+        }
+        "who" => {
+            let mut names = Vec::new();
+            for (pid, _) in state.connections.player_rooms(universe_id).await {
+                let name = state
+                    .object_store
+                    .get(universe_id, &pid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.get_string("name").map(str::to_string))
+                    .unwrap_or(pid);
+                names.push(name);
+            }
+            names.sort();
             ServerMessage::Output {
-                text: messages.join("\n"),
+                text: format!("Players here ({}): {}", names.len(), names.join(", ")),
+            }
+        }
+        "quit" => {
+            // Goodbye first, then the session ends (the disconnect is
+            // handled at once)
+            state
+                .connections
+                .send_to_player(
+                    universe_id,
+                    player_id,
+                    ServerMessage::Output {
+                        text: "Goodbye.".to_string(),
+                    },
+                )
+                .await;
+            state
+                .connections
+                .send_to_player(universe_id, player_id, ServerMessage::Quit)
+                .await;
+            ServerMessage::Silent
+        }
+        "give" => {
+            let args = args_after_verb(command);
+            let Some((item, target)) = args.split_once(" to ") else {
+                return ServerMessage::Error {
+                    message: "Usage: give <item> to <someone>".to_string(),
+                };
+            };
+            execute_lua_with_args(
+                state,
+                universe_id,
+                account_id,
+                "local pid, item, target = ...; return Commands.give(pid, item, target).message",
+                vec![
+                    player_id.to_string(),
+                    item.trim().to_string(),
+                    target.trim().to_string(),
+                ],
+            )
+            .await
+        }
+        "use" => {
+            let args = args_after_verb(command);
+            if args.is_empty() {
+                return ServerMessage::Error {
+                    message: "Use what?".to_string(),
+                };
+            }
+            let (item, target) = match args.split_once(" on ") {
+                Some((i, t)) => (i.trim().to_string(), t.trim().to_string()),
+                None => (args.trim().to_string(), String::new()),
+            };
+            execute_lua_with_args(
+                state,
+                universe_id,
+                account_id,
+                "local pid, item, target = ...; if target == '' then target = nil end; return Commands.use(pid, item, target).message",
+                vec![player_id.to_string(), item, target],
+            )
+            .await
+        }
+        "pvp" => {
+            // Flag yourself for player combat (counts under pvp_policy
+            // "flagged")
+            let on = match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => {
+                    let flagged = state
+                        .object_store
+                        .get(universe_id, player_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|me| me.get_bool("pvp"))
+                        .unwrap_or(false);
+                    return ServerMessage::Output {
+                        text: format!(
+                            "PvP is {} for you. Usage: pvp on|off",
+                            if flagged { "on" } else { "off" }
+                        ),
+                    };
+                }
+            };
+            let statement = match crate::objects::ObjectStore::set_properties_statement(
+                universe_id,
+                player_id,
+                &[("pvp", serde_json::json!(on))],
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ServerMessage::Error {
+                        message: format!("Could not change PvP: {}", e),
+                    }
+                }
+            };
+            match state.object_store.execute_batch(vec![statement]).await {
+                Ok(()) => ServerMessage::Output {
+                    text: format!("PvP {}.", if on { "on" } else { "off" }),
+                },
+                Err(e) => ServerMessage::Error {
+                    message: format!("Could not change PvP: {}", e),
+                },
             }
         }
         "create" => {
@@ -1689,6 +2100,7 @@ async fn execute_command(
                     access_level,
                     &verb,
                     "",
+                    false,
                 )
                 .await
                 {
@@ -1709,6 +2121,7 @@ async fn execute_command(
                 access_level,
                 &verb,
                 &args,
+                false,
             )
             .await
             {
@@ -1729,6 +2142,7 @@ async fn execute_command(
 /// whose object name contains it wins; otherwise the first candidate does.
 /// The handler runs as the object's owner and gets {verb, args, actor_id,
 /// object_id, room_id}; a string result becomes the reply.
+#[allow(clippy::too_many_arguments)] // the dispatch context, one flag
 async fn dispatch_custom_verb(
     state: &AppState,
     universe_id: &str,
@@ -1737,6 +2151,7 @@ async fn dispatch_custom_verb(
     access_level: AccessLevel,
     verb: &str,
     args: &str,
+    shadows_builtin: bool,
 ) -> Option<ServerMessage> {
     let room_id = state.connections.get_room_id(universe_id, player_id).await;
 
@@ -1816,7 +2231,7 @@ async fn dispatch_custom_verb(
     // only one offering the verb, their exact name for it, or the single
     // match. Otherwise another builder's look-alike could capture the verb
     // and bill them; the handler still runs, with no paying player.
-    let (chosen, picked) = if objects(&candidates) == 1 {
+    let (chosen, mut picked) = if objects(&candidates) == 1 {
         (candidates[0].clone(), true)
     } else if objects(&exact) == 1 {
         (exact[0].clone(), true)
@@ -1826,6 +2241,11 @@ async fn dispatch_custom_verb(
         let first = exact.first().or(fuzzy.first()).unwrap_or(&candidates[0]);
         (first.clone(), false)
     };
+    // A verb shadowing a built-in (the player may have meant the built-in)
+    // never gets the player's wallet
+    if shadows_builtin {
+        picked = false;
+    }
 
     let handler_args = serde_json::json!({
         "verb": verb,

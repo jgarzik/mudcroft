@@ -15,7 +15,6 @@ use tracing::warn;
 use super::{AppState, ServerMessage};
 use crate::combat::engine::{process_due, tick_statements, Combatant, TickEvent, TickOutcome};
 use crate::combat::now_ms;
-use crate::objects::Object;
 
 /// Longest sleep with nothing due (a safety net; changes wake it sooner)
 const IDLE_WAIT: Duration = Duration::from_secs(60);
@@ -47,142 +46,122 @@ pub async fn run_effect_scheduler(state: AppState) {
 struct Processed {
     universe: String,
     entity: String,
-    obj: Object,
     is_player: bool,
     outcome: TickOutcome,
-    /// Who caused a death: the source of the last effect that dealt damage
-    killer: Option<String>,
-    /// Where a player who died respawns (already committed)
-    respawn: Option<String>,
+    /// Its death (already handled in the run), killed by the source of the
+    /// last effect that dealt damage
+    death: Option<super::combat::Death>,
 }
 
 /// Commit everything due at `now`
 pub async fn process(state: &AppState, now: u64) {
     let mut had_errors = false;
-    let processed = {
+    // One run: everything due commits as one batch (hooks and messages
+    // follow the commit)
+    let processed = super::scripting::in_run(state, async {
         // Serializes against attacks and effect writes, which also read
         // and write HP and effect rows. Released before reporting: hooks
         // that run then may write effects themselves.
         let _writes = state.effects.write_guard().await;
         let due = state.effects.due(now).await;
         if due.is_empty() {
-            return;
+            return Ok(Vec::new());
         }
 
-        let mut statements = Vec::new();
         let mut processed = Vec::new();
         for ((universe, entity), _) in due {
-            // Work from the table, the source of truth, not the cache: the
-            // object may have been deleted (rows cascaded) and even recreated
-            let effects = match crate::combat::EffectRegistry::load_entity(
-                state.db.pool(),
-                &universe,
-                &entity,
-            )
-            .await
-            {
-                Ok(effects) if effects.is_empty() => {
-                    state.effects.cache_clear(&universe, &entity).await;
-                    continue;
-                }
-                Ok(effects) => effects,
-                Err(e) => {
-                    warn!("effects: loading {} failed: {}", entity, e);
-                    had_errors = true;
-                    continue;
-                }
-            };
-            let obj = match state.object_store.get(&universe, &entity).await {
-                Ok(Some(obj)) => obj,
-                Ok(None) => {
-                    // The object is gone, and its rows with it
-                    state.effects.cache_clear(&universe, &entity).await;
-                    continue;
-                }
-                Err(e) => {
-                    warn!("effects: lookup of {} failed: {}", entity, e);
-                    had_errors = true;
-                    continue;
-                }
-            };
-            let is_player = obj.class == "player";
-            let target = Combatant::from_object(&obj, if is_player { 100 } else { 10 });
-            let outcome = process_due(&target, &effects, now);
-            let mut entity_statements =
-                match tick_statements(&universe, &entity, is_player, &effects, &outcome) {
-                    Ok(s) => s,
+            // Each entity is a nested part: one that fails (a death that
+            // cannot be handled) is undone and logged, the others go on
+            let one = super::scripting::in_run(state, async {
+                // Work from the table, the source of truth, not the cache: the
+                // object may have been deleted (rows cascaded) and even recreated
+                let effects = match crate::combat::EffectRegistry::load_entity(
+                    state.db.pool(),
+                    &universe,
+                    &entity,
+                )
+                .await
+                {
+                    Ok(effects) if effects.is_empty() => {
+                        state.effects.cache_clear(&universe, &entity).await;
+                        return Ok(None);
+                    }
+                    Ok(effects) => effects,
                     Err(e) => {
-                        warn!("effects: {}: {}", entity, e);
-                        had_errors = true;
-                        continue;
+                        return Err(format!("effects: loading {} failed: {}", entity, e));
                     }
                 };
-            let killer = outcome.events.iter().rev().find_map(|event| match event {
-                TickEvent::Damage { effect, .. } => effects
-                    .all()
-                    .iter()
-                    .find(|e| e.effect_type == *effect)
-                    .and_then(|e| e.source_id.clone()),
-                _ => None,
-            });
-            // A player who dies drops what they carry and respawns in the
-            // same batch: HP restored and moved (or, with no respawn room
-            // yet, revived where they fell), never left dead at 0 HP
-            let mut respawn = None;
-            if outcome.killed && is_player {
-                let found = state.player_manager.respawn_room(&obj, &universe).await;
-                let drops = match obj.parent_id.as_deref() {
-                    Some(room) => {
-                        state
-                            .player_manager
-                            .drop_statements(&universe, &entity, room)
+                let obj = match state.object_store.get(&universe, &entity).await {
+                    Ok(Some(obj)) => obj,
+                    Ok(None) => {
+                        // The object is gone, and its rows with it
+                        state.effects.cache_clear(&universe, &entity).await;
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        return Err(format!("effects: lookup of {} failed: {}", entity, e));
+                    }
+                };
+                let is_player = obj.class == "player";
+                let target = Combatant::from_object(&obj, if is_player { 100 } else { 10 });
+                let outcome = process_due(&target, &effects, now);
+                let entity_statements =
+                    match tick_statements(&universe, &entity, is_player, &effects, &outcome) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err(format!("effects: {}: {}", entity, e));
+                        }
+                    };
+                let killer = outcome.events.iter().rev().find_map(|event| match event {
+                    TickEvent::Damage { effect, .. } => effects
+                        .all()
+                        .iter()
+                        .find(|e| e.effect_type == *effect)
+                        .and_then(|e| e.source_id.clone()),
+                    _ => None,
+                });
+                // Written now (in this run), so a death below works from them
+                state
+                    .object_store
+                    .execute_batch(entity_statements)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // A death follows the universe's policy, as for any death
+                let death = if outcome.killed {
+                    let killer_obj = match killer {
+                        Some(ref k) => state.object_store.get(&universe, k).await.ok().flatten(),
+                        None => None,
+                    };
+                    let dead = state
+                        .object_store
+                        .get(&universe, &entity)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_else(|| obj.clone());
+                    Some(
+                        super::combat::death(state, &universe, &dead, killer_obj.as_ref(), now)
                             .await
-                    }
-                    None => Ok(Vec::new()),
+                            .map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    None
                 };
-                match (found, drops) {
-                    (Ok(room), Ok(drops)) => {
-                        entity_statements.extend(drops);
-                        // With no respawn room, revive in place: no move
-                        // (they may have walked on meanwhile)
-                        entity_statements.extend(respawn_statements(
-                            &universe,
-                            &entity,
-                            &target,
-                            room.as_deref(),
-                        ));
-                        respawn = match room {
-                            Some(room) => Some(room),
-                            None => {
-                                warn!("effects: no respawn room for {}; reviving in place", entity);
-                                state.connections.get_room_id(&universe, &entity).await
-                            }
-                        };
-                    }
-                    (Err(e), _) | (_, Err(e)) => {
-                        warn!("effects: respawn of {} not prepared: {}", entity, e);
-                        had_errors = true;
-                        continue;
-                    }
+                Ok::<_, String>(Some(Processed {
+                    universe: universe.clone(),
+                    entity: entity.clone(),
+                    is_player,
+                    outcome,
+                    death,
+                }))
+            })
+            .await;
+            match one {
+                Ok(Some(p)) => processed.push(p),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("effects: {} not processed: {}", entity, e);
+                    had_errors = true;
                 }
-            }
-            statements.extend(entity_statements);
-            processed.push(Processed {
-                universe,
-                entity,
-                obj,
-                is_player,
-                outcome,
-                killer,
-                respawn,
-            });
-        }
-        if !statements.is_empty() {
-            if let Err(e) = state.object_store.execute_batch(statements).await {
-                warn!("due effects not committed (retrying): {}", e);
-                drop(_writes);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                return;
             }
         }
         for p in &processed {
@@ -195,7 +174,16 @@ pub async fn process(state: &AppState, now: u64) {
                     .await;
             }
         }
-        processed
+        Ok::<_, String>(processed)
+    })
+    .await;
+    let processed = match processed {
+        Ok(processed) => processed,
+        Err(e) => {
+            warn!("due effects not committed (retrying): {}", e);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            return;
+        }
     };
 
     for p in &processed {
@@ -205,31 +193,6 @@ pub async fn process(state: &AppState, now: u64) {
     if had_errors {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-}
-
-/// Statements restoring a dead player: full HP, at the respawn room
-fn respawn_statements(
-    universe: &str,
-    entity: &str,
-    target: &Combatant,
-    room: Option<&str>,
-) -> Vec<(String, Vec<serde_json::Value>)> {
-    let mut statements = Vec::new();
-    if let Ok(hp) = crate::objects::ObjectStore::set_properties_statement(
-        universe,
-        entity,
-        &[("hp", serde_json::json!(target.max_hp))],
-    ) {
-        statements.push(hp);
-    }
-    if let Some(room) = room {
-        statements.push(crate::objects::ObjectStore::set_parent_statement(
-            universe,
-            entity,
-            Some(room),
-        ));
-    }
-    statements
 }
 
 /// Tell a player what their effects did; announce and handle deaths
@@ -252,77 +215,7 @@ async fn report(state: &AppState, p: &Processed) {
                 .await;
         }
     }
-    if !p.outcome.killed {
-        return;
-    }
-    let name = p
-        .obj
-        .properties
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Something")
-        .to_string();
-    let death_room = p.obj.parent_id.clone();
-    if let Some(ref room) = death_room {
-        state
-            .connections
-            .broadcast_room_except(
-                universe,
-                room,
-                p.is_player.then_some(entity),
-                ServerMessage::Output {
-                    text: format!("{} dies.", name),
-                },
-            )
-            .await;
-    }
-
-    if !p.is_player {
-        // As for a kill by attack: the NPC's on_death runs (as its owner)
-        let args = serde_json::json!({
-            "object_id": entity,
-            "room_id": death_room,
-            "killer_id": p.killer,
-        });
-        if let Err(e) = super::scripting::invoke_handler(
-            state,
-            universe,
-            entity,
-            death_room.clone(),
-            "on_death",
-            args,
-        )
-        .await
-        {
-            warn!("on_death of {} failed: {}", entity, e);
-        }
-        return;
-    }
-
-    // A player: inventory dropped and respawned (committed above). Show them
-    // where they are.
-    state
-        .connections
-        .send_to_player(
-            universe,
-            entity,
-            ServerMessage::Output {
-                text: "You have died.".to_string(),
-            },
-        )
-        .await;
-    if let Some(ref respawn) = p.respawn {
-        state
-            .connections
-            .update_room(universe, entity, Some(respawn.clone()))
-            .await;
-        if let Some(room_msg) =
-            super::websocket::build_room_message(state, universe, respawn, None).await
-        {
-            state
-                .connections
-                .send_to_player(universe, entity, room_msg)
-                .await;
-        }
+    if let Some(ref death) = p.death {
+        super::combat::report_death(state, universe, death).await;
     }
 }

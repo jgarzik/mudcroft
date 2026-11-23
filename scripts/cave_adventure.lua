@@ -83,8 +83,8 @@ game.create_object("/items/sapphire-necklace", "item", "/rooms/treasure-chamber"
 game.create_object("/weapons/troll-slayer", "weapon", "/rooms/treasure-chamber", {
     name = "Troll Slayer Sword",
     description = "A legendary blade that glows with a faint blue light near trolls. Runes of power are etched along the blade.",
-    damage_dice = "2d6",
-    damage_bonus = 3,
+    damage = "2d6+3",
+    damage_type = "slashing",
     weight = 4
 })
 
@@ -92,8 +92,7 @@ game.create_object("/weapons/troll-slayer", "weapon", "/rooms/treasure-chamber",
 game.create_object("/weapons/rusty-sword", "weapon", "/rooms/cave-entrance", {
     name = "Rusty Short Sword",
     description = "A battered but serviceable short sword. Better than nothing.",
-    damage_dice = "1d6",
-    damage_bonus = 0,
+    damage = "1d6",
     weight = 2
 })
 

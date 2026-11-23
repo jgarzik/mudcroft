@@ -3,12 +3,12 @@
 Mudcroft keeps all state in a single SQLite database (WAL mode, foreign keys
 on). `mudd_init` creates it, and re-running `mudd_init` upgrades it in place:
 `mudd_init` is the only place schema upgrades live (`mudd` never migrates).
-The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 11):
+The schema version is kept in `PRAGMA user_version` (`SCHEMA_VERSION`, now 14):
 `mudd` refuses a database at any other version, and `mudd_init` upgrades an
 older one step by step (`Database::upgrade`). The upgrade steps are
 6 -> 7 (adds the `credits_holder_exists` trigger), 7 -> 8 (adds the
 `actions` table), 8 -> 9 (adds `cluster_nodes`), 9 -> 10 (adds `online_players`) and
-10 -> 11 (adds `payment_requests`); an older database is refused with a "create a new database" error (from
+10 -> 11 (adds `payment_requests`), 11 -> 12 (adds `applied_commands`), 12 -> 13 (adds `combat` and `deadlines`), 13 -> 14 (rebuilds `deadlines` with every kind and its triggers, `applied_commands` keyed per player, the equipment trigger); an older database is refused with a "create a new database" error (from
 version 1 there is none: its SHA-256 password hashes cannot become argon2id);
 at the current version a re-run creates any missing tables and refreshes the
 core mudlib.
@@ -402,6 +402,58 @@ the object.
 | expires_at | INTEGER NOT NULL | ms since epoch (a minute after the request) |
 
 Foreign key `(universe_id, object_id)` to `objects` ON DELETE CASCADE.
+
+### applied_commands
+
+Commands saved with an id (`{"type": "command", "id"}`, set by gateways):
+a command sent again with a saved id (a retry after a failover) is not run
+twice. The row is written in the command's own Raft entry; rows past their
+deadline are deleted by later such entries.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| player_id | TEXT NOT NULL | The player who sent it (ids are per player) |
+| command_id | TEXT NOT NULL | Up to 64 characters |
+| expires_at | INTEGER NOT NULL | ms since epoch (ten minutes after) |
+
+Primary key `(universe_id, player_id, command_id)`.
+
+### combat
+
+Fights in progress: one row per fighter (`api/combat.rs`).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| entity_id | TEXT NOT NULL | The fighter |
+| target_id | TEXT NOT NULL | Whom it attacks |
+| next_round_at | INTEGER NOT NULL | ms since epoch; index `combat_due` |
+
+Primary key `(universe_id, entity_id)`; foreign key `(universe_id, entity_id)`
+to `objects` ON DELETE CASCADE.
+
+### deadlines
+
+World events due at an absolute time: a corpse decaying, an NPC respawning
+or wandering, a room resetting. Triggers `wander_on_insert`/`wander_on_update`
+(and `reset_on_insert`/`reset_on_update`) give an object whose properties get
+a positive `wander_seconds` (`reset_seconds`) a `wander` (`reset`) row due at
+time 0 (the same on every replica); the scheduler reschedules it.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| universe_id | TEXT NOT NULL | |
+| object_id | TEXT NOT NULL | The corpse or NPC |
+| kind | TEXT NOT NULL | `decay`, `respawn`, `wander`, `reset` (an object's `on_reset`, every `reset_seconds`) or `delete` (an NPC gone for good: its death report deletes it after `on_death`; this row deletes it a minute later if the report never ran) |
+| due_at | INTEGER NOT NULL | ms since epoch; index `deadlines_due` |
+
+Primary key `(universe_id, object_id, kind)`; foreign key to `objects` ON
+DELETE CASCADE.
+
+Trigger `unequip_on_move` (schema 13, ensured by 14) on `objects`: when an object's
+`parent_id` changes, its `equipped_by` property (equipment) is removed.
+
 ## Startup Validation
 
 `mudd` opens an existing database only. It does not create the database or

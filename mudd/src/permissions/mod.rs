@@ -428,10 +428,14 @@ impl PermissionManager {
         let Some(ref pool) = self.db_pool else {
             return AccessLevel::Player;
         };
+        // Through the current run, if any (it may have changed the row)
+        let Ok(mut conn) = crate::db::run::reader(pool).await else {
+            return AccessLevel::Player;
+        };
         let Ok(Some((level,))) =
             sqlx::query_as::<_, (String,)>("SELECT access_level FROM accounts WHERE id = ?")
                 .bind(account_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await
         else {
             return AccessLevel::Player;
@@ -452,12 +456,15 @@ impl PermissionManager {
         let Some(ref pool) = self.db_pool else {
             return AccessLevel::Player;
         };
+        let Ok(mut conn) = crate::db::run::reader(pool).await else {
+            return AccessLevel::Player;
+        };
         let level = match sqlx::query_as::<_, (String,)>(
             "SELECT level FROM universe_members WHERE universe_id = ? AND account_id = ?",
         )
         .bind(universe_id)
         .bind(account_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         {
             Ok(Some((level,))) => AccessLevel::from_str(&level).unwrap_or(AccessLevel::Player),
@@ -474,11 +481,12 @@ impl PermissionManager {
             return Some(owner.clone());
         }
         let pool = self.db_pool.as_ref()?;
+        let mut conn = crate::db::run::reader(pool).await.ok()?;
         // Cache only a found owner: a missing universe may be created later
         let owner =
             match sqlx::query_as::<_, (String,)>("SELECT owner_id FROM universes WHERE id = ?")
                 .bind(universe_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await
             {
                 Ok(Some((owner,))) => owner,
@@ -683,7 +691,7 @@ impl PermissionManager {
         )
         .bind(grant_id)
         .bind(universe_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *crate::db::run::reader(pool).await?)
         .await?;
 
         Ok(row.map(|r| r.into_grant()))
@@ -703,13 +711,16 @@ impl PermissionManager {
         let Some(ref pool) = self.db_pool else {
             return Vec::new();
         };
+        let Ok(mut conn) = crate::db::run::reader(pool).await else {
+            return Vec::new();
+        };
 
         let rows: Vec<PathGrantRow> = match sqlx::query_as(
             "SELECT id, universe_id, grantee_id, path_prefix, can_delegate, granted_by, granted_at FROM path_grants WHERE universe_id = ? AND grantee_id = ?",
         )
         .bind(universe_id)
         .bind(account_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         {
             Ok(rows) => rows,
@@ -743,7 +754,7 @@ impl PermissionManager {
         let rows: Vec<PathGrantRow> = sqlx::query_as(
             "SELECT id, universe_id, grantee_id, path_prefix, can_delegate, granted_by, granted_at FROM path_grants",
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *crate::db::run::reader(pool).await?)
         .await?;
 
         // Replaces the cache

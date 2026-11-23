@@ -682,3 +682,463 @@ async fn test_custom_verbs_survive_restart() {
         .await
         .expect("the verb went with its object");
 }
+
+/// A Lua run is one change: if it errors part way, nothing it did is kept:
+/// no object, no verb, no timer (tables and caches alike)
+#[tokio::test]
+async fn test_failed_run_keeps_nothing() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "atomic_wiz".into(),
+        })
+        .await
+        .unwrap();
+    // A bell exists (with code); a failing run adds a verb to it and a new
+    // object, then errors
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local h = game.store_code([[return {{ ring = function(a) return "Ding!" end }}]])
+           return game.create_object("/items/bell", "item", "{}", {{name = "bell", fixed = true, code_hash = h}}) and "made" or "not made""#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("made")
+        .await
+        .expect("bell made");
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval assert(game.add_action("ring", "/items/bell", "ring"), "add_action failed")
+           assert(game.create_object("/items/clapper", "item", "{}", {{name = "clapper"}}), "create failed")
+           error("changed my mind")"#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    let err = wiz.expect("error").await.expect("the run failed");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("changed my mind"),
+        "{err}"
+    );
+    let objects: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE id = '/items/clapper'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(objects, 0, "the object was not kept");
+    let actions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE object_id = '/items/bell'")
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+    assert_eq!(actions, 0, "nor its verb");
+    wiz.drain().await;
+    wiz.command("ring bell").await.unwrap();
+    wiz.expect_output_containing("Unknown command")
+        .await
+        .expect("the verb is not in the cache either");
+
+    // A run that succeeds keeps everything, as one change, and can read its
+    // own writes along the way
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/gong", "item", "{}", {{name = "gong"}})
+           local g = game.get_object("/items/gong")
+           return g and ("read back " .. g.name) or "not visible""#,
+        entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("read back gong")
+        .await
+        .expect("a run sees its own writes");
+}
+
+/// `clients` wizards each send writing commands (read a counter, write it
+/// back) as fast as replies come, for `secs`: (commands done, errors seen)
+async fn concurrent_writes(server: &TestServer, clients: usize, secs: u64) -> (u64, Vec<String>) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let entrance = server.world().entrance_id.clone();
+    let mut handles = Vec::new();
+    for _ in 0..clients {
+        let c = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut wiz = server
+            .connect_as(Role::Wizard {
+                username: format!("writer{}", c),
+            })
+            .await
+            .unwrap();
+        wiz.drain().await;
+        wiz.command(&format!(
+            r#"eval game.create_object("/items/ctr{c}", "item", "{e}", {{name = "ctr", n = 0}}) return "made""#,
+            c = c,
+            e = entrance
+        ))
+        .await
+        .unwrap();
+        wiz.expect_output_containing("made").await.unwrap();
+        handles.push(tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let mut done = 0u64;
+            let mut errors = Vec::new();
+            while tokio::time::Instant::now() < deadline {
+                wiz.command(&format!(
+                    r#"eval local o = game.get_object("/items/ctr{c}") game.update_object("/items/ctr{c}", {{n = (o.n or (o.properties or {{}}).n or 0) + 1}}) return "k""#,
+                    c = c
+                ))
+                .await
+                .unwrap();
+                loop {
+                    let m = wiz.expect_any().await.unwrap();
+                    if m["type"] == "output" && m["text"] == "k" {
+                        done += 1;
+                        break;
+                    }
+                    if m["type"] == "error" {
+                        errors.push(m.to_string());
+                        break;
+                    }
+                }
+            }
+            (done, errors)
+        }));
+    }
+    let mut total = 0;
+    let mut errors = Vec::new();
+    for h in handles {
+        let (done, errs) = h.await.unwrap();
+        total += done;
+        errors.extend(errs);
+    }
+    (total, errors)
+}
+
+/// Many players writing at once: every command succeeds (no "database is
+/// locked" from SQLite's shared cache, no pool exhaustion while runs wait
+/// for the write gate)
+#[tokio::test]
+async fn test_concurrent_writing_commands() {
+    let server = TestServer::start().await.expect("server");
+    let (done, errors) = concurrent_writes(&server, 32, 2).await;
+    assert!(
+        errors.is_empty(),
+        "{} errors, e.g. {:?}",
+        errors.len(),
+        errors.first()
+    );
+    assert!(done > 32, "progress: {}", done);
+}
+
+/// Throughput of writing commands from concurrent clients (manual:
+/// `cargo test --release --test integration_test bench_writes -- --ignored --nocapture`)
+#[tokio::test]
+#[ignore]
+async fn bench_writes() {
+    let server = TestServer::start().await.expect("server");
+    for clients in [1, 8, 32] {
+        let (done, errors) = concurrent_writes(&server, clients, 3).await;
+        println!(
+            "BENCH {} clients: {}/s writing commands, {} errors",
+            clients,
+            done / 3,
+            errors.len()
+        );
+    }
+}
+
+/// A command is one change: walking into a room moves the player and runs
+/// the room's on_enter hook (which writes), all as one Raft entry
+#[tokio::test]
+async fn test_command_is_one_raft_entry() {
+    let server = TestServer::start().await.expect("server");
+    let passage = "/rooms/hall".to_string();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "batch_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local h = game.store_code([[return {{ on_enter = function(a)
+               local r = game.get_object("{p}")
+               game.update_object("{p}", {{visits = (r.metadata.visits or 0) + 1}})
+             end }}]])
+           assert(game.create_object("/rooms/porch", "room", nil, {{name = "Porch", exits = {{east = "{p}"}}}}))
+           assert(game.create_object("{p}", "room", nil, {{name = "Hall", code_hash = h}}))
+           return "rooms built""#,
+        p = passage
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("rooms built")
+        .await
+        .expect("built");
+    wiz.drain().await;
+    wiz.command("goto /rooms/porch").await.unwrap();
+    wiz.expect("room").await.expect("at the porch");
+    let entries = || async {
+        sqlx::query_scalar::<_, i64>("SELECT MAX(log_index) FROM raft_log")
+            .fetch_one(server.pool())
+            .await
+            .unwrap()
+    };
+    let before = entries().await;
+    wiz.drain().await;
+    wiz.command("east").await.unwrap();
+    wiz.expect("room").await.expect("moved");
+    let mut visits = None;
+    for _ in 0..50 {
+        visits = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT json_extract(properties, '$.visits') FROM objects WHERE id = ?",
+        )
+        .bind(&passage)
+        .fetch_one(server.pool())
+        .await
+        .unwrap();
+        if visits.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(visits, Some(1), "the hook ran");
+    assert_eq!(entries().await - before, 1, "move and hook in one entry");
+}
+
+/// A command sent with an id is answered with `done` once saved, and the
+/// same id sent again (a gateway retrying after a failover) does not run it
+/// a second time
+#[tokio::test]
+async fn test_command_id_runs_once() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "once_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    let cmd = serde_json::json!({
+        "type": "command",
+        "id": "cmd-1",
+        "text": format!(
+            r#"eval local o = game.get_object("/items/tally") if o then game.update_object("/items/tally", {{n = o.metadata.n + 1}}) else game.create_object("/items/tally", "item", "{}", {{name = "tally", n = 1}}) end return "counted""#,
+            entrance
+        ),
+    });
+    wiz.send_json(&cmd).await.unwrap();
+    wiz.expect_output_containing("counted").await.expect("ran");
+    let done = wiz.expect("done").await.expect("done");
+    assert_eq!(done["id"], "cmd-1");
+
+    // The retry: not run again
+    wiz.send_json(&cmd).await.unwrap();
+    let done = wiz.expect("done").await.expect("done again");
+    assert_eq!(done["id"], "cmd-1");
+    let n: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.n') FROM objects WHERE id = '/items/tally'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "the command ran once");
+
+    // A new id runs
+    let mut next = cmd.clone();
+    next["id"] = "cmd-2".into();
+    wiz.send_json(&next).await.unwrap();
+    wiz.expect("done").await.expect("done");
+    let n: i64 = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.n') FROM objects WHERE id = '/items/tally'",
+    )
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+}
+
+/// Command ids are per player: another player's command with the same id
+/// still runs (nobody can suppress someone else's commands)
+#[tokio::test]
+async fn test_command_ids_are_per_player() {
+    let server = TestServer::start().await.expect("server");
+    let mut a = server
+        .connect_as(Role::Wizard {
+            username: "ida".into(),
+        })
+        .await
+        .unwrap();
+    let mut b = server
+        .connect_as(Role::Wizard {
+            username: "idb".into(),
+        })
+        .await
+        .unwrap();
+    let cmd = |who: &str| {
+        serde_json::json!({
+            "type": "command",
+            "id": "same-id",
+            "text": format!(r#"eval game.create_object("/items/mark-{}", "item", nil, {{name = "mark"}}) return "marked""#, who),
+        })
+    };
+    a.drain().await;
+    a.send_json(&cmd("a")).await.unwrap();
+    a.expect("done").await.expect("a done");
+    b.drain().await;
+    b.send_json(&cmd("b")).await.unwrap();
+    b.expect_output_containing("marked")
+        .await
+        .expect("b's command ran despite a's id");
+}
+
+/// An object can never end up inside itself (directly or through what it
+/// contains): such a move is refused
+#[tokio::test]
+async fn test_no_containment_cycles() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "cycle_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/outer", "container", "{e}", {{name = "outer"}})
+           game.create_object("/items/inner", "container", "/items/outer", {{name = "inner"}})
+           local ok1 = pcall(game.move_object, "/items/outer", "/items/inner")
+           local ok2 = pcall(game.move_object, "/items/outer", "/items/outer")
+           local ok3 = pcall(game.update_object, "/items/outer", {{parent_id = "/items/inner"}})
+           return tostring(ok1) .. tostring(ok2) .. tostring(ok3)"#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("falsefalse")
+        .await
+        .expect("moves into itself refused");
+    let parent: String = sqlx::query_scalar(
+        "SELECT parent_id FROM objects WHERE universe_id = ? AND id = '/items/outer'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(parent, entrance);
+}
+
+/// Lifecycle hooks: an object's on_create runs when it is created (or
+/// cloned) with code, its on_destroy before it is deleted; a creating chain
+/// (on_create creating more of itself) is bounded
+#[tokio::test]
+async fn test_lifecycle_create_destroy() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "lifecycle_wiz".into(),
+        })
+        .await
+        .unwrap();
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval game.create_object("/items/ledger", "item", "{e}", {{name = "ledger", log = ""}})
+           local h = game.store_code([[
+             local function note(w) local l = game.get_object("/items/ledger") game.update_object("/items/ledger", {{log = l.metadata.log .. w}}) end
+             return {{
+               on_create = function(a) note("C") end,
+               on_destroy = function(a) note("D") end,
+             }}]])
+           game.create_object("/items/egg", "item", "{e}", {{name = "egg", code_hash = h}})
+           game.clone_object("/items/egg", "/items/egg-two", "{e}")
+           game.delete_object("/items/egg")
+           local breeder = game.store_code([[return {{ on_create = function(a)
+             local n = (tonumber(string.match(a.object_id, "(%d+)$")) or 0) + 1
+             game.create_object("/items/rabbit-" .. n, "item", nil, {{name = "rabbit", code_hash = game.get_object(a.object_id).code_hash}})
+           end }}]])
+           game.create_object("/items/rabbit-0", "item", nil, {{name = "rabbit", code_hash = breeder}})
+           return game.get_object("/items/ledger").metadata.log"#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("CCD")
+        .await
+        .expect("created, cloned, destroyed");
+    let rabbits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE universe_id = ? AND id LIKE '/items/rabbit-%'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert!((2..=40).contains(&rabbits), "a bounded chain: {}", rabbits);
+}
+
+/// A clone keeps code only for a cloner who may act as the original's
+/// owner (else the copy's code would run as the cloner); on_destroy cannot
+/// block a deletion by adding contents
+#[tokio::test]
+async fn test_lifecycle_hooks_cannot_be_abused() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut adm = server
+        .connect_as(Role::Admin {
+            username: "lifecycle_adm".into(),
+        })
+        .await
+        .unwrap();
+    let mut wiz = server
+        .connect_as(Role::Wizard {
+            username: "lifecycle_cloner".into(),
+        })
+        .await
+        .unwrap();
+    adm.drain().await;
+    adm.command(&format!(
+        r#"eval local h = game.store_code([[return {{
+             on_destroy = function(a) game.create_object(a.object_id .. "/stowaway", "item", a.object_id, {{name = "stowaway"}}) end,
+           }}]])
+           game.create_object("/items/idol", "item", "{e}", {{name = "idol", code_hash = h}})
+           game.create_object("/items/crate", "item", "{e}", {{name = "crate", code_hash = h}})
+           return "made""#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    adm.expect_output_containing("made").await.unwrap();
+
+    // The wizard's copy of the admin's idol carries no code
+    wiz.drain().await;
+    wiz.command(&format!(
+        r#"eval local c = game.clone_object("/items/idol", "/items/idol-copy", "{e}") return "code:" .. tostring(c.code_hash)"#,
+        e = entrance
+    ))
+    .await
+    .unwrap();
+    wiz.expect_output_containing("code:nil")
+        .await
+        .expect("code dropped");
+
+    // on_destroy putting a stowaway inside does not stop the deletion
+    adm.drain().await;
+    adm.command(r#"eval return tostring(game.delete_object("/items/crate"))"#)
+        .await
+        .unwrap();
+    adm.expect_output_containing("true").await.expect("deleted");
+    let crate_left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE universe_id = ? AND id = '/items/crate'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(crate_left, 0);
+}

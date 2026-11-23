@@ -2,7 +2,7 @@
 //!
 //! Runs the user-story suite in `tests/lua/game_logic_tests.lua` (regions,
 //! fixed objects, custom weapon class, spawner chest, combat, permissions,
-//! class inheritance) through a wizard's `eval` against a real server.
+//! class inheritance) through an admin's `eval` against a real server.
 //!
 //! Run from mudd/:
 //!
@@ -10,10 +10,12 @@
 //! cargo test --release --test lua_game_logic_test
 //! ```
 //!
-//! The suite is run one SECTION per eval to stay inside the eval budget.
-//! Real player and builder accounts are created here and their ids passed
-//! to the suite in an `ACCOUNTS` table, since access levels come from the
-//! accounts table and `game.set_actor` needs a real account.
+//! The suite is run one SECTION per eval to stay inside the eval budget,
+//! by an admin (universe settings such as pvp_policy need admin+). Real
+//! wizard, player, second player and builder accounts are created here and
+//! their ids passed to the suite in an `ACCOUNTS` table, since access
+//! levels come from the accounts table and `game.set_actor` needs a real
+//! account.
 
 mod harness;
 
@@ -81,13 +83,26 @@ fn field(line: &str, key: &str) -> usize {
 async fn test_lua_game_logic() {
     let server = TestServer::start().await.expect("Failed to start server");
 
-    let mut wizard = server
+    // The runner: an admin (universe settings need admin+)
+    let mut runner = server
+        .connect_as(Role::Admin {
+            username: "luaadmin".to_string(),
+        })
+        .await
+        .expect("Failed to connect as admin");
+    let wizard = server
         .connect_as(Role::Wizard {
             username: "luatester".to_string(),
         })
         .await
         .expect("Failed to connect as wizard");
     // Kept connected for the whole run: the player's body is its player object
+    let player2 = server
+        .connect_as(Role::Player {
+            username: "luarival".to_string(),
+        })
+        .await
+        .expect("Failed to connect as second player");
     let player = server
         .connect_as(Role::Player {
             username: "luaplayer".to_string(),
@@ -103,15 +118,19 @@ async fn test_lua_game_logic() {
         .expect("Failed to connect as builder");
 
     let prelude = format!(
-        "local ACCOUNTS = {{ wizard = {}, player = {}, builder = {}, player_body = {} }}\n",
+        "local ACCOUNTS = {{ admin = {}, wizard = {}, player = {}, builder = {}, \
+         player_body = {}, player2 = {}, player2_body = {} }}\n",
+        lua_str(runner.account_id()),
         lua_str(wizard.account_id()),
         lua_str(player.account_id()),
         lua_str(builder.account_id()),
         lua_str(player.player_id().expect("player body")),
+        lua_str(player2.account_id()),
+        lua_str(player2.player_id().expect("second player body")),
     );
 
     // Section names and the total test count come from the suite itself
-    let listing = run_section(&mut wizard, &prelude, "list").await;
+    let listing = run_section(&mut runner, &prelude, "list").await;
     let sections: Vec<String> = listing
         .split_whitespace()
         .nth(1)
@@ -125,7 +144,7 @@ async fn test_lua_game_logic() {
     let mut failures = Vec::new();
     let mut skips = Vec::new();
     for section in &sections {
-        let report = run_section(&mut wizard, &prelude, section).await;
+        let report = run_section(&mut runner, &prelude, section).await;
         println!("{}", report);
         for line in report.lines() {
             if line.starts_with("FAIL ") {

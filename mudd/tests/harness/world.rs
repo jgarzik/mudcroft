@@ -114,8 +114,10 @@ impl TestWorld {
 
         // Get core lib hashes to include in universe config
         let core_lib_hashes = store.get_core_lib_hashes().await?;
+        // 1 s combat rounds keep fights quick in tests
         let config = json!({
-            "lib_hashes": core_lib_hashes
+            "lib_hashes": core_lib_hashes,
+            "combat_round_ms": 1000
         });
 
         // Owned by the global admin, so the wizard and builder are exactly
@@ -254,8 +256,7 @@ impl TestWorld {
             "description",
             json!("A battered but serviceable short sword."),
         );
-        sword.set_property("damage_dice", json!("1d6"));
-        sword.set_property("damage_bonus", json!(0));
+        sword.set_property("damage", json!("1d6"));
         sword.set_property("weight", json!(2));
         store.create(&sword).await?;
         let sword_id = sword.id.clone();
