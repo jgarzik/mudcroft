@@ -1,0 +1,13 @@
+# zizmor (GitHub Actions static analysis) configuration, run by CI.
+rules:
+  # ci.yml both tests (with Rust/npm caches) and calls the container publish.
+  # The published image never uses those caches: it is built from scratch by
+  # docker buildx, whose cache only publish runs write. PR caches are scoped
+  # to the PR ref and unreadable from main, and npm ci verifies every package
+  # against the lockfile's integrity hashes.
+  cache-poisoning:
+    ignore:
+      - ci.yml
+  # `uses: ./.github/workflows/container.yml` is the documented local syntax.
+  self-repository:
+    disable: true
