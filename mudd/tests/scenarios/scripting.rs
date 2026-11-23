@@ -322,6 +322,141 @@ async fn test_call_out_and_heart_beat_fire() {
     );
 }
 
+/// A call_out is consumed in the same change as its handler's writes: a
+/// handler that succeeds runs once and its writes stand; one that fails
+/// keeps none of its writes and is dropped, not retried (as in LPMud)
+#[tokio::test]
+async fn test_call_out_consumed_with_its_handler() {
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "consume_wiz").await;
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local code = game.store_code([[return {{
+                 arm = function(a)
+                   game.call_out(0.2, "count")
+                   game.call_out(0.2, "fail")
+                 end,
+                 count = function(a)
+                   local o = game.get_object(a.object_id)
+                   game.update_object(a.object_id, {{count = (o.metadata.count or 0) + 1}})
+                 end,
+                 fail = function(a)
+                   game.update_object(a.object_id, {{failed_write = true}})
+                   error("handler bug")
+                 end,
+               }}]])
+               game.create_object("/items/counter", "item", "{room}", {{name = "counter", code_hash = code}})
+               game.use_object("/items/counter", "consume_wiz", "arm")
+               return true"#,
+            room = entrance
+        ),
+    )
+    .await;
+    // Both have fired by now; a retried one would also have run again
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let count = eval(
+        &mut wiz,
+        r#"return game.get_object("/items/counter").metadata.count"#,
+    )
+    .await;
+    assert_eq!(count, "1", "the succeeding call_out ran once");
+    let failed = eval(
+        &mut wiz,
+        r#"return tostring(game.get_object("/items/counter").metadata.failed_write)"#,
+    )
+    .await;
+    assert_eq!(failed, "nil", "a failing handler keeps none of its writes");
+
+    drop(wiz);
+    server.stop();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.db_path.display()))
+        .await
+        .unwrap();
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM timers")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pending, 0, "both call_outs consumed");
+}
+
+/// A server killed partway through a batch of due call_outs loses none of
+/// them and runs none twice: each is consumed only with its handler's
+/// writes, so after the restart the rest fire, exactly once each
+#[tokio::test]
+async fn test_call_outs_survive_a_crash_mid_batch() {
+    const N: usize = 24;
+    let mut server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "batch_wiz").await;
+    let notify = wiz.player_id().expect("player id").to_string();
+    eval(
+        &mut wiz,
+        &format!(
+            r#"local code = game.store_code([[return {{
+                 arm = function(a)
+                   for i = 1, {n} do game.call_out(0.5, "hit", tostring(i)) end
+                 end,
+                 hit = function(a)
+                   local o = game.get_object(a.object_id)
+                   local k = "k" .. a.args
+                   game.update_object(a.object_id, {{[k] = (o.metadata[k] or 0) + 1}})
+                   for _ = 1, 200000 do end
+                   game.send(o.metadata.notify, "hit " .. a.args)
+                 end,
+               }}]])
+               game.create_object("/items/batch", "item", "{room}",
+                 {{name = "batch", notify = "{notify}", code_hash = code}})
+               game.use_object("/items/batch", "batch_wiz", "arm")
+               return true"#,
+            n = N,
+            room = entrance,
+            notify = notify
+        ),
+    )
+    .await;
+    // A callback is running (its message goes out just before its change
+    // commits) and the rest of the batch has not run yet: kill the server
+    // now. Whether or not that callback committed, each call_out must end
+    // up applied exactly once.
+    wiz.expect_output_containing("hit ")
+        .await
+        .expect("first call_out fired");
+    server.stop();
+    drop(wiz);
+
+    server.start_again().await.expect("restart");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.db_path.display()))
+        .await
+        .unwrap();
+    let props = || async {
+        let json: String =
+            sqlx::query_scalar("SELECT properties FROM objects WHERE id = '/items/batch'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let p = props().await;
+        let done = (1..=N).filter(|i| p.get(format!("k{i}")).is_some()).count();
+        if done == N || tokio::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let p = props().await;
+    for i in 1..=N {
+        assert_eq!(
+            p.get(format!("k{i}")).and_then(|v| v.as_i64()),
+            Some(1),
+            "call_out {i} ran exactly once: {p}"
+        );
+    }
+}
+
 /// Object code runs as the object's owner, never as the player who
 /// triggers it: a wizard's trap cannot borrow an admin's privileges.
 #[tokio::test]

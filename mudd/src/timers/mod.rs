@@ -119,6 +119,8 @@ impl HeartBeat {
 /// Result of firing a timer
 #[derive(Debug, Clone)]
 pub struct TimerFired {
+    /// The call_out's id (None for a heartbeat beat)
+    pub timer_id: Option<String>,
     pub object_id: String,
     pub universe_id: String,
     pub method: String,
@@ -261,6 +263,21 @@ impl TimerManager {
         owned && self.remove_timer(timer_id).await
     }
 
+    /// Take a due call_out out of the cache before firing it (its row is
+    /// deleted with the handler's writes). False if it is gone already
+    /// (cancelled meanwhile by an earlier callback).
+    pub async fn take_timer(&self, timer_id: &str) -> bool {
+        self.timers.write().await.remove(timer_id).is_some()
+    }
+
+    /// The statement that consumes a fired call_out's row
+    pub fn consume_statement(timer_id: &str) -> (&'static str, Vec<serde_json::Value>) {
+        (
+            "DELETE FROM timers WHERE id = ?",
+            vec![serde_json::json!(timer_id)],
+        )
+    }
+
     /// Remove a timer by ID
     pub async fn remove_timer(&self, timer_id: &str) -> bool {
         // Remove from DB via Raft if available, otherwise direct SQL
@@ -368,26 +385,27 @@ impl TimerManager {
         self.changed.notified().await
     }
 
-    /// Check for due timers and heartbeats, returning fired callbacks
+    /// Due call_outs (earliest first) and heartbeats. A call_out is only
+    /// reported: the timer loop takes it out of the cache
+    /// ([`Self::take_timer`]) and deletes its row in the same change as its
+    /// handler's writes, so it is never lost between the two. Heartbeats
+    /// are re-armed here (beats write nothing).
     pub async fn tick(&self) -> Vec<TimerFired> {
         let mut fired = Vec::new();
 
-        // Check one-shot timers
-        let due_timers: Vec<Timer> = {
+        let mut due_timers: Vec<Timer> = {
             let timers = self.timers.read().await;
             timers.values().filter(|t| t.is_due()).cloned().collect()
         };
-
+        due_timers.sort_by_key(|t| t.fire_at);
         for timer in due_timers {
             fired.push(TimerFired {
-                object_id: timer.object_id.clone(),
-                universe_id: timer.universe_id.clone(),
-                method: timer.method.clone(),
-                args: timer.args.clone(),
+                timer_id: Some(timer.id),
+                object_id: timer.object_id,
+                universe_id: timer.universe_id,
+                method: timer.method,
+                args: timer.args,
             });
-
-            // Remove fired timer
-            self.remove_timer(&timer.id).await;
         }
 
         // Check heartbeats
@@ -396,6 +414,7 @@ impl TimerManager {
             for hb in heartbeats.values_mut() {
                 if hb.is_due() {
                     fired.push(TimerFired {
+                        timer_id: None,
                         object_id: hb.object_id.clone(),
                         universe_id: hb.universe_id.clone(),
                         method: hb.method.clone(),
@@ -607,8 +626,46 @@ mod tests {
         assert_eq!(fired[0].method, "on_fire");
         assert_eq!(fired[0].args, Some("test_arg".to_string()));
 
-        // Timer should be removed after firing
+        // Reported, not taken: the timer loop takes it before firing
+        assert_eq!(manager.timer_count().await, 1);
+        let id = fired[0].timer_id.clone().unwrap();
+        assert!(manager.take_timer(&id).await);
+        assert!(!manager.take_timer(&id).await, "taken once");
         assert_eq!(manager.timer_count().await, 0);
+    }
+
+    /// tick() reports a due call_out without consuming it: the row stays
+    /// until the timer loop deletes it in the same batch as the handler's
+    /// writes, so a crash or failover in between loses nothing
+    #[tokio::test]
+    async fn test_tick_does_not_consume_call_outs() {
+        let pool = crate::db::test_utils::test_pool().await;
+        for sql in [
+            "INSERT INTO accounts (id, username, password_hash, access_level, created_at)
+             VALUES ('acct', 'acct', 'x', 'player', '2026-01-01')",
+            "INSERT INTO universes (id, name, owner_id, config, created_at)
+             VALUES ('u1', 'u1', 'acct', '{}', '2026-01-01')",
+            "INSERT INTO objects (id, universe_id, class, properties, created_at, updated_at)
+             VALUES ('obj1', 'u1', 'item', '{}', '2026-01-01', '2026-01-01')",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let manager = TimerManager::new(Some(pool.clone()), None);
+        let mut timer = Timer::new("u1", "obj1", "on_fire", 0, None);
+        timer.fire_at = chrono::Utc::now().timestamp_millis() - 100;
+        let id = manager.add_timer(timer).await.unwrap();
+
+        let fired = manager.tick().await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].timer_id.as_deref(), Some(id.as_str()));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM timers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "the stored call_out is consumed only with its handler"
+        );
     }
 
     #[tokio::test]

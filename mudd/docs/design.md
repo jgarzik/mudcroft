@@ -367,9 +367,15 @@ contextual verbs (`ActionRegistry`) and Lua-defined classes (`ClassRegistry`; th
 
 ### Timer Loop
 
-`run_timer_loop` ticks every 100 ms. Each due `call_out` or heartbeat runs
-its method on the object's code (as the owner) with `{object_id, room_id,
-args}`. A heartbeat whose object no longer exists is removed. One-shot timers
+`run_timer_loop` runs each due `call_out` (earliest first) or heartbeat on
+the object's code (as the owner) with `{object_id, room_id, args}`. A
+`call_out` is consumed in the same run as its handler: its row's delete is a
+kept write in that run, and the handler a nested part of it, so success
+commits the delete and the handler's writes as one Raft batch, and a failing
+handler keeps none of its writes while the delete still commits (dropped, as
+in LPMud). The timer leaves the cache before it runs; if nothing commits (a
+crash, a lost leadership) its row remains and the next primary fires it once.
+A heartbeat whose object no longer exists is removed. One-shot timers
 are persisted in `timers` and heartbeats in `heartbeats` (one write to set or
 remove; beats write nothing), both reloaded whenever the node becomes
 primary (it alone runs this loop). The timer loop is

@@ -321,48 +321,115 @@ pub async fn run_timer_loop(state: AppState) {
             }
         }
         for fired in state.timers.tick().await {
-            let room_id = match state
-                .object_store
-                .get(&fired.universe_id, &fired.object_id)
-                .await
-            {
-                Ok(Some(obj)) => obj.parent_id,
-                Ok(None) => {
-                    // Object is gone: stop its heartbeat too
-                    state
-                        .timers
-                        .remove_heartbeat(&fired.universe_id, &fired.object_id)
-                        .await;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!("Timer object {} lookup failed: {}", fired.object_id, e);
-                    continue;
-                }
-            };
-            let args = serde_json::json!({
-                "object_id": fired.object_id,
-                "room_id": room_id,
-                "args": fired.args,
-            });
-            if let Err(e) = invoke_handler(
-                &state,
-                &fired.universe_id,
-                &fired.object_id,
-                room_id,
-                &fired.method,
-                args,
-            )
-            .await
-            {
-                tracing::warn!(
-                    "Timer {} on {} failed: {}",
-                    fired.method,
-                    fired.object_id,
-                    e
-                );
+            match fired.timer_id.clone() {
+                Some(id) => fire_call_out(&state, &id, &fired).await,
+                None => fire_heart_beat(&state, &fired).await,
             }
         }
+    }
+}
+
+/// The callback's args: {object_id, room_id, args}
+fn timer_args(fired: &crate::timers::TimerFired, room_id: &Option<String>) -> serde_json::Value {
+    serde_json::json!({
+        "object_id": fired.object_id,
+        "room_id": room_id,
+        "args": fired.args,
+    })
+}
+
+/// Fire a due call_out and consume it in the same change as its handler's
+/// writes: one Raft batch holds both, so the timer is never gone without
+/// its effects, or the reverse. Its row is deleted as a kept write: a
+/// handler that fails keeps none of its writes and the call_out is dropped,
+/// not retried (LPMud). If nothing commits (a crash, a lost leadership),
+/// the row stays and the next primary fires it once.
+async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerFired) {
+    // Out of the cache first: this loop never fires it twice, whatever
+    // happens below (the table keeps it until it is consumed)
+    if !state.timers.take_timer(id).await {
+        return; // cancelled by an earlier callback
+    }
+    let outcome = in_run(state, async {
+        let (sql, params) = crate::timers::TimerManager::consume_statement(id);
+        state
+            .raft_writer
+            .execute_kept(sql, params)
+            .await
+            .map_err(|e| e.to_string())?;
+        let room_id = match state
+            .object_store
+            .get(&fired.universe_id, &fired.object_id)
+            .await
+        {
+            Ok(Some(obj)) => obj.parent_id,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(format!("looking up {}: {}", fired.object_id, e)),
+        };
+        // A nested part of this run: if it fails, only its writes are undone
+        if let Err(e) = invoke_handler(
+            state,
+            &fired.universe_id,
+            &fired.object_id,
+            room_id.clone(),
+            &fired.method,
+            timer_args(fired, &room_id),
+        )
+        .await
+        {
+            tracing::warn!(
+                "call_out {} on {} failed: {}",
+                fired.method,
+                fired.object_id,
+                e
+            );
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(e) = outcome {
+        tracing::warn!("call_out {} on {}: {}", fired.method, fired.object_id, e);
+    }
+}
+
+/// Fire one heartbeat beat (beats write nothing themselves; the handler
+/// runs as its own change)
+async fn fire_heart_beat(state: &AppState, fired: &crate::timers::TimerFired) {
+    let room_id = match state
+        .object_store
+        .get(&fired.universe_id, &fired.object_id)
+        .await
+    {
+        Ok(Some(obj)) => obj.parent_id,
+        Ok(None) => {
+            // Object is gone: stop its heartbeat too
+            state
+                .timers
+                .remove_heartbeat(&fired.universe_id, &fired.object_id)
+                .await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Timer object {} lookup failed: {}", fired.object_id, e);
+            return;
+        }
+    };
+    if let Err(e) = invoke_handler(
+        state,
+        &fired.universe_id,
+        &fired.object_id,
+        room_id.clone(),
+        &fired.method,
+        timer_args(fired, &room_id),
+    )
+    .await
+    {
+        tracing::warn!(
+            "heart_beat {} on {} failed: {}",
+            fired.method,
+            fired.object_id,
+            e
+        );
     }
 }
 

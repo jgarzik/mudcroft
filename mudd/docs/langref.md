@@ -737,6 +737,12 @@ running.
 
 Pending call_outs and heartbeats are saved to the database and reloaded at startup.
 
+A call_out is used up in the same change as its handler's writes: it runs
+once. If the handler fails, none of its writes are kept and the call_out is
+dropped, not retried (as in LPMud). One that falls due while the server is
+down or changing primary fires once, late. A heartbeat skips beats it missed;
+a failing beat is logged and the heartbeat keeps going.
+
 Deleting an object cancels both its call_outs and its heartbeat.
 
 ## Status effects
