@@ -340,6 +340,10 @@ pub enum ServerMessage {
     /// handler that only used game.send). Never sent to clients.
     #[serde(skip)]
     Silent,
+    /// End this session now (the player quit): the session loop stops and
+    /// handles the disconnect at once. Never sent to clients.
+    #[serde(skip)]
+    Quit,
 }
 
 /// Messages sent from client to server
@@ -671,12 +675,18 @@ async fn handle_socket(
     }
 
     // Main loop: handle incoming messages and outgoing messages
+    // Set when the player quit (no grace period)
+    let mut quit = false;
     loop {
         tokio::select! {
             // Handle outgoing messages from our channel. The channel closes
             // when a newer connection for this player replaces us.
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
+                if matches!(msg, ServerMessage::Quit) {
+                    quit = true;
+                    break;
+                }
                 if let Ok(json) = serde_json::to_string(&msg) {
                     if !socket.send(json).await {
                         break;
@@ -717,6 +727,25 @@ async fn handle_socket(
 
     // Grace period before handling disconnect, so a reconnect does not drop
     // inventory
+    // Quit: the disconnect is handled now, without the grace period
+    if quit && !replaced {
+        let room = state
+            .object_store
+            .get(&universe_id, &player_id_clone)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|p| p.parent_id);
+        if let Err(e) = state
+            .player_manager
+            .finish_disconnect(&universe_id, &player_id_clone, &online_since)
+            .await
+        {
+            warn!("Error handling player quit: {}", e);
+        }
+        disconnect_hook(&state, &universe_id, &player_id_clone, room).await;
+        return;
+    }
     if !replaced {
         let (cancel_rx, gen) = state
             .connections
@@ -1224,7 +1253,7 @@ async fn execute_command(
     // safety commands such as pvp or flee, and never with the wallet)
     let soft = matches!(
         verb.as_str(),
-        "wield" | "wear" | "unwield" | "remove" | "equipment" | "eq"
+        "wield" | "wear" | "unwield" | "remove" | "equipment" | "eq" | "who" | "give" | "use"
     ) || (matches!(verb.as_str(), "get" | "take") && command.contains(" from "));
     if soft {
         let args = parts[1..].join(" ");
@@ -1383,7 +1412,7 @@ async fn execute_command(
         "help" => {
             let mut text = String::from(
                 "Commands: look, north/south/east/west/up/down, say <message>, \
-                 get/take <item> [from <container>], drop <item>, inventory/i, attack/kill <target>, flee, wield/wear/remove/equipment, pvp on/off, help. \
+                 get/take <item> [from <container>], drop <item>, inventory/i, give <item> to <someone>, use <item> [on <target>], attack/kill <target>, flee, wield/wear/remove/equipment, pvp on/off, who, quit, help. \
                  Objects may offer their own verbs (e.g. 'pull lever').",
             );
             if access_level >= AccessLevel::Builder {
@@ -1907,6 +1936,83 @@ async fn execute_command(
                 },
                 Err(reason) => ServerMessage::Output { text: reason },
             }
+        }
+        "who" => {
+            let mut names = Vec::new();
+            for (pid, _) in state.connections.player_rooms(universe_id).await {
+                let name = state
+                    .object_store
+                    .get(universe_id, &pid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.get_string("name").map(str::to_string))
+                    .unwrap_or(pid);
+                names.push(name);
+            }
+            names.sort();
+            ServerMessage::Output {
+                text: format!("Players here ({}): {}", names.len(), names.join(", ")),
+            }
+        }
+        "quit" => {
+            // Goodbye first, then the session ends (the disconnect is
+            // handled at once)
+            state
+                .connections
+                .send_to_player(
+                    universe_id,
+                    player_id,
+                    ServerMessage::Output {
+                        text: "Goodbye.".to_string(),
+                    },
+                )
+                .await;
+            state
+                .connections
+                .send_to_player(universe_id, player_id, ServerMessage::Quit)
+                .await;
+            ServerMessage::Silent
+        }
+        "give" => {
+            let args = args_after_verb(command);
+            let Some((item, target)) = args.split_once(" to ") else {
+                return ServerMessage::Error {
+                    message: "Usage: give <item> to <someone>".to_string(),
+                };
+            };
+            execute_lua_with_args(
+                state,
+                universe_id,
+                account_id,
+                "local pid, item, target = ...; return Commands.give(pid, item, target).message",
+                vec![
+                    player_id.to_string(),
+                    item.trim().to_string(),
+                    target.trim().to_string(),
+                ],
+            )
+            .await
+        }
+        "use" => {
+            let args = args_after_verb(command);
+            if args.is_empty() {
+                return ServerMessage::Error {
+                    message: "Use what?".to_string(),
+                };
+            }
+            let (item, target) = match args.split_once(" on ") {
+                Some((i, t)) => (i.trim().to_string(), t.trim().to_string()),
+                None => (args.trim().to_string(), String::new()),
+            };
+            execute_lua_with_args(
+                state,
+                universe_id,
+                account_id,
+                "local pid, item, target = ...; if target == '' then target = nil end; return Commands.use(pid, item, target).message",
+                vec![player_id.to_string(), item, target],
+            )
+            .await
         }
         "pvp" => {
             // Flag yourself for player combat (counts under pvp_policy

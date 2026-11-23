@@ -105,9 +105,8 @@ for features that do not exist yet; see its `SKIP` table. Planned:
 - **Persistent actions**: registered verbs are in memory and lost on restart.
 - **High-occupancy rooms**: above about 100 occupants, send an aggregated
   view (count, notable entities, sampled chat).
-- **Player commands**: `who`, `quit`, `give`/`use` as server commands (the
-  mudlib has `Commands.give` and `Commands.use`), global commands
-  registered from Lua.
+- **Global commands** registered from Lua (`who`, `quit`, `give`, `use`
+  are built in).
 
 ## Lua API
 

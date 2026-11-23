@@ -628,7 +628,7 @@ this context. It needs the same permission as `add_action`. **Returns**
 
 ### How a typed verb is dispatched
 
-1. Built-in commands always win. These verbs can't be overridden: `look`, `l`, the directions and their abbreviations, `say`, `help`, `get`, `take`, `drop`, `inventory`, `inv`, `i`, `attack`, `kill`, `goto`, `setportal`, `eval` and `create`. For the "soft" built-ins `wield`, `wear`, `unwield`, `remove`, `equipment`, `eq` and `get`/`take ... from ...`, a matching custom verb (below) comes first and the built-in runs only if none matches; such a handler never gets the player as payer (they may have meant the built-in). Safety commands (`pvp`, `flee`) can't be shadowed.
+1. Built-in commands always win. These verbs can't be overridden: `look`, `l`, the directions and their abbreviations, `say`, `help`, `get`, `take`, `drop`, `inventory`, `inv`, `i`, `attack`, `kill`, `goto`, `setportal`, `eval` and `create`. For the "soft" built-ins `wield`, `wear`, `unwield`, `remove`, `equipment`, `eq`, `who`, `give`, `use` and `get`/`take ... from ...`, a matching custom verb (below) comes first and the built-in runs only if none matches; such a handler never gets the player as payer (they may have meant the built-in). Safety commands (`pvp`, `flee`) can't be shadowed.
 2. The first word, lowercased, is the verb. The rest of the line is `args`.
 3. Candidates are collected in this order:
    - room actions registered for the player's room, but only for objects that are nearby;
@@ -1186,9 +1186,11 @@ their subclasses).
 
 `Commands.flee` wraps [`game.flee`](#gamefleeid) (the built-in `flee`
 command uses the same engine call); like it, it moves a player only when
-that player is the one acting (an `eval` of theirs), never from object code. The library also defines
-`Commands.give`, `Commands.look`, `Commands.say` and `Commands.use`, but no
-player command calls them.
+that player is the one acting (an `eval` of theirs), never from object code.
+The `give` and `use` commands call `Commands.give` and `Commands.use`
+(which returns `{success, message}`; an `on_use` returning a string makes
+the message). The library also defines `Commands.look` and `Commands.say`,
+which no player command calls.
 
 ### `Combat`
 
@@ -1299,7 +1301,6 @@ use the [`Combat`](#combat) library or your own code.
 These are not built yet. See the [roadmap](../../docs/roadmap.md).
 
 - **Unfired handlers:** `on_use` fires only through `game.use_object`.
-- **Missing player commands:** there is no `use` or `give` command. Add verbs with `game.add_action`.
 - **Universe config:** keys such as `spawn_room` are not read by the server; use `setportal`.
 
 ---

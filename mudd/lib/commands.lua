@@ -333,14 +333,14 @@ function Commands.use(player_id, item_name, target_name)
         end
     end
 
-    -- Try to use the object
-    if game.use_object then
-        local result = game.use_object(item.id, player_id, "use", target_id)
-        if result then
-            return result
-        end
+    -- Its on_use (as its owner); a string reply is the message
+    local result = game.use_object(item.id, player_id, "use", target_id)
+    if type(result) == "table" then
+        return result
     end
-
+    if result ~= nil and result ~= "nil" then
+        return {success = true, message = tostring(result)}
+    end
     return {success = false, message = "You can't use that."}
 end
 

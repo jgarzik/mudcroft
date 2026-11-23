@@ -818,7 +818,6 @@ These are planned or partial; see the [roadmap](../../docs/roadmap.md).
 Don't build on them yet:
 
 - **Handlers that never fire on their own:** `on_use` (call it with `game.use_object`).
-- **Commands:** there are no `use` or `give` player commands (add verbs instead).
 - **Universe config:** a key like `spawn_room` has no effect. Use `setportal` for the spawn room.
 
 ---

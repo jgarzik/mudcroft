@@ -190,6 +190,9 @@ after the verb as their argument.
 | `say <msg>` | all | `<name> says: ...` to others in the room |
 | `get`/`take <item>`, `drop <item>`, `inventory`/`inv`/`i` | all | Call `Commands.take/drop/inventory` from the mudlib; `take` refuses `fixed` and living objects, and item names match literally (`%`, `_` escaped); `get <item>\|all from <container>` calls `Commands.take_from` |
 | `flee` | all | Leave through a random exit, ending your fight (`game.flee`) |
+| `give <item> to <someone>`, `use <item> [on <target>]` | all | `Commands.give` / `Commands.use` from the mudlib |
+| `who` | all | The players in the universe |
+| `quit` | all | Leave now: the session ends and the disconnect is handled at once (no grace period) |
 | `attack`/`kill <target>` | all | Rust combat against an NPC (`npc`, an `npc` subclass, or `monster`), or a player as `pvp_policy` allows: the first blow, then rounds both ways until the fight ends |
 | `pvp on`/`off` | all | Flag yourself for player combat (counts under `pvp_policy = "flagged"`) |
 | `wield`/`unwield`, `wear`/`remove <item>`, `equipment`/`eq` | all | Equipment (`api/equipment.rs`): weapon dice, type and bonus and worn armor class count in combat |

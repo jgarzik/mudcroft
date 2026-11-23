@@ -848,3 +848,77 @@ async fn test_move_hooks_after_review() {
     );
     assert_eq!(n, 1, "on_move ran despite the crowd's on_init");
 }
+
+/// who lists the players in the universe; give hands an item over; use runs
+/// an item's on_use; quit leaves at once (the room's on_disconnect fires
+/// without the grace period)
+#[tokio::test]
+async fn test_player_commands_who_give_use_quit() {
+    let server = TestServer::start().await.expect("server");
+    let entrance = server.world().entrance_id.clone();
+    let mut wiz = wizard(&server, "giver").await;
+    let mut friend = server
+        .connect_as(crate::harness::Role::Player {
+            username: "receiver".into(),
+        })
+        .await
+        .unwrap();
+    let friend_id = friend.player_id().unwrap().to_string();
+    let me = wiz.player_id().unwrap().to_string();
+    let out = eval(
+        &mut wiz,
+        &format!(
+            r#"game.create_object("/items/token", "item", "{me}", {{name = "token"}})
+               local h = game.store_code([[return {{ on_use = function(a) return "The lamp glows." end }}]])
+               game.create_object("/items/lamp", "item", "{me}", {{name = "lamp", code_hash = h}})
+               local r = game.store_code([[return {{ on_disconnect = function(a) game.update_object("/rooms/lobby/ledger", {{farewell = a.player_id}}) end }}]])
+               game.create_object("/rooms/lobby", "room", nil, {{name = "Lobby", code_hash = r}})
+               game.create_object("/rooms/lobby/ledger", "item", "/rooms/lobby", {{name = "ledger"}})
+               game.move_object("{f}", "/rooms/lobby")
+               return "ok""#,
+            me = me,
+            f = friend_id
+        ),
+    )
+    .await;
+    assert_eq!(out, "ok");
+    let _ = &entrance;
+    wiz.drain().await;
+    wiz.command("goto /rooms/lobby").await.unwrap();
+    wiz.expect("room").await.unwrap();
+    wiz.drain().await;
+    wiz.command("who").await.unwrap();
+    let who = wiz.expect_output_containing("receiver").await.unwrap();
+    assert!(who.contains("giver"), "{}", who);
+    wiz.drain().await;
+    wiz.command("give token to receiver").await.unwrap();
+    wiz.expect_output_containing("You give token to receiver")
+        .await
+        .unwrap();
+    friend
+        .expect_output_containing("gives you token")
+        .await
+        .expect("told");
+    wiz.drain().await;
+    wiz.command("use lamp").await.unwrap();
+    wiz.expect_output_containing("The lamp glows")
+        .await
+        .unwrap();
+    // The receiver quits: on_disconnect at once
+    friend.drain().await;
+    friend.command("quit").await.unwrap();
+    friend.expect_output_containing("Goodbye").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let farewell: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(properties, '$.farewell') FROM objects WHERE universe_id = ? AND id = '/rooms/lobby/ledger'",
+    )
+    .bind(server.universe_id())
+    .fetch_one(server.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        farewell.as_deref(),
+        Some(friend_id.as_str()),
+        "on_disconnect without the grace period"
+    );
+}
