@@ -34,6 +34,7 @@ updates:
       npm-minor:
         update-types: [minor, patch]
 
+  # Base images use floating tags; this proposes new major versions
   - package-ecosystem: docker
     directory: /
     schedule:

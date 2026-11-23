@@ -1,13 +1,12 @@
 # syntax=docker/dockerfile:1
 
-# Base images are pinned by digest; Dependabot proposes updates.
 
 # =============================================================================
 # Stage 1: Rust dependency planner (cargo-chef)
 # =============================================================================
-FROM rust:1-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS rust-planner
+FROM rust:1-trixie AS rust-planner
 
-RUN cargo install cargo-chef --locked --version 0.1.78
+RUN cargo install cargo-chef --locked
 
 WORKDIR /mudd
 COPY mudd/Cargo.toml mudd/Cargo.lock ./
@@ -17,9 +16,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 # =============================================================================
 # Stage 2: Rust dependency cache and build
 # =============================================================================
-FROM rust:1-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS rust-builder
+FROM rust:1-trixie AS rust-builder
 
-RUN cargo install cargo-chef --locked --version 0.1.78
+RUN cargo install cargo-chef --locked
 
 WORKDIR /mudd
 
@@ -35,7 +34,7 @@ RUN cargo build --locked --release --bin mudd --bin mudd_init --bin mudd_admin
 # =============================================================================
 # Stage 3: Node frontend build
 # =============================================================================
-FROM node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS node-builder
+FROM node:24-trixie-slim AS node-builder
 
 WORKDIR /client
 
@@ -50,7 +49,7 @@ RUN npm run build
 # =============================================================================
 # Stage 4: Final runtime image
 # =============================================================================
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
+FROM debian:trixie-slim AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/jgarzik/mudcroft"
 LABEL org.opencontainers.image.licenses="MIT"
