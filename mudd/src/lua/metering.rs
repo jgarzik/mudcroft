@@ -1,7 +1,7 @@
 //! Resource metering for Lua execution
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Tracks resource usage during Lua execution
 #[derive(Debug, Clone)]

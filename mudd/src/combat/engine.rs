@@ -559,12 +559,14 @@ mod tests {
         // to 2), and the burn ends; the stun is untouched
         let out = process_due(&target, &effects, 1_000);
         assert_eq!(out.hp, 15);
-        assert!(out
-            .events
-            .contains(&TickEvent::Expired(EffectType::Burning)));
-        assert!(!out
-            .events
-            .contains(&TickEvent::Expired(EffectType::Stunned)));
+        assert!(
+            out.events
+                .contains(&TickEvent::Expired(EffectType::Burning))
+        );
+        assert!(
+            !out.events
+                .contains(&TickEvent::Expired(EffectType::Stunned))
+        );
         let statements = tick_statements("u", "/npcs/x", false, &effects, &out).unwrap();
         // poison clock moved, burn deleted, hp set: the stun costs nothing
         assert_eq!(statements.len(), 3, "{:?}", statements);
@@ -576,12 +578,14 @@ mod tests {
             amount: 9,
             dtype: DamageType::Poison
         }));
-        assert!(out
-            .events
-            .contains(&TickEvent::Expired(EffectType::Poisoned)));
-        assert!(out
-            .events
-            .contains(&TickEvent::Expired(EffectType::Stunned)));
+        assert!(
+            out.events
+                .contains(&TickEvent::Expired(EffectType::Poisoned))
+        );
+        assert!(
+            out.events
+                .contains(&TickEvent::Expired(EffectType::Stunned))
+        );
         assert!(out.effects.is_empty());
 
         // Lethal damage kills once, ending the effects and leaving the room
@@ -667,9 +671,11 @@ mod tests {
             Some((BLEED_DAMAGE, DamageType::Physical))
         );
         let statements = attack_statements("u", "/npcs/x", &out).unwrap();
-        assert!(statements
-            .iter()
-            .any(|(sql, _)| sql.contains("INSERT INTO active_effects")));
+        assert!(
+            statements
+                .iter()
+                .any(|(sql, _)| sql.contains("INSERT INTO active_effects"))
+        );
     }
 
     /// Review fixes: no zero-damage events; regenerating always heals;

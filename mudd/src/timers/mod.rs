@@ -521,16 +521,18 @@ mod tests {
         assert_eq!(mgr.heartbeat_count().await, 2, "one heartbeat per universe");
 
         for _ in 0..MAX_TIMERS_PER_OBJECT {
-            assert!(mgr
-                .try_add_timer(Timer::new("a", "/clock", "tick", 60_000, None))
-                .await
-                .is_some());
+            assert!(
+                mgr.try_add_timer(Timer::new("a", "/clock", "tick", 60_000, None))
+                    .await
+                    .is_some()
+            );
         }
         // Universe b's object has its own cap
-        assert!(mgr
-            .try_add_timer(Timer::new("b", "/clock", "tick", 60_000, None))
-            .await
-            .is_some());
+        assert!(
+            mgr.try_add_timer(Timer::new("b", "/clock", "tick", 60_000, None))
+                .await
+                .is_some()
+        );
 
         // Removing b's object's timers and heartbeat leaves a's alone
         mgr.remove_timers_for_object("b", "/clock").await;

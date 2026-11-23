@@ -120,7 +120,7 @@ impl TestServer {
             {
                 Ok(child) => break (addr, child),
                 Err(e) if attempt < 3 && e.to_string().contains("exited during startup") => {
-                    continue
+                    continue;
                 }
                 Err(e) => return Err(e),
             }

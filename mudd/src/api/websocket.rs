@@ -4,17 +4,17 @@ use std::collections::BTreeMap;
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
-use super::scripting::{self, ScriptContext};
 use super::AppState;
+use super::scripting::{self, ScriptContext};
 use crate::auth::accounts::Account;
 use crate::images::generate_room_image;
 use crate::permissions::AccessLevel;
@@ -393,7 +393,7 @@ async fn admit(
             return Err((
                 StatusCode::BAD_REQUEST,
                 "Universe ID required in query param: ?universe=<id>".to_string(),
-            ))
+            ));
         }
     };
     match state.object_store.universe_exists(&universe_id).await {
@@ -402,7 +402,7 @@ async fn admit(
             return Err((
                 StatusCode::NOT_FOUND,
                 format!("Universe not found: {}", universe_id),
-            ))
+            ));
         }
         Err(e) => {
             warn!("Error checking universe: {}", e);
@@ -1799,7 +1799,7 @@ async fn execute_command(
                 Err(e) => {
                     return ServerMessage::Error {
                         message: format!("Attack failed: {}", e),
-                    }
+                    };
                 }
             }
 
@@ -1819,7 +1819,7 @@ async fn execute_command(
                     Err(e) => {
                         return ServerMessage::Error {
                             message: format!("Attack failed: {}", e),
-                        }
+                        };
                     }
                 };
             let death = if blow.killed {
@@ -1837,7 +1837,7 @@ async fn execute_command(
                     Err(e) => {
                         return ServerMessage::Error {
                             message: format!("Attack failed: {}", e),
-                        }
+                        };
                     }
                 }
             } else {
@@ -2046,7 +2046,7 @@ async fn execute_command(
                 Err(e) => {
                     return ServerMessage::Error {
                         message: format!("Could not change PvP: {}", e),
-                    }
+                    };
                 }
             };
             match state.object_store.execute_batch(vec![statement]).await {

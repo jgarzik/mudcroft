@@ -234,7 +234,7 @@ pub fn shutdown_on_signals() -> watch::Receiver<bool> {
 async fn termination_signal() -> &'static str {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut term) => tokio::select! {
                 _ = term.recv() => "SIGTERM",

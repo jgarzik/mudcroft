@@ -1,7 +1,7 @@
 //! Lua sandbox - secure execution environment
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mlua::{Function, HookTriggers, Lua, Result as LuaResult, StdLib, Value, VmState};

@@ -402,7 +402,7 @@ impl VeniceClient {
             .as_ref()
             .ok_or_else(|| "No base64 image data in response".to_string())?;
 
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         let bytes = STANDARD
             .decode(b64)
             .map_err(|e| format!("Failed to decode base64: {}", e))?;

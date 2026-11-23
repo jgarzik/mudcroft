@@ -950,10 +950,12 @@ async fn test_eval_command_denied_for_player() {
     // Should get error
     let output = player.expect("error").await.expect("should receive error");
     assert_eq!(output["type"], "error");
-    assert!(output["message"]
-        .as_str()
-        .unwrap()
-        .contains("Permission denied"));
+    assert!(
+        output["message"]
+            .as_str()
+            .unwrap()
+            .contains("Permission denied")
+    );
 }
 
 // =============================================================================

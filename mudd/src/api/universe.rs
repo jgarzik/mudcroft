@@ -4,18 +4,18 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
-use super::scripting::{self, ScriptContext};
 use super::AppState;
+use super::scripting::{self, ScriptContext};
 use crate::auth::accounts::Account;
 use crate::permissions::AccessLevel;
 use crate::universe::validate_universe_id;
@@ -173,13 +173,13 @@ async fn universe_admin(
             return Err(api_error(
                 StatusCode::NOT_FOUND,
                 format!("Universe not found: {}", universe_id),
-            ))
+            ));
         }
         Err(e) => {
             return Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Database error: {}", e),
-            ))
+            ));
         }
     };
     let level = state
@@ -221,14 +221,14 @@ async fn set_portal(
                 StatusCode::NOT_FOUND,
                 format!("Room not found: {}", request.room_id),
             )
-            .into_response()
+            .into_response();
         }
         Err(e) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Database error: {}", e),
             )
-            .into_response()
+            .into_response();
         }
     };
     if room.class != "room" {

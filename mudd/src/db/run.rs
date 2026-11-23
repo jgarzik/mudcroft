@@ -27,8 +27,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
 use sqlx::pool::PoolConnection;
@@ -625,10 +625,11 @@ mod tests {
                 let run = current().unwrap();
                 run.execute(&[insert(3)]).await.unwrap();
                 // A failing statement undoes only its own call
-                assert!(run
-                    .execute(&[insert(4), ("BOGUS".to_string(), vec![])])
-                    .await
-                    .is_err());
+                assert!(
+                    run.execute(&[insert(4), ("BOGUS".to_string(), vec![])])
+                        .await
+                        .is_err()
+                );
                 let mut conn = reader(&pool).await.unwrap();
                 let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
                     .fetch_one(&mut *conn)

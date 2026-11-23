@@ -1029,10 +1029,11 @@ mod tests {
         );
 
         // Owner is not a member level
-        assert!(pm
-            .set_access_level("u", "user1", AccessLevel::Owner)
-            .await
-            .is_err());
+        assert!(
+            pm.set_access_level("u", "user1", AccessLevel::Owner)
+                .await
+                .is_err()
+        );
     }
 
     /// Levels are per universe: member levels apply only in their universe,
@@ -1147,24 +1148,28 @@ mod tests {
         };
 
         // Player can read
-        assert!(pm
-            .check_permission(&user, Action::Read, &fixed_obj)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::Read, &fixed_obj)
+                .is_allowed()
+        );
 
         // Player cannot move fixed objects
-        assert!(!pm
-            .check_permission(&user, Action::Move, &fixed_obj)
-            .is_allowed());
+        assert!(
+            !pm.check_permission(&user, Action::Move, &fixed_obj)
+                .is_allowed()
+        );
 
         // Player can move non-fixed objects
-        assert!(pm
-            .check_permission(&user, Action::Move, &movable_obj)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::Move, &movable_obj)
+                .is_allowed()
+        );
 
         // Player cannot modify
-        assert!(!pm
-            .check_permission(&user, Action::Modify, &movable_obj)
-            .is_allowed());
+        assert!(
+            !pm.check_permission(&user, Action::Modify, &movable_obj)
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1194,14 +1199,16 @@ mod tests {
         };
 
         // Builder can modify objects in their granted path
-        assert!(pm
-            .check_permission(&user, Action::Modify, &obj_in_path)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::Modify, &obj_in_path)
+                .is_allowed()
+        );
 
         // Builder cannot modify objects outside their granted path
-        assert!(!pm
-            .check_permission(&user, Action::Modify, &obj_outside_path)
-            .is_allowed());
+        assert!(
+            !pm.check_permission(&user, Action::Modify, &obj_outside_path)
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1224,14 +1231,16 @@ mod tests {
         };
 
         // Owner can modify their own object
-        assert!(pm
-            .check_permission(&user, Action::Modify, &owned_obj)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::Modify, &owned_obj)
+                .is_allowed()
+        );
 
         // Cannot modify someone else's object
-        assert!(!pm
-            .check_permission(&user, Action::Modify, &not_owned_obj)
-            .is_allowed());
+        assert!(
+            !pm.check_permission(&user, Action::Modify, &not_owned_obj)
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1246,24 +1255,28 @@ mod tests {
         };
 
         // Wizard can move fixed objects
-        assert!(pm
-            .check_permission(&user, Action::Move, &fixed_obj)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::Move, &fixed_obj)
+                .is_allowed()
+        );
 
         // Wizard can modify anything
-        assert!(pm
-            .check_permission(&user, Action::Modify, &fixed_obj)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::Modify, &fixed_obj)
+                .is_allowed()
+        );
 
         // Wizard can store code
-        assert!(pm
-            .check_permission(&user, Action::StoreCode, &fixed_obj)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::StoreCode, &fixed_obj)
+                .is_allowed()
+        );
 
         // But wizard cannot grant credits (requires admin)
-        assert!(!pm
-            .check_permission(&user, Action::GrantCredits, &fixed_obj)
-            .is_allowed());
+        assert!(
+            !pm.check_permission(&user, Action::GrantCredits, &fixed_obj)
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1278,12 +1291,14 @@ mod tests {
         };
 
         // Admin can administer
-        assert!(pm
-            .check_permission(&user, Action::AdminConfig, &obj)
-            .is_allowed());
-        assert!(pm
-            .check_permission(&user, Action::GrantCredits, &obj)
-            .is_allowed());
+        assert!(
+            pm.check_permission(&user, Action::AdminConfig, &obj)
+                .is_allowed()
+        );
+        assert!(
+            pm.check_permission(&user, Action::GrantCredits, &obj)
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1301,19 +1316,22 @@ mod tests {
         let user = UserContext::builder("builder1", "universe1", grants);
 
         // Can move within granted path
-        assert!(pm
-            .check_move_permission(&user, "/d/forest/cave", "/d/forest/clearing", None)
-            .is_allowed());
+        assert!(
+            pm.check_move_permission(&user, "/d/forest/cave", "/d/forest/clearing", None)
+                .is_allowed()
+        );
 
         // Cannot move to ungrated path
-        assert!(!pm
-            .check_move_permission(&user, "/d/forest/cave", "/d/desert/oasis", None)
-            .is_allowed());
+        assert!(
+            !pm.check_move_permission(&user, "/d/forest/cave", "/d/desert/oasis", None)
+                .is_allowed()
+        );
 
         // Cannot move from ungrated path
-        assert!(!pm
-            .check_move_permission(&user, "/d/desert/oasis", "/d/forest/clearing", None)
-            .is_allowed());
+        assert!(
+            !pm.check_move_permission(&user, "/d/desert/oasis", "/d/forest/clearing", None)
+                .is_allowed()
+        );
     }
 
     #[test]

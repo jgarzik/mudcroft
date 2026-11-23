@@ -312,10 +312,12 @@ mod tests {
             .remove_room_action("u", "room_1", "pull", "lever_1")
             .await
             .unwrap();
-        assert!(registry
-            .get_room_actions("u", "room_1", "pull")
-            .await
-            .is_empty());
+        assert!(
+            registry
+                .get_room_actions("u", "room_1", "pull")
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -343,10 +345,12 @@ mod tests {
             .unwrap();
 
         registry.clear_by_object("u", "lever_1").await;
-        assert!(registry
-            .get_room_actions("u", "room_1", "pull")
-            .await
-            .is_empty());
+        assert!(
+            registry
+                .get_room_actions("u", "room_1", "pull")
+                .await
+                .is_empty()
+        );
     }
 
     /// The same object id in two universes has independent actions
@@ -362,21 +366,27 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(registry
-            .get_object_action("b", "/items/x", "rub")
-            .await
-            .is_none());
-        assert!(registry
-            .get_room_actions("b", "/rooms/r", "pull")
-            .await
-            .is_empty());
+        assert!(
+            registry
+                .get_object_action("b", "/items/x", "rub")
+                .await
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_room_actions("b", "/rooms/r", "pull")
+                .await
+                .is_empty()
+        );
 
         // Clearing the object in universe b leaves universe a's actions
         registry.clear_by_object("b", "/items/x").await;
-        assert!(registry
-            .get_object_action("a", "/items/x", "rub")
-            .await
-            .is_some());
+        assert!(
+            registry
+                .get_object_action("a", "/items/x", "rub")
+                .await
+                .is_some()
+        );
         assert_eq!(
             registry
                 .get_room_actions("a", "/rooms/r", "pull")

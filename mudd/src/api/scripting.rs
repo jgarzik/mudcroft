@@ -18,7 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use super::{AppState, ServerMessage};
-use crate::lua::{json_to_lua, GameApi, GameMessage, MessageQueue, Sandbox, SandboxConfig};
+use crate::lua::{GameApi, GameMessage, MessageQueue, Sandbox, SandboxConfig, json_to_lua};
 
 /// Who and where a script runs as
 #[derive(Debug, Clone, Default)]

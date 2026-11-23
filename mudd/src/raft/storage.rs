@@ -203,7 +203,7 @@ impl LogStore {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unknown entry type: {}", other),
-                ))
+                ));
             }
         };
         Ok(Entry {
@@ -584,7 +584,7 @@ pub(crate) fn bind_params<'q>(
     mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     params: &[serde_json::Value],
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     for param in params {
         query = match param {
             serde_json::Value::Null => query.bind(Option::<String>::None),
@@ -1118,10 +1118,12 @@ mod tests {
         let mut follower = StateMachine::new(shared(test_pool().await), None)
             .await
             .unwrap();
-        assert!(follower
-            .install_snapshot(&snapshot.meta, Cursor::new(data))
-            .await
-            .is_err());
+        assert!(
+            follower
+                .install_snapshot(&snapshot.meta, Cursor::new(data))
+                .await
+                .is_err()
+        );
         let (last_applied, _) = follower.applied_state().await.unwrap();
         assert!(last_applied.is_none(), "nothing recorded");
     }

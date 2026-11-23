@@ -23,8 +23,8 @@ use serde_json::json;
 use tracing::warn;
 
 use super::{AppState, ServerMessage};
-use crate::combat::engine::{attack_mods, attack_statements, resolve_attack, Combatant};
-use crate::combat::{now_ms, DamageType};
+use crate::combat::engine::{Combatant, attack_mods, attack_statements, resolve_attack};
+use crate::combat::{DamageType, now_ms};
 use crate::objects::Object;
 
 /// Round length when the universe sets none
@@ -2151,12 +2151,14 @@ impl CombatEngine {
         let hp = who.hp.saturating_sub(dealt).max(0);
         state
             .object_store
-            .execute_batch(vec![crate::objects::ObjectStore::set_properties_statement(
-                u,
-                target_id,
-                &[("hp", json!(hp))],
-            )
-            .map_err(|e| e.to_string())?])
+            .execute_batch(vec![
+                crate::objects::ObjectStore::set_properties_statement(
+                    u,
+                    target_id,
+                    &[("hp", json!(hp))],
+                )
+                .map_err(|e| e.to_string())?,
+            ])
             .await
             .map_err(|e| e.to_string())?;
         let killed = was_alive && hp == 0;
@@ -2302,12 +2304,14 @@ impl Engine for CombatEngine {
                 .min(who.max_hp as i64);
             self.state
                 .object_store
-                .execute_batch(vec![crate::objects::ObjectStore::set_properties_statement(
-                    universe_id,
-                    target,
-                    &[("hp", json!(hp))],
-                )
-                .map_err(|e| e.to_string())?])
+                .execute_batch(vec![
+                    crate::objects::ObjectStore::set_properties_statement(
+                        universe_id,
+                        target,
+                        &[("hp", json!(hp))],
+                    )
+                    .map_err(|e| e.to_string())?,
+                ])
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(hp)

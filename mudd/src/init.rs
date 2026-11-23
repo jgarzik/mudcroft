@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tracing::info;
 
 use crate::auth::accounts::AccountService;
@@ -283,10 +283,12 @@ mod tests {
         // Try without credentials - should fail
         let result = init_database(&db_path, None, None, HashMap::new(), None).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("username required"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("username required")
+        );
     }
 
     #[tokio::test]

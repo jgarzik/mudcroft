@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::raft::RaftWriter;
@@ -383,10 +383,12 @@ mod tests {
         assert!(!credits.deduct("u1", &alice(), 11).await.unwrap());
         assert_eq!(credits.balance("u1", &alice()).await.unwrap(), 10);
         // A holder with no row at all has nothing to spend
-        assert!(!credits
-            .deduct("u1", &Holder::Account("bob".into()), 1)
-            .await
-            .unwrap());
+        assert!(
+            !credits
+                .deduct("u1", &Holder::Account("bob".into()), 1)
+                .await
+                .unwrap()
+        );
     }
 
     /// Transfers are atomic between accounts and objects
@@ -433,10 +435,12 @@ mod tests {
         let till = Holder::Object("/shops/till".into());
         assert!(credits.grant("u1", &till, 5).await.is_ok());
         assert!(credits.grant("u2", &till, 5).await.is_err());
-        assert!(credits
-            .grant("u1", &Holder::Account("ghost".into()), 5)
-            .await
-            .is_err());
+        assert!(
+            credits
+                .grant("u1", &Holder::Account("ghost".into()), 5)
+                .await
+                .is_err()
+        );
         // A transfer to a missing holder changes nothing
         credits.grant("u1", &alice(), 10).await.unwrap();
         let gone = Holder::Object("/shops/gone".into());

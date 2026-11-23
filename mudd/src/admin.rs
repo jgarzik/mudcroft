@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::auth::accounts::AccountService;
 use crate::db::Database;
@@ -158,9 +158,11 @@ mod tests {
             .unwrap();
         assert_eq!(level_of(&path, "alice").await, "player");
 
-        assert!(set_global_level(&path, "nobody", GlobalLevel::Admin)
-            .await
-            .is_err());
+        assert!(
+            set_global_level(&path, "nobody", GlobalLevel::Admin)
+                .await
+                .is_err()
+        );
     }
 
     /// The last global admin cannot be removed

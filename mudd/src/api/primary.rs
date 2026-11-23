@@ -10,12 +10,12 @@
 
 use std::time::Duration;
 
-use openraft::async_runtime::WatchReceiver;
 use openraft::ReadPolicy;
+use openraft::async_runtime::WatchReceiver;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use super::{combat, effect_scheduler, scripting, AppState};
+use super::{AppState, combat, effect_scheduler, scripting};
 
 /// Run the lifecycle forever. `active` is true while this node is the
 /// active primary (caches rebuilt, schedulers running); game traffic is

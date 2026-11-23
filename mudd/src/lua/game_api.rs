@@ -1,7 +1,7 @@
 //! Game API exposed to Lua scripts
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 use parking_lot::Mutex;

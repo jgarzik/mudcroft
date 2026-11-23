@@ -13,8 +13,8 @@
 use serde_json::json;
 use tracing::warn;
 
-use super::websocket::ServerMessage;
 use super::AppState;
+use super::websocket::ServerMessage;
 use crate::credits::Holder;
 
 /// How long a player has to answer
@@ -89,7 +89,7 @@ pub async fn answer(
             Ok(false) => {
                 return Ok(Some(ServerMessage::Output {
                     text: format!("You don't have {} credits.", amount),
-                }))
+                }));
             }
             Err(e) => {
                 warn!("payment {}: transfer failed: {}", id, e);

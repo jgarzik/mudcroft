@@ -1,11 +1,11 @@
 //! Authentication API endpoints
 
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 

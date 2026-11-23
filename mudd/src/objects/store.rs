@@ -788,12 +788,14 @@ mod tests {
         let rat = store.get("u", "/npcs/rat").await.unwrap().unwrap();
         assert_eq!(rat.properties["max-hp.v2"], 7);
         for bad in ["", "q\"r", "back\\slash", "nl\n"] {
-            assert!(ObjectStore::set_properties_statement(
-                "u",
-                "/npcs/rat",
-                &[(bad, serde_json::json!(1))]
-            )
-            .is_err());
+            assert!(
+                ObjectStore::set_properties_statement(
+                    "u",
+                    "/npcs/rat",
+                    &[(bad, serde_json::json!(1))]
+                )
+                .is_err()
+            );
         }
     }
 }

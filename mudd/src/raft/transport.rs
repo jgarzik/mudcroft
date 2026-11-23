@@ -41,8 +41,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use super::types::{NodeId, TypeConfig};
 use super::GameRaft;
+use super::types::{NodeId, TypeConfig};
 
 /// The name every cluster certificate must carry (subjectAltName DNS), so
 /// a node is verified whatever address it is reached at
