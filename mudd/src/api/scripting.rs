@@ -445,6 +445,10 @@ async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerF
     if !state.timers.begin_firing(id).await {
         return; // cancelled meanwhile
     }
+    if state.timers.settle_only(id) {
+        // Its handler already ran: only its row is left to delete
+        return settle_call_out(state, id).await;
+    }
     let what = format!("call_out {} on {}", fired.method, fired.object_id);
     match state.timers.is_stored(id).await {
         Ok(true) => {}
@@ -481,14 +485,14 @@ async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerF
 }
 
 /// After a call_out ran (or cannot): delete its row unless the handler's
-/// batch already did, then forget it. A failed delete keeps it pending, to
-/// be tried again later.
+/// batch already did, then forget it. A failed delete is tried again later
+/// as a delete only: the handler never runs twice.
 async fn settle_call_out(state: &AppState, id: &str) {
     if !matches!(state.timers.is_stored(id).await, Ok(false)) {
         let (sql, params) = crate::timers::TimerManager::consume_statement(id);
         if let Err(e) = state.raft_writer.execute(sql, params).await {
             tracing::warn!("deleting call_out {}: {}", id, e);
-            return state.timers.defer(id).await;
+            return state.timers.defer_settle(id).await;
         }
     }
     state.timers.forget_timer(id).await;

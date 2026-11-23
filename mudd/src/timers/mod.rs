@@ -167,6 +167,9 @@ struct Flight {
     cancelling: std::collections::HashSet<String>,
     /// Firing failed to save or read: not before (Unix ms), attempts
     deferred: std::collections::HashMap<String, (i64, u32)>,
+    /// Its handler already ran; only deleting its row failed: a retry
+    /// deletes it without running the handler again
+    settle_only: std::collections::HashSet<String>,
 }
 
 /// First wait before firing a call_out again whose save or read failed;
@@ -355,6 +358,18 @@ impl TimerManager {
         self.changed.notify_one();
     }
 
+    /// Its handler ran but deleting its row failed: retry the delete only
+    /// (later, with the same growing wait), never the handler
+    pub async fn defer_settle(&self, timer_id: &str) {
+        self.flight().settle_only.insert(timer_id.to_string());
+        self.defer(timer_id).await;
+    }
+
+    /// Whether only the call_out's row delete is left (its handler ran)
+    pub fn settle_only(&self, timer_id: &str) -> bool {
+        self.flight().settle_only.contains(timer_id)
+    }
+
     /// When a call_out is next due: its fire_at, or later if deferred
     fn due_at(&self, flight: &Flight, timer: &Timer) -> i64 {
         flight
@@ -369,6 +384,7 @@ impl TimerManager {
         let mut flight = self.flight();
         flight.firing.remove(timer_id);
         flight.deferred.remove(timer_id);
+        flight.settle_only.remove(timer_id);
     }
 
     /// Whether the call_out's row exists (the truth: a cached call_out
@@ -861,6 +877,23 @@ mod tests {
         assert!(second_wait > first_wait, "{second_wait} > {first_wait}");
         mgr.forget_timer(&id).await;
         assert_eq!(mgr.next_deadline().await, None);
+    }
+
+    /// A call_out whose handler already ran but whose row delete failed is
+    /// retried as a delete only: its handler never runs again
+    #[tokio::test]
+    async fn test_settle_only_after_handler_ran() {
+        let mgr = TimerManager::new(None, None);
+        let mut timer = Timer::new("a", "/clock", "tick", 0, None);
+        timer.fire_at = chrono::Utc::now().timestamp_millis() - 100;
+        let id = mgr.add_timer(timer).await.unwrap();
+        assert!(mgr.begin_firing(&id).await);
+        assert!(!mgr.settle_only(&id), "not yet run");
+        mgr.defer_settle(&id).await;
+        assert!(mgr.begin_firing(&id).await, "tried again (later)");
+        assert!(mgr.settle_only(&id), "only its delete is left");
+        mgr.forget_timer(&id).await;
+        assert!(!mgr.settle_only(&id));
     }
 
     #[tokio::test]
