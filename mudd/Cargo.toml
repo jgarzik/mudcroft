@@ -3,6 +3,7 @@ name = "mudd"
 version = "0.1.0"
 edition = "2021"
 description = "Mudcroft server daemon"
+publish = false
 
 [[bin]]
 name = "mudd"
