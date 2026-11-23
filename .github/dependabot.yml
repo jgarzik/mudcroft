@@ -33,6 +33,12 @@ updates:
     groups:
       npm-minor:
         update-types: [minor, patch]
+    # typescript-eslint pins its typescript peer below the next major
+    # (8.x: <6.1.0), so a typescript major cannot install until it catches
+    # up. Raise this bound when typescript-eslint's peer range admits 7.
+    ignore:
+      - dependency-name: typescript
+        versions: ['>=7']
 
   # Base images use floating tags; this proposes new major versions
   - package-ecosystem: docker
