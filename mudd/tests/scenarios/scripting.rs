@@ -354,8 +354,20 @@ async fn test_call_out_consumed_with_its_handler() {
         ),
     )
     .await;
-    // Both have fired by now; a retried one would also have run again
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Wait until both have fired, then a little longer: a retried or
+    // duplicated one would run again
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && eval(
+            &mut wiz,
+            r#"return tostring(game.get_object("/items/counter").metadata.count)"#,
+        )
+        .await
+            == "nil"
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
     let count = eval(
         &mut wiz,
         r#"return game.get_object("/items/counter").metadata.count"#,
@@ -370,15 +382,21 @@ async fn test_call_out_consumed_with_its_handler() {
     assert_eq!(failed, "nil", "a failing handler keeps none of its writes");
 
     drop(wiz);
-    server.stop();
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.db_path.display()))
         .await
         .unwrap();
-    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM timers")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(pending, 0, "both call_outs consumed");
+    let pending = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM timers")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while pending().await != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(pending().await, 0, "both call_outs consumed");
+    server.stop();
 }
 
 /// A server killed partway through a batch of due call_outs loses none of

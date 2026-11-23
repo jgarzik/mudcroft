@@ -263,11 +263,32 @@ impl TimerManager {
         owned && self.remove_timer(timer_id).await
     }
 
-    /// Take a due call_out out of the cache before firing it (its row is
-    /// deleted with the handler's writes). False if it is gone already
-    /// (cancelled meanwhile by an earlier callback).
-    pub async fn take_timer(&self, timer_id: &str) -> bool {
-        self.timers.write().await.remove(timer_id).is_some()
+    /// Forget a settled call_out (cache only: its row is already deleted)
+    pub async fn forget_timer(&self, timer_id: &str) {
+        self.timers.write().await.remove(timer_id);
+    }
+
+    /// Try a call_out again in `delay_ms` (cache only: the stored fire_at
+    /// is unchanged, so a restart fires it at once)
+    pub async fn retry_later(&self, timer_id: &str, delay_ms: i64) {
+        if let Some(t) = self.timers.write().await.get_mut(timer_id) {
+            t.fire_at = chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(delay_ms);
+        }
+    }
+
+    /// Whether the call_out's row exists (the truth: a cached call_out
+    /// whose row is gone was cancelled or consumed already)
+    pub async fn is_stored(&self, timer_id: &str) -> anyhow::Result<bool> {
+        let Some(ref pool) = self.pool else {
+            return Ok(true);
+        };
+        let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM timers WHERE id = ?")
+            .bind(timer_id)
+            .fetch_optional(&mut *crate::db::run::reader(pool).await?)
+            .await?;
+        Ok(found.is_some())
     }
 
     /// The statement that consumes a fired call_out's row
@@ -386,10 +407,10 @@ impl TimerManager {
     }
 
     /// Due call_outs (earliest first) and heartbeats. A call_out is only
-    /// reported: the timer loop takes it out of the cache
-    /// ([`Self::take_timer`]) and deletes its row in the same change as its
-    /// handler's writes, so it is never lost between the two. Heartbeats
-    /// are re-armed here (beats write nothing).
+    /// reported: the timer loop deletes its row in the same change as its
+    /// handler's writes and then forgets it ([`Self::forget_timer`]), so it
+    /// is never lost between the two. Heartbeats are re-armed here (beats
+    /// write nothing).
     pub async fn tick(&self) -> Vec<TimerFired> {
         let mut fired = Vec::new();
 
@@ -626,11 +647,12 @@ mod tests {
         assert_eq!(fired[0].method, "on_fire");
         assert_eq!(fired[0].args, Some("test_arg".to_string()));
 
-        // Reported, not taken: the timer loop takes it before firing
+        // Reported, not removed: the timer loop forgets it once settled
         assert_eq!(manager.timer_count().await, 1);
         let id = fired[0].timer_id.clone().unwrap();
-        assert!(manager.take_timer(&id).await);
-        assert!(!manager.take_timer(&id).await, "taken once");
+        manager.retry_later(&id, 60_000).await;
+        assert!(manager.tick().await.is_empty(), "retried later, not now");
+        manager.forget_timer(&id).await;
         assert_eq!(manager.timer_count().await, 0);
     }
 

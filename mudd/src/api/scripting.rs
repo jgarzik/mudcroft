@@ -161,6 +161,7 @@ pub async fn invoke_handler(
         Origin {
             payer: None,
             hooks: HookBudget::new(),
+            prefix: Vec::new(),
         },
     )
     .await
@@ -188,6 +189,33 @@ pub async fn invoke_verb_handler(
         Origin {
             payer: payer.map(str::to_string),
             hooks: HookBudget::new(),
+            prefix: Vec::new(),
+        },
+    )
+    .await
+}
+
+/// invoke_handler for a fired call_out: `prefix` (its delete) leads the
+/// run's batch if the handler writes anything, so the timer is consumed
+/// in the same Raft entry as the handler's writes
+async fn invoke_timer_handler(
+    state: &AppState,
+    fired: &crate::timers::TimerFired,
+    room_id: Option<String>,
+    prefix: Vec<crate::db::run::Statement>,
+) -> Result<Option<String>, String> {
+    let args = timer_args(fired, &room_id);
+    invoke_handler_at(
+        state,
+        &fired.universe_id,
+        &fired.object_id,
+        room_id,
+        &fired.method,
+        args,
+        Origin {
+            payer: None,
+            hooks: HookBudget::new(),
+            prefix,
         },
     )
     .await
@@ -246,6 +274,9 @@ struct Origin {
     payer: Option<String>,
     /// The move-hook allowance it may use
     hooks: HookBudget,
+    /// Statements leading the handler run's batch if it writes anything
+    /// (a fired call_out's delete: consumed with the handler's writes)
+    prefix: Vec<crate::db::run::Statement>,
 }
 
 /// invoke_handler at a hook nesting depth (move hooks run handlers that can
@@ -262,6 +293,7 @@ fn invoke_handler_at<'a>(
     let Origin {
         payer,
         hooks: budget,
+        prefix,
     } = origin;
     Box::pin(async move {
         let Some((code, owner_id)) = object_code(state, object_id, universe_id).await? else {
@@ -277,7 +309,7 @@ fn invoke_handler_at<'a>(
         let libs = load_universe_lib_codes(state, universe_id).await?;
         // One change (joins the caller's if inside one): a failing handler
         // keeps nothing
-        in_run(state, async {
+        in_run_with(state, prefix, async {
             let queue = MessageQueue::shared();
             let result = {
                 let mut sandbox = prepare(state, &ctx, &queue, &libs, SandboxConfig::default())?;
@@ -338,58 +370,79 @@ fn timer_args(fired: &crate::timers::TimerFired, room_id: &Option<String>) -> se
     })
 }
 
+/// How long a call_out waits before another try when its row or object
+/// could not be read (in memory only: the table is unchanged)
+const CALL_OUT_RETRY_MS: i64 = 1_000;
+
 /// Fire a due call_out and consume it in the same change as its handler's
-/// writes: one Raft batch holds both, so the timer is never gone without
-/// its effects, or the reverse. Its row is deleted as a kept write: a
-/// handler that fails keeps none of its writes and the call_out is dropped,
-/// not retried (LPMud). If nothing commits (a crash, a lost leadership),
-/// the row stays and the next primary fires it once.
+/// writes. The table decides: a call_out whose row is gone (cancelled, or
+/// consumed already) does not run. The handler's run carries the row's
+/// delete as its batch prefix, so if the handler writes, both commit as
+/// one Raft entry (one commit) and the timer is never gone without its
+/// effects, or the reverse. A handler that writes nothing, or fails (its
+/// writes discarded; dropped, not retried, as in LPMud), has the row
+/// deleted on its own. The call_out stays cached until settled; if
+/// nothing commits (a crash, a lost leadership) its row remains and the
+/// next primary fires it once. A read error retries it shortly instead.
 async fn fire_call_out(state: &AppState, id: &str, fired: &crate::timers::TimerFired) {
-    // Out of the cache first: this loop never fires it twice, whatever
-    // happens below (the table keeps it until it is consumed)
-    if !state.timers.take_timer(id).await {
-        return; // cancelled by an earlier callback
-    }
-    let outcome = in_run(state, async {
-        let (sql, params) = crate::timers::TimerManager::consume_statement(id);
-        state
-            .raft_writer
-            .execute_kept(sql, params)
-            .await
-            .map_err(|e| e.to_string())?;
-        let room_id = match state
-            .object_store
-            .get(&fired.universe_id, &fired.object_id)
-            .await
-        {
-            Ok(Some(obj)) => obj.parent_id,
-            Ok(None) => return Ok(()),
-            Err(e) => return Err(format!("looking up {}: {}", fired.object_id, e)),
-        };
-        // A nested part of this run: if it fails, only its writes are undone
-        if let Err(e) = invoke_handler(
-            state,
-            &fired.universe_id,
-            &fired.object_id,
-            room_id.clone(),
-            &fired.method,
-            timer_args(fired, &room_id),
-        )
-        .await
-        {
-            tracing::warn!(
-                "call_out {} on {} failed: {}",
-                fired.method,
-                fired.object_id,
-                e
-            );
+    match state.timers.is_stored(id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            state.timers.forget_timer(id).await;
+            return;
         }
-        Ok(())
-    })
-    .await;
-    if let Err(e) = outcome {
-        tracing::warn!("call_out {} on {}: {}", fired.method, fired.object_id, e);
+        Err(e) => {
+            tracing::warn!("call_out {} on {}: {}", fired.method, fired.object_id, e);
+            state.timers.retry_later(id, CALL_OUT_RETRY_MS).await;
+            return;
+        }
     }
+    let room_id = match state
+        .object_store
+        .get(&fired.universe_id, &fired.object_id)
+        .await
+    {
+        Ok(Some(obj)) => obj.parent_id,
+        // Gone (deleting an object cancels its timers anyway)
+        Ok(None) => return settle_call_out(state, id).await,
+        Err(e) => {
+            tracing::warn!("call_out {} on {}: {}", fired.method, fired.object_id, e);
+            state.timers.retry_later(id, CALL_OUT_RETRY_MS).await;
+            return;
+        }
+    };
+    let (sql, params) = crate::timers::TimerManager::consume_statement(id);
+    let run = invoke_timer_handler(state, fired, room_id, vec![(sql.to_string(), params)]);
+    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(
+            "call_out {} on {} failed (dropped): {}",
+            fired.method,
+            fired.object_id,
+            e
+        ),
+        Err(_) => tracing::error!(
+            "call_out {} on {} panicked (dropped)",
+            fired.method,
+            fired.object_id
+        ),
+    }
+    settle_call_out(state, id).await;
+}
+
+/// After a call_out ran (or cannot): delete its row unless the handler's
+/// batch already did, then forget it. If the delete fails it stays cached
+/// and is tried again shortly (its row is the truth).
+async fn settle_call_out(state: &AppState, id: &str) {
+    if !matches!(state.timers.is_stored(id).await, Ok(false)) {
+        let (sql, params) = crate::timers::TimerManager::consume_statement(id);
+        if let Err(e) = state.raft_writer.execute(sql, params).await {
+            tracing::warn!("deleting call_out {}: {}", id, e);
+            state.timers.retry_later(id, CALL_OUT_RETRY_MS).await;
+            return;
+        }
+    }
+    state.timers.forget_timer(id).await;
 }
 
 /// Fire one heartbeat beat (beats write nothing themselves; the handler
@@ -721,6 +774,7 @@ async fn run_move_hooks(
                 // A move hook is passive: nobody chose to run it, nobody pays
                 payer: None,
                 hooks: budget.deeper(),
+                prefix: Vec::new(),
             },
         )
         .await
