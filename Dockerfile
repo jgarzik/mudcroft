@@ -1,11 +1,13 @@
 # syntax=docker/dockerfile:1
 
+# Base images are pinned by digest; Dependabot proposes updates.
+
 # =============================================================================
 # Stage 1: Rust dependency planner (cargo-chef)
 # =============================================================================
-FROM rust:bookworm AS rust-planner
+FROM rust:1-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS rust-planner
 
-RUN cargo install cargo-chef
+RUN cargo install cargo-chef --locked --version 0.1.78
 
 WORKDIR /mudd
 COPY mudd/Cargo.toml mudd/Cargo.lock ./
@@ -15,31 +17,31 @@ RUN cargo chef prepare --recipe-path recipe.json
 # =============================================================================
 # Stage 2: Rust dependency cache and build
 # =============================================================================
-FROM rust:bookworm AS rust-builder
+FROM rust:1-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS rust-builder
 
-RUN cargo install cargo-chef
+RUN cargo install cargo-chef --locked --version 0.1.78
 
 WORKDIR /mudd
 
 # Build dependencies (cached layer)
 COPY --from=rust-planner /mudd/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json
 
 # Build application
 COPY mudd/Cargo.toml mudd/Cargo.lock ./
 COPY mudd/src ./src
-RUN cargo build --release --bin mudd --bin mudd_init --bin mudd_admin
+RUN cargo build --locked --release --bin mudd --bin mudd_init --bin mudd_admin
 
 # =============================================================================
 # Stage 3: Node frontend build
 # =============================================================================
-FROM node:20-bookworm AS node-builder
+FROM node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS node-builder
 
 WORKDIR /client
 
 # Install dependencies (cached layer)
 COPY client/package.json client/package-lock.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 # Build frontend
 COPY client/ ./
@@ -48,7 +50,7 @@ RUN npm run build
 # =============================================================================
 # Stage 4: Final runtime image
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/jgarzik/mudcroft"
 LABEL org.opencontainers.image.licenses="MIT"
