@@ -35,7 +35,7 @@ RUN cargo build --locked --release --bin mudd --bin mudd_init --bin mudd_admin
 # =============================================================================
 # Stage 4: Node frontend build
 # =============================================================================
-FROM node:24-trixie-slim AS node-builder
+FROM node:26-trixie-slim AS node-builder
 
 WORKDIR /client
 
